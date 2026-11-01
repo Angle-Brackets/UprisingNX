@@ -1,21 +1,23 @@
 // A sampling profiler for the game thread. A thread on another core pauses
 // it about every millisecond (svcSetThreadActivity), reads its PC and LR
 // (svcGetThreadContext3) and lets it go. Samples, as raw addresses with the
-// runtime address of main() to find the load base by, go to sdmc:/switch/uprisingnx/prof.bin every 10 s, over the last
-// file; scripts/prof.py symbolizes and ranks them against the ELF.
+// runtime address of main() to find the load base by, go to
+// sdmc:/switch/uprisingnx/prof.bin every 10 s, over the last file. The buffer
+// is a ring of the last ~65 s, so the file shows what is on screen now, not
+// the boot; scripts/prof.py symbolizes and ranks them against the ELF.
 #include <stdio.h>
 #include <string.h>
 #include <switch.h>
 
 #define PROF_PATH "sdmc:/switch/uprisingnx/prof.bin"
-#define PROF_MAX (1 << 18)  // 256k samples, 8 MB
+#define PROF_MAX (1 << 16)  // 64k samples, ~65 s at 1 kHz, 1 MB
 #define PROF_DUMP_EVERY 10000
 
 int main(int argc, char **argv);
 
 typedef struct { u64 pc, lr; } Sample;
 static Sample samples[PROF_MAX];
-static u32 count, failed;
+static u32 count, failed;  // count: samples ever taken; the ring holds the last PROF_MAX
 static Handle target;
 static Thread sampler;
 static volatile bool running;
@@ -23,11 +25,12 @@ static volatile bool running;
 static void dump(void) {
     FILE *f = fopen(PROF_PATH ".tmp", "wb");
     if (!f) return;
-    u32 header[4] = {0x464f5250 /* PROF */, 2, count, failed};
+    u32 kept = count < PROF_MAX ? count : PROF_MAX;
+    u32 header[4] = {0x464f5250 /* PROF */, 2, kept, failed};
     u64 anchor = (u64)&main;
     fwrite(header, sizeof header, 1, f);
     fwrite(&anchor, sizeof anchor, 1, f);
-    fwrite(samples, sizeof(Sample), count, f);
+    fwrite(samples, sizeof(Sample), kept, f);  // ring order, which a histogram doesn't mind
     fclose(f);
     remove(PROF_PATH);
     rename(PROF_PATH ".tmp", PROF_PATH);
@@ -43,7 +46,7 @@ static void sample_loop(void *arg) {
         Result rc = svcGetThreadContext3(&ctx, target);
         svcSetThreadActivity(target, ThreadActivity_Runnable);
         if (R_FAILED(rc)) { failed++; continue; }
-        if (count < PROF_MAX) samples[count++] = (Sample){ctx.pc.x, ctx.lr};
+        samples[count++ % PROF_MAX] = (Sample){ctx.pc.x, ctx.lr};
         if (++since_dump >= PROF_DUMP_EVERY) { since_dump = 0; dump(); }
     }
     dump();

@@ -5,6 +5,7 @@
 // Built with RECOMP=1 the NRO links 3dsrecomp's librecomp.a and runs it.
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
 #include <pthread.h>
 #include <switch.h>
@@ -74,6 +75,25 @@ static void read_input(PadState *pad, UnxInput *in) {
 
 struct args { const char *rom; u32 interpret; };
 
+// KEY=VALUE lines from sdmc:/switch/uprisingnx/env.txt become environment
+// variables, which Zakuro reads for its switches (ZAKURO_GPU_TIMES,
+// ZAKURO_GPU_SHADERS, RUST_LOG...), to try them without a rebuild. # starts a
+// comment.
+static void load_env(void) {
+    FILE *f = fopen("sdmc:/switch/uprisingnx/env.txt", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq) continue;
+        *eq = 0;
+        setenv(line, eq + 1, 1);
+        printf("env: %s=%s\n", line, eq + 1);
+    }
+    fclose(f);
+}
+
 // the game loop, on a thread with a big stack: recompiled code nests a C
 // frame per guest call (up to RECOMP_DEPTH_LIMIT deep), and the desktop port
 // gives its main thread 8 MiB for that
@@ -92,6 +112,7 @@ static void *game(void *p) {
     hidInitializeTouchScreen();
     appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
 
+    load_env();
     void *unx = unx_create(nwindowGetDefault(), args->rom, "sdmc:/switch/uprisingnx/data", recomp);
     prof_start();
     if (!unx) {
