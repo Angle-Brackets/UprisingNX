@@ -103,12 +103,33 @@ pub struct Memory {
     /// while a loop is watched for changing nothing, what each byte the CPU
     /// wrote held before its first write, see crate::idle.
     write_log: Option<Box<WriteLog>>,
+    /// the last log, kept for the next watch so it isn't allocated and grown
+    /// again each time (UprisingNX: on Switch a third of a frame went there).
+    spare_log: Option<Box<WriteLog>>,
+}
+
+/// a multiplicative hash for guest addresses: the keys aren't adversarial,
+/// and SipHash cost more than the writes it logged.
+#[derive(Default, Clone, Copy)]
+struct AddrHasher(u64);
+
+impl std::hash::Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
 }
 
 /// what the CPU's writes wrote over, byte by byte.
-#[derive(Default)]
 struct WriteLog {
-    old: HashMap<VAddr, u8>,
+    old: HashMap<VAddr, u8, std::hash::BuildHasherDefault<AddrHasher>>,
     /// it wrote more than is kept, too much for a loop that polls.
     overflowed: bool,
 }
@@ -218,6 +239,7 @@ impl Memory {
             faults: BTreeMap::new(),
             host_mailbox: [0; HOST_MAILBOX_WORDS],
             write_log: None,
+            spare_log: None,
         }
     }
 
@@ -230,11 +252,18 @@ impl Memory {
     /// starts noting what the CPU's writes write over, forgetting what was
     /// noted before.
     pub(crate) fn log_writes(&mut self) {
-        self.write_log = Some(Box::default());
+        let mut log = self.write_log.take().or_else(|| self.spare_log.take()).unwrap_or_else(|| {
+            Box::new(WriteLog { old: HashMap::with_capacity_and_hasher(MOST_LOGGED, Default::default()), overflowed: false })
+        });
+        log.old.clear();
+        log.overflowed = false;
+        self.write_log = Some(log);
     }
 
     pub(crate) fn stop_logging_writes(&mut self) {
-        self.write_log = None;
+        if let Some(log) = self.write_log.take() {
+            self.spare_log = Some(log);
+        }
     }
 
     /// whether every byte the CPU wrote since log_writes holds again what it

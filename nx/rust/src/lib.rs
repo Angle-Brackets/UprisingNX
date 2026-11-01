@@ -28,6 +28,17 @@ impl log::Log for Logger {
 
 static LOGGER: Logger = Logger;
 
+/// the tables 3dsrecomp writes beside the code (`recomp_abi`,
+/// `recomp_entries`, ...), from librecomp.a linked into the NRO.
+#[repr(C)]
+pub struct UnxRecomp {
+    pub abi: u32,
+    pub entries: *const c_void,
+    pub entry_count: u32,
+    pub modules: *const c_void,
+    pub module_count: u32,
+}
+
 /// what the C shell read from the controllers this frame, already mapped to
 /// the 3DS's buttons (PadState bits) and axes.
 #[repr(C)]
@@ -49,7 +60,12 @@ pub struct Unx {
     window_start: Instant,
     window_frames: u32,
     window_emulating: Duration,
+    window_presenting: Duration,
     worst: Duration,
+    /// zakuro_gpu::stats summed over the window, in ms
+    spent: [f64; 9],
+    draws: u64,
+    syncs: u64,
 }
 
 fn cstr(p: *const c_char) -> Option<String> {
@@ -61,14 +77,16 @@ fn cstr(p: *const c_char) -> Option<String> {
 }
 
 /// starts Zakuro on the ROM at `rom`, presenting to `nwindow` (libnx's
-/// nwindowGetDefault()); `data_dir` holds saves and the like. Null on
-/// failure, with the reason logged.
+/// nwindowGetDefault()); `data_dir` holds saves and the like. `recomp` is the
+/// statically linked recompiled code, or null to interpret. Null on failure,
+/// with the reason logged.
 ///
 /// # Safety
 /// `nwindow` is a live NWindow for the life of the returned handle; the
-/// strings are NUL-terminated.
+/// strings are NUL-terminated; `recomp` is null or points to 3dsrecomp's
+/// tables, which live as long as the program.
 #[no_mangle]
-pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, data_dir: *const c_char, interpret: u32) -> *mut Unx {
+pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, data_dir: *const c_char, recomp: *const UnxRecomp) -> *mut Unx {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
     let (Some(rom), Some(data_dir)) = (cstr(rom), cstr(data_dir)) else {
@@ -87,17 +105,38 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     log::info!("unx: presenter {} up in {:?}", presenter.name(), started.elapsed());
     presenter.set_layout(ScreenLayout::TopOnly);
 
+    let linked = recomp.as_ref().map(|r| {
+        log::info!("unx: recompiled code linked in, ABI {}, {} entries, {} modules", r.abi, r.entry_count, r.module_count);
+        zakuro_core::recompiled::Linked::new(0x0004000000030100, r.abi, r.entries, r.entry_count, r.modules, r.module_count)
+    });
     let config = Config {
         data_dir: Some(PathBuf::from(&data_dir)),
         hardware_renderer: true,
         device: presenter.shared_device(),
-        find_recompiled: interpret == 0,
+        linked,
+        find_recompiled: false,
         username: "Pit".into(),
         ..Config::default()
     };
     let started = Instant::now();
     let system = match loader::load(&rom, config) {
-        Ok(system) => system,
+        Ok(mut system) => {
+            // what the recompiled code leaves to the interpreter, printed
+            // every 10 s (diagnostics)
+            system.interpreted_pcs = Some(Default::default());
+            // where the linked code still leaves the interpreter, for
+            // 3dsrecomp to make functions of (Zakuro only sets this up where
+            // it finds a library dir, which Horizon has none of)
+            if system.recompiled.is_some() && system.hints.is_none() {
+                if let Some(title) = &system.title {
+                    let text = &title.exheader.text;
+                    let range = text.address..text.address + text.num_pages * 0x1000;
+                    system.hints = Some(zakuro_core::hints::Hints::new(std::path::Path::new("sdmc:/switch/uprisingnx/kiu.so"), range));
+                    log::info!("unx: noting interpreted code in sdmc:/switch/uprisingnx/kiu.hints");
+                }
+            }
+            system
+        }
         Err(error) => {
             log::error!("unx: could not load {rom}, {error}");
             return std::ptr::null_mut();
@@ -111,7 +150,11 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         window_start: Instant::now(),
         window_frames: 0,
         window_emulating: Duration::ZERO,
+        window_presenting: Duration::ZERO,
         worst: Duration::ZERO,
+        spent: [0.0; 9],
+        draws: 0,
+        syncs: 0,
     }))
 }
 
@@ -149,6 +192,17 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let outcome = unx.system.run_frame();
     let took = started.elapsed();
     unx.frame += 1;
+    // no sound out yet (B3); drained so it doesn't pile up
+    drop(unx.system.take_audio());
+    let gpu = zakuro_gpu::stats::take();
+    for (sum, ms) in unx.spent.iter_mut().zip([
+        gpu.recompiled, gpu.services, gpu.drawing, gpu.shading, gpu.textures, gpu.waiting, gpu.sync, gpu.frame_end, gpu.audio,
+    ]) {
+        *sum += ms;
+    }
+    unx.draws += gpu.draws;
+    unx.syncs += gpu.syncs;
+    let presenting = Instant::now();
 
     let (top, bottom) = (shown(&mut unx.system, Screen::Top), shown(&mut unx.system, Screen::Bottom));
     let blank = std::sync::Arc::new(Vec::new());
@@ -165,6 +219,8 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         }
     }
 
+    unx.window_presenting += presenting.elapsed();
+
     // a line every 2 s: emulated frames per second, how long emulating took
     // on average and at worst, and the interpreter's share
     unx.window_frames += 1;
@@ -173,14 +229,37 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let window = unx.window_start.elapsed();
     if window >= Duration::from_secs(2) {
         let frames = unx.window_frames as f64;
+        let fallbacks = unx.system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
         println!(
-            "unx: frame {} {:.1} fps, emulating {:.1} ms avg {:.1} ms worst, {} interpreted",
+            "unx: frame {} {:.1} fps, emulating {:.1} ms avg {:.1} ms worst, {} interpreted, {} recompiled, {} fallbacks",
             unx.frame,
             frames / window.as_secs_f64(),
             unx.window_emulating.as_secs_f64() * 1000.0 / frames,
             unx.worst.as_secs_f64() * 1000.0,
             unx.system.interpreted_instructions,
+            unx.system.recompiled_instructions,
+            fallbacks,
         );
+        let [recompiled, services, drawing, shading, textures, waiting, sync, frame_end, audio] = unx.spent.map(|ms| ms / frames);
+        println!(
+            "  per frame ms: recompiled {recompiled:.1} services {services:.1} | gpu: draw {drawing:.1} shade {shading:.1} tex {textures:.1} wait {waiting:.1} sync {sync:.1} ({:.1} syncs) | frame end {frame_end:.1} audio {audio:.1} | present {:.1} | {:.0} draws",
+            unx.syncs as f64 / frames,
+            unx.window_presenting.as_secs_f64() * 1000.0 / frames,
+            unx.draws as f64 / frames,
+        );
+        if unx.frame % 600 < frames as u64 {
+            if let Some(pcs) = &mut unx.system.interpreted_pcs {
+                let mut top: Vec<(u32, u64)> = pcs.drain().collect();
+                top.sort_by(|a, b| b.1.cmp(&a.1));
+                let total: u64 = top.iter().map(|(_, n)| n).sum();
+                let list: Vec<String> = top.iter().take(12).map(|(pc, n)| format!("{pc:08X}:{n}")).collect();
+                println!("  interpreted in the last 10 s: {total} at {} PCs; top: {}", top.len(), list.join(" "));
+            }
+        }
+        unx.spent = [0.0; 9];
+        unx.draws = 0;
+        unx.syncs = 0;
+        unx.window_presenting = Duration::ZERO;
         unx.window_start = Instant::now();
         unx.window_frames = 0;
         unx.window_emulating = Duration::ZERO;

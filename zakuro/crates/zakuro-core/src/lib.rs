@@ -222,6 +222,9 @@ pub struct System {
     /// instructions the interpreter ran for want of recompiled code, and
     /// the ones recompiled code ran, to see how much the library covers.
     pub interpreted_instructions: u64,
+    /// when set, how often each PC ran in the interpreter (UprisingNX
+    /// diagnostics: what the recompiled code leaves to it).
+    pub interpreted_pcs: Option<std::collections::HashMap<u32, u64>>,
     pub recompiled_instructions: u64,
 }
 
@@ -298,6 +301,7 @@ impl System {
             recompiled: None,
             hints: None,
             interpreted_instructions: 0,
+            interpreted_pcs: None,
             recompiled_instructions: 0,
         }
     }
@@ -506,6 +510,9 @@ impl System {
                 }
                 self.interpreted_instructions += 1;
                 let thumb = self.cpu.cpsr.thumb;
+                if let Some(pcs) = &mut self.interpreted_pcs {
+                    *pcs.entry(pc | thumb as u32).or_insert(0) += 1;
+                }
                 if let (Some(hints), Some(library)) = (&mut self.hints, &self.recompiled) {
                     if !library.has_code(pc | thumb as u32) {
                         hints.interpreted(pc, thumb);

@@ -61,7 +61,12 @@ LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*
 
 RUST_LIB_DIR := $(TOPDIR)/../rust/target/aarch64-nintendo-switch-freestanding/release
 MESA_VK_DIR := $(TOPDIR)/../../build/mesa
-LIBS	:= -L$(RUST_LIB_DIR) -L$(MESA_VK_DIR) -luprising_nx -lvulkan -lzstd -lexpat -lz -lnx -lm
+# RECOMP=1 links 3dsrecomp's code (scripts/build-recomp-nx.sh) and runs it
+ifeq ($(RECOMP),1)
+RECOMP_LIBS := -L$(TOPDIR)/../../build/nx-recomp -lrecomp
+CFLAGS += -DUNX_RECOMP
+endif
+LIBS	:= $(RECOMP_LIBS) -L$(RUST_LIB_DIR) -L$(MESA_VK_DIR) -luprising_nx -lvulkan -lzstd -lexpat -lz -lnx -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

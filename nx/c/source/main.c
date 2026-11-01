@@ -2,9 +2,11 @@
 // the Rust side (uprising_nx) runs Zakuro and presents through NVK.
 //   argv[1] ROM path (default: the copy Dekopon already has on the SD card)
 //   argv[2] "interpret" to skip recompiled code
+// Built with RECOMP=1 the NRO links 3dsrecomp's librecomp.a and runs it.
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
 #include <switch.h>
 
 typedef struct {
@@ -14,10 +16,25 @@ typedef struct {
     u16 touch_x, touch_y;
 } UnxInput;
 
-void *unx_create(void *nwindow, const char *rom, const char *data_dir, u32 interpret);
+typedef struct {
+    u32 abi;
+    const void *entries;
+    u32 entry_count;
+    const void *modules;
+    u32 module_count;
+} UnxRecomp;
+
+#ifdef UNX_RECOMP
+extern const u32 recomp_abi, recomp_entry_count, recomp_module_count;
+extern const u8 recomp_entries, recomp_modules;
+#endif
+
+void *unx_create(void *nwindow, const char *rom, const char *data_dir, const UnxRecomp *recomp);
 u32 unx_frame(void *unx, const UnxInput *input);
 void unx_destroy(void *unx);
 void nx_tls_init(void);
+void prof_start(void);
+void prof_stop(void);
 
 // 3DS PadState bits, from zakuro-core services/hid.rs
 enum {
@@ -55,15 +72,19 @@ static void read_input(PadState *pad, UnxInput *in) {
     }
 }
 
-int main(int argc, char **argv) {
-    socketInitializeDefault();
-    nxlinkStdio();
-    nx_tls_init();
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    printf("uprising_nx: starting\n");
+struct args { const char *rom; u32 interpret; };
 
-    const char *rom = argc > 1 ? argv[1] : "sdmc:/switch/dekopon/roms/Kid Icarus Uprising (USA).cci";
-    u32 interpret = argc > 2 && !strcmp(argv[2], "interpret");
+// the game loop, on a thread with a big stack: recompiled code nests a C
+// frame per guest call (up to RECOMP_DEPTH_LIMIT deep), and the desktop port
+// gives its main thread 8 MiB for that
+static void *game(void *p) {
+    const struct args *args = p;
+    const UnxRecomp *recomp = NULL;
+#ifdef UNX_RECOMP
+    static UnxRecomp linked;
+    linked = (UnxRecomp){recomp_abi, &recomp_entries, recomp_entry_count, &recomp_modules, recomp_module_count};
+    if (!args->interpret) recomp = &linked;
+#endif
 
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
@@ -71,7 +92,8 @@ int main(int argc, char **argv) {
     hidInitializeTouchScreen();
     appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
 
-    void *unx = unx_create(nwindowGetDefault(), rom, "sdmc:/switch/uprisingnx/data", interpret);
+    void *unx = unx_create(nwindowGetDefault(), args->rom, "sdmc:/switch/uprisingnx/data", recomp);
+    prof_start();
     if (!unx) {
         printf("uprising_nx: could not start, see above\n");
     } else {
@@ -82,7 +104,31 @@ int main(int argc, char **argv) {
             if ((in.buttons & (P_START | P_SELECT)) == (P_START | P_SELECT)) break;
             if (unx_frame(unx, &in)) break;
         }
+        prof_stop();
         unx_destroy(unx);
+    }
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    socketInitializeDefault();
+    nxlinkStdio();
+    nx_tls_init();
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("uprising_nx: starting\n");
+
+    struct args args = {
+        argc > 1 ? argv[1] : "sdmc:/switch/dekopon/roms/Kid Icarus Uprising (USA).cci",
+        argc > 2 && !strcmp(argv[2], "interpret"),
+    };
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16 << 20);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, game, &args) != 0) {
+        printf("uprising_nx: could not start the game thread\n");
+    } else {
+        pthread_join(thread, NULL);
     }
     printf("uprising_nx: exiting\n");
     fflush(stdout);
