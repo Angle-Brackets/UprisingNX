@@ -69,7 +69,13 @@ impl Hints {
             text.push_str(&format!("{address:08X}\n"));
         }
         let partial = self.path.with_extension("hints.new");
-        match std::fs::write(&partial, text).and_then(|()| std::fs::rename(&partial, &self.path)) {
+        let replace = |partial: &Path, path: &Path| {
+            // Horizon's rename does not replace a file that is there already
+            #[cfg(target_os = "horizon")]
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(partial, path)
+        };
+        match std::fs::write(&partial, text).and_then(|()| replace(&partial, &self.path)) {
             Ok(()) => self.saved = self.seen.len(),
             Err(error) => log::warn!("could not write {}, {error}", self.path.display()),
         }

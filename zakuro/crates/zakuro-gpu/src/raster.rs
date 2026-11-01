@@ -1743,8 +1743,11 @@ impl TextureCache {
                 let texels = Arc::get_mut(&mut copy).expect("a copy no one else holds");
                 let tile = data.len() / (width * height / 64) as usize;
                 let tiles = decoded.bytes.chunks(tile).zip(data.chunks(tile)).enumerate();
-                for (index, _) in tiles.filter(|(_, (old, new))| old != new) {
+                for (index, (_, new)) in tiles.filter(|(_, (old, new))| old != new) {
                     let (tile_x, tile_y) = (index as u32 % (width / 8) * 8, index as u32 / (width / 8) * 8);
+                    if crate::texture::decode_tile(new, format, texels, width, tile_x, tile_y) {
+                        continue;
+                    }
                     for y in tile_y..tile_y + 8 {
                         for x in tile_x..tile_x + 8 {
                             texels[(y * width + x) as usize] = crate::texture::sample_texel(data, format, width, x, y);
@@ -1766,10 +1769,7 @@ impl TextureCache {
             self.entries.clear();
             self.texels = 0;
         }
-        let texels: Arc<[[u8; 4]]> = (0..height)
-            .flat_map(|y| (0..width).map(move |x| (x, y)))
-            .map(|(x, y)| crate::texture::sample_texel(data, format, width, x, y))
-            .collect();
+        let texels: Arc<[[u8; 4]]> = Arc::from(crate::texture::decode_texture(data, format, width, height));
         let replacement = picture_for(self.pack.as_deref(), data, &texels, key, &mut self.rows);
         let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
         if let Some(old) = self.entries.insert(key, decoded) {

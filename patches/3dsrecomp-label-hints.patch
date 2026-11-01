@@ -1,0 +1,40 @@
+diff --git a/src/build.rs b/src/build.rs
+index 19e7cff..9ecb0aa 100644
+--- a/src/build.rs
++++ b/src/build.rs
+@@ -176,9 +176,35 @@ pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses:
+         program.seeds.extend(outside.iter().map(|&address| (address, Source::Hint)));
+         analyses[index] = discover::analyze(program);
+     }
++    let inside = label_hints(&mut analyses[index], &hinted);
++    if inside > 0 {
++        eprintln!("hints: {inside} places inside functions became labels, entries the host can resume at");
++    }
+     outside.len()
+ }
+ 
++/// the hinted places in the middle of a function's code that are not one of
++/// its labels, where computed branches the analysis could not follow land,
++/// such as a hand-written decoder's jumps into its own unrolled loops. made
++/// labels, the function's dispatch takes its own indirect branches there and
++/// the host can enter there, instead of interpreting until the next label.
++pub fn label_hints(analysis: &mut Analysis, hinted: &[u32]) -> usize {
++    let mut added = std::collections::BTreeSet::new();
++    for function in analysis.functions.values_mut() {
++        let thumb = (function.mode == Mode::Thumb) as u32;
++        for &address in hinted {
++            if address & 1 != thumb {
++                continue;
++            }
++            let at = address & !1;
++            if function.instructions.binary_search(&at).is_ok() && function.labels.insert(at) {
++                added.insert(address);
++            }
++        }
++    }
++    added.len()
++}
++
+ /// the hinted places none of the functions the analysis found holds, which
+ /// start functions of their own, odd for Thumb.
+ pub fn new_functions(analysis: &Analysis, hinted: &[u32]) -> Vec<u32> {

@@ -80,6 +80,63 @@ pub fn sample_texel(data: &[u8], format: TextureFormat, width: u32, x: u32, y: u
     }
 }
 
+/// where each of a tile's 64 texels sits, by its place in the tile's
+/// Morton order, (x, y) inside the tile.
+const TILE_ORDER: [(u8, u8); 64] = {
+    let mut order = [(0u8, 0u8); 64];
+    let mut y = 0;
+    while y < 8 {
+        let mut x = 0;
+        while x < 8 {
+            order[crate::format::morton_interleave(x, y) as usize] = (x as u8, y as u8);
+            x += 1;
+        }
+        y += 1;
+    }
+    order
+};
+
+/// decodes one 8x8 tile of a byte-sized format, the tile's bytes alone,
+/// into the RGBA8 texels of a whole image width texels across. false for
+/// formats it does not handle, ETC1 and the 4-bit ones, which go texel by
+/// texel instead.
+pub fn decode_tile(tile: &[u8], format: TextureFormat, texels: &mut [[u8; 4]], width: u32, tile_x: u32, tile_y: u32) -> bool {
+    let bits = format.bits_per_pixel();
+    if bits < 8 || matches!(format, TextureFormat::Etc1 | TextureFormat::Etc1A4) {
+        return false;
+    }
+    let bytes = (bits / 8) as usize;
+    if tile.len() < 64 * bytes {
+        return false;
+    }
+    let width = width as usize;
+    let (left, top) = (tile_x as usize, tile_y as usize);
+    for (texel, &(x, y)) in tile.chunks_exact(bytes).zip(TILE_ORDER.iter()) {
+        texels[(top + y as usize) * width + left + x as usize] = decode_bytes(format, texel);
+    }
+    true
+}
+
+/// a whole texture as straight RGBA8, row by row: a tile at a time where
+/// the format and size allow, texel by texel otherwise.
+pub fn decode_texture(data: &[u8], format: TextureFormat, width: u32, height: u32) -> Vec<[u8; 4]> {
+    let bits = format.bits_per_pixel() as usize;
+    let tiled = width.is_multiple_of(8) && height.is_multiple_of(8) && bits >= 8
+        && !matches!(format, TextureFormat::Etc1 | TextureFormat::Etc1A4)
+        && data.len() >= (width * height) as usize * bits / 8;
+    if !tiled {
+        return (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).map(|(x, y)| sample_texel(data, format, width, x, y)).collect();
+    }
+    let mut texels = vec![[0u8; 4]; (width * height) as usize];
+    let tile = 64 * bits / 8;
+    let across = width / 8;
+    for (index, bytes) in data.chunks_exact(tile).take((across * (height / 8)) as usize).enumerate() {
+        let index = index as u32;
+        decode_tile(bytes, format, &mut texels, width, index % across * 8, index / across * 8);
+    }
+    texels
+}
+
 fn sample_uncompressed(
     data: &[u8],
     format: TextureFormat,
@@ -322,6 +379,18 @@ const fn expand6(v: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the tile-at-a-time decode gives what sampling texel by texel does.
+    #[test]
+    fn whole_textures_decode_like_single_texels() {
+        let (width, height) = (24u32, 16u32);
+        for format in [TextureFormat::Rgba8, TextureFormat::Rgb8, TextureFormat::Rgba5551, TextureFormat::Rgb565, TextureFormat::Rgba4, TextureFormat::La8, TextureFormat::L8, TextureFormat::L4, TextureFormat::Etc1] {
+            let len = (width * height * format.bits_per_pixel() / 8) as usize;
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 + i / 5) as u8).collect();
+            let expected: Vec<[u8; 4]> = (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).map(|(x, y)| sample_texel(&data, format, width, x, y)).collect();
+            assert_eq!(decode_texture(&data, format, width, height), expected, "{format:?}");
+        }
+    }
 
     #[test]
     fn rgba8_round_trips() {
