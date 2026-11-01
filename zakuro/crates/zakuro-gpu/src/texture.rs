@@ -96,13 +96,20 @@ const TILE_ORDER: [(u8, u8); 64] = {
     order
 };
 
+/// whether ZAKURO_PER_TEXEL_TEXTURES=1 has every texture decoded texel by
+/// texel, the way it was before tiles, to tell whether the tiles are at fault.
+fn per_texel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZAKURO_PER_TEXEL_TEXTURES").is_ok_and(|value| value != "0"))
+}
+
 /// decodes one 8x8 tile of a byte-sized format, the tile's bytes alone,
 /// into the RGBA8 texels of a whole image width texels across. false for
 /// formats it does not handle, ETC1 and the 4-bit ones, which go texel by
 /// texel instead.
 pub fn decode_tile(tile: &[u8], format: TextureFormat, texels: &mut [[u8; 4]], width: u32, tile_x: u32, tile_y: u32) -> bool {
     let bits = format.bits_per_pixel();
-    if bits < 8 || matches!(format, TextureFormat::Etc1 | TextureFormat::Etc1A4) {
+    if per_texel() || bits < 8 || matches!(format, TextureFormat::Etc1 | TextureFormat::Etc1A4) {
         return false;
     }
     let bytes = (bits / 8) as usize;
@@ -121,7 +128,8 @@ pub fn decode_tile(tile: &[u8], format: TextureFormat, texels: &mut [[u8; 4]], w
 /// the format and size allow, texel by texel otherwise.
 pub fn decode_texture(data: &[u8], format: TextureFormat, width: u32, height: u32) -> Vec<[u8; 4]> {
     let bits = format.bits_per_pixel() as usize;
-    let tiled = width.is_multiple_of(8) && height.is_multiple_of(8) && bits >= 8
+    let tiled = !per_texel()
+        && width.is_multiple_of(8) && height.is_multiple_of(8) && bits >= 8
         && !matches!(format, TextureFormat::Etc1 | TextureFormat::Etc1A4)
         && data.len() >= (width * height) as usize * bits / 8;
     if !tiled {
