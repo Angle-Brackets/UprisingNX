@@ -19,6 +19,23 @@ pub static AUDIO: AtomicU64 = AtomicU64::new(0);
 /// what the GPU drew brought back for the CPU's reads and writes, and how often.
 pub static SYNC: AtomicU64 = AtomicU64::new(0);
 pub static SYNCS: AtomicU64 = AtomicU64::new(0);
+/// write-backs of what the GPU drew to guest memory, each a wait for the
+/// GPU, by what asked for them (see WRITE_BACK_NAMES), and their time.
+pub static WRITE_BACKS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub static WRITE_BACK: AtomicU64 = AtomicU64::new(0);
+pub const WRITE_BACK_NAMES: [&str; 6] = ["overlap", "beside", "fill", "flush", "sync", "other"];
+pub const BACK_OVERLAP: usize = 0;
+pub const BACK_BESIDE: usize = 1;
+pub const BACK_FILL: usize = 2;
+pub const BACK_FLUSH: usize = 3;
+pub const BACK_SYNC: usize = 4;
+
+/// counts a write-back of surfaces for a reason, when there are any.
+pub fn write_back(why: usize, surfaces: usize) {
+    if surfaces > 0 {
+        WRITE_BACKS[why].fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// what a frame spent, in milliseconds, and the draws it made.
 #[derive(Debug, Clone, Copy, Default)]
@@ -34,6 +51,8 @@ pub struct Spent {
     pub audio: f64,
     pub sync: f64,
     pub syncs: u64,
+    pub write_backs: [u64; 6],
+    pub write_back: f64,
 }
 
 /// what was spent since the last take, starting afresh.
@@ -51,6 +70,8 @@ pub fn take() -> Spent {
         audio: ms(&AUDIO),
         sync: ms(&SYNC),
         syncs: SYNCS.swap(0, Ordering::Relaxed),
+        write_backs: std::array::from_fn(|i| WRITE_BACKS[i].swap(0, Ordering::Relaxed)),
+        write_back: ms(&WRITE_BACK),
     }
 }
 

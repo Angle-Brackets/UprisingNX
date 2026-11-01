@@ -2466,6 +2466,7 @@ impl Hardware {
             .filter(|&i| i != index && self.surfaces[i].dirty_overlaps(from, to))
             .collect();
         if !others.is_empty() {
+            crate::stats::write_back(crate::stats::BACK_OVERLAP, others.len());
             self.write_back(memory, others)?;
             self.begin()?;
         }
@@ -2487,6 +2488,7 @@ impl Hardware {
                 // memory changed beside rows the GPU drew and it lacks, which
                 // an upload alone would lose. they come down first, along
                 // with what changed
+                crate::stats::write_back(crate::stats::BACK_BESIDE, 1);
                 self.write_back(memory, vec![index])?;
                 self.begin()?;
                 memory.read(addr, &mut bytes);
@@ -3252,6 +3254,7 @@ impl Hardware {
         // frame, which it clears whole before drawing into it again
         let written: Vec<usize> = partial.into_iter().filter(|&i| !self.surfaces[i].supersede(addr, len)).collect();
         if !written.is_empty() {
+            crate::stats::write_back(crate::stats::BACK_FILL, written.len());
             self.write_back(memory, written)?;
         }
         Ok(())
@@ -4061,7 +4064,8 @@ impl Hardware {
     /// runs what the batch recorded and writes everything it drew back to
     /// guest memory.
     pub(crate) fn flush<M: GpuMemory>(&mut self, memory: &mut M) -> Result<(), String> {
-        let dirty = (0..self.surfaces.len()).filter(|&i| self.surfaces[i].dirty.is_some()).collect();
+        let dirty: Vec<usize> = (0..self.surfaces.len()).filter(|&i| self.surfaces[i].dirty.is_some()).collect();
+        crate::stats::write_back(crate::stats::BACK_FLUSH, dirty.len());
         self.write_back(memory, dirty)?;
         self.submit()?;
         self.wait()
@@ -4109,6 +4113,7 @@ impl Hardware {
         let overlapping: Vec<usize> =
             (0..self.surfaces.len()).filter(|&i| kept(&self.surfaces[i]) && self.surfaces[i].overlaps(addr, len)).collect();
         let dirty: Vec<usize> = overlapping.iter().copied().filter(|&i| self.surfaces[i].dirty_overlaps(addr, len)).collect();
+        crate::stats::write_back(crate::stats::BACK_SYNC, dirty.len());
         self.write_back(memory, dirty)?;
         for i in overlapping {
             self.surfaces[i].checked = false;
@@ -5171,6 +5176,10 @@ impl Hardware {
     /// when those still hold them, else running the batch and reading them
     /// back.
     fn write_back<M: GpuMemory>(&mut self, memory: &mut M, dirty: Vec<usize>) -> Result<(), String> {
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let _timer = crate::stats::time(&crate::stats::WRITE_BACK);
         self.mark(Work::Download, false);
         let (captured, others): (Vec<usize>, Vec<usize>) =
             dirty.into_iter().partition(|&i| self.surfaces[i].captured().is_some());

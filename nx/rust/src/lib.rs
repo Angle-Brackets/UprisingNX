@@ -66,6 +66,8 @@ pub struct Unx {
     spent: [f64; 9],
     draws: u64,
     syncs: u64,
+    write_backs: [u64; 6],
+    write_back: f64,
 }
 
 fn cstr(p: *const c_char) -> Option<String> {
@@ -155,6 +157,8 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         spent: [0.0; 9],
         draws: 0,
         syncs: 0,
+        write_backs: [0; 6],
+        write_back: 0.0,
     }))
 }
 
@@ -202,6 +206,10 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     }
     unx.draws += gpu.draws;
     unx.syncs += gpu.syncs;
+    for (sum, n) in unx.write_backs.iter_mut().zip(gpu.write_backs) {
+        *sum += n;
+    }
+    unx.write_back += gpu.write_back;
     let presenting = Instant::now();
 
     let (top, bottom) = (shown(&mut unx.system, Screen::Top), shown(&mut unx.system, Screen::Bottom));
@@ -247,6 +255,15 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             unx.window_presenting.as_secs_f64() * 1000.0 / frames,
             unx.draws as f64 / frames,
         );
+        let backs: Vec<String> = zakuro_gpu::stats::WRITE_BACK_NAMES
+            .iter()
+            .zip(unx.write_backs)
+            .filter(|(_, n)| *n > 0)
+            .map(|(name, n)| format!("{name} {:.1}", n as f64 / frames))
+            .collect();
+        if !backs.is_empty() {
+            println!("  write-backs per frame: {} ({:.1} ms)", backs.join(", "), unx.write_back / frames);
+        }
         if unx.frame % 600 < frames as u64 {
             if let Some(pcs) = &mut unx.system.interpreted_pcs {
                 let mut top: Vec<(u32, u64)> = pcs.drain().collect();
@@ -259,6 +276,8 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         unx.spent = [0.0; 9];
         unx.draws = 0;
         unx.syncs = 0;
+        unx.write_backs = [0; 6];
+        unx.write_back = 0.0;
         unx.window_presenting = Duration::ZERO;
         unx.window_start = Instant::now();
         unx.window_frames = 0;
