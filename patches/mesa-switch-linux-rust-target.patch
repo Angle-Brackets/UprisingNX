@@ -1,0 +1,36 @@
+diff --git a/build-switch.sh b/build-switch.sh
+index cc2722d..51540ff 100755
+--- a/build-switch.sh
++++ b/build-switch.sh
+@@ -18,6 +18,9 @@ docker run -d --name "$CONTAINER_NAME" \
+ 
+ run() { docker exec "$CONTAINER_NAME" bash -c "$1"; }
+ 
++# UprisingNX: Mesa's Rust (NAK, nil) cross-compiles against the aarch64 Linux std
++run '/root/.cargo/bin/rustup target add aarch64-unknown-linux-gnu'
++
+ # Install cross-build wrappers for bindgen and Rust compiler probes.
+ run '
+ mkdir -p /usr/local/libexec
+diff --git a/rustc-switch-wrapper.sh b/rustc-switch-wrapper.sh
+index 008e20d..06d8523 100755
+--- a/rustc-switch-wrapper.sh
++++ b/rustc-switch-wrapper.sh
+@@ -10,7 +10,7 @@ if [ "$SCRIPT_DIR" = "$0" ]; then
+     SCRIPT_DIR=.
+ fi
+ 
+-RUST_TARGET=${MESA_SWITCH_RUST_TARGET:-}
++RUST_TARGET=${MESA_SWITCH_RUST_TARGET:-aarch64-unknown-linux-gnu}
+ 
+ if [ -n "${MESA_SWITCH_RUSTC:-}" ]; then
+     RUSTC_BIN="$MESA_SWITCH_RUSTC"
+@@ -33,6 +33,8 @@ fi
+ for arg in "$@"; do
+     case "$arg" in
+         *sanity_check_for_rust.rs*|*sanitycheckrs.rs*) RUST_TARGET= ;;
++        # meson's build-machine rule (proc-macros and their deps) links with cc
++        linker=cc|-Clinker=cc) RUST_TARGET= ;;
+     esac
+ done
+ 

@@ -1,0 +1,23 @@
+[package]
+name = "uprising_nx"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The Switch frontend over Zakuro: a staticlib the libnx C shell in ../c links.
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+zakuro-core = { path = "../../zakuro/crates/zakuro-core" }
+zakuro-gpu = { path = "../../zakuro/crates/zakuro-gpu", default-features = false, features = ["vulkan"] }
+zakuro-common = { path = "../../zakuro/crates/zakuro-common" }
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+debug = 1
+
+[patch.crates-io]
+libc = { path = "../../build/vendor/libc" }

@@ -1,0 +1,19 @@
+[package]
+name = "zakuro_nx"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Compile check: Zakuro's core crates for aarch64 Horizon.
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+zakuro-core = { path = "../../../zakuro/crates/zakuro-core" }
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+
+[patch.crates-io]
+libc = { path = "../../../build/vendor/libc" }

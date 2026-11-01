@@ -1,0 +1,19 @@
+[package]
+name = "zakuro-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# builders of NCCH and CIA files, for the tests of the crates that read them
+testing = []
+
+[dependencies]
+zakuro-common.workspace = true
+log.workspace = true
+thiserror.workspace = true
+crc32fast = "1"
+
+# Horizon has no mmap of files
+[target.'cfg(not(target_os = "horizon"))'.dependencies]
+memmap2.workspace = true

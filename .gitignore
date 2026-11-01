@@ -1,0 +1,31 @@
+third_party/
+build/
+dumps/
+roms/
+saves/
+*.sav
+*.3ds
+*.cia
+*.cxi
+*.cci
+code.bin
+recompiled/
+
+# probe build output
+probes/*/rust/target/
+probes/*/c/build/
+probes/*/c/*.elf
+probes/*/c/*.nro
+probes/*/c/*.nacp
+probes/*/c/*.map
+
+# frontend and Zakuro build outputs
+nx/rust/target/
+nx/c/build/
+zakuro/target/
+*.lst
+nx/c/*.elf
+nx/c/*.nro
+nx/c/*.nacp
+nx/c/*.map
+__pycache__/

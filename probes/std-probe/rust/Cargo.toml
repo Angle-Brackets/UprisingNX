@@ -1,0 +1,23 @@
+[package]
+name = "std_probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Checks the parts of Rust std that Zakuro leans on, on real Horizon:
+# std::thread, thread_local!, Mutex/Condvar/mpsc, rayon, Instant, std::fs.
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+debug = 1
+
+# libc for aarch64 Horizon (libnx): patches/libc-0.2.191-horizon-aarch64.patch,
+# applied to a copy in build/vendor/libc by scripts/vendor-libc.sh
+[patch.crates-io]
+libc = { path = "../../../build/vendor/libc" }

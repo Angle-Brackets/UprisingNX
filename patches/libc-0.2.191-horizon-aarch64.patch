@@ -1,0 +1,63 @@
+diff --color -ruN libc.orig/src/unix/newlib/mod.rs libc/src/unix/newlib/mod.rs
+--- libc.orig/src/unix/newlib/mod.rs	2026-10-31 21:32:26.245446846 -0700
++++ libc/src/unix/newlib/mod.rs	2026-10-31 21:32:26.262276333 -0700
+@@ -1,7 +1,16 @@
+ use crate::prelude::*;
+ 
+-pub type blkcnt_t = i32;
+-pub type blksize_t = i32;
++cfg_if! {
++    // Switch (libnx, devkitA64 newlib): long, 8 bytes. With i32 Rust's struct
++    // stat is 96 bytes while stat() writes 104.
++    if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
++        pub type blkcnt_t = i64;
++        pub type blksize_t = i64;
++    } else {
++        pub type blkcnt_t = i32;
++        pub type blksize_t = i32;
++    }
++}
+ 
+ cfg_if! {
+     if #[cfg(target_os = "rtems")] {
+@@ -20,6 +29,11 @@
+         pub type dev_t = u64;
+         pub type ino_t = u64;
+         pub type off_t = i64;
++    } else if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
++        // Switch (libnx, devkitA64 newlib): short, unsigned short, long
++        pub type dev_t = c_short;
++        pub type ino_t = c_ushort;
++        pub type off_t = c_long;
+     } else if #[cfg(any(target_arch = "arm", target_arch = "powerpc"))] {
+         pub type dev_t = u32;
+         pub type ino_t = u32;
+@@ -57,6 +71,9 @@
+ 
+ pub type socklen_t = u32;
+ pub type speed_t = u32;
++#[cfg(all(target_os = "horizon", target_arch = "aarch64"))]
++pub type suseconds_t = c_long;
++#[cfg(not(all(target_os = "horizon", target_arch = "aarch64")))]
+ pub type suseconds_t = i32;
+ cfg_if! {
+     if #[cfg(target_os = "espidf")] {
+@@ -403,6 +420,18 @@
+         pub const __SIZEOF_PTHREAD_RWLOCK_T: usize = 4;
+         pub const __SIZEOF_PTHREAD_RWLOCKATTR_T: usize = 12;
+         pub const __SIZEOF_PTHREAD_BARRIER_T: usize = 32;
++    } else if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
++        // Switch (libnx). Initializers are all zero (sys/lock.h).
++        const __PTHREAD_INITIALIZER_BYTE: u8 = 0;
++        pub const __SIZEOF_PTHREAD_ATTR_T: usize = 24;
++        pub const __SIZEOF_PTHREAD_MUTEX_T: usize = 12;
++        pub const __SIZEOF_PTHREAD_MUTEXATTR_T: usize = 4;
++        pub const __SIZEOF_PTHREAD_COND_T: usize = 16;
++        pub const __SIZEOF_PTHREAD_CONDATTR_T: usize = 8;
++        pub const __SIZEOF_PTHREAD_RWLOCK_T: usize = 16;
++        // empty struct in this newlib; any size is safe
++        pub const __SIZEOF_PTHREAD_RWLOCKATTR_T: usize = 8;
++        pub const __SIZEOF_PTHREAD_BARRIER_T: usize = 20;
+     } else if #[cfg(target_os = "vita")] {
+         const __PTHREAD_INITIALIZER_BYTE: u8 = 0xff;
+         pub const __SIZEOF_PTHREAD_ATTR_T: usize = 4;
