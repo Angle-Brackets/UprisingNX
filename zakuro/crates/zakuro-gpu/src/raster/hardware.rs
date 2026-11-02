@@ -551,6 +551,9 @@ pub(crate) fn pipeline_cache(title: u64) -> Option<std::path::PathBuf> {
     if cfg!(test) {
         return None;
     }
+    if cfg!(target_os = "horizon") {
+        return Some(std::path::PathBuf::from(format!("sdmc:/switch/uprisingnx/data/cache/pipelines/{title:016X}.bin")));
+    }
     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(std::path::PathBuf::from);
     let dir = if cfg!(windows) {
         var("LOCALAPPDATA")
@@ -601,7 +604,12 @@ fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache, path: &st
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| std::fs::write(&partial, data))
-        .and_then(|()| std::fs::rename(&partial, path));
+        .and_then(|()| {
+            if cfg!(target_os = "horizon") {
+                let _ = std::fs::remove_file(path);
+            }
+            std::fs::rename(&partial, path)
+        });
     match written {
         Ok(()) => log::debug!(target: "zakuro_gpu::pipelines", "kept {} KB of pipelines in {}", size / 1024, path.display()),
         Err(error) => {
@@ -1120,7 +1128,11 @@ impl Compiler {
         };
         let queue = Arc::new((Mutex::new(waiting), Condvar::new()));
         let (sent, made) = mpsc::channel();
-        let count = thread::available_parallelism().map_or(1, |cores| cores.get().saturating_sub(2).clamp(1, 3));
+        let count = if cfg!(target_os = "horizon") {
+            2
+        } else {
+            thread::available_parallelism().map_or(1, |cores| cores.get().saturating_sub(2).clamp(1, 3))
+        };
         let threads = (0..count)
             .map_while(|_| {
                 let (jobs, sent, device, kept) = (queue.clone(), sent.clone(), device.clone(), kept.clone());
@@ -2462,10 +2474,60 @@ impl Hardware {
         let size = self.surfaces[index].size();
         let row = self.surfaces[index].row_bytes();
         let (from, to) = rows.map_or((addr, size), |(start, end)| (addr + start * row, (end - start) * row));
-        let others: Vec<usize> = (0..self.surfaces.len())
-            .filter(|&i| i != index && self.surfaces[i].dirty_overlaps(from, to))
-            .collect();
+        let (s_row, s_kind, s_tiled) = (self.surfaces[index].row_bytes(), self.surfaces[index].kind, self.surfaces[index].tiled);
+        let mut others = Vec::new();
+        for i in 0..self.surfaces.len() {
+            if i != index && self.surfaces[i].dirty_overlaps(from, to) {
+                let o = &mut self.surfaces[i];
+                if o.row_bytes() != s_row || o.kind != s_kind || o.tiled != s_tiled {
+                    o.dirty = None;
+                    o.guarded = None;
+                    o.write_guarded = None;
+                    o.cleared = None;
+                } else {
+                    others.push(i);
+                }
+            }
+        }
         if !others.is_empty() {
+            static LOGGED_OVERLAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = LOGGED_OVERLAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 30 {
+                let s = &self.surfaces[index];
+                let other_desc: Vec<String> = others
+                    .iter()
+                    .map(|&i| {
+                        let o = &self.surfaces[i];
+                        format!(
+                            "#{i}(addr=0x{:08X}..0x{:08X} {}x{} {:?} tiled={} dirty={:?} cleared={:?} stale={:?} cap={})",
+                            o.addr,
+                            o.addr + o.size(),
+                            o.width,
+                            o.height,
+                            o.kind,
+                            o.tiled,
+                            o.dirty,
+                            o.cleared,
+                            o.stale,
+                            o.captured().is_some()
+                        )
+                    })
+                    .collect();
+                log::info!(
+                    target: "zakuro_gpu::waits",
+                    "BACK_OVERLAP #{n}: req #{index}(addr=0x{:08X}..0x{:08X} {}x{} {:?} tiled={} rows={:?} dirty={:?} stale={:?}) overlaps [{}]",
+                    s.addr,
+                    s.addr + s.size(),
+                    s.width,
+                    s.height,
+                    s.kind,
+                    s.tiled,
+                    rows,
+                    s.dirty,
+                    s.stale,
+                    other_desc.join(", ")
+                );
+            }
             crate::stats::write_back(crate::stats::BACK_OVERLAP, others.len());
             self.write_back(memory, others)?;
             self.begin()?;
@@ -3007,10 +3069,14 @@ impl Hardware {
             return;
         }
         let bytes: Vec<u8> = self.new_keys.drain(..).filter_map(|key| key_bytes(&key)).flatten().collect();
-        let written = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut file| {
-            use std::io::Write;
-            file.write_all(&bytes)
-        });
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(&path))
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(&bytes)
+            });
         if let Err(error) = written {
             log::warn!("could not keep the pipelines used in {}, {error}", path.display());
         }
@@ -3267,8 +3333,8 @@ impl Hardware {
         let index_bytes = (indices.len() * 4) as u64;
         let index_offset = self.stage(index_bytes, 4)?;
         let staging = self.ring(index_offset, index_bytes);
-        for (out, index) in staging.as_chunks_mut::<4>().0.iter_mut().zip(indices) {
-            *out = index.to_le_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(indices.as_ptr() as *const u8, staging.as_mut_ptr(), index_bytes as usize);
         }
         let vertex_bytes = (vertices.len() * VERTEX_SIZE) as u64;
         let vertex_offset = self.stage(vertex_bytes, 16)?;
@@ -3277,10 +3343,12 @@ impl Hardware {
         // Vulkan to the one on its right or further down the image, so the
         // images run bottom up
         let staging = self.ring(vertex_offset, vertex_bytes);
+        let inv_width_2 = 2.0 / width;
+        let inv_height_2 = 2.0 / height;
         for (out, v) in staging.as_chunks_mut::<VERTEX_SIZE>().0.iter_mut().zip(vertices) {
             let w = 1.0 / v.inv_w;
-            let x = v.x / width * 2.0 - 1.0;
-            let y = v.y / height * 2.0 - 1.0;
+            let x = v.x * inv_width_2 - 1.0;
+            let y = v.y * inv_height_2 - 1.0;
             let depth = v.z * depth_map.scale + depth_map.offset;
             let (c, t, q, view) = (v.color_over_w, v.texcoords_over_w, v.quaternion_over_w, v.view_over_w);
             let values: [f32; 24] = [
@@ -3309,8 +3377,8 @@ impl Hardware {
                 view[2] * w,
                 0.0,
             ];
-            for (bytes, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
-                *bytes = value.to_le_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(values.as_ptr() as *const u8, out.as_mut_ptr(), VERTEX_SIZE);
             }
         }
         Ok((vertex_offset, index_offset))
@@ -4223,10 +4291,13 @@ impl Hardware {
         self.overdrawn(target, (0, self.surfaces[target].height), None);
         self.capture(target)?;
         // turned upright for showing at any scale, at the console's own too
-        // that beats the CPU waiting for the GPU and decoding the buffer
-        self.capture_screen(target)?;
-        if twinned && self.direct {
-            self.upright_image(target, true)?;
+        // that beats the CPU waiting for the GPU and decoding the buffer.
+        // a tiled output is never a screen buffer.
+        if !t.output_tiled {
+            self.capture_screen(target)?;
+            if twinned && self.direct {
+                self.upright_image(target, true)?;
+            }
         }
         self.submit()?;
         Ok(true)

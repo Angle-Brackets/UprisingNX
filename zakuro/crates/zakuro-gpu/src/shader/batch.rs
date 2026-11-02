@@ -46,7 +46,7 @@ impl Uniforms {
 
 /// a batch of vertices' registers.
 #[derive(Clone)]
-struct Batch {
+pub(super) struct Batch {
     input: [Wide; INPUT_REGISTERS],
     output: [Wide; OUTPUT_REGISTERS],
     temp: [Wide; TEMP_REGISTERS],
@@ -54,6 +54,35 @@ struct Batch {
     address: [[i32; LANES]; 2],
     loop_counter: i32,
     condition: [[bool; LANES]; 2],
+}
+
+impl Batch {
+    pub(super) fn new() -> Self {
+        Self {
+            input: [ZERO; INPUT_REGISTERS],
+            output: [ZERO; OUTPUT_REGISTERS],
+            temp: [TEMP_START; TEMP_REGISTERS],
+            address: [[0; LANES]; 2],
+            loop_counter: 0,
+            condition: [[false; LANES]; 2],
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn reset(&mut self, program: &Program, inputs: &[[Vec4; INPUT_REGISTERS]]) {
+        self.output = [ZERO; OUTPUT_REGISTERS];
+        self.temp.fill(TEMP_START);
+        self.address = [[0; LANES]; 2];
+        self.loop_counter = 0;
+        self.condition = [[false; LANES]; 2];
+        let last = inputs.len() - 1;
+        for register in (0..INPUT_REGISTERS).filter(|register| program.inputs & (1 << register) != 0) {
+            for (component, row) in self.input[register].iter_mut().enumerate() {
+                let lanes: [f32; LANES] = std::array::from_fn(|lane| inputs[lane.min(last)][register][component]);
+                *row = f32x8::from(lanes);
+            }
+        }
+    }
 }
 
 /// every lane, one bit each.
@@ -92,24 +121,37 @@ pub(super) fn run(
     program: &Program,
     inputs: &[[Vec4; INPUT_REGISTERS]],
     outputs: &mut [[Vec4; OUTPUT_REGISTERS]],
+    batch: &mut Batch,
     blocks: &mut Vec<Block>,
     forks: &mut Vec<Fork>,
 ) {
     debug_assert!(!inputs.is_empty() && inputs.len() <= LANES);
-    let mut batch = start(program, inputs);
+    batch.reset(program, inputs);
     blocks.clear();
     forks.clear();
-    let finished = execute(unit, uniforms, program, &mut batch, blocks, forks, unit.entry_point, 0, ALL, None);
+    let finished = execute(unit, uniforms, program, batch, blocks, forks, unit.entry_point, 0, ALL, None);
     forks.push((finished, batch.output));
     // each lane's outputs from the copy it finished in. the registers
     // nothing writes stay zero, as they come
-    for (lanes, registers) in forks.iter() {
+    if forks.len() == 1 && forks[0].0 == ALL {
+        let registers = &forks[0].1;
         for register in (0..OUTPUT_REGISTERS).filter(|register| program.outputs & (1 << register) != 0) {
             for component in 0..4 {
                 let values = registers[register][component].to_array();
                 for (lane, output) in outputs.iter_mut().enumerate() {
-                    if lanes & (1 << lane) != 0 {
-                        output[register][component] = values[lane];
+                    output[register][component] = values[lane];
+                }
+            }
+        }
+    } else {
+        for (lanes, registers) in forks.iter() {
+            for register in (0..OUTPUT_REGISTERS).filter(|register| program.outputs & (1 << register) != 0) {
+                for component in 0..4 {
+                    let values = registers[register][component].to_array();
+                    for (lane, output) in outputs.iter_mut().enumerate() {
+                        if lanes & (1 << lane) != 0 {
+                            output[register][component] = values[lane];
+                        }
                     }
                 }
             }
@@ -125,37 +167,16 @@ pub(super) fn run_geometry(
     uniforms: &Uniforms,
     program: &Program,
     inputs: &[[Vec4; INPUT_REGISTERS]],
+    batch: &mut Batch,
     emitters: &mut Emitters,
     blocks: &mut Vec<Block>,
     forks: &mut Vec<Fork>,
 ) {
     debug_assert!(!inputs.is_empty() && inputs.len() <= LANES);
-    let mut batch = start(program, inputs);
+    batch.reset(program, inputs);
     blocks.clear();
     forks.clear();
-    execute(unit, uniforms, program, &mut batch, blocks, forks, unit.entry_point, 0, ALL, Some(emitters));
-}
-
-/// a batch with the inputs in its lanes and everything else zero.
-fn start(program: &Program, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Batch {
-    let mut batch = Batch {
-        input: [ZERO; INPUT_REGISTERS],
-        output: [ZERO; OUTPUT_REGISTERS],
-        temp: [TEMP_START; TEMP_REGISTERS],
-        address: [[0; LANES]; 2],
-        loop_counter: 0,
-        condition: [[false; LANES]; 2],
-    };
-    // lanes past the last vertex repeat it, so that they branch its way.
-    // only the registers the program reads matter
-    let last = inputs.len() - 1;
-    for register in (0..INPUT_REGISTERS).filter(|register| program.inputs & (1 << register) != 0) {
-        for (component, row) in batch.input[register].iter_mut().enumerate() {
-            let lanes: [f32; LANES] = std::array::from_fn(|lane| inputs[lane.min(last)][register][component]);
-            *row = f32x8::from(lanes);
-        }
-    }
-    batch
+    execute(unit, uniforms, program, batch, blocks, forks, unit.entry_point, 0, ALL, Some(emitters));
 }
 
 /// each active lane's output registers into its emitter's slot, a
@@ -245,7 +266,12 @@ fn execute(
                 let a = operand(unit, uniforms, batch, &op.sources[0], sa);
                 let b = operand(unit, uniforms, batch, &op.sources[1], sb);
                 let c = operand(unit, uniforms, batch, &op.sources[2], sc);
-                let result: Wide = std::array::from_fn(|i| multiply(a.row(i), b.row(i)) + c.row(i));
+                let result: Wide = [
+                    multiply(a.row(0), b.row(0)) + c.row(0),
+                    multiply(a.row(1), b.row(1)) + c.row(1),
+                    multiply(a.row(2), b.row(2)) + c.row(2),
+                    multiply(a.row(3), b.row(3)) + c.row(3),
+                ];
                 write(batch, op, &result);
                 pc += 1;
             }
@@ -357,14 +383,15 @@ fn uniform(unit: &ShaderUnit, index: i32) -> Vec4 {
 /// a source as an instruction reads it, its rows in swizzled order, read
 /// where they are, and whether they are negated.
 struct Source<'a> {
-    rows: [&'a Lanes; 4],
+    value: &'a Wide,
+    swizzle: [u8; 4],
     negate: bool,
 }
 
 impl Source<'_> {
     #[inline(always)]
     fn row(&self, component: usize) -> Lanes {
-        let row = *self.rows[component];
+        let row = self.value[self.swizzle[component] as usize];
         if self.negate { -row } else { row }
     }
 }
@@ -392,7 +419,7 @@ fn operand<'a>(unit: &ShaderUnit, uniforms: &'a Uniforms, batch: &'a Batch, oper
             }
         }
     };
-    Source { rows: operand.swizzle.map(|component| &value[component as usize]), negate: operand.negate }
+    Source { value, swizzle: operand.swizzle, negate: operand.negate }
 }
 
 #[inline(always)]
@@ -403,12 +430,15 @@ fn write(batch: &mut Batch, op: &Op, value: &Wide) {
         0x10..=0x1F => &mut batch.temp[(register - 0x10) as usize],
         _ => return,
     };
-    // the mask's most significant bit selects x
-    for (component, row) in slot.iter_mut().enumerate() {
-        if op.mask & (0b1000 >> component) != 0 {
-            *row = value[component];
-        }
+    if op.mask == 0b1111 {
+        *slot = *value;
+        return;
     }
+    // the mask's most significant bit selects x
+    if op.mask & 0b1000 != 0 { slot[0] = value[0]; }
+    if op.mask & 0b0100 != 0 { slot[1] = value[1]; }
+    if op.mask & 0b0010 != 0 { slot[2] = value[2]; }
+    if op.mask & 0b0001 != 0 { slot[3] = value[3]; }
 }
 
 /// what a sum of floats starts from, so that dot products add up exactly
@@ -448,24 +478,33 @@ fn arithmetic(unit: &ShaderUnit, uniforms: &Uniforms, batch: &mut Batch, op: &Op
     let [sa, sb, _] = scratch;
     let a = operand(unit, uniforms, batch, &op.sources[0], sa);
     let b = operand(unit, uniforms, batch, &op.sources[1], sb);
-    let pairs = |f: fn(Lanes, Lanes) -> Lanes| -> Wide { std::array::from_fn(|i| f(a.row(i), b.row(i))) };
     let result: Wide = match op.opcode {
-        OpCode::Add => pairs(|x, y| x + y),
-        OpCode::Mul => pairs(multiply),
+        OpCode::Add => [a.row(0) + b.row(0), a.row(1) + b.row(1), a.row(2) + b.row(2), a.row(3) + b.row(3)],
+        OpCode::Mul => [multiply(a.row(0), b.row(0)), multiply(a.row(1), b.row(1)), multiply(a.row(2), b.row(2)), multiply(a.row(3), b.row(3))],
         // x when it is greater, else y, which is how NaN behaves on hardware
-        OpCode::Max => pairs(|x, y| x.simd_gt(y).select(x, y)),
-        OpCode::Min => pairs(|x, y| x.simd_lt(y).select(x, y)),
+        OpCode::Max => [
+            a.row(0).simd_gt(b.row(0)).select(a.row(0), b.row(0)),
+            a.row(1).simd_gt(b.row(1)).select(a.row(1), b.row(1)),
+            a.row(2).simd_gt(b.row(2)).select(a.row(2), b.row(2)),
+            a.row(3).simd_gt(b.row(3)).select(a.row(3), b.row(3)),
+        ],
+        OpCode::Min => [
+            a.row(0).simd_lt(b.row(0)).select(a.row(0), b.row(0)),
+            a.row(1).simd_lt(b.row(1)).select(a.row(1), b.row(1)),
+            a.row(2).simd_lt(b.row(2)).select(a.row(2), b.row(2)),
+            a.row(3).simd_lt(b.row(3)).select(a.row(3), b.row(3)),
+        ],
         OpCode::Dp3 => [dot(&a, &b, 3); 4],
         OpCode::Dp4 => [dot(&a, &b, 4); 4],
         OpCode::Dph | OpCode::DphI => [dot(&a, &b, 3) + b.row(3); 4],
-        OpCode::Mov => std::array::from_fn(|i| a.row(i)),
-        OpCode::Flr => std::array::from_fn(|i| each(a.row(i), f32::floor)),
+        OpCode::Mov => [a.row(0), a.row(1), a.row(2), a.row(3)],
+        OpCode::Flr => [each(a.row(0), f32::floor), each(a.row(1), f32::floor), each(a.row(2), f32::floor), each(a.row(3), f32::floor)],
         OpCode::Rcp => [f32x8::ONE / a.row(0); 4],
         OpCode::Rsq => [f32x8::ONE / a.row(0).sqrt(); 4],
         OpCode::Ex2 => [each(a.row(0), f32::exp2); 4],
         OpCode::Lg2 => [each(a.row(0), f32::log2); 4],
-        OpCode::Sge | OpCode::SgeI => pairs(|x, y| select(x.simd_ge(y))),
-        OpCode::Slt | OpCode::SltI => pairs(|x, y| select(x.simd_lt(y))),
+        OpCode::Sge | OpCode::SgeI => [select(a.row(0).simd_ge(b.row(0))), select(a.row(1).simd_ge(b.row(1))), select(a.row(2).simd_ge(b.row(2))), select(a.row(3).simd_ge(b.row(3)))],
+        OpCode::Slt | OpCode::SltI => [select(a.row(0).simd_lt(b.row(0))), select(a.row(1).simd_lt(b.row(1))), select(a.row(2).simd_lt(b.row(2))), select(a.row(3).simd_lt(b.row(3)))],
         OpCode::Dst | OpCode::DstI => [f32x8::ONE, multiply(a.row(1), b.row(1)), a.row(2), b.row(3)],
         OpCode::LitP => {
             let (x, y, w) = (a.row(0), a.row(1), a.row(3));

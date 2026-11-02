@@ -622,13 +622,14 @@ pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Ve
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
     let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
     let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
+    let mut batch = batch::Batch::new();
     // the program compiled, the batches it gives back shaded the way below
     #[cfg(feature = "jit")]
     if let Some(compiled) = unit.decoded.as_ref().filter(|_| !trace_nan).and_then(|program| jit::compiled(unit, program)) {
         let mut uniforms = None;
         jit::run_vertices(&compiled, unit, program, inputs, &mut outputs, |inputs, outputs| {
             let uniforms = uniforms.get_or_insert_with(|| batch::Uniforms::new(unit));
-            batch::run(unit, uniforms, program, inputs, outputs, &mut blocks, &mut forks);
+            batch::run(unit, uniforms, program, inputs, outputs, &mut batch, &mut blocks, &mut forks);
         });
         return outputs;
     }
@@ -636,7 +637,7 @@ pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Ve
     let uniforms = batch::Uniforms::new(unit);
     for (inputs, outputs) in inputs.chunks(batch::LANES).zip(outputs.chunks_mut(batch::LANES)) {
         if !trace_nan {
-            batch::run(unit, &uniforms, program, inputs, outputs, &mut blocks, &mut forks);
+            batch::run(unit, &uniforms, program, inputs, outputs, &mut batch, &mut blocks, &mut forks);
             continue;
         }
         for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
@@ -671,13 +672,14 @@ pub fn run_geometry_many(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) 
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
     let mut triangles = Vec::with_capacity(inputs.len());
     let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
+    let mut batch = batch::Batch::new();
     #[cfg(feature = "jit")]
     if let Some(compiled) = unit.decoded.as_ref().filter(|_| !trace_nan).and_then(|program| jit::compiled(unit, program)) {
         let mut uniforms = None;
         jit::run_geometry(&compiled, unit, program, inputs, &mut triangles, |inputs, triangles| {
             let uniforms = uniforms.get_or_insert_with(|| batch::Uniforms::new(unit));
             let mut emitters = batch::Emitters::new();
-            batch::run_geometry(unit, uniforms, program, inputs, &mut emitters, &mut blocks, &mut forks);
+            batch::run_geometry(unit, uniforms, program, inputs, &mut batch, &mut emitters, &mut blocks, &mut forks);
             triangles.extend(emitters.triangles.into_iter().take(inputs.len()));
         });
         return triangles;
@@ -695,7 +697,7 @@ pub fn run_geometry_many(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) 
             continue;
         }
         let mut emitters = batch::Emitters::new();
-        batch::run_geometry(unit, &uniforms, program, inputs, &mut emitters, &mut blocks, &mut forks);
+        batch::run_geometry(unit, &uniforms, program, inputs, &mut batch, &mut emitters, &mut blocks, &mut forks);
         triangles.extend(emitters.triangles.into_iter().take(inputs.len()));
     }
     triangles
@@ -1133,9 +1135,10 @@ mod tests {
         let program = unit.decoded.as_ref().expect("a prepared unit");
         let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
         let (mut blocks, mut forks) = (Vec::new(), Vec::new());
+        let mut batch = batch::Batch::new();
         let uniforms = batch::Uniforms::new(unit);
         for (inputs, outputs) in inputs.chunks(batch::LANES).zip(outputs.chunks_mut(batch::LANES)) {
-            batch::run(unit, &uniforms, program, inputs, outputs, &mut blocks, &mut forks);
+            batch::run(unit, &uniforms, program, inputs, outputs, &mut batch, &mut blocks, &mut forks);
         }
         outputs
     }

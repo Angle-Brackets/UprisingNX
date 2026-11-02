@@ -328,38 +328,41 @@ fn host_face() -> Option<&'static Face> {
 /// glyphs for the characters a font has, at EM pixels an em.
 fn rasterize(data: &[u8]) -> Option<Face> {
     use ab_glyph::{point, Font, FontRef, PxScale};
-    use rayon::prelude::*;
 
     let font = FontRef::try_from_slice_and_index(data, 0).ok()?;
     let per_unit = EM / font.units_per_em()?;
     let scale = PxScale::from(font.height_unscaled() * per_unit);
     let (width, height) = (CELL_WIDTH as usize, CELL_HEIGHT as usize);
-    let glyphs: Vec<Glyph> = characters()
-        .par_iter()
-        .filter_map(|&character| {
-            let id = font.glyph_id(character);
-            // the glyph a font has for what it lacks
-            if id.0 == 0 {
-                return None;
-            }
-            let advance = (font.h_advance_unscaled(id) * per_unit).round().clamp(0.0, 255.0) as u8;
-            let mut alpha = vec![0u8; width * height].into_boxed_slice();
-            let (mut left, mut drawn) = (0, 0);
-            if let Some(outline) = font.outline_glyph(id.with_scale_and_position(scale, point(0.0, HOST_BASELINE as f32))) {
-                let bounds = outline.px_bounds();
-                left = bounds.min.x.clamp(-128.0, 127.0) as i8;
-                drawn = (bounds.max.x - bounds.min.x).clamp(0.0, CELL_WIDTH as f32) as u8;
-                outline.draw(|x, y, coverage| {
-                    let (x, y) = (x as usize, bounds.min.y as i32 + y as i32);
-                    if x < width && (0..height as i32).contains(&y) {
-                        let pixel = &mut alpha[y as usize * width + x];
-                        *pixel = (*pixel).max((coverage * 15.0).round().clamp(0.0, 15.0) as u8);
-                    }
-                });
-            }
-            Some(Glyph { code: character as u16, alpha, left, width: drawn, advance })
-        })
-        .collect();
+    let make_glyph = |&character: &char| {
+        let id = font.glyph_id(character);
+        // the glyph a font has for what it lacks
+        if id.0 == 0 {
+            return None;
+        }
+        let advance = (font.h_advance_unscaled(id) * per_unit).round().clamp(0.0, 255.0) as u8;
+        let mut alpha = vec![0u8; width * height].into_boxed_slice();
+        let (mut left, mut drawn) = (0, 0);
+        if let Some(outline) = font.outline_glyph(id.with_scale_and_position(scale, point(0.0, HOST_BASELINE as f32))) {
+            let bounds = outline.px_bounds();
+            left = bounds.min.x.clamp(-128.0, 127.0) as i8;
+            drawn = (bounds.max.x - bounds.min.x).clamp(0.0, CELL_WIDTH as f32) as u8;
+            outline.draw(|x, y, coverage| {
+                let (x, y) = (x as usize, bounds.min.y as i32 + y as i32);
+                if x < width && (0..height as i32).contains(&y) {
+                    let pixel = &mut alpha[y as usize * width + x];
+                    *pixel = (*pixel).max((coverage * 15.0).round().clamp(0.0, 15.0) as u8);
+                }
+            });
+        }
+        Some(Glyph { code: character as u16, alpha, left, width: drawn, advance })
+    };
+    #[cfg(target_os = "horizon")]
+    let glyphs: Vec<Glyph> = characters().iter().filter_map(make_glyph).collect();
+    #[cfg(not(target_os = "horizon"))]
+    let glyphs: Vec<Glyph> = {
+        use rayon::prelude::*;
+        characters().par_iter().filter_map(make_glyph).collect()
+    };
     // a font that has none of Japanese is no better than the bitmap one
     if !glyphs.iter().any(|glyph| glyph.code == 0x3042) {
         return None;

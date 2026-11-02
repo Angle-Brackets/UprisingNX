@@ -721,13 +721,29 @@ impl LastSemantics {
     }
 }
 
+fn shader_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = if cfg!(target_os = "horizon") {
+            2
+        } else {
+            std::thread::available_parallelism().map_or(2, |c| (c.get() / 2).clamp(1, 4))
+        };
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .stack_size(256 * 1024)
+            .thread_name(|i| format!("shader worker {i}"))
+            .build()
+            .expect("shader pool")
+    })
+}
+
 /// vertices a draw needs before shading them is worth splitting over
-/// threads, fewer cost more in handing them out than the threads save, on
-/// a laptop's four cores most of all.
-const PARALLEL_VERTICES: usize = 512;
+/// threads.
+const PARALLEL_VERTICES: usize = 32;
 /// the fewest vertices each thread takes at a time, whole batches of the
 /// shader's.
-const PARALLEL_CHUNK: usize = 64;
+const PARALLEL_CHUNK: usize = 16;
 
 fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Vec<[Vec4; 16]> {
     let mask = registers[REG_VS_OUTPUT_MASK];
@@ -745,10 +761,12 @@ fn shade_with<T: Send>(
     if inputs.len() < PARALLEL_VERTICES {
         return shader::run_vertices(unit, inputs).into_iter().map(then).collect();
     }
-    // a few chunks a thread, handing out many small ones costs more than
-    // the threads waiting on the last
-    let chunk = (inputs.len() / (rayon::current_num_threads() * 4)).next_multiple_of(8).max(PARALLEL_CHUNK);
-    inputs.par_chunks(chunk).flat_map_iter(|chunk| shader::run_vertices(unit, chunk).into_iter().map(&then)).collect()
+    let pool = shader_pool();
+    let chunk = (inputs.len() / (pool.current_num_threads() * 2)).next_multiple_of(8).max(PARALLEL_CHUNK);
+    pool.install(|| {
+        use rayon::prelude::*;
+        inputs.par_chunks(chunk).flat_map_iter(|chunk| shader::run_vertices(unit, chunk).into_iter().map(&then)).collect()
+    })
 }
 
 fn geometry_stage(
@@ -784,7 +802,7 @@ fn geometry_stage(
         pending.clear();
     }
     // many primitives go over threads, like many vertices do
-    let emitted: Vec<Vec<_>> = if invocations.len() < PARALLEL_VERTICES / 4 {
+    let emitted: Vec<Vec<_>> = if cfg!(target_os = "horizon") || invocations.len() < PARALLEL_VERTICES / 4 {
         shader::run_geometry_many(unit, &invocations)
     } else {
         invocations.par_chunks(PARALLEL_CHUNK / 4).flat_map_iter(|chunk| shader::run_geometry_many(unit, chunk)).collect()
@@ -852,7 +870,7 @@ fn fixed_primitives(
             })
             .collect::<Vec<_>>()
     };
-    let triangles: Vec<_> = if primitives.len() < PARALLEL_VERTICES / 4 {
+    let triangles: Vec<_> = if cfg!(target_os = "horizon") || primitives.len() < PARALLEL_VERTICES / 4 {
         run(&primitives)
     } else {
         primitives.par_chunks(PARALLEL_CHUNK).flat_map_iter(run).collect()
@@ -2712,19 +2730,23 @@ fn fill(
         })
         .filter(|piece| !piece.2.is_empty())
         .collect();
-    let total = pieces
-        .into_par_iter()
-        .map(|(mut color_band, mut depth_band, band_rows)| {
-            let mut stats = FillStats::default();
-            for &triangle in triangles {
-                fill_triangle(color_band.as_mut(), depth_band.as_mut(), band_rows.clone(), triangle, state, &mut stats);
-            }
-            stats
-        })
-        .reduce(FillStats::default, |mut all, stats| {
-            all.add(stats);
-            all
-        });
+    let fill_piece = |(mut color_band, mut depth_band, band_rows): Piece| {
+        let mut stats = FillStats::default();
+        for &triangle in triangles {
+            fill_triangle(color_band.as_mut(), depth_band.as_mut(), band_rows.clone(), triangle, state, &mut stats);
+        }
+        stats
+    };
+    #[cfg(target_os = "horizon")]
+    let total = pieces.into_iter().map(fill_piece).fold(FillStats::default(), |mut all, stats| {
+        all.add(stats);
+        all
+    });
+    #[cfg(not(target_os = "horizon"))]
+    let total = pieces.into_par_iter().map(fill_piece).reduce(FillStats::default, |mut all, stats| {
+        all.add(stats);
+        all
+    });
     stats.add(total);
 }
 

@@ -32,6 +32,9 @@ fn span(pattern: &[u8]) -> [u8; SPAN] {
 /// whether bytes hold the pattern over and over, from its first byte.
 #[cfg(any(test, feature = "vulkan"))]
 pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
+    if pattern.iter().all(|&b| b == 0) {
+        return bytes.iter().all(|&b| b == 0);
+    }
     let span = span(pattern);
     bytes.chunks(SPAN).all(|chunk| *chunk == span[..chunk.len()])
 }
@@ -40,6 +43,10 @@ pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
 /// hold it already. titles clear the same buffers to the same values frame
 /// after frame, and reading memory costs less than writing it.
 pub(crate) fn fill(bytes: &mut [u8], pattern: &[u8]) {
+    if pattern.iter().all(|&b| b == 0) {
+        bytes.fill(0);
+        return;
+    }
     let span = span(pattern);
     for chunk in bytes.chunks_mut(SPAN) {
         let span = &span[..chunk.len()];

@@ -107,7 +107,7 @@ pub enum FileBacking {
     /// a file in one of the writable archives, kept on the host.
     Host(PathBuf),
     /// read-only bytes generated in memory.
-    Memory(Vec<u8>),
+    Memory(std::sync::Arc<[u8]>),
     /// a RomFS with mods over it, and the image it is in.
     Layered(std::sync::Arc<zakuro_fs::layered::Layered>, std::sync::Arc<zakuro_fs::RomImage>),
 }
@@ -155,7 +155,7 @@ impl OpenFile {
         let backing = match &self.backing {
             FileBacking::RomImage { image, offset, size } => SavedBacking::RomImage { image: place(image)?, offset: *offset, size: *size },
             FileBacking::Host(path) => SavedBacking::Host(path.clone()),
-            FileBacking::Memory(bytes) => SavedBacking::Memory(bytes.clone()),
+            FileBacking::Memory(bytes) => SavedBacking::Memory(bytes.to_vec()),
             FileBacking::Layered(layered, image) => SavedBacking::Layered {
                 layered: layers.iter().position(|known| std::sync::Arc::ptr_eq(known, layered))? as u32,
                 image: place(image)?,
@@ -171,7 +171,7 @@ impl SavedFile {
         let backing = match self.backing {
             SavedBacking::RomImage { image, offset, size } => FileBacking::RomImage { image: images.get(image as usize)?.clone(), offset, size },
             SavedBacking::Host(path) => FileBacking::Host(path),
-            SavedBacking::Memory(bytes) => FileBacking::Memory(bytes),
+            SavedBacking::Memory(bytes) => FileBacking::Memory(bytes.into()),
             SavedBacking::Layered { layered, image } => {
                 FileBacking::Layered(layers.get(layered as usize)?.clone(), images.get(image as usize)?.clone())
             }
@@ -1082,7 +1082,7 @@ fn open_system_archive(system: &mut System, path: NcchArchivePath) -> Option<u32
     log::debug!("fs: opened the system's {name} ({} bytes)", data.len());
     Some(system.services.fs.add_file(OpenFile {
         path: format!("nand:/{name}"),
-        backing: FileBacking::Memory(data),
+        backing: FileBacking::Memory(data.into()),
     }))
 }
 
@@ -1112,7 +1112,7 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
             Some(system.services.fs.add_file(OpenFile { path: path.into(), backing }))
         }
         SELF_NCCH_CODE | SELF_NCCH_EXEFS => {
-            let data = title.exefs_file(".code")?.to_vec();
+            let data: std::sync::Arc<[u8]> = title.exefs_file(".code")?.into();
             Some(system.services.fs.add_file(OpenFile {
                 path: "exefs:/.code".into(),
                 backing: FileBacking::Memory(data),
@@ -1177,11 +1177,11 @@ fn read_delay(length: u32) -> u64 {
 }
 
 fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u32) -> u32 {
-    let Some(file) = system.services.fs.files.get(&file_id).cloned() else {
+    let Some(backing) = system.services.fs.files.get(&file_id).map(|f| f.backing.clone()) else {
         return 0;
     };
 
-    match file.backing {
+    match backing {
         FileBacking::RomImage {
             image,
             offset: base,
