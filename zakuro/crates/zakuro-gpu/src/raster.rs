@@ -809,7 +809,7 @@ fn shader_pool() -> &'static rayon::ThreadPool {
 /// vertices a draw needs before shading them is worth splitting over
 /// threads.
 #[cfg(target_os = "horizon")]
-const PARALLEL_VERTICES: usize = 384;
+const PARALLEL_VERTICES: usize = 48;
 #[cfg(not(target_os = "horizon"))]
 const PARALLEL_VERTICES: usize = 32;
 /// the fewest vertices each thread takes at a time, whole batches of the
@@ -989,13 +989,9 @@ fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> 
     let ndc_x = vertex.clip[0] * inv_w;
     let ndc_y = vertex.clip[1] * inv_w;
 
-    // window coordinates, y points up, from the bottom of the buffer, the
-    // way the PICA's viewport is defined. it places vertices on a sixteenth
-    // of a pixel.
-    let snap = |c: f32| (c * 16.0).round() * (1.0 / 16.0);
     Some(Screen {
-        x: snap(vx + (ndc_x * 0.5 + 0.5) * vw),
-        y: snap(vy + (ndc_y * 0.5 + 0.5) * vh),
+        x: vx + (ndc_x * 0.5 + 0.5) * vw,
+        y: vy + (ndc_y * 0.5 + 0.5) * vh,
         z: vertex.clip[2] * inv_w,
         inv_w,
         clip_x: vertex.clip[0],
@@ -1261,6 +1257,7 @@ fn note_text(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
 /// into one slice per line across the text buffer's rows, each slid along
 /// the screen by what its line needs. none when the draw is not quads
 /// across the lines the buffer holds.
+#[allow(dead_code)]
 fn centered_subtitle(vertices: &[Vertex], lines: &[TextLine]) -> Option<Vec<Vertex>> {
     if lines.is_empty() || vertices.is_empty() || vertices.len() % 6 != 0 {
         return None;
@@ -1374,6 +1371,7 @@ fn is_portrait(registers: &[u32]) -> bool {
     on_bottom(registers)
         && registers[base + 1] == (256 << 16 | 256)
         && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
+        && (registers[REG_COLOR_OPERATION] & 0x100 != 0 || registers[REG_ALPHA_TEST] & 1 != 0)
 }
 
 /// a textured draw over the whole bottom screen's 240x320, the way the
@@ -1526,14 +1524,6 @@ const PORTRAIT_FADE: f32 = 24.0;
 // ponytail: fades by the vertices' alpha, so only a draw that blends by it
 // fades, as Kid Icarus Uprising's portraits do.
 fn faded_top(topology: u32, vertices: &[Vertex]) -> Vec<Vertex> {
-    if cfg!(target_os = "horizon") {
-        let mut faded = vertices.to_vec();
-        for vertex in &mut faded {
-            let row = (vertex.clip[0] / vertex.clip[3] * 0.5 + 0.5) * 240.0;
-            vertex.color[3] *= ((240.0 - row) / PORTRAIT_FADE).clamp(0.0, 1.0);
-        }
-        return faded;
-    }
     // where an edge crosses the band's lower edge, in clip space, so the
     // cut is where it is however far the vertex is
     let edge = (240.0 - PORTRAIT_FADE) / 120.0 - 1.0;
@@ -1781,6 +1771,10 @@ impl Scratch {
     /// the vertices the indices name, each once, in the order they first
     /// come, and each index's place among them.
     fn unique_indices(&mut self, count: usize, mut get_index: impl FnMut(usize) -> u32) {
+        if self.stamps.is_empty() {
+            self.stamps.resize(4096, 0);
+            self.places.resize(4096, 0);
+        }
         self.stamp = self.stamp.wrapping_add(1);
         if self.stamp == 0 {
             // the stamps came around, none of the old ones may match
@@ -2955,8 +2949,18 @@ pub fn draw<M: GpuMemory>(
     if vertex_count == 0 || vertex_count > 0x1_0000 {
         return 0;
     }
-    if resources.portraits.in_play && is_bottom(registers) {
-        if !on_bottom(registers) || (!is_portrait(registers) && vertex_count > 16) {
+    if is_bottom(registers) {
+        if !resources.portraits.in_play {
+            return vertex_count;
+        }
+        if !on_bottom(registers) {
+            return vertex_count;
+        }
+        let base = TEXTURE_UNIT_BASES[0];
+        if TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4 {
+            return vertex_count;
+        }
+        if !is_portrait(registers) && vertex_count > 16 {
             return vertex_count;
         }
     }
@@ -2979,10 +2983,14 @@ pub fn draw<M: GpuMemory>(
         let size = if index_short { 2 } else { 1 };
         let len = (vertex_count * size) as usize;
         let bytes = &mut scratch.bytes;
-        bytes.resize(len, 0);
+        bytes.clear();
+        bytes.reserve(len);
         match memory.slice(index_base, len) {
-            Some(slice) => bytes.copy_from_slice(slice),
-            None => memory.read(index_base, bytes),
+            Some(slice) => bytes.extend_from_slice(slice),
+            None => {
+                bytes.resize(len, 0);
+                memory.read(index_base, bytes);
+            }
         }
     }
     let plan = scratch.plans.update(registers, fixed_attributes);
@@ -3049,9 +3057,11 @@ pub fn draw<M: GpuMemory>(
     }
     let plan = scratch.plans.current();
     scratch.inputs.clear();
-    scratch.inputs.resize(scratch.unique.len(), plan.template);
-    for (i, &vertex_index) in scratch.unique.iter().enumerate() {
-        plan.fetch_into(memory, attribute_base, vertex_index, &mut scratch.inputs[i]);
+    scratch.inputs.reserve(scratch.unique.len());
+    for &vertex_index in &scratch.unique {
+        let mut input = plan.template;
+        plan.fetch_into(memory, attribute_base, vertex_index, &mut input);
+        scratch.inputs.push(input);
     }
     let order = indexed.then_some(&scratch.order[..]);
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &scratch.inputs, order };
@@ -3070,8 +3080,18 @@ pub fn draw_immediate<M: GpuMemory>(
     resources: &mut Resources,
     vertices: &[[Vec4; 16]],
 ) -> u32 {
-    if resources.portraits.in_play && is_bottom(registers) {
-        if !on_bottom(registers) || (!is_portrait(registers) && vertices.len() > 16) {
+    if is_bottom(registers) {
+        if !resources.portraits.in_play {
+            return vertices.len() as u32;
+        }
+        if !on_bottom(registers) {
+            return vertices.len() as u32;
+        }
+        let base = TEXTURE_UNIT_BASES[0];
+        if TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4 {
+            return vertices.len() as u32;
+        }
+        if !is_portrait(registers) && vertices.len() > 16 {
             return vertices.len() as u32;
         }
     }
@@ -3186,12 +3206,22 @@ fn triangle_indices<'a>(
 
 /// the vertices of each triangle out of count of them, for a list, a strip
 /// (1) or a fan (2).
-fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
-    match topology {
-        1 => (2..count).map(|i| if i % 2 == 0 { (i - 2, i - 1, i) } else { (i - 1, i - 2, i) }).collect(),
-        2 => (2..count).map(|i| (0, i - 1, i)).collect(),
-        _ => (0..count / 3).map(|t| (t * 3, t * 3 + 1, t * 3 + 2)).collect(),
-    }
+fn assemble(topology: u32, count: usize) -> impl Iterator<Item = (usize, usize, usize)> {
+    let triangles = match topology {
+        1 | 2 => count.saturating_sub(2),
+        _ => count / 3,
+    };
+    (0..triangles).map(move |i| match topology {
+        1 => {
+            if (i + 2) % 2 == 0 {
+                (i, i + 1, i + 2)
+            } else {
+                (i + 1, i, i + 2)
+            }
+        }
+        2 => (0, i + 1, i + 2),
+        _ => (i * 3, i * 3 + 1, i * 3 + 2),
+    })
 }
 
 /// assembles shaded vertices into triangles the way the primitive configuration
@@ -3217,21 +3247,16 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                     flush_portraits(memory, resources);
                 }
                 let centered = shaded_in_order(registers, vertices)
-                    .and_then(|shaded| centered_subtitle(&shaded, &resources.portraits.text_lines));
-                let drawn = match &centered {
-                    Some(centered) => {
-                        draw_subtitle_shadow(registers, memory, resources, Vertices::Shaded(centered));
-                        Some(rasterize(registers, memory, resources, Vertices::Shaded(centered)).unwrap_or(0))
-                    }
-                    None => {
-                        draw_subtitle_shadow(registers, memory, resources, vertices);
-                        None
-                    }
+                    .as_deref()
+                    .and_then(|v| centered_subtitle(v, &resources.portraits.text_lines));
+                let draw_vertices = match &centered {
+                    Some(v) => Vertices::Shaded(v),
+                    None => vertices,
                 };
+                draw_subtitle_shadow(registers, memory, resources, draw_vertices);
+                rasterize(registers, memory, resources, draw_vertices);
                 resources.portraits.adding = false;
-                if drawn.is_some() {
-                    return drawn;
-                }
+                return Some(0);
             }
         } else if is_text_buffer(registers) {
             // the CPU decodes its arrays, so its letters say where they are
@@ -3240,7 +3265,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 return None;
             }
             note_text(registers, resources, vertices);
-        } else if resources.portraits.in_play && (on_bottom(registers) || is_bottom(registers)) {
+        } else if on_bottom(registers) || is_bottom(registers) {
             // the CPU decodes its arrays then, and its vertices say where it is
             #[cfg(feature = "vulkan")]
             if matches!(vertices, Vertices::Raw { .. }) {
@@ -3249,7 +3274,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             if on_bottom(registers) {
                 if is_portrait(registers) {
                     mirror_portrait(registers, resources, vertices);
-                } else {
+                } else if resources.portraits.in_play {
                     mirror_hud(registers, resources, vertices);
                 }
             }
@@ -3426,9 +3451,12 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     };
     // which of the vertices made each vertex of the draw is
     let at = |i: usize| order.map_or(i, |order| order[i]);
-    let triangle_indices = assemble(topology, order.map_or(shaded.len(), <[usize]>::len));
-
-    let triangle_count = triangle_indices.len();
+    let count = order.map_or(shaded.len(), <[usize]>::len);
+    let triangle_indices = assemble(topology, count);
+    let triangle_count = match topology {
+        1 | 2 => count.saturating_sub(2),
+        _ => count / 3,
+    };
     let mut clipped_away = 0u32;
     let mut culled = 0u32;
     let mut stats = FillStats::default();
@@ -3520,6 +3548,12 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         let target = &state.target;
         // tiles are whole in any buffer a title really draws into
         if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
+            if indices.is_empty() {
+                resources.placed = placed;
+                resources.slots = slots;
+                resources.shaded_indices = indices;
+                return Some(0);
+            }
             let geometry = hardware::Geometry::Placed { vertices: &placed, indices: &indices };
             match hardware.draw(memory, &state.hardware(registers, geometry)) {
                 Ok(()) => {

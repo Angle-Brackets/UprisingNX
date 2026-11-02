@@ -485,10 +485,13 @@ impl Surface {
     /// them, as on the console, where the GPU put its pixels there at once.
     /// a title can put something else where a buffer it is done with was,
     /// which the drawing written back later would break.
-    fn guard_writes<M: GpuMemory>(&mut self, memory: &mut M) {
-        let row = self.row_bytes();
-        if let Some((addr, len)) = widen(&mut self.write_guarded, self.dirty, self.addr, row) {
-            memory.guard_writes(addr, len);
+    fn guard_writes<M: GpuMemory>(&mut self, _memory: &mut M) {
+        #[cfg(not(target_os = "horizon"))]
+        {
+            let row = self.row_bytes();
+            if let Some((addr, len)) = widen(&mut self.write_guarded, self.dirty, self.addr, row) {
+                _memory.guard_writes(addr, len);
+            }
         }
     }
 

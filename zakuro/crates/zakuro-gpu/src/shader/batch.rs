@@ -124,7 +124,7 @@ impl Batch {
 const ALL: u8 = u8::MAX;
 
 /// the output registers of lanes that went their own way at a branch.
-type Fork = (u8, [Wide; OUTPUT_REGISTERS]);
+pub(super) type Fork = (u8, [Wide; OUTPUT_REGISTERS]);
 
 /// one emitted triangle, as each vertex's output registers.
 pub(super) type Triangle = [[Vec4; OUTPUT_REGISTERS]; 3];

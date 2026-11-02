@@ -68,7 +68,6 @@ pub struct Unx {
     syncs: u64,
     write_backs: [u64; 6],
     write_back: f64,
-    out_of_play: u32,
 }
 
 extern "C" {
@@ -120,9 +119,14 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         log::info!("unx: recompiled code linked in, ABI {}, {} entries, {} modules", r.abi, r.entry_count, r.module_count);
         zakuro_core::recompiled::Linked::new(0x0004000000030100, r.abi, r.entries, r.entry_count, r.modules, r.module_count)
     });
+    let resolution = std::env::var("ZAKURO_RESOLUTION")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     let config = Config {
         data_dir: Some(PathBuf::from(&data_dir)),
         hardware_renderer: true,
+        resolution,
         device: presenter.shared_device(),
         linked,
         find_recompiled: false,
@@ -168,7 +172,6 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         syncs: 0,
         write_backs: [0; 6],
         write_back: 0.0,
-        out_of_play: 0,
     }))
 }
 
@@ -202,12 +205,6 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         });
     }
 
-    let said = std::mem::take(&mut unx.system.memory.host_mailbox[3]);
-    if said != 0 {
-        unx.out_of_play = 0;
-    } else {
-        unx.out_of_play = unx.out_of_play.saturating_add(1);
-    }
     // Switch is a single-screen console: hybrid in-play extraction is always active.
     // Bottom-screen dialogue portraits and HUD islands are mirrored to top screen,
     // and bottom-screen rasterization is completely bypassed.

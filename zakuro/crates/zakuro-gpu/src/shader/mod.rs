@@ -7,8 +7,18 @@ pub(crate) mod glsl;
 #[cfg(feature = "jit")]
 mod jit;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+thread_local! {
+    static SHADER_SCRATCH: RefCell<(batch::Batch, Vec<Block>, Vec<batch::Fork>, [[Vec4; OUTPUT_REGISTERS]; batch::LANES])> = RefCell::new((
+        batch::Batch::new(),
+        Vec::with_capacity(16),
+        Vec::with_capacity(8),
+        [[ZERO; OUTPUT_REGISTERS]; batch::LANES],
+    ));
+}
 
 use isa::{Instruction, OpCode, OperandDescriptor};
 
@@ -659,26 +669,27 @@ pub fn run_vertices_mapped<T>(
     }
 
     let mut outputs = Vec::with_capacity(inputs.len());
-    let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
-    let mut batch = batch::Batch::new();
     let uniforms = batch::Uniforms::new(unit);
-    let mut batch_outputs = [[ZERO; OUTPUT_REGISTERS]; batch::LANES];
-    let mut state = ShaderState::new();
 
-    for chunk in inputs.chunks(batch::LANES) {
-        if !trace_nan {
-            batch::run(unit, &uniforms, program, chunk, &mut batch_outputs[..chunk.len()], &mut batch, &mut blocks, &mut forks);
-            for output in &batch_outputs[..chunk.len()] {
-                outputs.push(map(output));
-            }
-        } else {
-            for input in chunk {
-                state.input = *input;
-                execute(unit, program, &mut state, None);
-                outputs.push(map(&state.output));
+    SHADER_SCRATCH.with_borrow_mut(|(batch, blocks, forks, batch_outputs)| {
+        blocks.clear();
+        forks.clear();
+        for chunk in inputs.chunks(batch::LANES) {
+            if !trace_nan {
+                batch::run(unit, &uniforms, program, chunk, &mut batch_outputs[..chunk.len()], batch, blocks, forks);
+                for output in &batch_outputs[..chunk.len()] {
+                    outputs.push(map(output));
+                }
+            } else {
+                let mut state = ShaderState::new();
+                for input in chunk {
+                    state.input = *input;
+                    execute(unit, program, &mut state, None);
+                    outputs.push(map(&state.output));
+                }
             }
         }
-    }
+    });
     outputs
 }
 
@@ -699,29 +710,30 @@ pub fn run_vertices_into<T>(
         }
     };
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
-    let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
-    let mut batch = batch::Batch::new();
     let uniforms = batch::Uniforms::new(unit);
-    let mut batch_outputs = [[ZERO; OUTPUT_REGISTERS]; batch::LANES];
-    let mut state = ShaderState::new();
 
     let mut idx = 0;
-    for chunk in inputs.chunks(batch::LANES) {
-        if !trace_nan {
-            batch::run(unit, &uniforms, program, chunk, &mut batch_outputs[..chunk.len()], &mut batch, &mut blocks, &mut forks);
-            for output in &batch_outputs[..chunk.len()] {
-                outputs[idx] = map(output);
-                idx += 1;
-            }
-        } else {
-            for input in chunk {
-                state.input = *input;
-                execute(unit, program, &mut state, None);
-                outputs[idx] = map(&state.output);
-                idx += 1;
+    SHADER_SCRATCH.with_borrow_mut(|(batch, blocks, forks, batch_outputs)| {
+        blocks.clear();
+        forks.clear();
+        for chunk in inputs.chunks(batch::LANES) {
+            if !trace_nan {
+                batch::run(unit, &uniforms, program, chunk, &mut batch_outputs[..chunk.len()], batch, blocks, forks);
+                for output in &batch_outputs[..chunk.len()] {
+                    outputs[idx] = map(output);
+                    idx += 1;
+                }
+            } else {
+                let mut state = ShaderState::new();
+                for input in chunk {
+                    state.input = *input;
+                    execute(unit, program, &mut state, None);
+                    outputs[idx] = map(&state.output);
+                    idx += 1;
+                }
             }
         }
-    }
+    });
 }
 
 /// runs the vertex shader over many vertices, a batch of them at a time,
