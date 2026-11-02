@@ -607,9 +607,13 @@ impl ShaderUnit {
     }
 }
 
-/// runs the vertex shader over many vertices, a batch of them at a time,
-/// giving what running it on each would give.
-pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
+/// runs the vertex shader over many vertices, mapping each output directly without allocating
+/// a full-size intermediate outputs buffer.
+pub fn run_vertices_mapped<T>(
+    unit: &ShaderUnit,
+    inputs: &[[Vec4; INPUT_REGISTERS]],
+    mut map: impl FnMut([Vec4; OUTPUT_REGISTERS]) -> T,
+) -> Vec<T> {
     let decoded;
     let program = match &unit.decoded {
         Some(program) => program.as_ref(),
@@ -620,33 +624,47 @@ pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Ve
     };
     // tracing NaNs is the interpreter's
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
-    let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
-    let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
-    let mut batch = batch::Batch::new();
-    // the program compiled, the batches it gives back shaded the way below
     #[cfg(feature = "jit")]
     if let Some(compiled) = unit.decoded.as_ref().filter(|_| !trace_nan).and_then(|program| jit::compiled(unit, program)) {
+        let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
+        let mut batch = batch::Batch::new();
+        let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
         let mut uniforms = None;
         jit::run_vertices(&compiled, unit, program, inputs, &mut outputs, |inputs, outputs| {
             let uniforms = uniforms.get_or_insert_with(|| batch::Uniforms::new(unit));
             batch::run(unit, uniforms, program, inputs, outputs, &mut batch, &mut blocks, &mut forks);
         });
-        return outputs;
+        return outputs.into_iter().map(map).collect();
     }
-    let mut state = ShaderState::new();
+
+    let mut outputs = Vec::with_capacity(inputs.len());
+    let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
+    let mut batch = batch::Batch::new();
     let uniforms = batch::Uniforms::new(unit);
-    for (inputs, outputs) in inputs.chunks(batch::LANES).zip(outputs.chunks_mut(batch::LANES)) {
+    let mut batch_outputs = [[ZERO; OUTPUT_REGISTERS]; batch::LANES];
+    let mut state = ShaderState::new();
+
+    for chunk in inputs.chunks(batch::LANES) {
         if !trace_nan {
-            batch::run(unit, &uniforms, program, inputs, outputs, &mut batch, &mut blocks, &mut forks);
-            continue;
-        }
-        for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
-            state.input = *input;
-            execute(unit, program, &mut state, None);
-            *output = state.output;
+            batch::run(unit, &uniforms, program, chunk, &mut batch_outputs[..chunk.len()], &mut batch, &mut blocks, &mut forks);
+            for &output in &batch_outputs[..chunk.len()] {
+                outputs.push(map(output));
+            }
+        } else {
+            for input in chunk {
+                state.input = *input;
+                execute(unit, program, &mut state, None);
+                outputs.push(map(state.output));
+            }
         }
     }
     outputs
+}
+
+/// runs the vertex shader over many vertices, a batch of them at a time,
+/// giving what running it on each would give.
+pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
+    run_vertices_mapped(unit, inputs, |o| o)
 }
 
 /// runs the shader over one vertex.

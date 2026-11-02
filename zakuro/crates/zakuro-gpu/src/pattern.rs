@@ -32,8 +32,33 @@ fn span(pattern: &[u8]) -> [u8; SPAN] {
 /// whether bytes hold the pattern over and over, from its first byte.
 #[cfg(any(test, feature = "vulkan"))]
 pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
     if pattern.iter().all(|&b| b == 0) {
-        return bytes.iter().all(|&b| b == 0);
+        let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
+        return prefix.iter().all(|&b| b == 0)
+            && u64s.iter().all(|&w| w == 0)
+            && suffix.iter().all(|&b| b == 0);
+    }
+    match pattern.len() {
+        2 => {
+            let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
+            if prefix.is_empty() && suffix.is_empty() {
+                let p = u16::from_ne_bytes([pattern[0], pattern[1]]) as u64;
+                let target = p | (p << 16) | (p << 32) | (p << 48);
+                return u64s.iter().all(|&w| w == target);
+            }
+        }
+        4 => {
+            let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
+            if prefix.is_empty() && suffix.is_empty() {
+                let p = u32::from_ne_bytes([pattern[0], pattern[1], pattern[2], pattern[3]]) as u64;
+                let target = p | (p << 32);
+                return u64s.iter().all(|&w| w == target);
+            }
+        }
+        _ => {}
     }
     let span = span(pattern);
     bytes.chunks(SPAN).all(|chunk| *chunk == span[..chunk.len()])

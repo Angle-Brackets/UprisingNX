@@ -3351,35 +3351,31 @@ impl Hardware {
             let y = v.y * inv_height_2 - 1.0;
             let depth = v.z * depth_map.scale + depth_map.offset;
             let (c, t, q, view) = (v.color_over_w, v.texcoords_over_w, v.quaternion_over_w, v.view_over_w);
-            let values: [f32; 24] = [
-                x * w,
-                y * w,
-                0.0,
-                w,
-                c[0] * w,
-                c[1] * w,
-                c[2] * w,
-                c[3] * w,
-                t[0][0] * w,
-                t[0][1] * w,
-                t[1][0] * w,
-                t[1][1] * w,
-                t[2][0] * w,
-                t[2][1] * w,
-                depth,
-                0.0,
-                q[0] * w,
-                q[1] * w,
-                q[2] * w,
-                q[3] * w,
-                view[0] * w,
-                view[1] * w,
-                view[2] * w,
-                0.0,
-            ];
-            unsafe {
-                std::ptr::copy_nonoverlapping(values.as_ptr() as *const u8, out.as_mut_ptr(), VERTEX_SIZE);
-            }
+            let out_f32 = unsafe { &mut *(out.as_mut_ptr() as *mut [f32; 24]) };
+            out_f32[0] = x * w;
+            out_f32[1] = y * w;
+            out_f32[2] = 0.0;
+            out_f32[3] = w;
+            out_f32[4] = c[0] * w;
+            out_f32[5] = c[1] * w;
+            out_f32[6] = c[2] * w;
+            out_f32[7] = c[3] * w;
+            out_f32[8] = t[0][0] * w;
+            out_f32[9] = t[0][1] * w;
+            out_f32[10] = t[1][0] * w;
+            out_f32[11] = t[1][1] * w;
+            out_f32[12] = t[2][0] * w;
+            out_f32[13] = t[2][1] * w;
+            out_f32[14] = depth;
+            out_f32[15] = 0.0;
+            out_f32[16] = q[0] * w;
+            out_f32[17] = q[1] * w;
+            out_f32[18] = q[2] * w;
+            out_f32[19] = q[3] * w;
+            out_f32[20] = view[0] * w;
+            out_f32[21] = view[1] * w;
+            out_f32[22] = view[2] * w;
+            out_f32[23] = 0.0;
         }
         Ok((vertex_offset, index_offset))
     }

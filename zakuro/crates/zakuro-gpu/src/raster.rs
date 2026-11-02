@@ -396,7 +396,7 @@ fn map_inputs(registers: &[u32], block: usize, attributes: &[Vec4]) -> [Vec4; sh
 }
 
 /// one vertex after shading, clip-space position plus varyings.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Vertex {
     clip: Vec4,
     color: Vec4,
@@ -763,10 +763,13 @@ fn shader_pool() -> &'static rayon::ThreadPool {
 
 /// vertices a draw needs before shading them is worth splitting over
 /// threads.
-const PARALLEL_VERTICES: usize = 32;
+#[cfg(target_os = "horizon")]
+const PARALLEL_VERTICES: usize = 384;
+#[cfg(not(target_os = "horizon"))]
+const PARALLEL_VERTICES: usize = 96;
 /// the fewest vertices each thread takes at a time, whole batches of the
 /// shader's.
-const PARALLEL_CHUNK: usize = 16;
+const PARALLEL_CHUNK: usize = 32;
 
 fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Vec<[Vec4; 16]> {
     let mask = registers[REG_VS_OUTPUT_MASK];
@@ -782,13 +785,13 @@ fn shade_with<T: Send>(
     then: impl Fn([Vec4; shader::OUTPUT_REGISTERS]) -> T + Sync,
 ) -> Vec<T> {
     if inputs.len() < PARALLEL_VERTICES {
-        return shader::run_vertices(unit, inputs).into_iter().map(then).collect();
+        return shader::run_vertices_mapped(unit, inputs, then);
     }
     let pool = shader_pool();
     let chunk = (inputs.len() / (pool.current_num_threads() * 2)).next_multiple_of(8).max(PARALLEL_CHUNK);
     pool.install(|| {
         use rayon::prelude::*;
-        inputs.par_chunks(chunk).flat_map_iter(|chunk| shader::run_vertices(unit, chunk).into_iter().map(&then)).collect()
+        inputs.par_chunks(chunk).flat_map_iter(|chunk| shader::run_vertices_mapped(unit, chunk, &then)).collect()
     })
 }
 
@@ -904,7 +907,7 @@ fn fixed_primitives(
 
 /// screen-space vertex, with every varying pre-divided by w so the
 /// rasterizer only has to interpolate linearly and divide once per pixel.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Screen {
     x: f32,
     y: f32,
@@ -968,33 +971,60 @@ fn held_in_range(mut vertex: Vertex) -> Vertex {
     vertex
 }
 
-/// clips a triangle to the volume the PICA draws.
-fn clip_triangle(triangle: [Vertex; 3]) -> Vec<Vertex> {
+struct ClippedPoly {
+    vertices: [Vertex; 16],
+    len: usize,
+}
+
+impl ClippedPoly {
+    #[inline(always)]
+    fn as_slice(&self) -> &[Vertex] {
+        &self.vertices[..self.len]
+    }
+}
+
+/// clips a triangle to the volume the PICA draws, in place on the stack without heap allocation.
+#[inline(always)]
+fn clip_triangle(triangle: [Vertex; 3]) -> ClippedPoly {
     let triangle = triangle.map(held_in_range);
     let planes = CLIP_PLANES;
+    let mut poly = ClippedPoly {
+        vertices: [Vertex::default(); 16],
+        len: 3,
+    };
+    poly.vertices[0] = triangle[0];
+    poly.vertices[1] = triangle[1];
+    poly.vertices[2] = triangle[2];
+
     if triangle.iter().all(inside) {
-        return triangle.to_vec();
+        return poly;
     }
 
-    let mut polygon = triangle.to_vec();
+    let mut scratch = [Vertex::default(); 16];
     for plane in planes {
-        let mut clipped = Vec::with_capacity(polygon.len() + 1);
-        for (i, current) in polygon.iter().enumerate() {
-            let next = &polygon[(i + 1) % polygon.len()];
+        let mut clipped_len = 0;
+        let p_len = poly.len;
+        for i in 0..p_len {
+            let current = &poly.vertices[i];
+            let next = &poly.vertices[(i + 1) % p_len];
             let (d0, d1) = (plane(current), plane(next));
-            if d0 >= 0.0 {
-                clipped.push(*current);
+            if d0 >= 0.0 && clipped_len < 16 {
+                scratch[clipped_len] = *current;
+                clipped_len += 1;
             }
-            if (d0 >= 0.0) != (d1 >= 0.0) {
-                clipped.push(current.lerp(next, d0 / (d0 - d1)));
+            if (d0 >= 0.0) != (d1 >= 0.0) && clipped_len < 16 {
+                scratch[clipped_len] = current.lerp(next, d0 / (d0 - d1));
+                clipped_len += 1;
             }
         }
-        polygon = clipped;
-        if polygon.len() < 3 {
-            return Vec::new();
+        poly.len = clipped_len;
+        poly.vertices[..clipped_len].copy_from_slice(&scratch[..clipped_len]);
+        if poly.len < 3 {
+            poly.len = 0;
+            return poly;
         }
     }
-    polygon
+    poly
 }
 
 /// a texture that is rows of a buffer the GPU drew and still holds, which
@@ -1054,6 +1084,9 @@ pub struct Resources {
     /// the last draw's triangles as the GPU takes them, the next one's
     /// buffer.
     triangles: Vec<u32>,
+    placed: Vec<Screen>,
+    slots: Vec<u32>,
+    shaded_indices: Vec<u32>,
     /// the last draw's texture environment and lighting, which the next
     /// mostly keeps.
     tex_env: crate::tev::LastTexEnv,
@@ -1684,7 +1717,9 @@ impl Scratch {
             self.stamp = 1;
         }
         self.unique.clear();
+        self.unique.reserve(self.indices.len());
         self.order.clear();
+        self.order.reserve(self.indices.len());
         for &index in &self.indices {
             let i = index as usize;
             if self.stamps[i] != self.stamp {
@@ -3305,18 +3340,26 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // triangle of such vertices needs no clipping. what clipping makes goes
     // after them
     const OUTSIDE: u32 = u32::MAX;
-    let mut placed: Vec<Screen> = Vec::with_capacity(shaded.len());
-    let slots: Vec<u32> = shaded
-        .iter()
-        .map(|vertex| match inside(vertex).then(|| to_screen(vertex, viewport)).flatten() {
+    let mut placed = std::mem::take(&mut resources.placed);
+    let mut slots = std::mem::take(&mut resources.slots);
+    let mut indices = std::mem::take(&mut resources.shaded_indices);
+    placed.clear();
+    slots.clear();
+    indices.clear();
+    placed.reserve(shaded.len());
+    slots.reserve(shaded.len());
+    indices.reserve(triangle_count * 3);
+
+    for vertex in shaded {
+        let slot = match inside(vertex).then(|| to_screen(vertex, viewport)).flatten() {
             Some(screen) => {
                 placed.push(screen);
                 placed.len() as u32 - 1
             }
             None => OUTSIDE,
-        })
-        .collect();
-    let mut indices: Vec<u32> = Vec::with_capacity(triangle_count * 3);
+        };
+        slots.push(slot);
+    }
     let culls = |p: &Screen, q: &Screen, r: &Screen| {
         let counter_clockwise = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0.0;
         cull_mode != 0 && counter_clockwise == (cull_mode == 1)
@@ -3333,8 +3376,18 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             continue;
         }
         let polygon = clip_triangle([shaded[a], shaded[b], shaded[c]]);
-        let screen: Vec<Screen> = polygon.iter().filter_map(|v| to_screen(v, viewport)).collect();
-        if screen.len() < 3 || screen.len() != polygon.len() {
+        let poly_slice = polygon.as_slice();
+        let mut screen = [Screen::default(); 16];
+        let mut screen_len = 0;
+        for v in poly_slice {
+            if let Some(s) = to_screen(v, viewport) {
+                screen[screen_len] = s;
+                screen_len += 1;
+            } else {
+                break;
+            }
+        }
+        if screen_len < 3 || screen_len != poly_slice.len() {
             clipped_away += 1;
             continue;
         }
@@ -3343,8 +3396,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             continue;
         }
         let first = placed.len() as u32;
-        placed.extend_from_slice(&screen);
-        for i in 1..screen.len() as u32 - 1 {
+        placed.extend_from_slice(&screen[..screen_len]);
+        for i in 1..screen_len as u32 - 1 {
             indices.extend([first, first + i, first + i + 1]);
         }
     }
@@ -3356,13 +3409,21 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
             let geometry = hardware::Geometry::Placed { vertices: &placed, indices: &indices };
             match hardware.draw(memory, &state.hardware(registers, geometry)) {
-                Ok(()) => return Some(triangle_count as u32),
+                Ok(()) => {
+                    resources.placed = placed;
+                    resources.slots = slots;
+                    resources.shaded_indices = indices;
+                    return Some(triangle_count as u32);
+                }
                 Err(error) => log::error!("the GPU could not draw, {error}, drawing in software"),
             }
         }
         // the draw in between goes into twins alone, which the software
         // path has none of
         if hardware.pass == Pass::Twin {
+            resources.placed = placed;
+            resources.slots = slots;
+            resources.shaded_indices = indices;
             return Some(0);
         }
         // the software path works on guest memory, which has to hold what
@@ -3375,6 +3436,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if drawn.iter().any(Option::is_some) {
             let hardware = resources.hardware.take();
             let in_order: Vec<Vertex> = (0..order.map_or(shaded.len(), <[usize]>::len)).map(|i| shaded[at(i)]).collect();
+            resources.placed = placed;
+            resources.slots = slots;
+            resources.shaded_indices = indices;
             let drawn = rasterize(registers, memory, resources, Vertices::Shaded(&in_order));
             resources.hardware = hardware;
             return drawn;
@@ -3440,6 +3504,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         );
     }
 
+    resources.placed = placed;
+    resources.slots = slots;
+    resources.shaded_indices = indices;
     Some(stats.written)
 }
 
