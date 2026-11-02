@@ -18,25 +18,26 @@ pub const LANES: usize = 8;
 /// one component of a register, for every lane.
 type Lanes = f32x8;
 /// a register for every lane, a row of lanes per component.
-type Wide = [Lanes; 4];
+pub(crate) type Wide = [Lanes; 4];
 
-const ZERO: Wide = [f32x8::ZERO; 4];
+pub(crate) const ZERO: Wide = [f32x8::ZERO; 4];
 
 /// super::TEMP_START in every lane.
 const TEMP_START: Wide = [f32x8::ZERO, f32x8::ZERO, f32x8::ZERO, f32x8::ONE];
 
 /// the float uniforms in every lane, put there once for all of a draw's
 /// batches instead of at every read.
-pub(super) struct Uniforms([Wide; FLOAT_UNIFORMS]);
+pub(super) struct Uniforms<'a>(pub(super) &'a [Wide; FLOAT_UNIFORMS]);
 
-impl Uniforms {
-    pub(super) fn new(unit: &ShaderUnit) -> Uniforms {
-        Uniforms(unit.float_uniforms.map(|uniform| uniform.map(f32x8::splat)))
+impl<'a> Uniforms<'a> {
+    #[inline(always)]
+    pub(super) fn new(unit: &'a ShaderUnit) -> Uniforms<'a> {
+        Uniforms(&unit.wide_uniforms)
     }
 
     /// a uniform, none past the last one.
     #[inline(always)]
-    fn at(&self, index: i32) -> &Wide {
+    pub(super) fn at(&self, index: i32) -> &Wide {
         match usize::try_from(index).ok().and_then(|index| self.0.get(index)) {
             Some(value) => value,
             None => &ZERO,

@@ -90,6 +90,37 @@ pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
                 bytes.chunks(16).all(|c| c.iter().enumerate().all(|(i, &b)| b == pattern[i % 2]))
             }
         }
+        3 => {
+            let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
+            let p = [pattern[0], pattern[1], pattern[2]];
+            if !prefix.iter().enumerate().all(|(i, &b)| b == p[i % 3]) {
+                return false;
+            }
+            let w = [
+                u64::from_ne_bytes([p[0], p[1], p[2], p[0], p[1], p[2], p[0], p[1]]),
+                u64::from_ne_bytes([p[1], p[2], p[0], p[1], p[2], p[0], p[1], p[2]]),
+                u64::from_ne_bytes([p[2], p[0], p[1], p[2], p[0], p[1], p[2], p[0]]),
+            ];
+            let rot = prefix.len() % 3;
+            let cw0 = w[rot];
+            let cw1 = w[(rot + 2) % 3];
+            let cw2 = w[(rot + 1) % 3];
+            let chunks = u64s.chunks_exact(3);
+            let rem = chunks.remainder();
+            for chunk in chunks {
+                if (chunk[0] ^ cw0) | (chunk[1] ^ cw1) | (chunk[2] ^ cw2) != 0 {
+                    return false;
+                }
+            }
+            let rem_expected = [cw0, cw1];
+            for (i, &word) in rem.iter().enumerate() {
+                if word != rem_expected[i] {
+                    return false;
+                }
+            }
+            let total_bytes_before_suffix = prefix.len() + u64s.len() * 8;
+            suffix.iter().enumerate().all(|(i, &b)| b == p[(total_bytes_before_suffix + i) % 3])
+        }
         4 => {
             let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
             if prefix.len() % 4 == 0 {
@@ -156,6 +187,40 @@ pub(crate) fn fill(bytes: &mut [u8], pattern: &[u8]) {
                 for chunk in bytes.chunks_mut(SPAN) {
                     chunk.copy_from_slice(&span[..chunk.len()]);
                 }
+            }
+        }
+        3 => {
+            if holds(bytes, pattern) {
+                return;
+            }
+            let (prefix, u64s, suffix) = unsafe { bytes.align_to_mut::<u64>() };
+            let p = [pattern[0], pattern[1], pattern[2]];
+            for (i, b) in prefix.iter_mut().enumerate() {
+                *b = p[i % 3];
+            }
+            let w = [
+                u64::from_ne_bytes([p[0], p[1], p[2], p[0], p[1], p[2], p[0], p[1]]),
+                u64::from_ne_bytes([p[1], p[2], p[0], p[1], p[2], p[0], p[1], p[2]]),
+                u64::from_ne_bytes([p[2], p[0], p[1], p[2], p[0], p[1], p[2], p[0]]),
+            ];
+            let rot = prefix.len() % 3;
+            let cw0 = w[rot];
+            let cw1 = w[(rot + 2) % 3];
+            let cw2 = w[(rot + 1) % 3];
+            let mut chunks = u64s.chunks_exact_mut(3);
+            for chunk in chunks.by_ref() {
+                chunk[0] = cw0;
+                chunk[1] = cw1;
+                chunk[2] = cw2;
+            }
+            let rem = chunks.into_remainder();
+            let rem_expected = [cw0, cw1];
+            for (i, word) in rem.iter_mut().enumerate() {
+                *word = rem_expected[i];
+            }
+            let total_bytes_before_suffix = prefix.len() + u64s.len() * 8;
+            for (i, b) in suffix.iter_mut().enumerate() {
+                *b = p[(total_bytes_before_suffix + i) % 3];
             }
         }
         4 => {

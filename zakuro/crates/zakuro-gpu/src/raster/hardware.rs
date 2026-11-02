@@ -3286,7 +3286,7 @@ impl Hardware {
             surface.write_guarded = None;
             surface.cleared = None;
             surface.stale = None;
-            surface.checked = false;
+            surface.checked = true;
             surface.replaced();
         }
         Ok(())
@@ -3329,7 +3329,7 @@ impl Hardware {
     /// copies the vertices the CPU shaded and placed into the batch, with
     /// the target's pixels as clip space and w kept for perspective, then
     /// the indices of the triangles, and says where both start.
-    fn place(&mut self, vertices: &[Screen], indices: &[u32], (width, height): (f32, f32), depth_map: DepthMap) -> Result<(u64, u64), String> {
+    fn place(&mut self, vertices: &[Screen], indices: &[u32], (_width, _height): (f32, f32), depth_map: DepthMap) -> Result<(u64, u64), String> {
         let index_bytes = (indices.len() * 4) as u64;
         let index_offset = self.stage(index_bytes, 4)?;
         let staging = self.ring(index_offset, index_bytes);
@@ -3343,18 +3343,13 @@ impl Hardware {
         // Vulkan to the one on its right or further down the image, so the
         // images run bottom up
         let staging = self.ring(vertex_offset, vertex_bytes);
-        let inv_width_2 = 2.0 / width;
-        let inv_height_2 = 2.0 / height;
         for (out, v) in staging.as_chunks_mut::<VERTEX_SIZE>().0.iter_mut().zip(vertices) {
-            let w = 1.0 / v.inv_w;
-            let x = v.x * inv_width_2 - 1.0;
-            let y = v.y * inv_height_2 - 1.0;
             let depth = v.z * depth_map.scale + depth_map.offset;
             let out_f32 = unsafe { &mut *(out.as_mut_ptr() as *mut [f32; 24]) };
-            out_f32[0] = x * w;
-            out_f32[1] = y * w;
+            out_f32[0] = v.clip_x;
+            out_f32[1] = v.clip_y;
             out_f32[2] = 0.0;
-            out_f32[3] = w;
+            out_f32[3] = v.w;
             out_f32[4..8].copy_from_slice(&v.color);
             out_f32[8] = v.texcoords[0][0];
             out_f32[9] = v.texcoords[0][1];

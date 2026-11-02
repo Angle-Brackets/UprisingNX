@@ -41,6 +41,7 @@ pub struct ShaderUnit {
     pub program: Box<[u32; PROGRAM_SIZE]>,
     pub descriptors: Box<[u32; DESCRIPTOR_SIZE]>,
     pub float_uniforms: Box<[Vec4; FLOAT_UNIFORMS]>,
+    pub wide_uniforms: Box<[batch::Wide; FLOAT_UNIFORMS]>,
     pub int_uniforms: [[u8; 4]; 4],
     pub bool_uniforms: u16,
     pub entry_point: u32,
@@ -71,6 +72,7 @@ impl ShaderUnit {
             program: Box::new([0; PROGRAM_SIZE]),
             descriptors: Box::new([0; DESCRIPTOR_SIZE]),
             float_uniforms: Box::new([ZERO; FLOAT_UNIFORMS]),
+            wide_uniforms: Box::new([batch::ZERO; FLOAT_UNIFORMS]),
             int_uniforms: [[0; 4]; 4],
             bool_uniforms: 0,
             entry_point: 0,
@@ -112,6 +114,9 @@ impl ShaderUnit {
         self.program.copy_from_slice(&state.program);
         self.descriptors.copy_from_slice(&state.descriptors);
         self.float_uniforms.copy_from_slice(&state.float_uniforms);
+        for i in 0..FLOAT_UNIFORMS {
+            self.wide_uniforms[i] = self.float_uniforms[i].map(wide::f32x8::splat);
+        }
         self.int_uniforms = state.int_uniforms;
         self.bool_uniforms = state.bool_uniforms;
         self.entry_point = state.entry_point;
@@ -148,6 +153,7 @@ impl ShaderUnit {
     /// decodes the program, if it changed, before running it on many
     /// vertices.
     pub fn prepare(&mut self) {
+        self.sync_wide_uniforms();
         if self.decoded.is_some() {
             return;
         }
@@ -285,8 +291,16 @@ impl ShaderUnit {
         }
         if self.float_uniform_index < FLOAT_UNIFORMS {
             self.float_uniforms[self.float_uniform_index] = value;
+            self.wide_uniforms[self.float_uniform_index] = value.map(wide::f32x8::splat);
         }
         self.float_uniform_index += 1;
+    }
+
+    /// synchronizes the wide SIMD uniform cache with float_uniforms.
+    pub fn sync_wide_uniforms(&mut self) {
+        for i in 0..FLOAT_UNIFORMS {
+            self.wide_uniforms[i] = self.float_uniforms[i].map(wide::f32x8::splat);
+        }
     }
 
     /// the upload cursors, the staged words and the programs decoded, to

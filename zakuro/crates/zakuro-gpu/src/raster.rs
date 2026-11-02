@@ -805,9 +805,9 @@ fn shader_pool() -> &'static rayon::ThreadPool {
 /// vertices a draw needs before shading them is worth splitting over
 /// threads.
 #[cfg(target_os = "horizon")]
-const PARALLEL_VERTICES: usize = 64;
+const PARALLEL_VERTICES: usize = 32;
 #[cfg(not(target_os = "horizon"))]
-const PARALLEL_VERTICES: usize = 64;
+const PARALLEL_VERTICES: usize = 32;
 /// the fewest vertices each thread takes at a time, whole batches of the
 /// shader's.
 const PARALLEL_CHUNK: usize = 16;
@@ -832,7 +832,17 @@ fn shade_with<T: Send>(
     let chunk = (inputs.len() / (pool.current_num_threads() * 2)).next_multiple_of(8).max(PARALLEL_CHUNK);
     pool.install(|| {
         use rayon::prelude::*;
-        inputs.par_chunks(chunk).flat_map_iter(|chunk| shader::run_vertices_mapped(unit, chunk, &then)).collect()
+        inputs
+            .par_chunks(chunk)
+            .map(|chunk| shader::run_vertices_mapped(unit, chunk, &then))
+            .reduce(Vec::new, |mut a, b| {
+                if a.is_empty() {
+                    b
+                } else {
+                    a.extend(b);
+                    a
+                }
+            })
     })
 }
 
@@ -933,6 +943,9 @@ fn fixed_primitives(
             .iter()
             .flat_map(|primitive| {
                 patched.float_uniforms[start..start + per_primitive].copy_from_slice(primitive);
+                for i in start..start + per_primitive {
+                    patched.wide_uniforms[i] = patched.float_uniforms[i].map(wide::f32x8::splat);
+                }
                 shader::run_geometry_many(&patched, &[[shader::ZERO; shader::INPUT_REGISTERS]]).into_iter().flatten()
             })
             .collect::<Vec<_>>()
@@ -949,17 +962,20 @@ fn fixed_primitives(
 /// screen-space vertex, with every varying pre-divided by w so the
 /// rasterizer only has to interpolate linearly and divide once per pixel.
 #[derive(Clone, Copy, Debug, Default)]
-struct Screen {
-    x: f32,
-    y: f32,
+pub(crate) struct Screen {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
     /// z/w, which is linear in screen space, the depth map turns it into
     /// the value the depth buffer holds.
-    z: f32,
-    inv_w: f32,
-    color: Vec4,
-    texcoords: [[f32; 2]; 3],
-    quaternion: Vec4,
-    view: [f32; 3],
+    pub(crate) z: f32,
+    pub(crate) inv_w: f32,
+    pub(crate) clip_x: f32,
+    pub(crate) clip_y: f32,
+    pub(crate) w: f32,
+    pub(crate) color: Vec4,
+    pub(crate) texcoords: [[f32; 2]; 3],
+    pub(crate) quaternion: Vec4,
+    pub(crate) view: [f32; 3],
 }
 
 fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
@@ -975,12 +991,15 @@ fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> 
     // window coordinates, y points up, from the bottom of the buffer, the
     // way the PICA's viewport is defined. it places vertices on a sixteenth
     // of a pixel.
-    let snap = |c: f32| (c * 16.0).round() / 16.0;
+    let snap = |c: f32| (c * 16.0).round() * (1.0 / 16.0);
     Some(Screen {
         x: snap(vx + (ndc_x * 0.5 + 0.5) * vw),
         y: snap(vy + (ndc_y * 0.5 + 0.5) * vh),
         z: vertex.clip[2] * inv_w,
         inv_w,
+        clip_x: vertex.clip[0],
+        clip_y: vertex.clip[1],
+        w,
         color: vertex.color,
         texcoords: vertex.texcoords,
         quaternion: vertex.quaternion,
@@ -3409,15 +3428,17 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     slots.reserve(shaded.len());
     indices.reserve(triangle_count * 3);
 
+    let mut all_inside = true;
     for vertex in shaded {
-        let slot = match inside(vertex).then(|| to_screen(vertex, viewport)).flatten() {
-            Some(screen) => {
+        if inside(vertex) {
+            if let Some(screen) = to_screen(vertex, viewport) {
                 placed.push(screen);
-                placed.len() as u32 - 1
+                slots.push(placed.len() as u32 - 1);
+                continue;
             }
-            None => OUTSIDE,
-        };
-        slots.push(slot);
+        }
+        all_inside = false;
+        slots.push(OUTSIDE);
     }
     let culls = |p: &Screen, q: &Screen, r: &Screen| {
         if cull_mode == 0 {
@@ -3426,41 +3447,52 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         let counter_clockwise = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0.0;
         counter_clockwise == (cull_mode == 1)
     };
-    for (ia, ib, ic) in triangle_indices {
-        let (a, b, c) = (at(ia), at(ib), at(ic));
-        let [sa, sb, sc] = [slots[a], slots[b], slots[c]];
-        if sa != OUTSIDE && sb != OUTSIDE && sc != OUTSIDE {
-            if culls(&placed[sa as usize], &placed[sb as usize], &placed[sc as usize]) {
+    if all_inside {
+        for (ia, ib, ic) in triangle_indices {
+            let (a, b, c) = (at(ia), at(ib), at(ic));
+            if !culls(&placed[a], &placed[b], &placed[c]) {
+                indices.extend([a as u32, b as u32, c as u32]);
+            } else {
                 culled += 1;
-            } else {
-                indices.extend([sa, sb, sc]);
-            }
-            continue;
-        }
-        let polygon = clip_triangle([shaded[a], shaded[b], shaded[c]]);
-        let poly_slice = polygon.as_slice();
-        let mut screen = [Screen::default(); 16];
-        let mut screen_len = 0;
-        for v in poly_slice {
-            if let Some(s) = to_screen(v, viewport) {
-                screen[screen_len] = s;
-                screen_len += 1;
-            } else {
-                break;
             }
         }
-        if screen_len < 3 || screen_len != poly_slice.len() {
-            clipped_away += 1;
-            continue;
-        }
-        if culls(&screen[0], &screen[1], &screen[2]) {
-            culled += 1;
-            continue;
-        }
-        let first = placed.len() as u32;
-        placed.extend_from_slice(&screen[..screen_len]);
-        for i in 1..screen_len as u32 - 1 {
-            indices.extend([first, first + i, first + i + 1]);
+    } else {
+        for (ia, ib, ic) in triangle_indices {
+            let (a, b, c) = (at(ia), at(ib), at(ic));
+            let [sa, sb, sc] = [slots[a], slots[b], slots[c]];
+            if sa != OUTSIDE && sb != OUTSIDE && sc != OUTSIDE {
+                if culls(&placed[sa as usize], &placed[sb as usize], &placed[sc as usize]) {
+                    culled += 1;
+                } else {
+                    indices.extend([sa, sb, sc]);
+                }
+                continue;
+            }
+            let polygon = clip_triangle([shaded[a], shaded[b], shaded[c]]);
+            let poly_slice = polygon.as_slice();
+            let mut screen = [Screen::default(); 16];
+            let mut screen_len = 0;
+            for v in poly_slice {
+                if let Some(s) = to_screen(v, viewport) {
+                    screen[screen_len] = s;
+                    screen_len += 1;
+                } else {
+                    break;
+                }
+            }
+            if screen_len < 3 || screen_len != poly_slice.len() {
+                clipped_away += 1;
+                continue;
+            }
+            if culls(&screen[0], &screen[1], &screen[2]) {
+                culled += 1;
+                continue;
+            }
+            let first = placed.len() as u32;
+            placed.extend_from_slice(&screen[..screen_len]);
+            for i in 1..screen_len as u32 - 1 {
+                indices.extend([first, first + i, first + i + 1]);
+            }
         }
     }
 
