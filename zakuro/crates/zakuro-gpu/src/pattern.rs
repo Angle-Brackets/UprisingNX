@@ -41,24 +41,9 @@ pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
             && u64s.iter().all(|&w| w == 0)
             && suffix.iter().all(|&b| b == 0);
     }
-    match pattern.len() {
-        2 => {
-            let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
-            if prefix.is_empty() && suffix.is_empty() {
-                let p = u16::from_ne_bytes([pattern[0], pattern[1]]) as u64;
-                let target = p | (p << 16) | (p << 32) | (p << 48);
-                return u64s.iter().all(|&w| w == target);
-            }
-        }
-        4 => {
-            let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
-            if prefix.is_empty() && suffix.is_empty() {
-                let p = u32::from_ne_bytes([pattern[0], pattern[1], pattern[2], pattern[3]]) as u64;
-                let target = p | (p << 32);
-                return u64s.iter().all(|&w| w == target);
-            }
-        }
-        _ => {}
+    let p_len = pattern.len();
+    if bytes.len() <= 16 {
+        return bytes.iter().enumerate().all(|(i, &b)| b == pattern[i % p_len]);
     }
     let span = span(pattern);
     bytes.chunks(SPAN).all(|chunk| *chunk == span[..chunk.len()])
@@ -68,8 +53,18 @@ pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
 /// hold it already. titles clear the same buffers to the same values frame
 /// after frame, and reading memory costs less than writing it.
 pub(crate) fn fill(bytes: &mut [u8], pattern: &[u8]) {
+    if pattern.is_empty() {
+        return;
+    }
     if pattern.iter().all(|&b| b == 0) {
         bytes.fill(0);
+        return;
+    }
+    let p_len = pattern.len();
+    if bytes.len() <= 16 {
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = pattern[i % p_len];
+        }
         return;
     }
     let span = span(pattern);

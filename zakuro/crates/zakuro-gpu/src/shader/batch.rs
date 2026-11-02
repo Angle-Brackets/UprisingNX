@@ -77,10 +77,11 @@ impl Batch {
         self.condition = [[false; LANES]; 2];
         let last = inputs.len() - 1;
         for register in (0..INPUT_REGISTERS).filter(|register| program.inputs & (1 << register) != 0) {
-            for (component, row) in self.input[register].iter_mut().enumerate() {
-                let lanes: [f32; LANES] = std::array::from_fn(|lane| inputs[lane.min(last)][register][component]);
-                *row = f32x8::from(lanes);
-            }
+            let r0 = std::array::from_fn(|lane| inputs[lane.min(last)][register][0]);
+            let r1 = std::array::from_fn(|lane| inputs[lane.min(last)][register][1]);
+            let r2 = std::array::from_fn(|lane| inputs[lane.min(last)][register][2]);
+            let r3 = std::array::from_fn(|lane| inputs[lane.min(last)][register][3]);
+            self.input[register] = [f32x8::from(r0), f32x8::from(r1), f32x8::from(r2), f32x8::from(r3)];
         }
     }
 }
@@ -130,6 +131,18 @@ pub(super) fn run(
     blocks.clear();
     forks.clear();
     let finished = execute(unit, uniforms, program, batch, blocks, forks, unit.entry_point, 0, ALL, None);
+    if forks.is_empty() && finished == ALL {
+        for register in (0..OUTPUT_REGISTERS).filter(|register| program.outputs & (1 << register) != 0) {
+            let c0 = batch.output[register][0].to_array();
+            let c1 = batch.output[register][1].to_array();
+            let c2 = batch.output[register][2].to_array();
+            let c3 = batch.output[register][3].to_array();
+            for (lane, output) in outputs.iter_mut().enumerate() {
+                output[register] = [c0[lane], c1[lane], c2[lane], c3[lane]];
+            }
+        }
+        return;
+    }
     forks.push((finished, batch.output));
     // each lane's outputs from the copy it finished in. the registers
     // nothing writes stay zero, as they come
@@ -267,10 +280,10 @@ fn execute(
                 let b = operand(unit, uniforms, batch, &op.sources[1], sb);
                 let c = operand(unit, uniforms, batch, &op.sources[2], sc);
                 let result: Wide = [
-                    multiply(a.row(0), b.row(0)) + c.row(0),
-                    multiply(a.row(1), b.row(1)) + c.row(1),
-                    multiply(a.row(2), b.row(2)) + c.row(2),
-                    multiply(a.row(3), b.row(3)) + c.row(3),
+                    multiply(a.r0, b.r0) + c.r0,
+                    multiply(a.r1, b.r1) + c.r1,
+                    multiply(a.r2, b.r2) + c.r2,
+                    multiply(a.r3, b.r3) + c.r3,
                 ];
                 write(batch, op, &result);
                 pc += 1;
@@ -380,19 +393,23 @@ fn uniform(unit: &ShaderUnit, index: i32) -> Vec4 {
     }
 }
 
-/// a source as an instruction reads it, its rows in swizzled order, read
-/// where they are, and whether they are negated.
-struct Source<'a> {
-    value: &'a Wide,
-    swizzle: [u8; 4],
-    negate: bool,
+/// a source as an instruction reads it, pre-swizzled and pre-negated into registers.
+struct Source {
+    r0: Lanes,
+    r1: Lanes,
+    r2: Lanes,
+    r3: Lanes,
 }
 
-impl Source<'_> {
+impl Source {
     #[inline(always)]
     fn row(&self, component: usize) -> Lanes {
-        let row = self.value[self.swizzle[component] as usize];
-        if self.negate { -row } else { row }
+        match component {
+            0 => self.r0,
+            1 => self.r1,
+            2 => self.r2,
+            _ => self.r3,
+        }
     }
 }
 
@@ -400,7 +417,7 @@ impl Source<'_> {
 /// says. a uniform is the same in every lane unless an address register
 /// offsets it, which puts it together in scratch.
 #[inline(always)]
-fn operand<'a>(unit: &ShaderUnit, uniforms: &'a Uniforms, batch: &'a Batch, operand: &Operand, scratch: &'a mut Wide) -> Source<'a> {
+fn operand<'a>(unit: &ShaderUnit, uniforms: &'a Uniforms, batch: &'a Batch, operand: &Operand, scratch: &'a mut Wide) -> Source {
     let register = operand.register;
     let value: &'a Wide = match register {
         0x00..=0x0F => &batch.input[register as usize],
@@ -419,7 +436,20 @@ fn operand<'a>(unit: &ShaderUnit, uniforms: &'a Uniforms, batch: &'a Batch, oper
             }
         }
     };
-    Source { value, swizzle: operand.swizzle, negate: operand.negate }
+    let s = operand.swizzle;
+    let (mut r0, mut r1, mut r2, mut r3) = (
+        value[s[0] as usize],
+        value[s[1] as usize],
+        value[s[2] as usize],
+        value[s[3] as usize],
+    );
+    if operand.negate {
+        r0 = -r0;
+        r1 = -r1;
+        r2 = -r2;
+        r3 = -r3;
+    }
+    Source { r0, r1, r2, r3 }
 }
 
 #[inline(always)]
@@ -441,28 +471,18 @@ fn write(batch: &mut Batch, op: &Op, value: &Wide) {
     if op.mask & 0b0001 != 0 { slot[3] = value[3]; }
 }
 
-/// what a sum of floats starts from, so that dot products add up exactly
-/// the way the interpreter's do.
-#[inline(always)]
-fn sum_start() -> f32 {
-    std::iter::empty::<f32>().sum()
-}
-
 /// a dot product over the first count components, in every lane.
 #[inline(always)]
 fn dot(a: &Source, b: &Source, count: usize) -> Lanes {
-    let mut sum = f32x8::splat(sum_start());
-    for component in 0..count {
-        sum += a.row(component) * b.row(component);
+    let mut sum = multiply(a.r0, b.r0);
+    if count > 1 {
+        sum += multiply(a.r1, b.r1);
     }
-    // a lane without NaN had none in its products, where the shader's
-    // multiply changes nothing, so the sum is looked at once
-    if !sum.is_nan().any() {
-        return sum;
+    if count > 2 {
+        sum += multiply(a.r2, b.r2);
     }
-    let mut sum = f32x8::splat(sum_start());
-    for component in 0..count {
-        sum += multiply(a.row(component), b.row(component));
+    if count > 3 {
+        sum += multiply(a.r3, b.r3);
     }
     sum
 }
@@ -479,42 +499,42 @@ fn arithmetic(unit: &ShaderUnit, uniforms: &Uniforms, batch: &mut Batch, op: &Op
     let a = operand(unit, uniforms, batch, &op.sources[0], sa);
     let b = operand(unit, uniforms, batch, &op.sources[1], sb);
     let result: Wide = match op.opcode {
-        OpCode::Add => [a.row(0) + b.row(0), a.row(1) + b.row(1), a.row(2) + b.row(2), a.row(3) + b.row(3)],
-        OpCode::Mul => [multiply(a.row(0), b.row(0)), multiply(a.row(1), b.row(1)), multiply(a.row(2), b.row(2)), multiply(a.row(3), b.row(3))],
+        OpCode::Add => [a.r0 + b.r0, a.r1 + b.r1, a.r2 + b.r2, a.r3 + b.r3],
+        OpCode::Mul => [multiply(a.r0, b.r0), multiply(a.r1, b.r1), multiply(a.r2, b.r2), multiply(a.r3, b.r3)],
         // x when it is greater, else y, which is how NaN behaves on hardware
         OpCode::Max => [
-            a.row(0).simd_gt(b.row(0)).select(a.row(0), b.row(0)),
-            a.row(1).simd_gt(b.row(1)).select(a.row(1), b.row(1)),
-            a.row(2).simd_gt(b.row(2)).select(a.row(2), b.row(2)),
-            a.row(3).simd_gt(b.row(3)).select(a.row(3), b.row(3)),
+            a.r0.simd_gt(b.r0).select(a.r0, b.r0),
+            a.r1.simd_gt(b.r1).select(a.r1, b.r1),
+            a.r2.simd_gt(b.r2).select(a.r2, b.r2),
+            a.r3.simd_gt(b.r3).select(a.r3, b.r3),
         ],
         OpCode::Min => [
-            a.row(0).simd_lt(b.row(0)).select(a.row(0), b.row(0)),
-            a.row(1).simd_lt(b.row(1)).select(a.row(1), b.row(1)),
-            a.row(2).simd_lt(b.row(2)).select(a.row(2), b.row(2)),
-            a.row(3).simd_lt(b.row(3)).select(a.row(3), b.row(3)),
+            a.r0.simd_lt(b.r0).select(a.r0, b.r0),
+            a.r1.simd_lt(b.r1).select(a.r1, b.r1),
+            a.r2.simd_lt(b.r2).select(a.r2, b.r2),
+            a.r3.simd_lt(b.r3).select(a.r3, b.r3),
         ],
         OpCode::Dp3 => [dot(&a, &b, 3); 4],
         OpCode::Dp4 => [dot(&a, &b, 4); 4],
-        OpCode::Dph | OpCode::DphI => [dot(&a, &b, 3) + b.row(3); 4],
-        OpCode::Mov => [a.row(0), a.row(1), a.row(2), a.row(3)],
-        OpCode::Flr => [each(a.row(0), f32::floor), each(a.row(1), f32::floor), each(a.row(2), f32::floor), each(a.row(3), f32::floor)],
-        OpCode::Rcp => [f32x8::ONE / a.row(0); 4],
-        OpCode::Rsq => [f32x8::ONE / a.row(0).sqrt(); 4],
-        OpCode::Ex2 => [each(a.row(0), f32::exp2); 4],
-        OpCode::Lg2 => [each(a.row(0), f32::log2); 4],
-        OpCode::Sge | OpCode::SgeI => [select(a.row(0).simd_ge(b.row(0))), select(a.row(1).simd_ge(b.row(1))), select(a.row(2).simd_ge(b.row(2))), select(a.row(3).simd_ge(b.row(3)))],
-        OpCode::Slt | OpCode::SltI => [select(a.row(0).simd_lt(b.row(0))), select(a.row(1).simd_lt(b.row(1))), select(a.row(2).simd_lt(b.row(2))), select(a.row(3).simd_lt(b.row(3)))],
-        OpCode::Dst | OpCode::DstI => [f32x8::ONE, multiply(a.row(1), b.row(1)), a.row(2), b.row(3)],
+        OpCode::Dph | OpCode::DphI => [dot(&a, &b, 3) + b.r3; 4],
+        OpCode::Mov => [a.r0, a.r1, a.r2, a.r3],
+        OpCode::Flr => [each(a.r0, f32::floor), each(a.r1, f32::floor), each(a.r2, f32::floor), each(a.r3, f32::floor)],
+        OpCode::Rcp => [f32x8::ONE / a.r0; 4],
+        OpCode::Rsq => [f32x8::ONE / a.r0.sqrt(); 4],
+        OpCode::Ex2 => [each(a.r0, f32::exp2); 4],
+        OpCode::Lg2 => [each(a.r0, f32::log2); 4],
+        OpCode::Sge | OpCode::SgeI => [select(a.r0.simd_ge(b.r0)), select(a.r1.simd_ge(b.r1)), select(a.r2.simd_ge(b.r2)), select(a.r3.simd_ge(b.r3))],
+        OpCode::Slt | OpCode::SltI => [select(a.r0.simd_lt(b.r0)), select(a.r1.simd_lt(b.r1)), select(a.r2.simd_lt(b.r2)), select(a.r3.simd_lt(b.r3))],
+        OpCode::Dst | OpCode::DstI => [f32x8::ONE, multiply(a.r1, b.r1), a.r2, b.r3],
         OpCode::LitP => {
-            let (x, y, w) = (a.row(0), a.row(1), a.row(3));
+            let (x, y, w) = (a.r0, a.r1, a.r3);
             let conditions = [x.to_array().map(|x| x >= 0.0), w.to_array().map(|w| w >= 0.0)];
             let result = [each(x, |x| x.max(0.0)), each(y, |y| y.clamp(-127.9961, 127.9961)), f32x8::ZERO, each(w, |w| w.max(0.0))];
             batch.condition = conditions;
             result
         }
         OpCode::Mova => {
-            let (x, y) = (a.row(0).to_array(), a.row(1).to_array());
+            let (x, y) = (a.r0.to_array(), a.r1.to_array());
             if op.mask & 0b1000 != 0 {
                 batch.address[0] = x.map(|x| x as i32);
             }

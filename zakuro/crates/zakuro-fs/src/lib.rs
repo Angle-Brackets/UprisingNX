@@ -97,7 +97,7 @@ pub struct RomImage {
     #[cfg(target_os = "horizon")]
     head: Vec<u8>,
     #[cfg(target_os = "horizon")]
-    file: std::sync::Mutex<std::fs::File>,
+    cache: std::sync::Mutex<horizon::RomCache>,
     #[cfg(target_os = "horizon")]
     len: u64,
 }
@@ -123,15 +123,15 @@ impl RomImage {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
         let len = file.metadata()?.len();
-        let file = std::sync::Mutex::new(file);
-        let head_len = horizon::head_len(&file, len)?;
+        let cache = std::sync::Mutex::new(horizon::RomCache::new(file));
+        let head_len = horizon::head_len(&cache, len)?;
         let mut head = vec![0u8; head_len as usize];
-        let got = horizon::read_at(&file, 0, &mut head);
+        let got = horizon::read_at(&cache, 0, &mut head);
         if got != head.len() {
             return Err(FsError::Truncated { offset: got, len: head.len() });
         }
         log::info!("rom: {} MiB, {} KiB of it kept in memory", len >> 20, head_len >> 10);
-        Ok(RomImage { path, head, file, len })
+        Ok(RomImage { path, head, cache, len })
     }
 
     pub fn path(&self) -> &Path {
@@ -165,7 +165,7 @@ impl RomImage {
                 buf.copy_from_slice(&self.head[start..start + buf.len()]);
                 return buf.len();
             }
-            horizon::read_at(&self.file, offset, buf)
+            horizon::read_at(&self.cache, offset, buf)
         }
     }
 
@@ -189,32 +189,91 @@ mod horizon {
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::Mutex;
 
-    /// reads at offset until buf is full or the file ends, how much it read.
-    /// newlib on Horizon has no pread, so it seeks under the lock.
-    pub fn read_at(file: &Mutex<File>, offset: u64, buf: &mut [u8]) -> usize {
-        let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Err(e) = file.seek(SeekFrom::Start(offset)) {
-            log::warn!("rom: seek to 0x{offset:X} failed, {e}");
-            return 0;
-        }
-        let mut done = 0;
-        while done < buf.len() {
-            match file.read(&mut buf[done..]) {
-                Ok(0) => break,
-                Ok(n) => done += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    log::warn!("rom: read of {} bytes at 0x{:X} failed, {e}", buf.len(), offset + done as u64);
-                    break;
-                }
-            }
-        }
-        done
+    const CHUNK_SIZE: usize = 65536;
+    const NUM_CHUNKS: usize = 1024; // 64 MiB cache
+
+    struct CacheEntry {
+        offset: u64,
+        len: usize,
+        data: Box<[u8; CHUNK_SIZE]>,
     }
 
-    fn read(file: &Mutex<File>, offset: u64, len: usize) -> Vec<u8> {
+    pub struct RomCache {
+        file: File,
+        chunks: Vec<Option<CacheEntry>>,
+    }
+
+    impl RomCache {
+        pub fn new(file: File) -> Self {
+            let mut chunks = Vec::with_capacity(NUM_CHUNKS);
+            chunks.resize_with(NUM_CHUNKS, || None);
+            RomCache { file, chunks }
+        }
+
+        fn read_direct(&mut self, offset: u64, buf: &mut [u8]) -> usize {
+            if let Err(e) = self.file.seek(SeekFrom::Start(offset)) {
+                log::warn!("rom: seek to 0x{offset:X} failed, {e}");
+                return 0;
+            }
+            let mut done = 0;
+            while done < buf.len() {
+                match self.file.read(&mut buf[done..]) {
+                    Ok(0) => break,
+                    Ok(n) => done += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        log::warn!("rom: read of {} bytes at 0x{:X} failed, {e}", buf.len(), offset + done as u64);
+                        break;
+                    }
+                }
+            }
+            done
+        }
+    }
+
+    /// reads at offset until buf is full or the file ends, how much it read.
+    pub fn read_at(cache: &Mutex<RomCache>, offset: u64, buf: &mut [u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+
+        let mut state = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let chunk_base = offset & !(CHUNK_SIZE as u64 - 1);
+        let in_chunk = (offset - chunk_base) as usize;
+        if in_chunk + buf.len() <= CHUNK_SIZE {
+            let slot_idx = ((chunk_base / CHUNK_SIZE as u64) as usize) % NUM_CHUNKS;
+            if let Some(entry) = &state.chunks[slot_idx] {
+                if entry.offset == chunk_base {
+                    let available = entry.len.saturating_sub(in_chunk);
+                    let count = buf.len().min(available);
+                    buf[..count].copy_from_slice(&entry.data[in_chunk..in_chunk + count]);
+                    return count;
+                }
+            }
+
+            let mut entry = state.chunks[slot_idx].take().unwrap_or_else(|| CacheEntry {
+                offset: 0,
+                len: 0,
+                data: Box::new([0u8; CHUNK_SIZE]),
+            });
+            entry.offset = chunk_base;
+            let read_len = state.read_direct(chunk_base, &mut *entry.data);
+            entry.len = read_len;
+
+            let available = entry.len.saturating_sub(in_chunk);
+            let count = buf.len().min(available);
+            buf[..count].copy_from_slice(&entry.data[in_chunk..in_chunk + count]);
+            state.chunks[slot_idx] = Some(entry);
+            return count;
+        }
+
+        state.read_direct(offset, buf)
+    }
+
+    fn read(cache: &Mutex<RomCache>, offset: u64, len: usize) -> Vec<u8> {
         let mut buf = vec![0u8; len];
-        let got = read_at(file, offset, &mut buf);
+        let got = read_at(cache, offset, &mut buf);
         buf.truncate(got);
         buf
     }
@@ -222,8 +281,8 @@ mod horizon {
     /// how much of the file to keep in memory: up to the executable NCCH's
     /// RomFS file data. Anything that isn't a plain cartridge or NCCH with a
     /// RomFS (a CIA, an update) is kept whole.
-    pub fn head_len(file: &Mutex<File>, len: u64) -> Result<u64, FsError> {
-        let start = read(file, 0, 0x4000);
+    pub fn head_len(cache: &Mutex<RomCache>, len: u64) -> Result<u64, FsError> {
+        let start = read(cache, 0, 0x4000);
         let ncch_offset = if Ncsd::detect(&start) {
             Ncsd::parse(&start)?.executable_partition()?.offset
         } else if NcchHeader::detect(&start) {
@@ -231,14 +290,14 @@ mod horizon {
         } else {
             return Ok(len);
         };
-        let ncch = NcchHeader::parse(&read(file, ncch_offset, NcchHeader::SIZE))?;
+        let ncch = NcchHeader::parse(&read(cache, ncch_offset, NcchHeader::SIZE))?;
         if !ncch.has_romfs() {
             return Ok(len);
         }
         let romfs = ncch_offset + ncch.romfs_offset;
-        let level3 = romfs + RomFs::level3_offset(&read(file, romfs, 0x1000))?;
+        let level3 = romfs + RomFs::level3_offset(&read(cache, romfs, 0x1000))?;
         // the level 3 header's last word, where the file data starts
-        let header = read(file, level3, 0x28);
+        let header = read(cache, level3, 0x28);
         let word = header.get(0x24..0x28).ok_or(FsError::Truncated { offset: 0x24, len: header.len() })?;
         let file_data = u32::from_le_bytes(word.try_into().unwrap()) as u64;
         Ok((level3 + file_data).min(len))

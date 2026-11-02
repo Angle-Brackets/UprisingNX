@@ -92,28 +92,46 @@ void nx_audio_play(const int16_t *samples, uint32_t count) {
         if (g_buffers[i].in_flight) in_flight++;
     }
 
-    // Dynamic pitch/drift adjustment: 3DS rate is ~32728.5 Hz, Switch is 48000 Hz
+    // 3DS rate is ~32728.5 Hz, Switch is 48000 Hz.
+    // Fixed base pitch ratio. We only apply subtle micro-adjustments (+-0.5%)
+    // to keep buffer queue balanced without any perceptible pitch modulation.
     const double BASE_STEP = 32728.498 / 48000.0; // ~0.6818437
-    double step = BASE_STEP;
-    if (in_flight > 3) {
-        step *= 1.005; // Speed up slightly to drain queue
-    } else if (in_flight < 2) {
-        step *= 0.995; // Slow down slightly to prevent underrun
-    }
+    double rate_scale = 1.0 + (double)(in_flight - 3) * 0.002;
+    if (rate_scale < 0.995) rate_scale = 0.995;
+    if (rate_scale > 1.005) rate_scale = 1.005;
+    double step = BASE_STEP * rate_scale;
 
     // Fill available buffers
     for (int b = 0; b < NUM_BUFFERS; b++) {
         if (g_buffers[b].in_flight) continue;
 
-        // Check if we have enough input samples to produce SAMPLES_PER_BUFFER output samples
-        double end_pos = g_input_pos + (SAMPLES_PER_BUFFER - 1) * step;
-        if ((int)end_pos + 1 >= g_input_count) {
-            break; // Wait for more samples
+        int available = g_input_count - (int)g_input_pos;
+        int needed = (int)((double)SAMPLES_PER_BUFFER * step) + 2;
+        if (available < needed) {
+            // Under-run prevention: if no buffers are currently playing on DAC,
+            // push silence so the hardware stream never starves or clicks.
+            if (in_flight == 0) {
+                memset(g_buffers[b].data, 0, SAMPLES_PER_BUFFER * 2 * sizeof(int16_t));
+                g_buffers[b].audout_buf.next = NULL;
+                g_buffers[b].audout_buf.buffer = g_buffers[b].data;
+                g_buffers[b].audout_buf.buffer_size = BUFFER_MEM_SIZE;
+                g_buffers[b].audout_buf.data_size = SAMPLES_PER_BUFFER * 2 * sizeof(int16_t);
+                g_buffers[b].audout_buf.data_offset = 0;
+                g_buffers[b].in_flight = true;
+                audoutAppendAudioOutBuffer(&g_buffers[b].audout_buf);
+                in_flight++;
+            }
+            break;
         }
 
         int16_t *out = g_buffers[b].data;
         for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
             int idx = (int)g_input_pos;
+            if (idx + 1 >= g_input_count) {
+                out[i * 2 + 0] = 0;
+                out[i * 2 + 1] = 0;
+                continue;
+            }
             float frac = (float)(g_input_pos - idx);
             int16_t l0 = g_input[idx][0];
             int16_t l1 = g_input[idx + 1][0];

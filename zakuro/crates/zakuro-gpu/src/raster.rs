@@ -624,7 +624,7 @@ fn process_vertices<'a>(
     }
     // each vertex made once, by the threads that shade it
     let plan = VertexPlan::new(&map, registers[REG_VS_OUTPUT_MASK]);
-    let vertices = shade_with(vertex_shader, inputs, |outputs| plan.vertex(&outputs));
+    let vertices = shade_with(vertex_shader, inputs, |outputs| plan.vertex(outputs));
     (vertices, order)
 }
 
@@ -773,7 +773,7 @@ const PARALLEL_CHUNK: usize = 32;
 
 fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Vec<[Vec4; 16]> {
     let mask = registers[REG_VS_OUTPUT_MASK];
-    shade_with(unit, inputs, |outputs| pack_outputs(&outputs, mask))
+    shade_with(unit, inputs, |outputs| pack_outputs(outputs, mask))
 }
 
 /// runs the vertex shader over inputs, over threads when there are enough
@@ -782,7 +782,7 @@ fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_RE
 fn shade_with<T: Send>(
     unit: &ShaderUnit,
     inputs: &[[Vec4; shader::INPUT_REGISTERS]],
-    then: impl Fn([Vec4; shader::OUTPUT_REGISTERS]) -> T + Sync,
+    then: impl Fn(&[Vec4; shader::OUTPUT_REGISTERS]) -> T + Sync,
 ) -> Vec<T> {
     if inputs.len() < PARALLEL_VERTICES {
         return shader::run_vertices_mapped(unit, inputs, then);
@@ -915,10 +915,10 @@ struct Screen {
     /// the value the depth buffer holds.
     z: f32,
     inv_w: f32,
-    color_over_w: Vec4,
-    texcoords_over_w: [[f32; 2]; 3],
-    quaternion_over_w: Vec4,
-    view_over_w: [f32; 3],
+    color: Vec4,
+    texcoords: [[f32; 2]; 3],
+    quaternion: Vec4,
+    view: [f32; 3],
 }
 
 fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
@@ -940,10 +940,10 @@ fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> 
         y: snap(vy + (ndc_y * 0.5 + 0.5) * vh),
         z: vertex.clip[2] * inv_w,
         inv_w,
-        color_over_w: vertex.color.map(|c| c * inv_w),
-        texcoords_over_w: vertex.texcoords.map(|[u, v]| [u * inv_w, v * inv_w]),
-        quaternion_over_w: vertex.quaternion.map(|c| c * inv_w),
-        view_over_w: vertex.view.map(|c| c * inv_w),
+        color: vertex.color,
+        texcoords: vertex.texcoords,
+        quaternion: vertex.quaternion,
+        view: vertex.view,
     })
 }
 
@@ -2558,9 +2558,9 @@ fn fill_triangle(
     // q and -q are the same orientation, but halfway between them is not,
     // so the quaternions all go to the side of the first one.
     let flip = |mut vertex: Screen| {
-        let q = vertex.quaternion_over_w;
-        if (0..4).map(|i| q[i] * a.quaternion_over_w[i]).sum::<f32>() < 0.0 {
-            vertex.quaternion_over_w = q.map(|c| -c);
+        let q = vertex.quaternion;
+        if (0..4).map(|i| q[i] * a.quaternion[i]).sum::<f32>() < 0.0 {
+            vertex.quaternion = q.map(|c| -c);
         }
         vertex
     };
@@ -2635,9 +2635,10 @@ fn fill_triangle(
                 }
             }
 
-            let interpolate = |values: [f32; 3]| (w0 * values[0] + w1 * values[1] + w2 * values[2]) * w;
+            let (aw, bw, cw) = (w0 * a.inv_w, w1 * b.inv_w, w2 * c.inv_w);
+            let interpolate = |va: f32, vb: f32, vc: f32| (aw * va + bw * vb + cw * vc) * w;
             let color: Vec4 = std::array::from_fn(|i| {
-                interpolate([a.color_over_w[i], b.color_over_w[i], c.color_over_w[i]]).clamp(0.0, 1.0)
+                interpolate(a.color[i], b.color[i], c.color[i]).clamp(0.0, 1.0)
             });
 
             // sample the bound textures, then let the texture environment
@@ -2651,23 +2652,23 @@ fn fill_triangle(
                         2 if state.texture2_uses_coord1 => 1,
                         unit => unit,
                     };
-                    let u = interpolate([a.texcoords_over_w[set][0], b.texcoords_over_w[set][0], c.texcoords_over_w[set][0]]);
-                    let v = interpolate([a.texcoords_over_w[set][1], b.texcoords_over_w[set][1], c.texcoords_over_w[set][1]]);
+                    let u = interpolate(a.texcoords[set][0], b.texcoords[set][0], c.texcoords[set][0]);
+                    let v = interpolate(a.texcoords[set][1], b.texcoords[set][1], c.texcoords[set][1]);
                     samples[unit] = texture.sample(u, v);
                 }
                 if let Some(proctex) = &state.proctex {
                     let set = proctex.coordinates;
-                    let u = interpolate([a.texcoords_over_w[set][0], b.texcoords_over_w[set][0], c.texcoords_over_w[set][0]]);
-                    let v = interpolate([a.texcoords_over_w[set][1], b.texcoords_over_w[set][1], c.texcoords_over_w[set][1]]);
+                    let u = interpolate(a.texcoords[set][0], b.texcoords[set][0], c.texcoords[set][0]);
+                    let v = interpolate(a.texcoords[set][1], b.texcoords[set][1], c.texcoords[set][1]);
                     samples[3] = proctex.sample(u, v);
                 }
             }
 
             let fragment = state.lighting.as_ref().map(|lighting| {
                 let quaternion = std::array::from_fn(|i| {
-                    interpolate([a.quaternion_over_w[i], b.quaternion_over_w[i], c.quaternion_over_w[i]])
+                    interpolate(a.quaternion[i], b.quaternion[i], c.quaternion[i])
                 });
-                let view = std::array::from_fn(|i| interpolate([a.view_over_w[i], b.view_over_w[i], c.view_over_w[i]]));
+                let view = std::array::from_fn(|i| interpolate(a.view[i], b.view[i], c.view[i]));
                 lighting.shade(state.tables, quaternion, view, &samples)
             });
             let combined = state.tex_env.apply(color, samples, fragment);

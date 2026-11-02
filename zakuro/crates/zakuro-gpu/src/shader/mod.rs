@@ -612,7 +612,7 @@ impl ShaderUnit {
 pub fn run_vertices_mapped<T>(
     unit: &ShaderUnit,
     inputs: &[[Vec4; INPUT_REGISTERS]],
-    mut map: impl FnMut([Vec4; OUTPUT_REGISTERS]) -> T,
+    mut map: impl FnMut(&[Vec4; OUTPUT_REGISTERS]) -> T,
 ) -> Vec<T> {
     let decoded;
     let program = match &unit.decoded {
@@ -634,7 +634,7 @@ pub fn run_vertices_mapped<T>(
             let uniforms = uniforms.get_or_insert_with(|| batch::Uniforms::new(unit));
             batch::run(unit, uniforms, program, inputs, outputs, &mut batch, &mut blocks, &mut forks);
         });
-        return outputs.into_iter().map(map).collect();
+        return outputs.iter().map(&mut map).collect();
     }
 
     let mut outputs = Vec::with_capacity(inputs.len());
@@ -647,14 +647,14 @@ pub fn run_vertices_mapped<T>(
     for chunk in inputs.chunks(batch::LANES) {
         if !trace_nan {
             batch::run(unit, &uniforms, program, chunk, &mut batch_outputs[..chunk.len()], &mut batch, &mut blocks, &mut forks);
-            for &output in &batch_outputs[..chunk.len()] {
+            for output in &batch_outputs[..chunk.len()] {
                 outputs.push(map(output));
             }
         } else {
             for input in chunk {
                 state.input = *input;
                 execute(unit, program, &mut state, None);
-                outputs.push(map(state.output));
+                outputs.push(map(&state.output));
             }
         }
     }
@@ -664,7 +664,7 @@ pub fn run_vertices_mapped<T>(
 /// runs the vertex shader over many vertices, a batch of them at a time,
 /// giving what running it on each would give.
 pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {
-    run_vertices_mapped(unit, inputs, |o| o)
+    run_vertices_mapped(unit, inputs, |o| *o)
 }
 
 /// runs the shader over one vertex.
