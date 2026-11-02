@@ -35,18 +35,55 @@ pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
     if pattern.is_empty() {
         return true;
     }
+    let p_len = pattern.len();
+    if bytes.len() <= 16 {
+        return bytes.iter().enumerate().all(|(i, &b)| b == pattern[i % p_len]);
+    }
     if pattern.iter().all(|&b| b == 0) {
         let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
         return prefix.iter().all(|&b| b == 0)
             && u64s.iter().all(|&w| w == 0)
             && suffix.iter().all(|&b| b == 0);
     }
-    let p_len = pattern.len();
-    if bytes.len() <= 16 {
-        return bytes.iter().enumerate().all(|(i, &b)| b == pattern[i % p_len]);
+    match p_len {
+        1 => {
+            let val = u64::from_ne_bytes([pattern[0]; 8]);
+            let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
+            prefix.iter().all(|&b| b == pattern[0])
+                && u64s.iter().all(|&w| w == val)
+                && suffix.iter().all(|&b| b == pattern[0])
+        }
+        2 => {
+            let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
+            if prefix.len() % 2 == 0 {
+                let h = u16::from_ne_bytes([pattern[0], pattern[1]]) as u64;
+                let val = h | (h << 16) | (h << 32) | (h << 48);
+                let p = [pattern[0], pattern[1]];
+                prefix.iter().enumerate().all(|(i, &b)| b == p[i % 2])
+                    && u64s.iter().all(|&w| w == val)
+                    && suffix.iter().enumerate().all(|(i, &b)| b == p[i % 2])
+            } else {
+                bytes.chunks(16).all(|c| c.iter().enumerate().all(|(i, &b)| b == pattern[i % 2]))
+            }
+        }
+        4 => {
+            let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
+            if prefix.len() % 4 == 0 {
+                let w = u32::from_ne_bytes([pattern[0], pattern[1], pattern[2], pattern[3]]) as u64;
+                let val = w | (w << 32);
+                let p = [pattern[0], pattern[1], pattern[2], pattern[3]];
+                prefix.iter().enumerate().all(|(i, &b)| b == p[i % 4])
+                    && u64s.iter().all(|&w| w == val)
+                    && suffix.iter().enumerate().all(|(i, &b)| b == p[i % 4])
+            } else {
+                bytes.chunks(16).all(|c| c.iter().enumerate().all(|(i, &b)| b == pattern[i % 4]))
+            }
+        }
+        _ => {
+            let span = span(pattern);
+            bytes.chunks(SPAN).all(|chunk| *chunk == span[..chunk.len()])
+        }
     }
-    let span = span(pattern);
-    bytes.chunks(SPAN).all(|chunk| *chunk == span[..chunk.len()])
 }
 
 /// writes the pattern over bytes the way holds reads it, where they do not

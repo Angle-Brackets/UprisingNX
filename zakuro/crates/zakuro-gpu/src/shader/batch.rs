@@ -70,8 +70,12 @@ impl Batch {
 
     #[inline(always)]
     pub(super) fn reset(&mut self, program: &Program, inputs: &[[Vec4; INPUT_REGISTERS]]) {
-        self.output = [ZERO; OUTPUT_REGISTERS];
-        self.temp.fill(TEMP_START);
+        for register in (0..OUTPUT_REGISTERS).filter(|r| program.outputs & (1 << r) != 0) {
+            self.output[register] = ZERO;
+        }
+        for register in (0..TEMP_REGISTERS).filter(|r| program.temps & (1 << r) != 0) {
+            self.temp[register] = TEMP_START;
+        }
         self.address = [[0; LANES]; 2];
         self.loop_counter = 0;
         self.condition = [[false; LANES]; 2];
@@ -233,17 +237,19 @@ fn execute(
     let mut scratch = [ZERO; 3];
 
     loop {
-        while let Some(top) = blocks.last_mut() {
-            if pc != top.end {
-                break;
-            }
-            batch.loop_counter = batch.loop_counter.wrapping_add(top.increment);
-            if top.repeat == 0 {
-                pc = top.return_address;
-                blocks.pop();
-            } else {
-                top.repeat -= 1;
-                pc = top.start;
+        if !blocks.is_empty() {
+            while let Some(top) = blocks.last_mut() {
+                if pc != top.end {
+                    break;
+                }
+                batch.loop_counter = batch.loop_counter.wrapping_add(top.increment);
+                if top.repeat == 0 {
+                    pc = top.return_address;
+                    blocks.pop();
+                } else {
+                    top.repeat -= 1;
+                    pc = top.start;
+                }
             }
         }
         // a program that never ends is a decoding bug, the interpreter caps
@@ -279,13 +285,107 @@ fn execute(
                 let a = operand(unit, uniforms, batch, &op.sources[0], sa);
                 let b = operand(unit, uniforms, batch, &op.sources[1], sb);
                 let c = operand(unit, uniforms, batch, &op.sources[2], sc);
-                let result: Wide = [
-                    multiply(a.r0, b.r0) + c.r0,
-                    multiply(a.r1, b.r1) + c.r1,
-                    multiply(a.r2, b.r2) + c.r2,
-                    multiply(a.r3, b.r3) + c.r3,
-                ];
-                write(batch, op, &result);
+                let mask = op.mask;
+                if let Some(slot) = slot_mut(batch, op.destination) {
+                    if mask == 0b1111 {
+                        slot[0] = multiply(a.r0, b.r0) + c.r0;
+                        slot[1] = multiply(a.r1, b.r1) + c.r1;
+                        slot[2] = multiply(a.r2, b.r2) + c.r2;
+                        slot[3] = multiply(a.r3, b.r3) + c.r3;
+                    } else {
+                        if mask & 0b1000 != 0 { slot[0] = multiply(a.r0, b.r0) + c.r0; }
+                        if mask & 0b0100 != 0 { slot[1] = multiply(a.r1, b.r1) + c.r1; }
+                        if mask & 0b0010 != 0 { slot[2] = multiply(a.r2, b.r2) + c.r2; }
+                        if mask & 0b0001 != 0 { slot[3] = multiply(a.r3, b.r3) + c.r3; }
+                    }
+                }
+                pc += 1;
+            }
+            OpCode::Dp4 => {
+                let mask = op.mask;
+                let [sa, sb, _] = &mut scratch;
+                let a = operand(unit, uniforms, batch, &op.sources[0], sa);
+                let b = operand(unit, uniforms, batch, &op.sources[1], sb);
+                if let Some(slot) = slot_mut(batch, op.destination) {
+                    let d = dot(&a, &b, 4);
+                    if mask & 0b1000 != 0 { slot[0] = d; }
+                    if mask & 0b0100 != 0 { slot[1] = d; }
+                    if mask & 0b0010 != 0 { slot[2] = d; }
+                    if mask & 0b0001 != 0 { slot[3] = d; }
+                }
+                pc += 1;
+            }
+            OpCode::Dp3 => {
+                let mask = op.mask;
+                let [sa, sb, _] = &mut scratch;
+                let a = operand(unit, uniforms, batch, &op.sources[0], sa);
+                let b = operand(unit, uniforms, batch, &op.sources[1], sb);
+                if let Some(slot) = slot_mut(batch, op.destination) {
+                    let d = dot(&a, &b, 3);
+                    if mask & 0b1000 != 0 { slot[0] = d; }
+                    if mask & 0b0100 != 0 { slot[1] = d; }
+                    if mask & 0b0010 != 0 { slot[2] = d; }
+                    if mask & 0b0001 != 0 { slot[3] = d; }
+                }
+                pc += 1;
+            }
+            OpCode::Mul => {
+                let mask = op.mask;
+                let [sa, sb, _] = &mut scratch;
+                let a = operand(unit, uniforms, batch, &op.sources[0], sa);
+                let b = operand(unit, uniforms, batch, &op.sources[1], sb);
+                if let Some(slot) = slot_mut(batch, op.destination) {
+                    if mask == 0b1111 {
+                        slot[0] = multiply(a.r0, b.r0);
+                        slot[1] = multiply(a.r1, b.r1);
+                        slot[2] = multiply(a.r2, b.r2);
+                        slot[3] = multiply(a.r3, b.r3);
+                    } else {
+                        if mask & 0b1000 != 0 { slot[0] = multiply(a.r0, b.r0); }
+                        if mask & 0b0100 != 0 { slot[1] = multiply(a.r1, b.r1); }
+                        if mask & 0b0010 != 0 { slot[2] = multiply(a.r2, b.r2); }
+                        if mask & 0b0001 != 0 { slot[3] = multiply(a.r3, b.r3); }
+                    }
+                }
+                pc += 1;
+            }
+            OpCode::Add => {
+                let mask = op.mask;
+                let [sa, sb, _] = &mut scratch;
+                let a = operand(unit, uniforms, batch, &op.sources[0], sa);
+                let b = operand(unit, uniforms, batch, &op.sources[1], sb);
+                if let Some(slot) = slot_mut(batch, op.destination) {
+                    if mask == 0b1111 {
+                        slot[0] = a.r0 + b.r0;
+                        slot[1] = a.r1 + b.r1;
+                        slot[2] = a.r2 + b.r2;
+                        slot[3] = a.r3 + b.r3;
+                    } else {
+                        if mask & 0b1000 != 0 { slot[0] = a.r0 + b.r0; }
+                        if mask & 0b0100 != 0 { slot[1] = a.r1 + b.r1; }
+                        if mask & 0b0010 != 0 { slot[2] = a.r2 + b.r2; }
+                        if mask & 0b0001 != 0 { slot[3] = a.r3 + b.r3; }
+                    }
+                }
+                pc += 1;
+            }
+            OpCode::Mov => {
+                let mask = op.mask;
+                let [sa, _, _] = &mut scratch;
+                let a = operand(unit, uniforms, batch, &op.sources[0], sa);
+                if let Some(slot) = slot_mut(batch, op.destination) {
+                    if mask == 0b1111 {
+                        slot[0] = a.r0;
+                        slot[1] = a.r1;
+                        slot[2] = a.r2;
+                        slot[3] = a.r3;
+                    } else {
+                        if mask & 0b1000 != 0 { slot[0] = a.r0; }
+                        if mask & 0b0100 != 0 { slot[1] = a.r1; }
+                        if mask & 0b0010 != 0 { slot[2] = a.r2; }
+                        if mask & 0b0001 != 0 { slot[3] = a.r3; }
+                    }
+                }
                 pc += 1;
             }
             OpCode::Loop => {
@@ -413,6 +513,15 @@ impl Source {
     }
 }
 
+#[inline(always)]
+fn slot_mut(batch: &mut Batch, register: u32) -> Option<&mut Wide> {
+    match register {
+        0x00..=0x0F => Some(&mut batch.output[register as usize]),
+        0x10..=0x1F => Some(&mut batch.temp[(register - 0x10) as usize]),
+        _ => None,
+    }
+}
+
 /// a source's value in every lane, swizzled and negated as its descriptor
 /// says. a uniform is the same in every lane unless an address register
 /// offsets it, which puts it together in scratch.
@@ -437,6 +546,9 @@ fn operand<'a>(unit: &ShaderUnit, uniforms: &'a Uniforms, batch: &'a Batch, oper
         }
     };
     let s = operand.swizzle;
+    if s == [0, 1, 2, 3] && !operand.negate {
+        return Source { r0: value[0], r1: value[1], r2: value[2], r3: value[3] };
+    }
     let (mut r0, mut r1, mut r2, mut r3) = (
         value[s[0] as usize],
         value[s[1] as usize],
@@ -454,12 +566,7 @@ fn operand<'a>(unit: &ShaderUnit, uniforms: &'a Uniforms, batch: &'a Batch, oper
 
 #[inline(always)]
 fn write(batch: &mut Batch, op: &Op, value: &Wide) {
-    let register = op.destination;
-    let slot = match register {
-        0x00..=0x0F => &mut batch.output[register as usize],
-        0x10..=0x1F => &mut batch.temp[(register - 0x10) as usize],
-        _ => return,
-    };
+    let Some(slot) = slot_mut(batch, op.destination) else { return };
     if op.mask == 0b1111 {
         *slot = *value;
         return;
@@ -495,43 +602,137 @@ fn select(mask: Lanes) -> Lanes {
 
 #[inline(always)]
 fn arithmetic(unit: &ShaderUnit, uniforms: &Uniforms, batch: &mut Batch, op: &Op, scratch: &mut [Wide; 3]) {
+    let mask = op.mask;
     let [sa, sb, _] = scratch;
     let a = operand(unit, uniforms, batch, &op.sources[0], sa);
     let b = operand(unit, uniforms, batch, &op.sources[1], sb);
-    let result: Wide = match op.opcode {
-        OpCode::Add => [a.r0 + b.r0, a.r1 + b.r1, a.r2 + b.r2, a.r3 + b.r3],
-        OpCode::Mul => [multiply(a.r0, b.r0), multiply(a.r1, b.r1), multiply(a.r2, b.r2), multiply(a.r3, b.r3)],
-        // x when it is greater, else y, which is how NaN behaves on hardware
-        OpCode::Max => [
-            a.r0.simd_gt(b.r0).select(a.r0, b.r0),
-            a.r1.simd_gt(b.r1).select(a.r1, b.r1),
-            a.r2.simd_gt(b.r2).select(a.r2, b.r2),
-            a.r3.simd_gt(b.r3).select(a.r3, b.r3),
-        ],
-        OpCode::Min => [
-            a.r0.simd_lt(b.r0).select(a.r0, b.r0),
-            a.r1.simd_lt(b.r1).select(a.r1, b.r1),
-            a.r2.simd_lt(b.r2).select(a.r2, b.r2),
-            a.r3.simd_lt(b.r3).select(a.r3, b.r3),
-        ],
-        OpCode::Dp3 => [dot(&a, &b, 3); 4],
-        OpCode::Dp4 => [dot(&a, &b, 4); 4],
-        OpCode::Dph | OpCode::DphI => [dot(&a, &b, 3) + b.r3; 4],
-        OpCode::Mov => [a.r0, a.r1, a.r2, a.r3],
-        OpCode::Flr => [each(a.r0, f32::floor), each(a.r1, f32::floor), each(a.r2, f32::floor), each(a.r3, f32::floor)],
-        OpCode::Rcp => [f32x8::ONE / a.r0; 4],
-        OpCode::Rsq => [f32x8::ONE / a.r0.sqrt(); 4],
-        OpCode::Ex2 => [each(a.r0, f32::exp2); 4],
-        OpCode::Lg2 => [each(a.r0, f32::log2); 4],
-        OpCode::Sge | OpCode::SgeI => [select(a.r0.simd_ge(b.r0)), select(a.r1.simd_ge(b.r1)), select(a.r2.simd_ge(b.r2)), select(a.r3.simd_ge(b.r3))],
-        OpCode::Slt | OpCode::SltI => [select(a.r0.simd_lt(b.r0)), select(a.r1.simd_lt(b.r1)), select(a.r2.simd_lt(b.r2)), select(a.r3.simd_lt(b.r3))],
-        OpCode::Dst | OpCode::DstI => [f32x8::ONE, multiply(a.r1, b.r1), a.r2, b.r3],
+    match op.opcode {
+        OpCode::Add => {
+            if let Some(slot) = slot_mut(batch, op.destination) {
+                if mask == 0b1111 {
+                    slot[0] = a.r0 + b.r0;
+                    slot[1] = a.r1 + b.r1;
+                    slot[2] = a.r2 + b.r2;
+                    slot[3] = a.r3 + b.r3;
+                } else {
+                    if mask & 0b1000 != 0 { slot[0] = a.r0 + b.r0; }
+                    if mask & 0b0100 != 0 { slot[1] = a.r1 + b.r1; }
+                    if mask & 0b0010 != 0 { slot[2] = a.r2 + b.r2; }
+                    if mask & 0b0001 != 0 { slot[3] = a.r3 + b.r3; }
+                }
+            }
+        }
+        OpCode::Mul => {
+            if let Some(slot) = slot_mut(batch, op.destination) {
+                if mask == 0b1111 {
+                    slot[0] = multiply(a.r0, b.r0);
+                    slot[1] = multiply(a.r1, b.r1);
+                    slot[2] = multiply(a.r2, b.r2);
+                    slot[3] = multiply(a.r3, b.r3);
+                } else {
+                    if mask & 0b1000 != 0 { slot[0] = multiply(a.r0, b.r0); }
+                    if mask & 0b0100 != 0 { slot[1] = multiply(a.r1, b.r1); }
+                    if mask & 0b0010 != 0 { slot[2] = multiply(a.r2, b.r2); }
+                    if mask & 0b0001 != 0 { slot[3] = multiply(a.r3, b.r3); }
+                }
+            }
+        }
+        OpCode::Mov => {
+            if let Some(slot) = slot_mut(batch, op.destination) {
+                if mask == 0b1111 {
+                    slot[0] = a.r0;
+                    slot[1] = a.r1;
+                    slot[2] = a.r2;
+                    slot[3] = a.r3;
+                } else {
+                    if mask & 0b1000 != 0 { slot[0] = a.r0; }
+                    if mask & 0b0100 != 0 { slot[1] = a.r1; }
+                    if mask & 0b0010 != 0 { slot[2] = a.r2; }
+                    if mask & 0b0001 != 0 { slot[3] = a.r3; }
+                }
+            }
+        }
+        OpCode::Dp3 => {
+            if let Some(slot) = slot_mut(batch, op.destination) {
+                let d = dot(&a, &b, 3);
+                if mask & 0b1000 != 0 { slot[0] = d; }
+                if mask & 0b0100 != 0 { slot[1] = d; }
+                if mask & 0b0010 != 0 { slot[2] = d; }
+                if mask & 0b0001 != 0 { slot[3] = d; }
+            }
+        }
+        OpCode::Dp4 => {
+            if let Some(slot) = slot_mut(batch, op.destination) {
+                let d = dot(&a, &b, 4);
+                if mask & 0b1000 != 0 { slot[0] = d; }
+                if mask & 0b0100 != 0 { slot[1] = d; }
+                if mask & 0b0010 != 0 { slot[2] = d; }
+                if mask & 0b0001 != 0 { slot[3] = d; }
+            }
+        }
+        OpCode::Dph | OpCode::DphI => {
+            if let Some(slot) = slot_mut(batch, op.destination) {
+                let d = dot(&a, &b, 3) + b.r3;
+                if mask & 0b1000 != 0 { slot[0] = d; }
+                if mask & 0b0100 != 0 { slot[1] = d; }
+                if mask & 0b0010 != 0 { slot[2] = d; }
+                if mask & 0b0001 != 0 { slot[3] = d; }
+            }
+        }
+        OpCode::Max => {
+            if let Some(slot) = slot_mut(batch, op.destination) {
+                if mask & 0b1000 != 0 { slot[0] = a.r0.simd_gt(b.r0).select(a.r0, b.r0); }
+                if mask & 0b0100 != 0 { slot[1] = a.r1.simd_gt(b.r1).select(a.r1, b.r1); }
+                if mask & 0b0010 != 0 { slot[2] = a.r2.simd_gt(b.r2).select(a.r2, b.r2); }
+                if mask & 0b0001 != 0 { slot[3] = a.r3.simd_gt(b.r3).select(a.r3, b.r3); }
+            }
+        }
+        OpCode::Min => {
+            if let Some(slot) = slot_mut(batch, op.destination) {
+                if mask & 0b1000 != 0 { slot[0] = a.r0.simd_lt(b.r0).select(a.r0, b.r0); }
+                if mask & 0b0100 != 0 { slot[1] = a.r1.simd_lt(b.r1).select(a.r1, b.r1); }
+                if mask & 0b0010 != 0 { slot[2] = a.r2.simd_lt(b.r2).select(a.r2, b.r2); }
+                if mask & 0b0001 != 0 { slot[3] = a.r3.simd_lt(b.r3).select(a.r3, b.r3); }
+            }
+        }
+        OpCode::Flr => {
+            let res = [each(a.r0, f32::floor), each(a.r1, f32::floor), each(a.r2, f32::floor), each(a.r3, f32::floor)];
+            write(batch, op, &res);
+        }
+        OpCode::Rcp => {
+            let res = [f32x8::ONE / a.r0; 4];
+            write(batch, op, &res);
+        }
+        OpCode::Rsq => {
+            let res = [f32x8::ONE / a.r0.sqrt(); 4];
+            write(batch, op, &res);
+        }
+        OpCode::Ex2 => {
+            let res = [each(a.r0, f32::exp2); 4];
+            write(batch, op, &res);
+        }
+        OpCode::Lg2 => {
+            let res = [each(a.r0, f32::log2); 4];
+            write(batch, op, &res);
+        }
+        OpCode::Sge | OpCode::SgeI => {
+            let res = [select(a.r0.simd_ge(b.r0)), select(a.r1.simd_ge(b.r1)), select(a.r2.simd_ge(b.r2)), select(a.r3.simd_ge(b.r3))];
+            write(batch, op, &res);
+        }
+        OpCode::Slt | OpCode::SltI => {
+            let res = [select(a.r0.simd_lt(b.r0)), select(a.r1.simd_lt(b.r1)), select(a.r2.simd_lt(b.r2)), select(a.r3.simd_lt(b.r3))];
+            write(batch, op, &res);
+        }
+        OpCode::Dst | OpCode::DstI => {
+            let res = [f32x8::ONE, multiply(a.r1, b.r1), a.r2, b.r3];
+            write(batch, op, &res);
+        }
         OpCode::LitP => {
             let (x, y, w) = (a.r0, a.r1, a.r3);
             let conditions = [x.to_array().map(|x| x >= 0.0), w.to_array().map(|w| w >= 0.0)];
             let result = [each(x, |x| x.max(0.0)), each(y, |y| y.clamp(-127.9961, 127.9961)), f32x8::ZERO, each(w, |w| w.max(0.0))];
             batch.condition = conditions;
-            result
+            write(batch, op, &result);
         }
         OpCode::Mova => {
             let (x, y) = (a.r0.to_array(), a.r1.to_array());
@@ -541,7 +742,6 @@ fn arithmetic(unit: &ShaderUnit, uniforms: &Uniforms, batch: &mut Batch, op: &Op
             if op.mask & 0b0100 != 0 {
                 batch.address[1] = y.map(|y| y as i32);
             }
-            return;
         }
         OpCode::Cmp => {
             let modes = op.instruction.compare_modes();
@@ -550,14 +750,11 @@ fn arithmetic(unit: &ShaderUnit, uniforms: &Uniforms, batch: &mut Batch, op: &Op
                 std::array::from_fn(|lane| super::compare(modes[component], x[lane], y[lane]))
             });
             batch.condition = conditions;
-            return;
         }
         other => {
             log::debug!("unimplemented shader opcode {other:?}");
-            return;
         }
-    };
-    write(batch, op, &result);
+    }
 }
 
 /// the lanes a flow instruction goes its way in, one bit each.

@@ -190,7 +190,7 @@ mod horizon {
     use std::sync::Mutex;
 
     const CHUNK_SIZE: usize = 65536;
-    const NUM_CHUNKS: usize = 1024; // 64 MiB cache
+    const NUM_CHUNKS: usize = 2048; // 128 MiB cache
 
     struct CacheEntry {
         offset: u64,
@@ -239,36 +239,44 @@ mod horizon {
 
         let mut state = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let chunk_base = offset & !(CHUNK_SIZE as u64 - 1);
-        let in_chunk = (offset - chunk_base) as usize;
-        if in_chunk + buf.len() <= CHUNK_SIZE {
+        let mut total = 0;
+        while total < buf.len() {
+            let cur_offset = offset + total as u64;
+            let chunk_base = cur_offset & !(CHUNK_SIZE as u64 - 1);
+            let in_chunk = (cur_offset - chunk_base) as usize;
+            let to_read = (buf.len() - total).min(CHUNK_SIZE - in_chunk);
             let slot_idx = ((chunk_base / CHUNK_SIZE as u64) as usize) % NUM_CHUNKS;
-            if let Some(entry) = &state.chunks[slot_idx] {
-                if entry.offset == chunk_base {
-                    let available = entry.len.saturating_sub(in_chunk);
-                    let count = buf.len().min(available);
-                    buf[..count].copy_from_slice(&entry.data[in_chunk..in_chunk + count]);
-                    return count;
-                }
+
+            let in_cache = match &state.chunks[slot_idx] {
+                Some(entry) if entry.offset == chunk_base => true,
+                _ => false,
+            };
+
+            if !in_cache {
+                let mut entry = state.chunks[slot_idx].take().unwrap_or_else(|| CacheEntry {
+                    offset: 0,
+                    len: 0,
+                    data: Box::new([0u8; CHUNK_SIZE]),
+                });
+                entry.offset = chunk_base;
+                let read_len = state.read_direct(chunk_base, &mut *entry.data);
+                entry.len = read_len;
+                state.chunks[slot_idx] = Some(entry);
             }
 
-            let mut entry = state.chunks[slot_idx].take().unwrap_or_else(|| CacheEntry {
-                offset: 0,
-                len: 0,
-                data: Box::new([0u8; CHUNK_SIZE]),
-            });
-            entry.offset = chunk_base;
-            let read_len = state.read_direct(chunk_base, &mut *entry.data);
-            entry.len = read_len;
-
+            let entry = state.chunks[slot_idx].as_ref().unwrap();
             let available = entry.len.saturating_sub(in_chunk);
-            let count = buf.len().min(available);
-            buf[..count].copy_from_slice(&entry.data[in_chunk..in_chunk + count]);
-            state.chunks[slot_idx] = Some(entry);
-            return count;
+            let count = to_read.min(available);
+            if count == 0 {
+                break;
+            }
+            buf[total..total + count].copy_from_slice(&entry.data[in_chunk..in_chunk + count]);
+            total += count;
+            if count < to_read {
+                break;
+            }
         }
-
-        state.read_direct(offset, buf)
+        total
     }
 
     fn read(cache: &Mutex<RomCache>, offset: u64, len: usize) -> Vec<u8> {

@@ -466,6 +466,7 @@ pub struct Program {
     /// anything writes, one bit each.
     inputs: u16,
     outputs: u16,
+    temps: u16,
     /// a hash of the words it came from, which the GPU keeps programs by.
     fingerprint: u64,
 }
@@ -473,7 +474,7 @@ pub struct Program {
 impl Program {
     fn decode(unit: &ShaderUnit) -> Program {
         let ops: Box<[Op]> = unit.program.iter().map(|&word| Op::decode(Instruction(word), &unit.descriptors)).collect();
-        let (mut inputs, mut outputs) = (0u16, 0u16);
+        let (mut inputs, mut outputs, mut temps) = (0u16, 0u16, 0u16);
         for op in ops.iter() {
             let sources = match op.opcode {
                 OpCode::Mad | OpCode::MadI => 3,
@@ -484,13 +485,19 @@ impl Program {
             for source in &op.sources[..sources] {
                 if source.register < 0x10 {
                     inputs |= 1 << source.register;
+                } else if source.register < 0x20 {
+                    temps |= 1 << (source.register - 0x10);
                 }
             }
-            if op.opcode.writes() && op.destination < 0x10 {
-                outputs |= 1 << op.destination;
+            if op.opcode.writes() {
+                if op.destination < 0x10 {
+                    outputs |= 1 << op.destination;
+                } else if op.destination < 0x20 {
+                    temps |= 1 << (op.destination - 0x10);
+                }
             }
         }
-        Program { ops, inputs, outputs, fingerprint: unit.fingerprint() }
+        Program { ops, inputs, outputs, temps, fingerprint: unit.fingerprint() }
     }
 }
 
