@@ -71,6 +71,12 @@ pub struct Unx {
     out_of_play: u32,
 }
 
+extern "C" {
+    fn nx_audio_init();
+    fn nx_audio_play(samples: *const i16, count: u32);
+    fn nx_audio_exit();
+}
+
 fn cstr(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
@@ -107,6 +113,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     };
     log::info!("unx: presenter {} up in {:?}", presenter.name(), started.elapsed());
     presenter.set_layout(ScreenLayout::TopOnly);
+    nx_audio_init();
 
     let linked = recomp.as_ref().map(|r| {
         log::info!("unx: recompiled code linked in, ABI {}, {} entries, {} modules", r.abi, r.entry_count, r.module_count);
@@ -207,8 +214,10 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let outcome = unx.system.run_frame();
     let took = started.elapsed();
     unx.frame += 1;
-    // no sound out yet (B3); drained so it doesn't pile up
-    drop(unx.system.take_audio());
+    let audio = unx.system.take_audio();
+    if !audio.is_empty() {
+        nx_audio_play(audio.as_ptr() as *const i16, audio.len() as u32);
+    }
     let gpu = zakuro_gpu::stats::take();
     for (sum, ms) in unx.spent.iter_mut().zip([
         gpu.recompiled, gpu.services, gpu.drawing, gpu.shading, gpu.textures, gpu.waiting, gpu.sync, gpu.frame_end, gpu.audio,
@@ -317,6 +326,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
 /// `unx` came from unx_create and isn't used again.
 #[no_mangle]
 pub unsafe extern "C" fn unx_destroy(unx: *mut Unx) {
+    nx_audio_exit();
     if !unx.is_null() {
         drop(Box::from_raw(unx));
     }
