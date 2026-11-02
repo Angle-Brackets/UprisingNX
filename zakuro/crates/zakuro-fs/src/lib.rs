@@ -190,7 +190,7 @@ mod horizon {
     use std::sync::Mutex;
 
     const CHUNK_SIZE: usize = 65536;
-    const NUM_CHUNKS: usize = 2048; // 128 MiB cache
+    const NUM_CHUNKS: usize = 8192; // 512 MiB cache
 
     struct CacheEntry {
         offset: u64,
@@ -308,7 +308,10 @@ mod horizon {
         let header = read(cache, level3, 0x28);
         let word = header.get(0x24..0x28).ok_or(FsError::Truncated { offset: 0x24, len: header.len() })?;
         let file_data = u32::from_le_bytes(word.try_into().unwrap()) as u64;
-        Ok((level3 + file_data).min(len))
+        // Keep in RAM: the RomFS file metadata plus the first 48 MiB of file data,
+        // which contains all dialogue scripts (us/info/*.zrc) and dialogue scene resources (us/demo/*.zrc).
+        let dialogue_preload = 48 * 1024 * 1024;
+        Ok((level3 + file_data + dialogue_preload).min(len))
     }
 }
 

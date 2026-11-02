@@ -682,6 +682,48 @@ pub fn run_vertices_mapped<T>(
     outputs
 }
 
+/// runs the vertex shader over inputs, writing mapped outputs directly into an existing slice without allocating.
+pub fn run_vertices_into<T>(
+    unit: &ShaderUnit,
+    inputs: &[[Vec4; INPUT_REGISTERS]],
+    outputs: &mut [T],
+    mut map: impl FnMut(&[Vec4; OUTPUT_REGISTERS]) -> T,
+) {
+    debug_assert_eq!(inputs.len(), outputs.len());
+    let decoded;
+    let program = match &unit.decoded {
+        Some(program) => program.as_ref(),
+        None => {
+            decoded = Program::decode(unit);
+            &decoded
+        }
+    };
+    let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
+    let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
+    let mut batch = batch::Batch::new();
+    let uniforms = batch::Uniforms::new(unit);
+    let mut batch_outputs = [[ZERO; OUTPUT_REGISTERS]; batch::LANES];
+    let mut state = ShaderState::new();
+
+    let mut idx = 0;
+    for chunk in inputs.chunks(batch::LANES) {
+        if !trace_nan {
+            batch::run(unit, &uniforms, program, chunk, &mut batch_outputs[..chunk.len()], &mut batch, &mut blocks, &mut forks);
+            for output in &batch_outputs[..chunk.len()] {
+                outputs[idx] = map(output);
+                idx += 1;
+            }
+        } else {
+            for input in chunk {
+                state.input = *input;
+                execute(unit, program, &mut state, None);
+                outputs[idx] = map(&state.output);
+                idx += 1;
+            }
+        }
+    }
+}
+
 /// runs the vertex shader over many vertices, a batch of them at a time,
 /// giving what running it on each would give.
 pub fn run_vertices(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) -> Vec<[Vec4; OUTPUT_REGISTERS]> {

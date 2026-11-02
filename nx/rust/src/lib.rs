@@ -113,7 +113,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     };
     log::info!("unx: presenter {} up in {:?}", presenter.name(), started.elapsed());
     presenter.set_layout(ScreenLayout::TopOnly);
-    presenter.set_scaling(ScreenFilter::Sharp, false);
+    presenter.set_scaling(ScreenFilter::Smooth, false);
     nx_audio_init();
 
     let linked = recomp.as_ref().map(|r| {
@@ -208,8 +208,10 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     } else {
         unx.out_of_play = unx.out_of_play.saturating_add(1);
     }
-    let in_play = unx.out_of_play <= 10;
-    unx.system.gpu.set_in_play(in_play);
+    // Switch is a single-screen console: hybrid in-play extraction is always active.
+    // Bottom-screen dialogue portraits and HUD islands are mirrored to top screen,
+    // and bottom-screen rasterization is completely bypassed.
+    unx.system.gpu.set_in_play(true);
 
     let started = Instant::now();
     let outcome = unx.system.run_frame();
@@ -236,12 +238,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let top = shown(&mut unx.system, Screen::Top);
     let blank = std::sync::Arc::new(Vec::new());
     let ((top_px, tw, th), top_gpu) = top;
-    let (bottom_px, bw, bh, bottom_gpu) = if in_play {
-        (blank.clone(), 0, 0, None)
-    } else {
-        let ((px, w, h), gpu) = shown(&mut unx.system, Screen::Bottom);
-        (px, w, h, gpu)
-    };
+    let (bottom_px, bw, bh, bottom_gpu) = (blank.clone(), 0, 0, None);
     let result = unx.presenter.present(
         ScreenImage { width: tw, height: th, pixels: &top_px, gpu: top_gpu },
         ScreenImage { width: bw, height: bh, pixels: &bottom_px, gpu: bottom_gpu },

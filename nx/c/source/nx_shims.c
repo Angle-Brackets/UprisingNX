@@ -1,6 +1,7 @@
 // POSIX pieces Rust std calls that libnx/newlib don't provide.
 #include <errno.h>
 #include <unistd.h>
+#include <switch.h>
 
 // std reads the page size (thread stacks) and the processor count
 // (available_parallelism, so rayon's default pool size). Applications get
@@ -50,6 +51,9 @@ static void *nx_thread_trampoline(void *p) {
     struct nx_thread_start start = *(struct nx_thread_start *)p;
     free(p);
     nx_tls_init();
+    static int s_next_core = 1;
+    int core = __atomic_fetch_add(&s_next_core, 1, __ATOMIC_RELAXED) % 3;
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 0x7);
     return start.fn(start.arg);
 }
 

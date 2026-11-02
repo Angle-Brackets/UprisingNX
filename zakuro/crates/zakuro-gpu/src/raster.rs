@@ -805,7 +805,7 @@ fn shader_pool() -> &'static rayon::ThreadPool {
 /// vertices a draw needs before shading them is worth splitting over
 /// threads.
 #[cfg(target_os = "horizon")]
-const PARALLEL_VERTICES: usize = 128;
+const PARALLEL_VERTICES: usize = 384;
 #[cfg(not(target_os = "horizon"))]
 const PARALLEL_VERTICES: usize = 32;
 /// the fewest vertices each thread takes at a time, whole batches of the
@@ -820,7 +820,7 @@ fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_RE
 /// runs the vertex shader over inputs, over threads when there are enough
 /// of them, and what to do with each one's outputs on the thread that made
 /// them, in the inputs' order.
-fn shade_with<T: Send>(
+fn shade_with<T: Send + Default>(
     unit: &ShaderUnit,
     inputs: &[[Vec4; shader::INPUT_REGISTERS]],
     then: impl Fn(&[Vec4; shader::OUTPUT_REGISTERS]) -> T + Sync,
@@ -830,20 +830,17 @@ fn shade_with<T: Send>(
     }
     let pool = shader_pool();
     let chunk = (inputs.len() / (pool.current_num_threads() * 2)).next_multiple_of(8).max(PARALLEL_CHUNK);
+    let mut outputs: Vec<T> = (0..inputs.len()).map(|_| T::default()).collect();
     pool.install(|| {
         use rayon::prelude::*;
-        inputs
-            .par_chunks(chunk)
-            .map(|chunk| shader::run_vertices_mapped(unit, chunk, &then))
-            .reduce(Vec::new, |mut a, b| {
-                if a.is_empty() {
-                    b
-                } else {
-                    a.extend(b);
-                    a
-                }
-            })
-    })
+        outputs
+            .par_chunks_mut(chunk)
+            .zip(inputs.par_chunks(chunk))
+            .for_each(|(out_chunk, in_chunk)| {
+                shader::run_vertices_into(unit, in_chunk, out_chunk, &then);
+            });
+    });
+    outputs
 }
 
 fn geometry_stage(
@@ -1891,9 +1888,13 @@ impl TextureCache {
     fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Found {
         let _timer = crate::stats::time(&crate::stats::TEXTURES);
         let (_, format, width, height) = key;
-        let hash = fingerprint(data);
         let checked = (self.list, self.written.len());
         if let Some(decoded) = self.entries.get_mut(&key) {
+            if decoded.bytes == data {
+                decoded.checked = checked;
+                return (decoded.texels.clone(), decoded.replacement.clone());
+            }
+            let hash = fingerprint(data);
             if decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
                 // a title changing a few sprites of an atlas rewrites a
                 // handful of its 8x8 tiles, those alone are decoded again,
@@ -1928,6 +1929,7 @@ impl TextureCache {
             self.entries.clear();
             self.texels = 0;
         }
+        let hash = fingerprint(data);
         let texels: Arc<[[u8; 4]]> = Arc::from(crate::texture::decode_texture(data, format, width, height));
         let replacement = picture_for(self.pack.as_deref(), data, &texels, key, &mut self.rows);
         let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
@@ -3239,7 +3241,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             if on_bottom(registers) {
                 if is_portrait(registers) {
                     mirror_portrait(registers, resources, vertices);
-                } else if !cfg!(target_os = "horizon") {
+                } else {
                     mirror_hud(registers, resources, vertices);
                 }
             }

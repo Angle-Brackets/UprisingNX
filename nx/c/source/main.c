@@ -107,6 +107,7 @@ static void *game(void *p) {
 #endif
 
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 0x7);
     PadState pad;
     padInitializeDefault(&pad);
     hidInitializeTouchScreen();
@@ -114,7 +115,7 @@ static void *game(void *p) {
 
     load_env();
     void *unx = unx_create(nwindowGetDefault(), args->rom, "sdmc:/switch/uprisingnx/data", recomp);
-    prof_start();
+    if (getenv("UNX_PROF")) prof_start();
     if (!unx) {
         printf("uprising_nx: could not start, see above\n");
     } else {
@@ -125,7 +126,7 @@ static void *game(void *p) {
             if ((in.buttons & (P_START | P_SELECT)) == (P_START | P_SELECT)) break;
             if (unx_frame(unx, &in)) break;
         }
-        prof_stop();
+        if (getenv("UNX_PROF")) prof_stop();
         unx_destroy(unx);
     }
     return NULL;
