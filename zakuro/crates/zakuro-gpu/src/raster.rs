@@ -266,33 +266,72 @@ impl LoaderPlan {
     #[inline(always)]
     fn place(&self, bytes: &[u8], input: &mut [Vec4; shader::INPUT_REGISTERS]) {
         for field in &self.fields {
-            // the type once a field rather than once a component, as
-            // component reads it
             let (at, count) = (field.offset as usize, field.count as usize);
             let mut value = [0.0f32, 0.0, 0.0, 1.0];
+            let src = &bytes[at..];
             match field.ty {
                 0 => {
-                    for i in 0..count {
-                        value[i] = bytes[at + i] as i8 as f32;
+                    if src.len() >= count {
+                        for i in 0..count {
+                            value[i] = src[i] as i8 as f32;
+                        }
                     }
                 }
                 1 => {
-                    for i in 0..count {
-                        value[i] = bytes[at + i] as f32;
+                    if src.len() >= count {
+                        for i in 0..count {
+                            value[i] = src[i] as f32;
+                        }
                     }
                 }
                 2 => {
-                    for i in 0..count {
-                        let offset = at + i * 2;
-                        value[i] = i16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as f32;
+                    if src.len() >= count * 2 {
+                        match count {
+                            1 => {
+                                value[0] = i16::from_le_bytes([src[0], src[1]]) as f32;
+                            }
+                            2 => {
+                                value[0] = i16::from_le_bytes([src[0], src[1]]) as f32;
+                                value[1] = i16::from_le_bytes([src[2], src[3]]) as f32;
+                            }
+                            3 => {
+                                value[0] = i16::from_le_bytes([src[0], src[1]]) as f32;
+                                value[1] = i16::from_le_bytes([src[2], src[3]]) as f32;
+                                value[2] = i16::from_le_bytes([src[4], src[5]]) as f32;
+                            }
+                            4 => {
+                                value[0] = i16::from_le_bytes([src[0], src[1]]) as f32;
+                                value[1] = i16::from_le_bytes([src[2], src[3]]) as f32;
+                                value[2] = i16::from_le_bytes([src[4], src[5]]) as f32;
+                                value[3] = i16::from_le_bytes([src[6], src[7]]) as f32;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 _ => {
-                    let src = &bytes[at..];
-                    for i in 0..count {
-                        let offset = i * 4;
-                        let b = [src[offset], src[offset + 1], src[offset + 2], src[offset + 3]];
-                        value[i] = f32::from_bits(u32::from_le_bytes(b));
+                    if src.len() >= count * 4 {
+                        match count {
+                            1 => {
+                                value[0] = f32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                            }
+                            2 => {
+                                value[0] = f32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                                value[1] = f32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+                            }
+                            3 => {
+                                value[0] = f32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                                value[1] = f32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+                                value[2] = f32::from_le_bytes([src[8], src[9], src[10], src[11]]);
+                            }
+                            4 => {
+                                value[0] = f32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                                value[1] = f32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+                                value[2] = f32::from_le_bytes([src[8], src[9], src[10], src[11]]);
+                                value[3] = f32::from_le_bytes([src[12], src[13], src[14], src[15]]);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -766,12 +805,12 @@ fn shader_pool() -> &'static rayon::ThreadPool {
 /// vertices a draw needs before shading them is worth splitting over
 /// threads.
 #[cfg(target_os = "horizon")]
-const PARALLEL_VERTICES: usize = 768;
+const PARALLEL_VERTICES: usize = 64;
 #[cfg(not(target_os = "horizon"))]
-const PARALLEL_VERTICES: usize = 96;
+const PARALLEL_VERTICES: usize = 64;
 /// the fewest vertices each thread takes at a time, whole batches of the
 /// shader's.
-const PARALLEL_CHUNK: usize = 32;
+const PARALLEL_CHUNK: usize = 16;
 
 fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Vec<[Vec4; 16]> {
     let mask = registers[REG_VS_OUTPUT_MASK];
@@ -949,19 +988,27 @@ fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> 
     })
 }
 
-/// signed distances to the planes of the volume the PICA draws, w
-/// positive, and -w <= z <= 0, a vertex is inside when all are >= 0.
-const CLIP_PLANES: [fn(&Vertex) -> f32; 3] = [|v| v.clip[3] - 1e-5, |v| -v.clip[2], |v| v.clip[2] + v.clip[3]];
+#[inline(always)]
+fn plane_dist(v: &Vertex, plane_idx: usize) -> f32 {
+    match plane_idx {
+        0 => v.clip[3] - 1e-5,
+        1 => -v.clip[2],
+        _ => v.clip[2] + v.clip[3],
+    }
+}
 
 /// whether a vertex is inside the volume the PICA draws.
+#[inline(always)]
 fn inside(vertex: &Vertex) -> bool {
-    CLIP_PLANES.iter().all(|plane| plane(vertex) >= 0.0)
+    let [_, _, z, w] = vertex.clip;
+    w >= 1e-5 && z <= 0.0 && z + w >= 0.0
 }
 
 /// a vertex with z on an end of the range the PICA draws when it misses
 /// one only by rounding. the PICA works positions out in 24-bit floats,
 /// which land on 0 and -w, singles can miss them by a little, and 2D drawn
 /// on the near or far plane, a title's video say, lost triangles to it.
+#[inline(always)]
 fn held_in_range(mut vertex: Vertex) -> Vertex {
     let [_, _, z, w] = vertex.clip;
     let z_over_w = z / w;
@@ -989,7 +1036,6 @@ impl ClippedPoly {
 #[inline(always)]
 fn clip_triangle(triangle: [Vertex; 3]) -> ClippedPoly {
     let triangle = triangle.map(held_in_range);
-    let planes = CLIP_PLANES;
     let mut poly = ClippedPoly {
         vertices: [Vertex::default(); 16],
         len: 3,
@@ -1003,13 +1049,14 @@ fn clip_triangle(triangle: [Vertex; 3]) -> ClippedPoly {
     }
 
     let mut scratch = [Vertex::default(); 16];
-    for plane in planes {
+    for plane_idx in 0..3 {
         let mut clipped_len = 0;
         let p_len = poly.len;
         for i in 0..p_len {
             let current = &poly.vertices[i];
             let next = &poly.vertices[(i + 1) % p_len];
-            let (d0, d1) = (plane(current), plane(next));
+            let d0 = plane_dist(current, plane_idx);
+            let d1 = plane_dist(next, plane_idx);
             if d0 >= 0.0 && clipped_len < 16 {
                 scratch[clipped_len] = *current;
                 clipped_len += 1;
@@ -3373,8 +3420,11 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         slots.push(slot);
     }
     let culls = |p: &Screen, q: &Screen, r: &Screen| {
+        if cull_mode == 0 {
+            return false;
+        }
         let counter_clockwise = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0.0;
-        cull_mode != 0 && counter_clockwise == (cull_mode == 1)
+        counter_clockwise == (cull_mode == 1)
     };
     for (ia, ib, ic) in triangle_indices {
         let (a, b, c) = (at(ia), at(ib), at(ic));

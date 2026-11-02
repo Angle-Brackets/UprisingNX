@@ -5,10 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define NUM_BUFFERS 6
+#define NUM_BUFFERS 8
 #define SAMPLES_PER_BUFFER 800 // 800 stereo samples @ 48 kHz = 16.666 ms (1 frame @ 60fps)
 #define BUFFER_MEM_SIZE 0x1000 // 4096 bytes (aligned to 0x1000)
-#define MAX_INPUT_SAMPLES 8192
+#define MAX_INPUT_SAMPLES 16384
 
 typedef struct {
     AudioOutBuffer audout_buf;
@@ -20,6 +20,7 @@ static AudioBuffer g_buffers[NUM_BUFFERS];
 static int16_t g_input[MAX_INPUT_SAMPLES][2];
 static int g_input_count = 0;
 static double g_input_pos = 0.0;
+static const double BASE_STEP = 32728.498 / 48000.0; // ~0.6818437
 static double s_step = 32728.498 / 48000.0;
 static int16_t s_last_sample[2] = {0, 0};
 static bool g_initialized = false;
@@ -52,7 +53,7 @@ void nx_audio_init(void) {
 
     g_input_count = 0;
     g_input_pos = 0.0;
-    s_step = 32728.498 / 48000.0;
+    s_step = BASE_STEP;
     s_last_sample[0] = 0;
     s_last_sample[1] = 0;
     g_initialized = true;
@@ -97,32 +98,45 @@ void nx_audio_play(const int16_t *samples, uint32_t count) {
         if (g_buffers[i].in_flight) in_flight++;
     }
 
-    const double BASE_STEP = 32728.498 / 48000.0; // ~0.6818437
-
-    // Dynamic rate control: Target 2 in-flight hardware buffers + 200 input samples in reserve.
-    // Proportional control with low-pass filter ensures seamless audio playback across frame rate variations.
+    // Drift compensation: Target 3 in-flight hardware buffers (50 ms) + 400 input samples (~12 ms reserve)
+    // Keep pitch adjustments strictly within ±0.5% (imperceptible to human ears, no pitch warping)
     int total_input_available = g_input_count - (int)g_input_pos;
-    double target_input = 200.0 + (double)(2 - in_flight) * (SAMPLES_PER_BUFFER * BASE_STEP);
-    double error = (double)total_input_available - target_input;
+    double current_buffered = (double)(in_flight * SAMPLES_PER_BUFFER) * BASE_STEP + (double)total_input_available;
+    const double TARGET_BUFFERED = (3.0 * (double)SAMPLES_PER_BUFFER) * BASE_STEP + 400.0; // ~2036 samples
+    double error = current_buffered - TARGET_BUFFERED;
 
-    double target_scale = 1.0 + (error / 1500.0) * 0.08;
-    if (target_scale < 0.88) target_scale = 0.88;
-    if (target_scale > 1.12) target_scale = 1.12;
+    double target_scale = 1.0 + (error / 8000.0) * 0.005;
+    if (target_scale < 0.995) target_scale = 0.995;
+    if (target_scale > 1.005) target_scale = 1.005;
 
-    s_step = s_step * 0.90 + (BASE_STEP * target_scale) * 0.10;
+    s_step = s_step * 0.98 + (BASE_STEP * target_scale) * 0.02;
+
+    const int needed = (int)((double)SAMPLES_PER_BUFFER * s_step) + 2;
 
     // Fill available buffers
     for (int b = 0; b < NUM_BUFFERS; b++) {
         if (g_buffers[b].in_flight) continue;
 
+        // If hardware DAC already has 4 buffers queued (66 ms), hold off until next frame
+        if (in_flight >= 4) {
+            break;
+        }
+
         int available = g_input_count - (int)g_input_pos;
-        if (available < 16) {
-            // Truly exhausted
+
+        // If we already have 2+ buffers playing in DAC and not enough samples to fill a complete buffer,
+        // wait for next frame rather than playing truncated/stretched audio
+        if (in_flight >= 2 && available < needed) {
+            break;
+        }
+
+        // If input is completely exhausted:
+        if (available <= 0) {
             if (in_flight == 0) {
-                // If nothing is playing on DAC, write a smooth fade to silence
+                // Emergency DAC underrun prevention: smoothly fade out to silence
                 int16_t *out = g_buffers[b].data;
                 for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
-                    float fade = 1.0f - (float)i / 64.0f;
+                    float fade = 1.0f - (float)i / 32.0f;
                     if (fade < 0.0f) fade = 0.0f;
                     out[i * 2 + 0] = (int16_t)(s_last_sample[0] * fade);
                     out[i * 2 + 1] = (int16_t)(s_last_sample[1] * fade);
@@ -141,20 +155,16 @@ void nx_audio_play(const int16_t *samples, uint32_t count) {
             break;
         }
 
-        // If available is lower than needed, adapt step for this buffer so we stretch what we have
-        double buf_step = s_step;
-        int needed = (int)((double)SAMPLES_PER_BUFFER * buf_step) + 2;
-        if (available < needed) {
-            buf_step = (double)(available - 2) / (double)SAMPLES_PER_BUFFER;
-            if (buf_step < 0.25) buf_step = 0.25;
-        }
-
         int16_t *out = g_buffers[b].data;
+        int fade_count = 0;
         for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
             int idx = (int)g_input_pos;
             if (idx + 1 >= g_input_count) {
-                out[i * 2 + 0] = s_last_sample[0];
-                out[i * 2 + 1] = s_last_sample[1];
+                fade_count++;
+                float fade = 1.0f - (float)fade_count / 32.0f;
+                if (fade < 0.0f) fade = 0.0f;
+                out[i * 2 + 0] = (int16_t)(s_last_sample[0] * fade);
+                out[i * 2 + 1] = (int16_t)(s_last_sample[1] * fade);
                 continue;
             }
             float frac = (float)(g_input_pos - idx);
@@ -170,7 +180,11 @@ void nx_audio_play(const int16_t *samples, uint32_t count) {
             s_last_sample[0] = sample_l;
             s_last_sample[1] = sample_r;
 
-            g_input_pos += buf_step;
+            g_input_pos += s_step;
+        }
+        if (fade_count >= 32) {
+            s_last_sample[0] = 0;
+            s_last_sample[1] = 0;
         }
 
         // Enqueue to audout

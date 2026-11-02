@@ -316,16 +316,35 @@ fn execute(
                 let c = operand(unit, uniforms, batch, &op.sources[2], sc);
                 let mask = op.mask;
                 if let Some(slot) = slot_mut(batch, op.destination) {
-                    if mask == 0b1111 {
-                        slot[0] = multiply(a.r0, b.r0) + c.r0;
-                        slot[1] = multiply(a.r1, b.r1) + c.r1;
-                        slot[2] = multiply(a.r2, b.r2) + c.r2;
-                        slot[3] = multiply(a.r3, b.r3) + c.r3;
+                    let r0 = a.r0 * b.r0 + c.r0;
+                    let r1 = a.r1 * b.r1 + c.r1;
+                    let r2 = a.r2 * b.r2 + c.r2;
+                    let r3 = a.r3 * b.r3 + c.r3;
+                    let nan = (r0.is_nan() | r1.is_nan() | r2.is_nan() | r3.is_nan()).any();
+                    if !nan {
+                        if mask == 0b1111 {
+                            slot[0] = r0;
+                            slot[1] = r1;
+                            slot[2] = r2;
+                            slot[3] = r3;
+                        } else {
+                            if mask & 0b1000 != 0 { slot[0] = r0; }
+                            if mask & 0b0100 != 0 { slot[1] = r1; }
+                            if mask & 0b0010 != 0 { slot[2] = r2; }
+                            if mask & 0b0001 != 0 { slot[3] = r3; }
+                        }
                     } else {
-                        if mask & 0b1000 != 0 { slot[0] = multiply(a.r0, b.r0) + c.r0; }
-                        if mask & 0b0100 != 0 { slot[1] = multiply(a.r1, b.r1) + c.r1; }
-                        if mask & 0b0010 != 0 { slot[2] = multiply(a.r2, b.r2) + c.r2; }
-                        if mask & 0b0001 != 0 { slot[3] = multiply(a.r3, b.r3) + c.r3; }
+                        if mask == 0b1111 {
+                            slot[0] = multiply(a.r0, b.r0) + c.r0;
+                            slot[1] = multiply(a.r1, b.r1) + c.r1;
+                            slot[2] = multiply(a.r2, b.r2) + c.r2;
+                            slot[3] = multiply(a.r3, b.r3) + c.r3;
+                        } else {
+                            if mask & 0b1000 != 0 { slot[0] = multiply(a.r0, b.r0) + c.r0; }
+                            if mask & 0b0100 != 0 { slot[1] = multiply(a.r1, b.r1) + c.r1; }
+                            if mask & 0b0010 != 0 { slot[2] = multiply(a.r2, b.r2) + c.r2; }
+                            if mask & 0b0001 != 0 { slot[3] = multiply(a.r3, b.r3) + c.r3; }
+                        }
                     }
                 }
                 pc += 1;
@@ -364,16 +383,35 @@ fn execute(
                 let a = operand(unit, uniforms, batch, &op.sources[0], sa);
                 let b = operand(unit, uniforms, batch, &op.sources[1], sb);
                 if let Some(slot) = slot_mut(batch, op.destination) {
-                    if mask == 0b1111 {
-                        slot[0] = multiply(a.r0, b.r0);
-                        slot[1] = multiply(a.r1, b.r1);
-                        slot[2] = multiply(a.r2, b.r2);
-                        slot[3] = multiply(a.r3, b.r3);
+                    let r0 = a.r0 * b.r0;
+                    let r1 = a.r1 * b.r1;
+                    let r2 = a.r2 * b.r2;
+                    let r3 = a.r3 * b.r3;
+                    let nan = (r0.is_nan() | r1.is_nan() | r2.is_nan() | r3.is_nan()).any();
+                    if !nan {
+                        if mask == 0b1111 {
+                            slot[0] = r0;
+                            slot[1] = r1;
+                            slot[2] = r2;
+                            slot[3] = r3;
+                        } else {
+                            if mask & 0b1000 != 0 { slot[0] = r0; }
+                            if mask & 0b0100 != 0 { slot[1] = r1; }
+                            if mask & 0b0010 != 0 { slot[2] = r2; }
+                            if mask & 0b0001 != 0 { slot[3] = r3; }
+                        }
                     } else {
-                        if mask & 0b1000 != 0 { slot[0] = multiply(a.r0, b.r0); }
-                        if mask & 0b0100 != 0 { slot[1] = multiply(a.r1, b.r1); }
-                        if mask & 0b0010 != 0 { slot[2] = multiply(a.r2, b.r2); }
-                        if mask & 0b0001 != 0 { slot[3] = multiply(a.r3, b.r3); }
+                        if mask == 0b1111 {
+                            slot[0] = multiply(a.r0, b.r0);
+                            slot[1] = multiply(a.r1, b.r1);
+                            slot[2] = multiply(a.r2, b.r2);
+                            slot[3] = multiply(a.r3, b.r3);
+                        } else {
+                            if mask & 0b1000 != 0 { slot[0] = multiply(a.r0, b.r0); }
+                            if mask & 0b0100 != 0 { slot[1] = multiply(a.r1, b.r1); }
+                            if mask & 0b0010 != 0 { slot[2] = multiply(a.r2, b.r2); }
+                            if mask & 0b0001 != 0 { slot[3] = multiply(a.r3, b.r3); }
+                        }
                     }
                 }
                 pc += 1;
@@ -618,17 +656,25 @@ fn write(batch: &mut Batch, op: &Op, value: &Wide) {
 /// a dot product over the first count components, in every lane.
 #[inline(always)]
 fn dot(a: &Source, b: &Source, count: usize) -> Lanes {
-    let mut sum = multiply(a.r0, b.r0);
+    let mut sum = a.r0 * b.r0;
     if count > 1 {
-        sum += multiply(a.r1, b.r1);
+        sum += a.r1 * b.r1;
     }
     if count > 2 {
-        sum += multiply(a.r2, b.r2);
+        sum += a.r2 * b.r2;
     }
     if count > 3 {
-        sum += multiply(a.r3, b.r3);
+        sum += a.r3 * b.r3;
     }
-    sum
+    let nan = sum.is_nan();
+    if !nan.any() {
+        return sum;
+    }
+    let mut fix = multiply(a.r0, b.r0);
+    if count > 1 { fix += multiply(a.r1, b.r1); }
+    if count > 2 { fix += multiply(a.r2, b.r2); }
+    if count > 3 { fix += multiply(a.r3, b.r3); }
+    fix
 }
 
 /// true or false in every lane, as one and zero.
