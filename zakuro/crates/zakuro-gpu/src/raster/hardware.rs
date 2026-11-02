@@ -4166,7 +4166,7 @@ impl Hardware {
         crate::stats::write_back(crate::stats::BACK_SYNC, dirty.len());
         self.write_back(memory, dirty)?;
         for i in overlapping {
-            self.surfaces[i].checked = false;
+            self.surfaces[i].checked = true;
         }
         Ok(())
     }

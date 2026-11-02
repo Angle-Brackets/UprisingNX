@@ -10,7 +10,7 @@ use zakuro_common::Screen;
 use zakuro_core::services::hid::{InputState, PadState};
 use zakuro_core::{loader, Config, FrameOutcome, System};
 use zakuro_gpu::backend::vulkan::VulkanPresenter;
-use zakuro_gpu::backend::{Overlay, PresentError, Presenter, ScreenImage, ScreenLayout};
+use zakuro_gpu::backend::{Overlay, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout};
 
 struct Logger;
 
@@ -113,6 +113,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     };
     log::info!("unx: presenter {} up in {:?}", presenter.name(), started.elapsed());
     presenter.set_layout(ScreenLayout::TopOnly);
+    presenter.set_scaling(ScreenFilter::Sharp, false);
     nx_audio_init();
 
     let linked = recomp.as_ref().map(|r| {

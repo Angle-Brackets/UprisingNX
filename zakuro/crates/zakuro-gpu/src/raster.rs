@@ -805,7 +805,7 @@ fn shader_pool() -> &'static rayon::ThreadPool {
 /// vertices a draw needs before shading them is worth splitting over
 /// threads.
 #[cfg(target_os = "horizon")]
-const PARALLEL_VERTICES: usize = 32;
+const PARALLEL_VERTICES: usize = 128;
 #[cfg(not(target_os = "horizon"))]
 const PARALLEL_VERTICES: usize = 32;
 /// the fewest vertices each thread takes at a time, whole batches of the
@@ -1351,18 +1351,10 @@ impl PortraitDraw {
 }
 
 /// whether ZAKURO_PORTRAITS asks for the bottom screen's portraits on the
-/// top screen. On PC on by default unless ZAKURO_PORTRAITS=0. On Horizon
-/// (Switch) off by default (ZAKURO_PORTRAITS=1 to enable) to avoid
-/// obstructing top-screen gameplay with cut-off 2D bottom-screen portraits.
+/// top screen. On by default unless ZAKURO_PORTRAITS=0.
 pub(crate) fn portraits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        if cfg!(target_os = "horizon") {
-            std::env::var("ZAKURO_PORTRAITS").is_ok_and(|value| value == "1")
-        } else {
-            std::env::var("ZAKURO_PORTRAITS").map_or(true, |value| value != "0")
-        }
-    })
+    *ON.get_or_init(|| std::env::var("ZAKURO_PORTRAITS").map_or(true, |value| value != "0"))
 }
 
 /// whether a draw targets the bottom screen's 240x320 framebuffer.
@@ -1533,6 +1525,14 @@ const PORTRAIT_FADE: f32 = 24.0;
 // ponytail: fades by the vertices' alpha, so only a draw that blends by it
 // fades, as Kid Icarus Uprising's portraits do.
 fn faded_top(topology: u32, vertices: &[Vertex]) -> Vec<Vertex> {
+    if cfg!(target_os = "horizon") {
+        let mut faded = vertices.to_vec();
+        for vertex in &mut faded {
+            let row = (vertex.clip[0] / vertex.clip[3] * 0.5 + 0.5) * 240.0;
+            vertex.color[3] *= ((240.0 - row) / PORTRAIT_FADE).clamp(0.0, 1.0);
+        }
+        return faded;
+    }
     // where an edge crosses the band's lower edge, in clip space, so the
     // cut is where it is however far the vertex is
     let edge = (240.0 - PORTRAIT_FADE) / 120.0 - 1.0;
@@ -3237,9 +3237,10 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 return None;
             }
             if on_bottom(registers) {
-                match is_portrait(registers) {
-                    true => mirror_portrait(registers, resources, vertices),
-                    false => mirror_hud(registers, resources, vertices),
+                if is_portrait(registers) {
+                    mirror_portrait(registers, resources, vertices);
+                } else if !cfg!(target_os = "horizon") {
+                    mirror_hud(registers, resources, vertices);
                 }
             }
             return Some(0);
