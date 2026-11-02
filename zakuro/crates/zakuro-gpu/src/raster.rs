@@ -609,19 +609,23 @@ impl VertexPlan {
     /// picks the rasterizer's varyings out of a vertex's output registers.
     #[inline(always)]
     fn vertex(&self, outputs: &[Vec4; shader::OUTPUT_REGISTERS]) -> Vertex {
-        let mut lut = [0.0f32; 66];
-        unsafe {
-            std::ptr::copy_nonoverlapping(outputs.as_ptr() as *const f32, lut.as_mut_ptr(), 64);
+        #[inline(always)]
+        fn get(outputs: &[Vec4; shader::OUTPUT_REGISTERS], idx: u8) -> f32 {
+            if idx < 64 {
+                outputs[(idx >> 2) as usize][(idx & 3) as usize]
+            } else if idx == PLAN_ONE {
+                1.0
+            } else {
+                0.0
+            }
         }
-        lut[PLAN_ZERO as usize] = 0.0;
-        lut[PLAN_ONE as usize] = 1.0;
         let f = &self.from;
         Vertex {
-            clip: [lut[f[0] as usize], lut[f[1] as usize], lut[f[2] as usize], lut[f[3] as usize]],
-            color: [lut[f[4] as usize], lut[f[5] as usize], lut[f[6] as usize], lut[f[7] as usize]],
-            texcoords: [[lut[f[8] as usize], lut[f[9] as usize]], [lut[f[10] as usize], lut[f[11] as usize]], [lut[f[12] as usize], lut[f[13] as usize]]],
-            quaternion: [lut[f[14] as usize], lut[f[15] as usize], lut[f[16] as usize], lut[f[17] as usize]],
-            view: [lut[f[18] as usize], lut[f[19] as usize], lut[f[20] as usize]],
+            clip: [get(outputs, f[0]), get(outputs, f[1]), get(outputs, f[2]), get(outputs, f[3])],
+            color: [get(outputs, f[4]), get(outputs, f[5]), get(outputs, f[6]), get(outputs, f[7])],
+            texcoords: [[get(outputs, f[8]), get(outputs, f[9])], [get(outputs, f[10]), get(outputs, f[11])], [get(outputs, f[12]), get(outputs, f[13])]],
+            quaternion: [get(outputs, f[14]), get(outputs, f[15]), get(outputs, f[16]), get(outputs, f[17])],
+            view: [get(outputs, f[18]), get(outputs, f[19]), get(outputs, f[20])],
         }
     }
 }
@@ -805,7 +809,7 @@ fn shader_pool() -> &'static rayon::ThreadPool {
 /// vertices a draw needs before shading them is worth splitting over
 /// threads.
 #[cfg(target_os = "horizon")]
-const PARALLEL_VERTICES: usize = 96;
+const PARALLEL_VERTICES: usize = 384;
 #[cfg(not(target_os = "horizon"))]
 const PARALLEL_VERTICES: usize = 32;
 /// the fewest vertices each thread takes at a time, whole batches of the
@@ -820,7 +824,7 @@ fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_RE
 /// runs the vertex shader over inputs, over threads when there are enough
 /// of them, and what to do with each one's outputs on the thread that made
 /// them, in the inputs' order.
-fn shade_with<T: Send + Default>(
+fn shade_with<T: Send + Default + Clone>(
     unit: &ShaderUnit,
     inputs: &[[Vec4; shader::INPUT_REGISTERS]],
     then: impl Fn(&[Vec4; shader::OUTPUT_REGISTERS]) -> T + Sync,
@@ -830,7 +834,7 @@ fn shade_with<T: Send + Default>(
     }
     let pool = shader_pool();
     let chunk = (inputs.len() / (pool.current_num_threads() * 2)).next_multiple_of(8).max(PARALLEL_CHUNK);
-    let mut outputs: Vec<T> = (0..inputs.len()).map(|_| T::default()).collect();
+    let mut outputs: Vec<T> = vec![T::default(); inputs.len()];
     pool.install(|| {
         use rayon::prelude::*;
         outputs

@@ -5063,6 +5063,7 @@ impl Hardware {
             pending: Some(self.batch),
         };
         self.in_flight.push_back(submitted);
+        #[cfg(not(target_os = "horizon"))]
         for surface in &mut self.surfaces {
             surface.checked = false;
         }
