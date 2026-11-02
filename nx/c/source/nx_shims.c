@@ -51,8 +51,10 @@ static void *nx_thread_trampoline(void *p) {
     struct nx_thread_start start = *(struct nx_thread_start *)p;
     free(p);
     nx_tls_init();
-    static int s_next_core = 1;
-    int core = __atomic_fetch_add(&s_next_core, 1, __ATOMIC_RELAXED) % 3;
+    // Core 0 is dedicated to the main emulation thread. Worker and background
+    // threads alternate between Core 1 and Core 2 (0x7 allows migration if needed).
+    static int s_next_core = 0;
+    int core = 1 + (__atomic_fetch_add(&s_next_core, 1, __ATOMIC_RELAXED) % 2);
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 0x7);
     return start.fn(start.arg);
 }
