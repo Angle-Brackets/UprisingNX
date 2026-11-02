@@ -568,19 +568,21 @@ impl VertexPlan {
     }
 
     /// picks the rasterizer's varyings out of a vertex's output registers.
+    #[inline(always)]
     fn vertex(&self, outputs: &[Vec4; shader::OUTPUT_REGISTERS]) -> Vertex {
-        let outputs = outputs.as_flattened();
-        let get = |i: usize| match self.from[i] {
-            PLAN_ZERO => 0.0,
-            PLAN_ONE => 1.0,
-            from => outputs[from as usize],
-        };
+        let mut lut = [0.0f32; 66];
+        unsafe {
+            std::ptr::copy_nonoverlapping(outputs.as_ptr() as *const f32, lut.as_mut_ptr(), 64);
+        }
+        lut[PLAN_ZERO as usize] = 0.0;
+        lut[PLAN_ONE as usize] = 1.0;
+        let f = &self.from;
         Vertex {
-            clip: [get(0), get(1), get(2), get(3)],
-            color: [get(4), get(5), get(6), get(7)],
-            texcoords: [[get(8), get(9)], [get(10), get(11)], [get(12), get(13)]],
-            quaternion: [get(14), get(15), get(16), get(17)],
-            view: [get(18), get(19), get(20)],
+            clip: [lut[f[0] as usize], lut[f[1] as usize], lut[f[2] as usize], lut[f[3] as usize]],
+            color: [lut[f[4] as usize], lut[f[5] as usize], lut[f[6] as usize], lut[f[7] as usize]],
+            texcoords: [[lut[f[8] as usize], lut[f[9] as usize]], [lut[f[10] as usize], lut[f[11] as usize]], [lut[f[12] as usize], lut[f[13] as usize]]],
+            quaternion: [lut[f[14] as usize], lut[f[15] as usize], lut[f[16] as usize], lut[f[17] as usize]],
+            view: [lut[f[18] as usize], lut[f[19] as usize], lut[f[20] as usize]],
         }
     }
 }
@@ -1683,7 +1685,6 @@ impl Resources {
 #[derive(Default)]
 struct Scratch {
     bytes: Vec<u8>,
-    indices: Vec<u32>,
     /// for each vertex index, the stamp of the last draw that named it and
     /// its place among that draw's vertices. a draw stamps the entries it
     /// uses instead of clearing a table as long as its largest index.
@@ -1704,12 +1705,7 @@ struct Scratch {
 impl Scratch {
     /// the vertices the indices name, each once, in the order they first
     /// come, and each index's place among them.
-    fn unique(&mut self) {
-        let last = self.indices.iter().copied().max().unwrap_or(0) as usize;
-        if self.stamps.len() <= last {
-            self.stamps.resize(last + 1, 0);
-            self.places.resize(last + 1, 0);
-        }
+    fn unique_indices(&mut self, count: usize, mut get_index: impl FnMut(usize) -> u32) {
         self.stamp = self.stamp.wrapping_add(1);
         if self.stamp == 0 {
             // the stamps came around, none of the old ones may match
@@ -1717,17 +1713,23 @@ impl Scratch {
             self.stamp = 1;
         }
         self.unique.clear();
-        self.unique.reserve(self.indices.len());
+        self.unique.reserve(count);
         self.order.clear();
-        self.order.reserve(self.indices.len());
-        for &index in &self.indices {
-            let i = index as usize;
-            if self.stamps[i] != self.stamp {
-                self.stamps[i] = self.stamp;
-                self.places[i] = self.unique.len() as u32;
+        self.order.reserve(count);
+        for i in 0..count {
+            let index = get_index(i);
+            let idx = index as usize;
+            if idx >= self.stamps.len() {
+                let new_len = (idx + 1).max(self.stamps.len() * 2).max(256);
+                self.stamps.resize(new_len, 0);
+                self.places.resize(new_len, 0);
+            }
+            if self.stamps[idx] != self.stamp {
+                self.stamps[idx] = self.stamp;
+                self.places[idx] = self.unique.len() as u32;
                 self.unique.push(index);
             }
-            self.order.push(self.places[i] as usize);
+            self.order.push(self.places[idx] as usize);
         }
     }
 }
@@ -2951,13 +2953,14 @@ pub fn draw<M: GpuMemory>(
         }
     }
     if indexed {
-        scratch.indices.clear();
+        let bytes = std::mem::take(&mut scratch.bytes);
         if index_short {
-            scratch.indices.extend(scratch.bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32));
+            let chunks = bytes.as_chunks::<2>().0;
+            scratch.unique_indices(chunks.len(), |i| u16::from_le_bytes(chunks[i]) as u32);
         } else {
-            scratch.indices.extend(scratch.bytes.iter().map(|&b| b as u32));
+            scratch.unique_indices(bytes.len(), |i| bytes[i] as u32);
         }
-        scratch.unique();
+        scratch.bytes = bytes;
     } else {
         scratch.unique.clear();
         scratch.unique.extend((0..vertex_count).map(|i| first_vertex + i));
@@ -3221,9 +3224,11 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // a texture can be a buffer the GPU drew into, guest memory has to have
     // it before it is read
     // one the GPU still holds it copies there
+    #[allow(unused_mut)]
     let mut drawn: [Option<DrawnTexture>; 3] = [None; 3];
     // the rest of one reaching past the rows drawn is read as memory holds
     // it, as of what was written back last
+    #[allow(unused_mut)]
     let mut past = [false; 3];
     #[cfg(feature = "vulkan")]
     if let Some(hardware) = resources.hardware.as_mut() {

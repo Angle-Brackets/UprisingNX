@@ -29,8 +29,32 @@ fn span(pattern: &[u8]) -> [u8; SPAN] {
     span
 }
 
+#[inline(always)]
+fn holds_val_u64(u64s: &[u64], val: u64) -> bool {
+    let chunks = u64s.chunks_exact(8);
+    let rem = chunks.remainder();
+    for chunk in chunks {
+        let diff = (chunk[0] ^ val)
+            | (chunk[1] ^ val)
+            | (chunk[2] ^ val)
+            | (chunk[3] ^ val)
+            | (chunk[4] ^ val)
+            | (chunk[5] ^ val)
+            | (chunk[6] ^ val)
+            | (chunk[7] ^ val);
+        if diff != 0 {
+            return false;
+        }
+    }
+    for &w in rem {
+        if w != val {
+            return false;
+        }
+    }
+    true
+}
+
 /// whether bytes hold the pattern over and over, from its first byte.
-#[cfg(any(test, feature = "vulkan"))]
 pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
     if pattern.is_empty() {
         return true;
@@ -42,7 +66,7 @@ pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
     if pattern.iter().all(|&b| b == 0) {
         let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
         return prefix.iter().all(|&b| b == 0)
-            && u64s.iter().all(|&w| w == 0)
+            && holds_val_u64(u64s, 0)
             && suffix.iter().all(|&b| b == 0);
     }
     match p_len {
@@ -50,7 +74,7 @@ pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
             let val = u64::from_ne_bytes([pattern[0]; 8]);
             let (prefix, u64s, suffix) = unsafe { bytes.align_to::<u64>() };
             prefix.iter().all(|&b| b == pattern[0])
-                && u64s.iter().all(|&w| w == val)
+                && holds_val_u64(u64s, val)
                 && suffix.iter().all(|&b| b == pattern[0])
         }
         2 => {
@@ -60,7 +84,7 @@ pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
                 let val = h | (h << 16) | (h << 32) | (h << 48);
                 let p = [pattern[0], pattern[1]];
                 prefix.iter().enumerate().all(|(i, &b)| b == p[i % 2])
-                    && u64s.iter().all(|&w| w == val)
+                    && holds_val_u64(u64s, val)
                     && suffix.iter().enumerate().all(|(i, &b)| b == p[i % 2])
             } else {
                 bytes.chunks(16).all(|c| c.iter().enumerate().all(|(i, &b)| b == pattern[i % 2]))
@@ -73,7 +97,7 @@ pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
                 let val = w | (w << 32);
                 let p = [pattern[0], pattern[1], pattern[2], pattern[3]];
                 prefix.iter().enumerate().all(|(i, &b)| b == p[i % 4])
-                    && u64s.iter().all(|&w| w == val)
+                    && holds_val_u64(u64s, val)
                     && suffix.iter().enumerate().all(|(i, &b)| b == p[i % 4])
             } else {
                 bytes.chunks(16).all(|c| c.iter().enumerate().all(|(i, &b)| b == pattern[i % 4]))
@@ -104,11 +128,67 @@ pub(crate) fn fill(bytes: &mut [u8], pattern: &[u8]) {
         }
         return;
     }
-    let span = span(pattern);
-    for chunk in bytes.chunks_mut(SPAN) {
-        let span = &span[..chunk.len()];
-        if *chunk != *span {
-            chunk.copy_from_slice(span);
+    match p_len {
+        1 => {
+            if holds(bytes, pattern) {
+                return;
+            }
+            bytes.fill(pattern[0]);
+        }
+        2 => {
+            if holds(bytes, pattern) {
+                return;
+            }
+            let (prefix, u64s, suffix) = unsafe { bytes.align_to_mut::<u64>() };
+            if prefix.len() % 2 == 0 {
+                let h = u16::from_ne_bytes([pattern[0], pattern[1]]) as u64;
+                let val = h | (h << 16) | (h << 32) | (h << 48);
+                let p = [pattern[0], pattern[1]];
+                for (i, b) in prefix.iter_mut().enumerate() {
+                    *b = p[i % 2];
+                }
+                u64s.fill(val);
+                for (i, b) in suffix.iter_mut().enumerate() {
+                    *b = p[i % 2];
+                }
+            } else {
+                let span = span(pattern);
+                for chunk in bytes.chunks_mut(SPAN) {
+                    chunk.copy_from_slice(&span[..chunk.len()]);
+                }
+            }
+        }
+        4 => {
+            if holds(bytes, pattern) {
+                return;
+            }
+            let (prefix, u64s, suffix) = unsafe { bytes.align_to_mut::<u64>() };
+            if prefix.len() % 4 == 0 {
+                let w = u32::from_ne_bytes([pattern[0], pattern[1], pattern[2], pattern[3]]) as u64;
+                let val = w | (w << 32);
+                let p = [pattern[0], pattern[1], pattern[2], pattern[3]];
+                for (i, b) in prefix.iter_mut().enumerate() {
+                    *b = p[i % 4];
+                }
+                u64s.fill(val);
+                for (i, b) in suffix.iter_mut().enumerate() {
+                    *b = p[i % 4];
+                }
+            } else {
+                let span = span(pattern);
+                for chunk in bytes.chunks_mut(SPAN) {
+                    chunk.copy_from_slice(&span[..chunk.len()]);
+                }
+            }
+        }
+        _ => {
+            let span = span(pattern);
+            for chunk in bytes.chunks_mut(SPAN) {
+                let span = &span[..chunk.len()];
+                if *chunk != *span {
+                    chunk.copy_from_slice(span);
+                }
+            }
         }
     }
 }

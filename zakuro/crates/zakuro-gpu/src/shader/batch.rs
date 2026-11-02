@@ -79,13 +79,42 @@ impl Batch {
         self.address = [[0; LANES]; 2];
         self.loop_counter = 0;
         self.condition = [[false; LANES]; 2];
-        let last = inputs.len() - 1;
-        for register in (0..INPUT_REGISTERS).filter(|register| program.inputs & (1 << register) != 0) {
-            let r0 = std::array::from_fn(|lane| inputs[lane.min(last)][register][0]);
-            let r1 = std::array::from_fn(|lane| inputs[lane.min(last)][register][1]);
-            let r2 = std::array::from_fn(|lane| inputs[lane.min(last)][register][2]);
-            let r3 = std::array::from_fn(|lane| inputs[lane.min(last)][register][3]);
-            self.input[register] = [f32x8::from(r0), f32x8::from(r1), f32x8::from(r2), f32x8::from(r3)];
+        if inputs.len() == 8 {
+            for register in (0..INPUT_REGISTERS).filter(|r| program.inputs & (1 << r) != 0) {
+                let r0 = [
+                    inputs[0][register][0], inputs[1][register][0], inputs[2][register][0], inputs[3][register][0],
+                    inputs[4][register][0], inputs[5][register][0], inputs[6][register][0], inputs[7][register][0],
+                ];
+                let r1 = [
+                    inputs[0][register][1], inputs[1][register][1], inputs[2][register][1], inputs[3][register][1],
+                    inputs[4][register][1], inputs[5][register][1], inputs[6][register][1], inputs[7][register][1],
+                ];
+                let r2 = [
+                    inputs[0][register][2], inputs[1][register][2], inputs[2][register][2], inputs[3][register][2],
+                    inputs[4][register][2], inputs[5][register][2], inputs[6][register][2], inputs[7][register][2],
+                ];
+                let r3 = [
+                    inputs[0][register][3], inputs[1][register][3], inputs[2][register][3], inputs[3][register][3],
+                    inputs[4][register][3], inputs[5][register][3], inputs[6][register][3], inputs[7][register][3],
+                ];
+                self.input[register] = [f32x8::from(r0), f32x8::from(r1), f32x8::from(r2), f32x8::from(r3)];
+            }
+        } else {
+            let last = inputs.len() - 1;
+            for register in (0..INPUT_REGISTERS).filter(|r| program.inputs & (1 << r) != 0) {
+                let mut r0 = [0.0; 8];
+                let mut r1 = [0.0; 8];
+                let mut r2 = [0.0; 8];
+                let mut r3 = [0.0; 8];
+                for lane in 0..8 {
+                    let idx = lane.min(last);
+                    r0[lane] = inputs[idx][register][0];
+                    r1[lane] = inputs[idx][register][1];
+                    r2[lane] = inputs[idx][register][2];
+                    r3[lane] = inputs[idx][register][3];
+                }
+                self.input[register] = [f32x8::from(r0), f32x8::from(r1), f32x8::from(r2), f32x8::from(r3)];
+            }
         }
     }
 }
@@ -538,8 +567,16 @@ fn operand<'a>(unit: &ShaderUnit, uniforms: &'a Uniforms, batch: &'a Batch, oper
                 3 => uniforms.at(base.wrapping_add(batch.loop_counter)),
                 index => {
                     let offsets = &batch.address[index as usize - 1];
-                    let picked: [Vec4; LANES] = std::array::from_fn(|lane| uniform(unit, base.wrapping_add(offsets[lane])));
-                    *scratch = std::array::from_fn(|component| f32x8::from(picked.map(|value| value[component])));
+                    let mut picked = [[0.0; 4]; LANES];
+                    for lane in 0..LANES {
+                        picked[lane] = uniform(unit, base.wrapping_add(offsets[lane]));
+                    }
+                    *scratch = [
+                        f32x8::from([picked[0][0], picked[1][0], picked[2][0], picked[3][0], picked[4][0], picked[5][0], picked[6][0], picked[7][0]]),
+                        f32x8::from([picked[0][1], picked[1][1], picked[2][1], picked[3][1], picked[4][1], picked[5][1], picked[6][1], picked[7][1]]),
+                        f32x8::from([picked[0][2], picked[1][2], picked[2][2], picked[3][2], picked[4][2], picked[5][2], picked[6][2], picked[7][2]]),
+                        f32x8::from([picked[0][3], picked[1][3], picked[2][3], picked[3][3], picked[4][3], picked[5][3], picked[6][3], picked[7][3]]),
+                    ];
                     scratch
                 }
             }
