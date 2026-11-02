@@ -805,7 +805,7 @@ fn shader_pool() -> &'static rayon::ThreadPool {
 /// vertices a draw needs before shading them is worth splitting over
 /// threads.
 #[cfg(target_os = "horizon")]
-const PARALLEL_VERTICES: usize = 384;
+const PARALLEL_VERTICES: usize = 96;
 #[cfg(not(target_os = "horizon"))]
 const PARALLEL_VERTICES: usize = 32;
 /// the fewest vertices each thread takes at a time, whole batches of the
@@ -2951,8 +2951,10 @@ pub fn draw<M: GpuMemory>(
     if vertex_count == 0 || vertex_count > 0x1_0000 {
         return 0;
     }
-    if resources.portraits.in_play && is_bottom(registers) && !on_bottom(registers) {
-        return vertex_count;
+    if resources.portraits.in_play && is_bottom(registers) {
+        if !on_bottom(registers) || (!is_portrait(registers) && vertex_count > 16) {
+            return vertex_count;
+        }
     }
 
     let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
@@ -3064,8 +3066,10 @@ pub fn draw_immediate<M: GpuMemory>(
     resources: &mut Resources,
     vertices: &[[Vec4; 16]],
 ) -> u32 {
-    if resources.portraits.in_play && is_bottom(registers) && !on_bottom(registers) {
-        return vertices.len() as u32;
+    if resources.portraits.in_play && is_bottom(registers) {
+        if !on_bottom(registers) || (!is_portrait(registers) && vertices.len() > 16) {
+            return vertices.len() as u32;
+        }
     }
     // immediate mode sizes its vertices by GPUREG_VSH_NUM_ATTR.
     let count = ((registers[REG_VS_ATTRIBUTE_COUNT] & 0xF) + 1) as usize;
