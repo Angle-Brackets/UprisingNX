@@ -366,6 +366,10 @@ impl Gpu {
                 raster::flush_portraits(memory, &mut self.resources);
             }
         }
+        let bottom = [self.framebuffers[1].address_a_left, self.framebuffers[1].address_b_left].contains(&output_paddr);
+        if self.resources.portraits.in_play && bottom {
+            return;
+        }
 
         // flag layout, from the transfer engine's register,
         //   bit 0      flip the input vertically

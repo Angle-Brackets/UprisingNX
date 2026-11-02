@@ -231,8 +231,15 @@ impl InputPlan {
     }
 
     /// one vertex's input registers.
+    #[cfg(test)]
     fn fetch<M: GpuMemory>(&self, memory: &mut M, base: u32, vertex_index: u32) -> [Vec4; shader::INPUT_REGISTERS] {
         let mut input = self.template;
+        self.fetch_into(memory, base, vertex_index, &mut input);
+        input
+    }
+
+    #[inline(always)]
+    fn fetch_into<M: GpuMemory>(&self, memory: &mut M, base: u32, vertex_index: u32, input: &mut [Vec4; shader::INPUT_REGISTERS]) {
         for loader in &self.loaders {
             // base is physical, and a loader's offset can carry it from one
             // region into another, titles point the base at the start of VRAM
@@ -240,16 +247,15 @@ impl InputPlan {
             let vertex = memory.translate(base + loader.offset + vertex_index * loader.stride);
             let size = loader.size as usize;
             match memory.slice(vertex, size) {
-                Some(bytes) => loader.place(bytes, &mut input),
+                Some(bytes) => loader.place(bytes, input),
                 None => {
                     // twelve fields of sixteen bytes, and their alignment, fit
                     let mut bytes = [0u8; 256];
                     memory.read(vertex, &mut bytes[..size]);
-                    loader.place(&bytes[..size], &mut input);
+                    loader.place(&bytes[..size], input);
                 }
             }
         }
-        input
     }
 }
 
@@ -257,21 +263,38 @@ impl LoaderPlan {
     /// puts the fields of a vertex's bytes in their registers. components
     /// an array does not provide read as (0, 0, 0, 1), a two-component
     /// texture coordinate arrives as (u, v, 0, 1).
+    #[inline(always)]
     fn place(&self, bytes: &[u8], input: &mut [Vec4; shader::INPUT_REGISTERS]) {
         for field in &self.fields {
             // the type once a field rather than once a component, as
             // component reads it
             let (at, count) = (field.offset as usize, field.count as usize);
             let mut value = [0.0f32, 0.0, 0.0, 1.0];
-            let slots = value.iter_mut().enumerate().take(count);
             match field.ty {
-                0 => slots.for_each(|(i, slot)| *slot = bytes[at + i] as i8 as f32),
-                1 => slots.for_each(|(i, slot)| *slot = bytes[at + i] as f32),
-                2 => slots.for_each(|(i, slot)| *slot = i16::from_le_bytes([bytes[at + i * 2], bytes[at + i * 2 + 1]]) as f32),
-                _ => slots.for_each(|(i, slot)| {
-                    let word = &bytes[at + i * 4..at + i * 4 + 4];
-                    *slot = f32::from_bits(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
-                }),
+                0 => {
+                    for i in 0..count {
+                        value[i] = bytes[at + i] as i8 as f32;
+                    }
+                }
+                1 => {
+                    for i in 0..count {
+                        value[i] = bytes[at + i] as f32;
+                    }
+                }
+                2 => {
+                    for i in 0..count {
+                        let offset = at + i * 2;
+                        value[i] = i16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as f32;
+                    }
+                }
+                _ => {
+                    let src = &bytes[at..];
+                    for i in 0..count {
+                        let offset = i * 4;
+                        let b = [src[offset], src[offset + 1], src[offset + 2], src[offset + 3]];
+                        value[i] = f32::from_bits(u32::from_le_bytes(b));
+                    }
+                }
             }
             input[field.register] = value;
         }
@@ -1226,11 +1249,18 @@ impl PortraitDraw {
     }
 }
 
-/// whether ZAKURO_PORTRAITS=1 asks for the bottom screen's portraits on the
-/// top screen.
+/// whether ZAKURO_PORTRAITS asks for the bottom screen's portraits on the
+/// top screen. On by default unless ZAKURO_PORTRAITS=0.
 pub(crate) fn portraits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ZAKURO_PORTRAITS").is_ok_and(|value| value != "0"))
+    *ON.get_or_init(|| std::env::var("ZAKURO_PORTRAITS").map_or(true, |value| value != "0"))
+}
+
+/// whether a draw targets the bottom screen's 240x320 framebuffer.
+fn is_bottom(registers: &[u32]) -> bool {
+    let dimensions = registers[REG_FRAMEBUFFER_DIMENSIONS];
+    let height = ((dimensions >> 12) & 0x3FF) + 1;
+    height == 320 || read_float24(registers, REG_VIEWPORT_HEIGHT) == 160.0
 }
 
 /// a dialogue portrait as Kid Icarus Uprising draws it, an Etc1 256x256
@@ -2895,7 +2925,10 @@ pub fn draw<M: GpuMemory>(
     }
     let plan = scratch.plans.current();
     scratch.inputs.clear();
-    scratch.inputs.extend(scratch.unique.iter().map(|&vertex_index| plan.fetch(memory, attribute_base, vertex_index)));
+    scratch.inputs.resize(scratch.unique.len(), plan.template);
+    for (i, &vertex_index) in scratch.unique.iter().enumerate() {
+        plan.fetch_into(memory, attribute_base, vertex_index, &mut scratch.inputs[i]);
+    }
     let order = indexed.then_some(&scratch.order[..]);
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &scratch.inputs, order };
     rasterize(registers, memory, resources, vertices);
@@ -3078,16 +3111,19 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 return None;
             }
             note_text(registers, resources, vertices);
-        } else if resources.portraits.in_play && on_bottom(registers) {
+        } else if resources.portraits.in_play && (on_bottom(registers) || is_bottom(registers)) {
             // the CPU decodes its arrays then, and its vertices say where it is
             #[cfg(feature = "vulkan")]
             if matches!(vertices, Vertices::Raw { .. }) {
                 return None;
             }
-            match is_portrait(registers) {
-                true => mirror_portrait(registers, resources, vertices),
-                false => mirror_hud(registers, resources, vertices),
+            if on_bottom(registers) {
+                match is_portrait(registers) {
+                    true => mirror_portrait(registers, resources, vertices),
+                    false => mirror_hud(registers, resources, vertices),
+                }
             }
+            return Some(0);
         }
     }
     let vertex_count = vertices.len();

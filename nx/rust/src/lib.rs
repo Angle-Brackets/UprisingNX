@@ -68,6 +68,7 @@ pub struct Unx {
     syncs: u64,
     write_backs: [u64; 6],
     write_back: f64,
+    out_of_play: u32,
 }
 
 fn cstr(p: *const c_char) -> Option<String> {
@@ -159,6 +160,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         syncs: 0,
         write_backs: [0; 6],
         write_back: 0.0,
+        out_of_play: 0,
     }))
 }
 
@@ -192,6 +194,15 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         });
     }
 
+    let said = std::mem::take(&mut unx.system.memory.host_mailbox[3]);
+    if said != 0 {
+        unx.out_of_play = 0;
+    } else {
+        unx.out_of_play = unx.out_of_play.saturating_add(1);
+    }
+    let in_play = unx.out_of_play <= 10;
+    unx.system.gpu.set_in_play(in_play);
+
     let started = Instant::now();
     let outcome = unx.system.run_frame();
     let took = started.elapsed();
@@ -212,9 +223,15 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     unx.write_back += gpu.write_back;
     let presenting = Instant::now();
 
-    let (top, bottom) = (shown(&mut unx.system, Screen::Top), shown(&mut unx.system, Screen::Bottom));
+    let top = shown(&mut unx.system, Screen::Top);
     let blank = std::sync::Arc::new(Vec::new());
-    let (((top_px, tw, th), top_gpu), ((bottom_px, bw, bh), bottom_gpu)) = (top, bottom);
+    let ((top_px, tw, th), top_gpu) = top;
+    let (bottom_px, bw, bh, bottom_gpu) = if in_play {
+        (blank.clone(), 0, 0, None)
+    } else {
+        let ((px, w, h), gpu) = shown(&mut unx.system, Screen::Bottom);
+        (px, w, h, gpu)
+    };
     let result = unx.presenter.present(
         ScreenImage { width: tw, height: th, pixels: &top_px, gpu: top_gpu },
         ScreenImage { width: bw, height: bh, pixels: &bottom_px, gpu: bottom_gpu },
