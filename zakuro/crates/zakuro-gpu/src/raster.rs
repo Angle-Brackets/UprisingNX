@@ -1351,10 +1351,18 @@ impl PortraitDraw {
 }
 
 /// whether ZAKURO_PORTRAITS asks for the bottom screen's portraits on the
-/// top screen. On by default unless ZAKURO_PORTRAITS=0.
+/// top screen. On PC on by default unless ZAKURO_PORTRAITS=0. On Horizon
+/// (Switch) off by default (ZAKURO_PORTRAITS=1 to enable) to avoid
+/// obstructing top-screen gameplay with cut-off 2D bottom-screen portraits.
 pub(crate) fn portraits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ZAKURO_PORTRAITS").map_or(true, |value| value != "0"))
+    *ON.get_or_init(|| {
+        if cfg!(target_os = "horizon") {
+            std::env::var("ZAKURO_PORTRAITS").is_ok_and(|value| value == "1")
+        } else {
+            std::env::var("ZAKURO_PORTRAITS").map_or(true, |value| value != "0")
+        }
+    })
 }
 
 /// whether a draw targets the bottom screen's 240x320 framebuffer.

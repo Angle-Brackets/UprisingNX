@@ -99,17 +99,17 @@ void nx_audio_play(const int16_t *samples, uint32_t count) {
     }
 
     // Drift compensation: Target 3 in-flight hardware buffers (50 ms) + 400 input samples (~12 ms reserve)
-    // Keep pitch adjustments strictly within ±0.5% (imperceptible to human ears, no pitch warping)
+    // Keep pitch adjustments smoothly within ±2.0% (imperceptible, standard emulator rate matching)
     int total_input_available = g_input_count - (int)g_input_pos;
     double current_buffered = (double)(in_flight * SAMPLES_PER_BUFFER) * BASE_STEP + (double)total_input_available;
     const double TARGET_BUFFERED = (3.0 * (double)SAMPLES_PER_BUFFER) * BASE_STEP + 400.0; // ~2036 samples
     double error = current_buffered - TARGET_BUFFERED;
 
-    double target_scale = 1.0 + (error / 8000.0) * 0.005;
-    if (target_scale < 0.995) target_scale = 0.995;
-    if (target_scale > 1.005) target_scale = 1.005;
+    double target_scale = 1.0 + (error / 4000.0) * 0.02;
+    if (target_scale < 0.98) target_scale = 0.98;
+    if (target_scale > 1.02) target_scale = 1.02;
 
-    s_step = s_step * 0.98 + (BASE_STEP * target_scale) * 0.02;
+    s_step = s_step * 0.95 + (BASE_STEP * target_scale) * 0.05;
 
     const int needed = (int)((double)SAMPLES_PER_BUFFER * s_step) + 2;
 
@@ -124,9 +124,9 @@ void nx_audio_play(const int16_t *samples, uint32_t count) {
 
         int available = g_input_count - (int)g_input_pos;
 
-        // If we already have 2+ buffers playing in DAC and not enough samples to fill a complete buffer,
-        // wait for next frame rather than playing truncated/stretched audio
-        if (in_flight >= 2 && available < needed) {
+        // If we already have 1+ buffer playing in DAC and not enough samples to fill a complete buffer,
+        // wait for next frame rather than playing truncated/silence-padded audio
+        if (in_flight >= 1 && available < needed) {
             break;
         }
 
@@ -155,19 +155,23 @@ void nx_audio_play(const int16_t *samples, uint32_t count) {
             break;
         }
 
+        // Dynamic step for this buffer: if in_flight == 0 and available < needed,
+        // smoothly stretch available samples across SAMPLES_PER_BUFFER to avoid ANY dead silence
+        double step = s_step;
+        if (in_flight == 0 && available < needed && available >= 64) {
+            step = (double)(available - 1) / (double)SAMPLES_PER_BUFFER;
+        }
+
         int16_t *out = g_buffers[b].data;
-        int fade_count = 0;
         for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
             int idx = (int)g_input_pos;
             if (idx + 1 >= g_input_count) {
-                fade_count++;
-                float fade = 1.0f - (float)fade_count / 32.0f;
-                if (fade < 0.0f) fade = 0.0f;
-                out[i * 2 + 0] = (int16_t)(s_last_sample[0] * fade);
-                out[i * 2 + 1] = (int16_t)(s_last_sample[1] * fade);
-                continue;
+                idx = g_input_count - 2;
+                if (idx < 0) idx = 0;
             }
             float frac = (float)(g_input_pos - idx);
+            if (frac < 0.0f) frac = 0.0f;
+            if (frac > 1.0f) frac = 1.0f;
             int16_t l0 = g_input[idx][0];
             int16_t l1 = g_input[idx + 1][0];
             int16_t r0 = g_input[idx][1];
@@ -180,11 +184,7 @@ void nx_audio_play(const int16_t *samples, uint32_t count) {
             s_last_sample[0] = sample_l;
             s_last_sample[1] = sample_r;
 
-            g_input_pos += s_step;
-        }
-        if (fade_count >= 32) {
-            s_last_sample[0] = 0;
-            s_last_sample[1] = 0;
+            g_input_pos += step;
         }
 
         // Enqueue to audout
