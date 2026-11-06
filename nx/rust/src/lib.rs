@@ -267,6 +267,34 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         unx.presenter.set_layout(if in_play { ScreenLayout::TopOnly } else { ScreenLayout::LargeTop });
     }
 
+    // development: sdmc:/switch/uprisingnx/cmd.txt holding "save" or "load" (optionally
+    // followed by a slot name) saves or restores the whole console, so that a test
+    // can start from the same moment every time. the file is removed when read, and
+    // the result is written to cmd.result
+    if unx.frame % 15 == 0 {
+        let cmd_path = "sdmc:/switch/uprisingnx/cmd.txt";
+        if let Ok(text) = std::fs::read_to_string(cmd_path) {
+            let _ = std::fs::remove_file(cmd_path);
+            let mut words = text.split_whitespace();
+            let (verb, slot) = (words.next().unwrap_or(""), words.next().unwrap_or("slot0"));
+            let file = format!("sdmc:/switch/uprisingnx/{slot}.zst");
+            let started = Instant::now();
+            let result = match verb {
+                "save" => unx.system.save_state().and_then(|bytes| {
+                    std::fs::write(&file, &bytes).map(|_| format!("saved {} bytes", bytes.len())).map_err(|e| e.to_string())
+                }),
+                "load" => std::fs::read(&file).map_err(|e| e.to_string()).and_then(|bytes| unx.system.load_state(&bytes).map(|_| "loaded".to_string())),
+                other => Err(format!("unknown command {other:?}")),
+            };
+            let message = match result {
+                Ok(done) => format!("{verb} {slot}: {done} in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0),
+                Err(error) => format!("{verb} {slot}: failed, {error}"),
+            };
+            log::info!("unx: {message}");
+            let _ = std::fs::write("sdmc:/switch/uprisingnx/cmd.result", message);
+        }
+    }
+
     let started = Instant::now();
     let outcome = unx.system.run_frame();
     let took = started.elapsed();

@@ -637,6 +637,168 @@ impl VertexPlan {
 /// each vertex comes from when an index buffer repeats them, and comes back
 /// to say which of the vertices made each one is, none for the geometry
 /// shader's, which come in order.
+fn cull_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // off unless asked for: it saves shading time but its own copies cost more
+    *ON.get_or_init(|| std::env::var_os("ZAKURO_CULL").is_some())
+}
+
+/// the matrix that takes a draw's vertex position (input register 0) to its
+/// clip position, found by shading sixteen of its vertices and fitting, and
+/// checked on six more it was not fitted to. None when the draw's
+/// positions are not an affine function of that register (skinning, say).
+static FIT_WORST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FIT_FAILS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+fn fit_clip(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Option<[[f64; 4]; 4]> {
+    let fail = |why: usize| -> Option<[[f64; 4]; 4]> {
+        FIT_FAILS[why].fetch_add(inputs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        None
+    };
+    let n = inputs.len();
+    if inputs.iter().any(|input| input[0][3] != 1.0 || !input[0][..3].iter().all(|v| v.is_finite())) {
+        return fail(0);
+    }
+    // the extremes on each axis, then evenly spaced vertices
+    let mut picks: Vec<usize> = Vec::with_capacity(24);
+    for axis in 0..3 {
+        let low = (0..n).min_by(|&a, &b| inputs[a][0][axis].total_cmp(&inputs[b][0][axis]))?;
+        let high = (0..n).max_by(|&a, &b| inputs[a][0][axis].total_cmp(&inputs[b][0][axis]))?;
+        picks.push(low);
+        picks.push(high);
+    }
+    for i in 0..10 {
+        picks.push(i * (n - 1) / 9);
+    }
+    let fitted = picks.len();
+    for i in 0..6 {
+        picks.push((2 * i + 1) * (n - 1) / 12);
+    }
+    let samples: Vec<_> = picks.iter().map(|&i| inputs[i]).collect();
+    let plan = VertexPlan::new(&read_output_map(registers), registers[REG_VS_OUTPUT_MASK]);
+    let shaded = shade_with(unit, &samples, |outputs| plan.vertex(outputs).clip);
+    if shaded.iter().any(|clip| !clip.iter().all(|v| v.is_finite())) {
+        return fail(1);
+    }
+    // positions centred and scaled before fitting, so the ridge below is
+    // small next to every column whatever the mesh's coordinates are
+    let mut centre = [0.0f64; 3];
+    for sample in &samples[..fitted] {
+        for i in 0..3 {
+            centre[i] += sample[0][i] as f64 / fitted as f64;
+        }
+    }
+    let scale = samples[..fitted]
+        .iter()
+        .flat_map(|sample| (0..3).map(move |i| sample[0][i] as f64))
+        .zip(centre.iter().cycle())
+        .map(|(v, c)| (v - c).abs())
+        .fold(1e-9f64, f64::max);
+    let row = |k: usize| {
+        let p = &samples[k][0];
+        [(p[0] as f64 - centre[0]) / scale, (p[1] as f64 - centre[1]) / scale, (p[2] as f64 - centre[2]) / scale, 1.0]
+    };
+    // normal equations with a little ridge, which keeps a flat mesh (every
+    // z the same) solvable and right on its own plane
+    let mut normal = [[0.0f64; 4]; 4];
+    let mut rhs = [[0.0f64; 4]; 4];
+    for k in 0..fitted {
+        let a = row(k);
+        for i in 0..4 {
+            for j in 0..4 {
+                normal[i][j] += a[i] * a[j];
+            }
+            for c in 0..4 {
+                rhs[c][i] += a[i] * shaded[k][c] as f64;
+            }
+        }
+    }
+    for i in 0..4 {
+        normal[i][i] += normal[i][i] * 1e-9 + 1e-12;
+    }
+    let mut matrix = [[0.0f64; 4]; 4];
+    for c in 0..4 {
+        // gaussian elimination on [normal | rhs[c]]
+        let mut m = [[0.0f64; 5]; 4];
+        for i in 0..4 {
+            m[i][..4].copy_from_slice(&normal[i]);
+            m[i][4] = rhs[c][i];
+        }
+        for col in 0..4 {
+            let pivot = (col..4).max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))?;
+            if m[pivot][col].abs() < 1e-18 {
+                return fail(2);
+            }
+            m.swap(col, pivot);
+            for r in 0..4 {
+                if r != col {
+                    let f = m[r][col] / m[col][col];
+                    for k in col..5 {
+                        m[r][k] -= f * m[col][k];
+                    }
+                }
+            }
+        }
+        for i in 0..4 {
+            matrix[c][i] = m[i][4] / m[i][i];
+        }
+    }
+    let mut worst = 0.0f64;
+    for k in 0..samples.len() {
+        let a = row(k);
+        let size = (shaded[k][3].abs() as f64).max(1.0);
+        for c in 0..4 {
+            let predicted: f64 = (0..4).map(|i| matrix[c][i] * a[i]).sum();
+            let error = (predicted - shaded[k][c] as f64).abs() / size;
+            worst = if error.is_nan() { f64::INFINITY } else { worst.max(error) };
+        }
+    }
+    FIT_WORST.fetch_max((worst.min(1e6) * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+    if worst > 2e-3 {
+        return fail(3);
+    }
+    // back to the input's own coordinates
+    let mut raw = [[0.0f64; 4]; 4];
+    for c in 0..4 {
+        for i in 0..3 {
+            raw[c][i] = matrix[c][i] / scale;
+        }
+        raw[c][3] = matrix[c][3] - (0..3).map(|i| matrix[c][i] * centre[i] / scale).sum::<f64>();
+    }
+    Some(raw)
+}
+
+/// which vertices a draw needs shaded: every one a triangle that might be
+/// seen uses. A triangle whose three vertices all lie well outside one side
+/// of the view by the fitted matrix is left out.
+fn needed_vertices(
+    matrix: &[[f64; 4]; 4],
+    inputs: &[[Vec4; shader::INPUT_REGISTERS]],
+    topology: u32,
+    order: Option<&[usize]>,
+) -> Vec<bool> {
+    let side = |input: &[Vec4; shader::INPUT_REGISTERS]| -> u8 {
+        let a = [input[0][0] as f64, input[0][1] as f64, input[0][2] as f64, 1.0];
+        let clip: [f64; 4] = std::array::from_fn(|c| (0..4).map(|i| matrix[c][i] * a[i]).sum());
+        let [x, y, _, w] = clip;
+        let margin = 0.05 * w.abs() + 1e-3;
+        ((x < -w - margin) as u8) | ((x > w + margin) as u8) << 1 | ((y < -w - margin) as u8) << 2 | ((y > w + margin) as u8) << 3 | ((w < -margin) as u8) << 4
+    };
+    let sides: Vec<u8> = inputs.iter().map(side).collect();
+    let count = order.map_or(inputs.len(), <[usize]>::len);
+    let at = |i: usize| order.map_or(i, |order| order[i]);
+    let mut needed = vec![false; inputs.len()];
+    for (ia, ib, ic) in assemble(topology, count) {
+        let (a, b, c) = (at(ia), at(ib), at(ic));
+        if sides[a] & sides[b] & sides[c] == 0 {
+            needed[a] = true;
+            needed[b] = true;
+            needed[c] = true;
+        }
+    }
+    // vertices no triangle names are not drawn either way
+    needed
+}
+
 fn process_vertices<'a>(
     registers: &[u32],
     vertex_shader: &ShaderUnit,
@@ -3763,7 +3925,49 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
     let (shaded, order) = match vertices {
         Vertices::Shaded(shaded) => (shaded, None),
         Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
-            processed = process_vertices(registers, vertex_shader, geometry_shader, inputs, order);
+            let eligible = cull_enabled() && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 && inputs.len() >= 128 && !looks_at_vertices(registers);
+            let fitted = eligible.then(|| fit_clip(registers, vertex_shader, inputs)).flatten();
+            let culled = fitted
+                .map(|matrix| (needed_vertices(&matrix, inputs, topology, order), matrix))
+                .filter(|(needed, _)| needed.iter().filter(|&&n| !n).count() * 5 >= needed.len());
+            if std::env::var_os("ZAKURO_DRAW_LOG").is_some() {
+                use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+                static C: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+                C[0].fetch_add(1, Relaxed);
+                C[1].fetch_add(eligible as u64 * inputs.len() as u64, Relaxed);
+                C[2].fetch_add(fitted.is_some() as u64 * inputs.len() as u64, Relaxed);
+                if let Some((needed, _)) = &culled {
+                    C[3].fetch_add(needed.iter().filter(|&&n| !n).count() as u64, Relaxed);
+                    C[4].fetch_add(needed.len() as u64, Relaxed);
+                }
+                if C[0].load(Relaxed) % 2000 == 0 {
+                    log::info!(target: "zakuro_gpu::diag", "cull: worst fit error {}e-6 of w; fails w!=1 {} nonfinite {} singular {} mismatch {}; {} draws, eligible vertices {}, fitted {}, skipped {} of {}", FIT_WORST.swap(0, Relaxed), FIT_FAILS[0].swap(0, Relaxed), FIT_FAILS[1].swap(0, Relaxed), FIT_FAILS[2].swap(0, Relaxed), FIT_FAILS[3].swap(0, Relaxed), C[0].load(Relaxed), C[1].swap(0, Relaxed), C[2].swap(0, Relaxed), C[3].swap(0, Relaxed), C[4].swap(0, Relaxed));
+                    C[0].store(1, Relaxed);
+                }
+            }
+            processed = match culled {
+                Some((needed, matrix)) => {
+                    // only the vertices something visible uses are shaded, the
+                    // rest stay as they were made, a default vertex no drawn
+                    // triangle reads
+                    let kept: Vec<usize> = (0..inputs.len()).filter(|&i| needed[i]).collect();
+                    let subset: Vec<_> = kept.iter().map(|&i| inputs[i]).collect();
+                    let (shaded, _) = process_vertices(registers, vertex_shader, geometry_shader, &subset, None);
+                    let mut full = vec![Vertex::default(); inputs.len()];
+                    // the ones left out sit where the fit puts them, so a
+                    // triangle that mixes them with shaded ones stays off the
+                    // screen as it was
+                    for (i, input) in inputs.iter().enumerate().filter(|&(i, _)| !needed[i]) {
+                        let a = [input[0][0] as f64, input[0][1] as f64, input[0][2] as f64, 1.0];
+                        full[i].clip = std::array::from_fn(|c| (0..4).map(|k| matrix[c][k] * a[k]).sum::<f64>() as f32);
+                    }
+                    for (slot, vertex) in kept.iter().zip(shaded) {
+                        full[*slot] = vertex;
+                    }
+                    (full, order)
+                }
+                None => process_vertices(registers, vertex_shader, geometry_shader, inputs, order),
+            };
             (&processed.0[..], processed.1)
         }
         // arrays the GPU did not draw, which the CPU decodes first
