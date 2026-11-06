@@ -3172,6 +3172,33 @@ pub fn draw<M: GpuMemory>(
     if vertex_count == 0 || vertex_count > 0x1_0000 {
         return 0;
     }
+    {
+        // ZAKURO_DRAW_LOG: what the draws are made of, every 2000 draws
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("ZAKURO_DRAW_LOG").is_some()) {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static N: AtomicU64 = AtomicU64::new(0);
+            static TOTAL: AtomicU64 = AtomicU64::new(0);
+            static BIG: AtomicU64 = AtomicU64::new(0);
+            static BIG_TOTAL: AtomicU64 = AtomicU64::new(0);
+            static TINY: AtomicU64 = AtomicU64::new(0);
+            TOTAL.fetch_add(vertex_count as u64, Relaxed);
+            if vertex_count >= 500 {
+                BIG.fetch_add(1, Relaxed);
+                BIG_TOTAL.fetch_add(vertex_count as u64, Relaxed);
+            }
+            if vertex_count <= 12 {
+                TINY.fetch_add(1, Relaxed);
+            }
+            if N.fetch_add(1, Relaxed) % 2000 == 1999 {
+                log::info!(
+                    target: "zakuro_gpu::diag",
+                    "2000 draws: {} vertices, {} draws of 500+ vertices hold {} of them, {} draws of 12 or fewer",
+                    TOTAL.swap(0, Relaxed), BIG.swap(0, Relaxed), BIG_TOTAL.swap(0, Relaxed), TINY.swap(0, Relaxed)
+                );
+            }
+        }
+    }
     if is_bottom(registers) && resources.portraits.in_play && skip_bottom_in_play(registers, vertex_count) {
         return vertex_count;
     }
