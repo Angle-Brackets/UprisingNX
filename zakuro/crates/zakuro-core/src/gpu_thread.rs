@@ -85,6 +85,12 @@ pub(crate) fn execute(gpu: &mut Gpu, job: Job) -> Option<InterruptId> {
             gpu.texture_copy(&mut guest, input, output, size, input_gap, output_gap)
         }
         Gx::Dma { source, dest, size } => {
+            if size >= 0x10000 {
+                static DMAS: AtomicUsize = AtomicUsize::new(0);
+                if DMAS.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
+                    log::info!(target: "zakuro_gpu::diag", "big DMA {source:08x} -> {dest:08x}, {size:x} bytes");
+                }
+            }
             gpu.sync_memory(&mut guest, source, size);
             gpu.sync_memory(&mut guest, dest, size);
             let mut data = vec![0u8; size as usize];

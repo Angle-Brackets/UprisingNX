@@ -79,6 +79,16 @@ impl Context {
         // a whole batch, as nearly all are, reads its lanes without
         // checking each one against the last
         if let Ok(full) = <&[[Vec4; INPUT_REGISTERS]; LANES]>::try_from(inputs) {
+            #[cfg(target_arch = "aarch64")]
+            for register in registers(read) {
+                // four vertices' register, each a vector of its components,
+                // turned into the four components, each a vector of the
+                // vertices, in a few instructions rather than sixteen loads
+                // and stores
+                let rows = transpose4([full[0][register], full[1][register], full[2][register], full[3][register]]);
+                self.inputs[register] = rows;
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             for register in registers(read) {
                 for (component, row) in self.inputs[register].iter_mut().enumerate() {
                     *row = std::array::from_fn(|lane| full[lane][register][component]);
@@ -97,6 +107,14 @@ impl Context {
     /// the outputs the program writes out of rows, for the vertices there are.
     fn drain(&self, written: u16, outputs: &mut [[Vec4; OUTPUT_REGISTERS]]) {
         if let Ok(full) = <&mut [[Vec4; OUTPUT_REGISTERS]; LANES]>::try_from(&mut *outputs) {
+            #[cfg(target_arch = "aarch64")]
+            for register in registers(written) {
+                let lanes = transpose4(self.outputs[register]);
+                for (lane, output) in full.iter_mut().enumerate() {
+                    output[register] = lanes[lane];
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             for register in registers(written) {
                 for (lane, output) in full.iter_mut().enumerate() {
                     output[register] = std::array::from_fn(|component| self.outputs[register][component][lane]);
@@ -109,6 +127,30 @@ impl Context {
                 output[register] = std::array::from_fn(|component| self.outputs[register][component][lane]);
             }
         }
+    }
+}
+
+/// a 4 by 4 matrix of floats turned about its diagonal: rows become
+/// columns. NEON does it in eight instructions.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn transpose4(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    use std::arch::aarch64::*;
+    // SAFETY: loads and stores of four floats from and to arrays of four
+    unsafe {
+        let (a, b, c, d) = (vld1q_f32(m[0].as_ptr()), vld1q_f32(m[1].as_ptr()), vld1q_f32(m[2].as_ptr()), vld1q_f32(m[3].as_ptr()));
+        let (t0, t1) = (vtrn1q_f32(a, b), vtrn2q_f32(a, b));
+        let (t2, t3) = (vtrn1q_f32(c, d), vtrn2q_f32(c, d));
+        let pair = |x: float32x4_t, y: float32x4_t, low: bool| -> float32x4_t {
+            let (x, y) = (vreinterpretq_f64_f32(x), vreinterpretq_f64_f32(y));
+            vreinterpretq_f32_f64(if low { vtrn1q_f64(x, y) } else { vtrn2q_f64(x, y) })
+        };
+        let rows = [pair(t0, t2, true), pair(t1, t3, true), pair(t0, t2, false), pair(t1, t3, false)];
+        let mut out = [[0.0f32; 4]; 4];
+        for (row, value) in out.iter_mut().zip(rows) {
+            vst1q_f32(row.as_mut_ptr(), value);
+        }
+        out
     }
 }
 

@@ -4313,6 +4313,14 @@ impl Hardware {
             (0..self.surfaces.len()).filter(|&i| kept(&self.surfaces[i]) && self.surfaces[i].overlaps(addr, len)).collect();
         let dirty: Vec<usize> = overlapping.iter().copied().filter(|&i| self.surfaces[i].dirty_overlaps(addr, len)).collect();
         crate::stats::write_back(crate::stats::BACK_SYNC, dirty.len());
+        if !dirty.is_empty() {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 200 == 0 {
+                let what: Vec<String> =
+                    dirty.iter().map(|&i| format!("{:08x} {}x{} {:?}", self.surfaces[i].addr, self.surfaces[i].width, self.surfaces[i].height, self.surfaces[i].kind)).collect();
+                log::info!(target: "zakuro_gpu::diag", "sync write-back for {addr:08x}+{len:x}: [{}]", what.join(", "));
+            }
+        }
         self.write_back(memory, dirty)?;
         for i in overlapping {
             self.surfaces[i].checked = true;

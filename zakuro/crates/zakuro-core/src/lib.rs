@@ -1324,6 +1324,12 @@ unsafe fn sync_for_cpu_write(gpu: *mut (), linear_base: u32, memory: &mut Memory
     );
     let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::SYNC);
     zakuro_gpu::stats::SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if len >= 0x10000 {
+        static WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
+            log::info!(target: "zakuro_gpu::diag", "big CPU write over GPU memory {addr:08x}+{len:x}");
+        }
+    }
     let gpu: &mut Gpu = unsafe { &mut *(gpu as *mut gpu_thread::GpuCell) };
     gpu.sync_memory(&mut GuestMemory { memory, linear_base }, addr, len);
 }

@@ -574,7 +574,13 @@ impl Gpu {
         // every line and the gaps between them
         let span = |width: u32, skip: u32| if width == 0 { size } else { size + size.div_ceil(width) * skip };
         let (input, output) = (memory.translate(input_paddr), memory.translate(output_paddr));
-        self.sync_memory(memory, input, span(input_width, input_skip));
+        // a copy of a whole screen's worth from what the GPU drew, the title
+        // making an effect of it, costs a wait and a read back every frame;
+        // ZAKURO_FAST_COPY=1 copies what memory has, a frame or so old
+        static FAST_COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if size < 0x10000 || !*FAST_COPY.get_or_init(|| std::env::var_os("ZAKURO_FAST_COPY").is_some()) {
+            self.sync_memory(memory, input, span(input_width, input_skip));
+        }
         let output_width = (output_gap & 0xFFFF) * 16;
         let output_skip = (output_gap >> 16) * 16;
         self.sync_memory(memory, output, span(output_width, output_skip));
