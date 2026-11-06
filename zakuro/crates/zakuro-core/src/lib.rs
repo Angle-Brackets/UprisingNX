@@ -3,6 +3,7 @@
 
 pub mod camera;
 pub mod cheats;
+pub mod scan;
 pub mod enhancements;
 pub mod cro;
 pub mod download_play;
@@ -348,6 +349,7 @@ impl System {
         self.idle_interrupted(false);
         services::hid::update(self, input);
         cheats::run(self);
+        scan::tick(self);
         // run up to the boundary step() would end the frame at, and end it
         // here, once, instead of again when the next frame's first step
         // finds the boundary passed

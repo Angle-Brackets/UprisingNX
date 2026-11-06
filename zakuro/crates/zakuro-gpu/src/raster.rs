@@ -1129,6 +1129,18 @@ pub(crate) struct DrawnTexture {
     pub(crate) format: ColorFormat,
 }
 
+/// how a texture minifies: the magnification filter's bit says it by default
+/// (as it always has), ZAKURO_FILTER=split reads the minification bit as the
+/// console does, =any is linear when either asks.
+fn filter_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("ZAKURO_FILTER").as_deref() {
+        Ok("split") => 0,
+        Ok("any") => 2,
+        _ => 1,
+    })
+}
+
 /// texture unit 0's configuration and backing data for one draw call.
 struct BoundTexture {
     /// the texture decoded, row by row from the top, none when it is drawn
@@ -1137,6 +1149,8 @@ struct BoundTexture {
     drawn: Option<DrawnTexture>,
     /// bilinear rather than point sampling when magnifying.
     linear: bool,
+    /// bilinear rather than point sampling when minifying.
+    min_linear: bool,
     wrap_s: Wrap,
     wrap_t: Wrap,
     width: u32,
@@ -2180,6 +2194,7 @@ fn empty_texture() -> BoundTexture {
         texels: TEXELS.get_or_init(|| Arc::from([[0u8; 4]].as_slice())).clone(),
         drawn: None,
         linear: false,
+        min_linear: false,
         wrap_s: Wrap::Repeat,
         wrap_t: Wrap::Repeat,
         width: 1,
@@ -2246,6 +2261,11 @@ fn bind_texture<M: GpuMemory>(
         texels,
         drawn,
         linear: config & 0x2 != 0,
+        min_linear: match filter_mode() {
+            1 => config & 0x2 != 0,
+            2 => config & 0x6 != 0,
+            _ => config & 0x4 != 0,
+        },
         wrap_t: Wrap::from_raw(config >> 8),
         wrap_s: Wrap::from_raw(config >> 12),
         width,
@@ -4303,6 +4323,7 @@ mod tests {
             drawn: None,
             texels: vec![[0xFF; 4]; 8 * 8].into(),
             linear: false,
+        min_linear: false,
             wrap_s: wrap,
             wrap_t: wrap,
             width: 8,

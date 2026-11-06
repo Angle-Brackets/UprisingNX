@@ -1541,7 +1541,7 @@ pub struct Hardware {
     /// the same writing an image, made the first time it is needed.
     upright_image: Option<Compute>,
     samples: Option<Local>,
-    samplers: QuickMap<(bool, Wrap, Wrap, u32), vk::Sampler>,
+    samplers: QuickMap<(u8, Wrap, Wrap, u32), vk::Sampler>,
     ring: Buffer,
     used: u64,
     readback: Option<Buffer>,
@@ -3023,8 +3023,8 @@ impl Hardware {
 
     /// a sampler for a unit, which goes between an image's sizes down to
     /// smallest, as texture pack pictures have them.
-    fn sampler(&mut self, linear: bool, s: Wrap, t: Wrap, smallest: u32) -> Result<vk::Sampler, String> {
-        if let Some(&sampler) = self.samplers.get(&(linear, s, t, smallest)) {
+    fn sampler(&mut self, filters: u8, s: Wrap, t: Wrap, smallest: u32) -> Result<vk::Sampler, String> {
+        if let Some(&sampler) = self.samplers.get(&(filters, s, t, smallest)) {
             return Ok(sampler);
         }
         // the border is the shader's to draw, past the edge it clamps
@@ -3033,23 +3033,30 @@ impl Hardware {
             Wrap::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
             _ => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         };
-        let filter = if linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
-        let between = if smallest > 0 && linear { vk::SamplerMipmapMode::LINEAR } else { vk::SamplerMipmapMode::NEAREST };
+        let (mag, min) = (filters & 1 != 0, filters & 2 != 0);
+        let filter = |linear: bool| if linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
+        let between = if smallest > 0 && min { vk::SamplerMipmapMode::LINEAR } else { vk::SamplerMipmapMode::NEAREST };
         // a picture drawn a little smaller than its own size, as at 3 times
         // the console's resolution, stays as sharp as it is
-        let bias = if smallest > 0 { -0.5 } else { 0.0 };
+        let mut bias = if smallest > 0 { -0.5 } else { 0.0 };
+        // test switches: ZAKURO_MIP_BIAS=<float> overrides the bias,
+        // ZAKURO_NO_MIPS=1 samples only the full picture
+        if let Some(value) = std::env::var("ZAKURO_MIP_BIAS").ok().and_then(|v| v.parse::<f32>().ok()) {
+            bias = value;
+        }
+        let smallest_lod = if std::env::var_os("ZAKURO_NO_MIPS").is_some() { 0 } else { smallest };
         let info = vk::SamplerCreateInfo::default()
-            .mag_filter(filter)
-            .min_filter(filter)
+            .mag_filter(filter(mag))
+            .min_filter(filter(min))
             .mipmap_mode(between)
             .mip_lod_bias(bias)
             .address_mode_u(mode(s))
             .address_mode_v(mode(t))
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .max_lod(smallest as f32);
+            .max_lod(smallest_lod as f32);
         // SAFETY: plain object creation on our device
         let sampler = unsafe { self.device.create_sampler(&info, None) }.map_err(vk_error("create a sampler"))?;
-        self.samplers.insert((linear, s, t, smallest), sampler);
+        self.samplers.insert((filters, s, t, smallest), sampler);
         Ok(sampler)
     }
 
@@ -3827,10 +3834,10 @@ impl Hardware {
                             smallest
                         }
                     };
-                    samplers[unit] = self.sampler(bound.linear, bound.wrap_s, bound.wrap_t, smallest)?;
+                    samplers[unit] = self.sampler(bound.linear as u8 | (bound.min_linear as u8) << 1, bound.wrap_s, bound.wrap_t, smallest)?;
                     enabled |= 1 << unit;
                 }
-                None => samplers[unit] = self.sampler(false, Wrap::ClampToEdge, Wrap::ClampToEdge, 0)?,
+                None => samplers[unit] = self.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0)?,
             }
         }
         let tables = match draw.lighting.is_some() || draw.proctex || draw.fog {
