@@ -3259,7 +3259,9 @@ pub fn draw<M: GpuMemory>(
         } else {
             (first_vertex, vertex_count)
         };
-        if !is_bottom(registers) && raw_inputs(plan, memory, attribute_base, first, span, &mut scratch.raw) {
+        static NO_RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_raw = *NO_RAW.get_or_init(|| std::env::var_os("ZAKURO_NO_RAW_INPUTS").is_some());
+        if !no_raw && !is_bottom(registers) && raw_inputs(plan, memory, attribute_base, first, span, &mut scratch.raw) {
             scratch.relative.clear();
             if indexed {
                 // straight from the index buffer, the draw needs its indices
