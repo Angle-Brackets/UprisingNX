@@ -655,16 +655,30 @@ fn fit_clip(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT
         None
     };
     let n = inputs.len();
-    if inputs.iter().any(|input| input[0][3] != 1.0 || !input[0][..3].iter().all(|v| v.is_finite())) {
+    // one pass over the positions: they must be plain points, and the
+    // extremes on each axis are the first vertices to fit
+    let mut low = [(f32::INFINITY, 0usize); 3];
+    let mut high = [(f32::NEG_INFINITY, 0usize); 3];
+    let mut plain = true;
+    for (i, input) in inputs.iter().enumerate() {
+        let p = &input[0];
+        plain &= p[3] == 1.0 && p[0].is_finite() && p[1].is_finite() && p[2].is_finite();
+        for axis in 0..3 {
+            if p[axis] < low[axis].0 {
+                low[axis] = (p[axis], i);
+            }
+            if p[axis] > high[axis].0 {
+                high[axis] = (p[axis], i);
+            }
+        }
+    }
+    if !plain {
         return fail(0);
     }
-    // the extremes on each axis, then evenly spaced vertices
     let mut picks: Vec<usize> = Vec::with_capacity(24);
     for axis in 0..3 {
-        let low = (0..n).min_by(|&a, &b| inputs[a][0][axis].total_cmp(&inputs[b][0][axis]))?;
-        let high = (0..n).max_by(|&a, &b| inputs[a][0][axis].total_cmp(&inputs[b][0][axis]))?;
-        picks.push(low);
-        picks.push(high);
+        picks.push(low[axis].1);
+        picks.push(high[axis].1);
     }
     for i in 0..10 {
         picks.push(i * (n - 1) / 9);
@@ -776,10 +790,12 @@ fn needed_vertices(
     topology: u32,
     order: Option<&[usize]>,
 ) -> Vec<bool> {
+    let m: [[f32; 4]; 4] = std::array::from_fn(|c| std::array::from_fn(|i| matrix[c][i] as f32));
     let side = |input: &[Vec4; shader::INPUT_REGISTERS]| -> u8 {
-        let a = [input[0][0] as f64, input[0][1] as f64, input[0][2] as f64, 1.0];
-        let clip: [f64; 4] = std::array::from_fn(|c| (0..4).map(|i| matrix[c][i] * a[i]).sum());
-        let [x, y, _, w] = clip;
+        let p = &input[0];
+        let x = m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2] + m[0][3];
+        let y = m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2] + m[1][3];
+        let w = m[3][0] * p[0] + m[3][1] * p[1] + m[3][2] * p[2] + m[3][3];
         let margin = 0.05 * w.abs() + 1e-3;
         ((x < -w - margin) as u8) | ((x > w + margin) as u8) << 1 | ((y < -w - margin) as u8) << 2 | ((y > w + margin) as u8) << 3 | ((w < -margin) as u8) << 4
     };
@@ -3953,16 +3969,20 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     let kept: Vec<usize> = (0..inputs.len()).filter(|&i| needed[i]).collect();
                     let subset: Vec<_> = kept.iter().map(|&i| inputs[i]).collect();
                     let (shaded, _) = process_vertices(registers, vertex_shader, geometry_shader, &subset, None);
-                    let mut full = vec![Vertex::default(); inputs.len()];
-                    // the ones left out sit where the fit puts them, so a
-                    // triangle that mixes them with shaded ones stays off the
-                    // screen as it was
-                    for (i, input) in inputs.iter().enumerate().filter(|&(i, _)| !needed[i]) {
-                        let a = [input[0][0] as f64, input[0][1] as f64, input[0][2] as f64, 1.0];
-                        full[i].clip = std::array::from_fn(|c| (0..4).map(|k| matrix[c][k] * a[k]).sum::<f64>() as f32);
-                    }
-                    for (slot, vertex) in kept.iter().zip(shaded) {
-                        full[*slot] = vertex;
+                    let m: [[f32; 4]; 4] = std::array::from_fn(|c| std::array::from_fn(|i| matrix[c][i] as f32));
+                    let mut shaded = shaded.into_iter();
+                    let mut full: Vec<Vertex> = Vec::with_capacity(inputs.len());
+                    for (i, input) in inputs.iter().enumerate() {
+                        if needed[i] {
+                            full.push(shaded.next().unwrap_or_default());
+                        } else {
+                            // where the fit puts it, so a triangle that mixes it
+                            // with shaded vertices stays off the screen as it was
+                            let p = &input[0];
+                            let mut vertex = Vertex::default();
+                            vertex.clip = std::array::from_fn(|c| m[c][0] * p[0] + m[c][1] * p[1] + m[c][2] * p[2] + m[c][3]);
+                            full.push(vertex);
+                        }
                     }
                     (full, order)
                 }
