@@ -11,7 +11,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OPT="${1:--Os}"; JOBS="${2:-11}"
-CODE="$(realpath "${3:-$ROOT/build/desktop/port-usa/code}")"
+# the port with the game's overrides in it (3dsrecomp port ... --overrides build/desktop/overrides-usa) if there is one
+DEFAULT_CODE="$ROOT/build/desktop/port-usa/code"; [ -d "$ROOT/build/desktop/port-usa-ovr/code" ] && DEFAULT_CODE="$ROOT/build/desktop/port-usa-ovr/code"
+CODE="$(realpath "${3:-$DEFAULT_CODE}")"
 OUT="$ROOT/build/nx-recomp"
 OBJ="$OUT/obj${OPT}"
 CC=/opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc
