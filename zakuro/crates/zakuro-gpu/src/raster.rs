@@ -815,6 +815,87 @@ fn needed_vertices(
     needed
 }
 
+fn hit_was_computed(key: &Option<u64>, cache: &std::collections::HashMap<u64, Vec<Vertex>>) -> bool {
+    key.is_some_and(|key| !cache.contains_key(&key))
+}
+
+fn vcache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZAKURO_NO_VCACHE").is_none())
+}
+
+/// what tells a draw from the others from one frame to the next, cheaply:
+/// its program, size and a few of its vertices' positions.
+fn draw_signature(unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64 ^ unit.entry_point as u64;
+    let mut mix = |value: u32| {
+        hash = (hash ^ value as u64).wrapping_mul(0x100000001b3);
+    };
+    mix(inputs.len() as u32);
+    for at in [0, inputs.len() / 2, inputs.len() - 1] {
+        for value in &inputs[at][0] {
+            mix(value.to_bits());
+        }
+    }
+    hash
+}
+
+/// whether a draw is worth hashing: it hit the last few times, or it is
+/// time to look again (three in a row every thirty-second time, since what
+/// repeats does so on the next frame).
+fn vcache_worth(scores: &mut std::collections::HashMap<u64, (u8, u8)>, signature: u64) -> bool {
+    let entry = scores.entry(signature).or_insert((0, 0));
+    entry.1 = entry.1.wrapping_add(1);
+    entry.0 > 0 || entry.1 % 32 < 3
+}
+
+fn vcache_note(scores: &mut std::collections::HashMap<u64, (u8, u8)>, signature: u64, hit: bool) {
+    if let Some(entry) = scores.get_mut(&signature) {
+        entry.0 = if hit { 3 } else { entry.0.saturating_sub(1) };
+    }
+    if scores.len() > 4096 {
+        scores.clear();
+    }
+}
+
+/// a hash of everything shading a draw's vertices reads: program, uniforms,
+/// how outputs are packed, and the first four input registers of each vertex.
+fn shading_key(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut mix = |value: u32| {
+        hash = (hash ^ value as u64).wrapping_mul(0x100000001b3);
+    };
+    mix(unit.entry_point);
+    mix(inputs.len() as u32);
+    mix(registers[REG_VS_OUTPUT_MASK]);
+    for word in unit.program.iter().step_by(1) {
+        mix(*word);
+    }
+    for word in unit.descriptors.iter() {
+        mix(*word);
+    }
+    for uniform in unit.float_uniforms.iter() {
+        for value in uniform {
+            mix(value.to_bits());
+        }
+    }
+    for int in unit.int_uniforms {
+        mix(u32::from_le_bytes(int));
+    }
+    mix(unit.bool_uniforms as u32);
+    for from in VertexPlan::new(&read_output_map(registers), registers[REG_VS_OUTPUT_MASK]).from {
+        mix(from as u32);
+    }
+    for input in inputs {
+        for register in &input[..4] {
+            for value in register {
+                mix(value.to_bits());
+            }
+        }
+    }
+    hash
+}
+
 fn process_vertices<'a>(
     registers: &[u32],
     vertex_shader: &ShaderUnit,
@@ -1357,6 +1438,14 @@ pub(crate) enum Pass {
 /// what draws keep from one to the next.
 #[derive(Default)]
 pub struct Resources {
+    /// vertices shaded last time for draws whose program, uniforms and
+    /// inputs were exactly these, by a hash of them, to reuse when nothing
+    /// changed (a still camera).
+    vcache: std::collections::HashMap<u64, Vec<Vertex>>,
+    /// the generation before it, for draws that came back after a few others.
+    vcache_old: std::collections::HashMap<u64, Vec<Vertex>>,
+    /// per draw signature, how many recent lookups it hit (to three) and a counter.
+    vcache_score: std::collections::HashMap<u64, (u8, u8)>,
     /// the draw whose vertices a helper is shading, which is drawn once the
     /// next one has gone to shade too, see finish_pending.
     pending: std::collections::VecDeque<Pending>,
@@ -3961,7 +4050,24 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     C[0].store(1, Relaxed);
                 }
             }
-            processed = match culled {
+            let signature = (culled.is_none() && vcache_enabled() && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 && inputs.len() >= 128 && !looks_at_vertices(registers))
+                .then(|| draw_signature(vertex_shader, inputs));
+            let cache_key = signature.filter(|&signature| vcache_worth(&mut resources.vcache_score, signature)).map(|_| shading_key(registers, vertex_shader, inputs));
+            let hit = cache_key.and_then(|key| resources.vcache.get(&key).or_else(|| resources.vcache_old.get(&key))).map(|hit| (hit.clone(), order));
+            if std::env::var_os("ZAKURO_DRAW_LOG").is_some() {
+                use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+                static C: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+                C[0].fetch_add(signature.is_some() as u64, Relaxed);
+                C[1].fetch_add(cache_key.is_some() as u64, Relaxed);
+                C[2].fetch_add(hit.is_some() as u64, Relaxed);
+                if C[0].load(Relaxed) % 1000 == 999 {
+                    log::info!(target: "zakuro_gpu::diag", "vcache: eligible {} probed {} hit {}", C[0].swap(0, Relaxed), C[1].swap(0, Relaxed), C[2].swap(0, Relaxed));
+                }
+            }
+            if let (Some(signature), Some(_)) = (signature, cache_key) {
+                vcache_note(&mut resources.vcache_score, signature, hit.is_some());
+            }
+            processed = if let Some(hit) = hit { hit } else { match culled {
                 Some((needed, matrix)) => {
                     // only the vertices something visible uses are shaded, the
                     // rest stay as they were made, a default vertex no drawn
@@ -3987,7 +4093,13 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     (full, order)
                 }
                 None => process_vertices(registers, vertex_shader, geometry_shader, inputs, order),
-            };
+            } };
+            if let (Some(key), true) = (cache_key, hit_was_computed(&cache_key, &resources.vcache)) {
+                if resources.vcache.len() >= 40 {
+                    resources.vcache_old = std::mem::take(&mut resources.vcache);
+                }
+                resources.vcache.insert(key, processed.0.clone());
+            }
             (&processed.0[..], processed.1)
         }
         // arrays the GPU did not draw, which the CPU decodes first
