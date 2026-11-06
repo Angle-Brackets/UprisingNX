@@ -5,6 +5,7 @@ use zakuro_cpu::Bus;
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
 use crate::kernel::object::{KObject, SharedMemory};
+use crate::gpu_thread::Gx;
 use crate::System;
 
 /// size of the GSP shared memory block.
@@ -173,8 +174,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let address = buffer.get(&mut system.memory, 1) & !7;
             let address = virtual_to_physical(system, address);
             let size = buffer.get(&mut system.memory, 2) & !3;
-            system.submit_command_list(address, size);
-            signal_interrupt(system, InterruptId::P3d);
+            system.submit_command_list(address, size, Some(InterruptId::P3d));
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
@@ -183,12 +183,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let source = buffer.get(&mut system.memory, 1);
             let dest = buffer.get(&mut system.memory, 2);
             let size = buffer.get(&mut system.memory, 3);
-            system.sync_gpu(source, size);
-            system.sync_gpu(dest, size);
-            let mut data = vec![0u8; size as usize];
-            system.memory.read_bytes(source, &mut data);
-            system.memory.write_bytes(dest, &data);
-            signal_interrupt(system, InterruptId::Dma);
+            system.queue_gx(Gx::Dma { source, dest, size }, Some(InterruptId::Dma));
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
@@ -226,8 +221,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let input_dimensions = buffer.get(&mut system.memory, 3);
             let output_dimensions = buffer.get(&mut system.memory, 4);
             let flags = buffer.get(&mut system.memory, 5);
-            system.display_transfer(input, output, input_dimensions, output_dimensions, flags);
-            signal_interrupt(system, InterruptId::Ppf);
+            system.display_transfer(input, output, input_dimensions, output_dimensions, flags, Some(InterruptId::Ppf));
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
@@ -240,8 +234,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let size = buffer.get(&mut system.memory, 3);
             let input_gap = buffer.get(&mut system.memory, 4);
             let output_gap = buffer.get(&mut system.memory, 5);
-            system.texture_copy(input, output, size, input_gap, output_gap);
-            signal_interrupt(system, InterruptId::Ppf);
+            system.texture_copy(input, output, size, input_gap, output_gap, Some(InterruptId::Ppf));
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
@@ -258,15 +251,8 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                 }
                 let width = fill_width(control);
                 let physical = virtual_to_physical(system, start);
-                system.memory_fill(physical, physical + (end - start), value, width);
-                signal_interrupt(
-                    system,
-                    if bank == 0 {
-                        InterruptId::Psc0
-                    } else {
-                        InterruptId::Psc1
-                    },
-                );
+                let done = if bank == 0 { InterruptId::Psc0 } else { InterruptId::Psc1 };
+                system.memory_fill(physical, physical + (end - start), value, width, Some(done));
             }
             buffer.reply(&mut system.memory, id, &[]);
             true
@@ -554,20 +540,14 @@ fn execute_command(system: &mut System, command: GxCommand) {
     match command.id {
         // RequestDma(source, destination, size)
         0x00 => {
-            let (src, dst, size) = (command.data[0], command.data[1], command.data[2]);
-            system.sync_gpu(src, size);
-            system.sync_gpu(dst, size);
-            let mut buf = vec![0u8; size as usize];
-            system.memory.read_bytes(src, &mut buf);
-            system.memory.write_bytes(dst, &buf);
-            signal_interrupt(system, InterruptId::Dma);
+            let (source, dest, size) = (command.data[0], command.data[1], command.data[2]);
+            system.queue_gx(Gx::Dma { source, dest, size }, Some(InterruptId::Dma));
         }
         // ProcessCommandList(address, size, ...)
         0x01 => {
             let address = virtual_to_physical(system, command.data[0] & !7);
             let size = command.data[1] & !3;
-            system.submit_command_list(address, size);
-            signal_interrupt(system, InterruptId::P3d);
+            system.submit_command_list(address, size, Some(InterruptId::P3d));
         }
         // MemoryFill(start0, value0, end0, start1, value1, end1, control)
         0x02 => {
@@ -580,15 +560,8 @@ fn execute_command(system: &mut System, command: GxCommand) {
                 }
                 let width = fill_width(command.data[6] >> (bank as u32 * 16));
                 let physical = virtual_to_physical(system, start);
-                system.memory_fill(physical, physical + (end - start), value, width);
-                signal_interrupt(
-                    system,
-                    if bank == 0 {
-                        InterruptId::Psc0
-                    } else {
-                        InterruptId::Psc1
-                    },
-                );
+                let done = if bank == 0 { InterruptId::Psc0 } else { InterruptId::Psc1 };
+                system.memory_fill(physical, physical + (end - start), value, width, Some(done));
             }
         }
         // DisplayTransfer(input, output, input dim, output dim, flags)
@@ -599,8 +572,8 @@ fn execute_command(system: &mut System, command: GxCommand) {
                 command.data[2],
                 command.data[3],
                 command.data[4],
+                Some(InterruptId::Ppf),
             );
-            signal_interrupt(system, InterruptId::Ppf);
         }
         // TextureCopy(input, output, size, input gap, output gap, flags)
         0x04 => {
@@ -610,8 +583,8 @@ fn execute_command(system: &mut System, command: GxCommand) {
                 command.data[2],
                 command.data[3],
                 command.data[4],
+                Some(InterruptId::Ppf),
             );
-            signal_interrupt(system, InterruptId::Ppf);
         }
         // CacheFlush
         0x05 => {}

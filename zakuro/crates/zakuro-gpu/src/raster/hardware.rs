@@ -1440,6 +1440,8 @@ pub struct Hardware {
     device: ash::Device,
     push: ash::khr::push_descriptor::Device,
     queue: vk::Queue,
+    /// see SharedDevice::queue_lock.
+    queue_lock: Arc<std::sync::Mutex<()>>,
     memory_types: vk::PhysicalDeviceMemoryProperties,
     uniform_alignment: u64,
     storage_alignment: u64,
@@ -1613,6 +1615,7 @@ impl Hardware {
         // with create infos that live as long as each call
         unsafe {
             let queue = shared.queue;
+            let queue_lock = shared.queue_lock.clone();
             let memory_types = instance.get_physical_device_memory_properties(physical);
             let pool = device
                 .create_command_pool(
@@ -1717,6 +1720,7 @@ impl Hardware {
                 device,
                 push,
                 queue,
+                queue_lock,
                 memory_types,
                 uniform_alignment: properties.limits.min_uniform_buffer_offset_alignment.max(16),
                 storage_alignment: properties.limits.min_storage_buffer_offset_alignment.max(16),
@@ -5054,6 +5058,7 @@ impl Hardware {
             let buffers = [self.commands];
             let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
             let started = std::time::Instant::now();
+            let _queue = self.queue_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             self.device.queue_submit(self.queue, &submit, self.fence).map_err(vk_error("submit"))?;
             let took = started.elapsed().as_secs_f64() * 1000.0;
             if took >= 20.0 {
@@ -5762,7 +5767,7 @@ pub(crate) fn render_device(
     // SAFETY: a queue the device was made with
     let queue = unsafe { device.get_device_queue(family, 0) };
     let (_entry, instance) = (entry.clone(), instance.clone());
-    Ok(SharedDevice { _entry, instance, physical, family, device, queue, logic_ops, statistics, dynamic })
+    Ok(SharedDevice { _entry, instance, physical, family, device, queue, queue_lock: Default::default(), logic_ops, statistics, dynamic })
 }
 
 /// which of the blend state the device lets draws set as they go, none

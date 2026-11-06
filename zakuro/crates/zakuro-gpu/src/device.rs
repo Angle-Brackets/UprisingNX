@@ -5,8 +5,8 @@
 use ash::vk;
 
 /// a device, the instance it came from and its one queue, gone once the
-/// last of the renderer and the presenter lets go of it. both record and
-/// submit on the thread the window runs on, so the queue needs no lock.
+/// last of the renderer and the presenter lets go of it. the queue is shared,
+/// and each locks it, see queue_lock, to submit.
 pub struct SharedDevice {
     pub(crate) _entry: ash::Entry,
     pub(crate) instance: ash::Instance,
@@ -14,6 +14,9 @@ pub struct SharedDevice {
     pub(crate) family: u32,
     pub(crate) device: ash::Device,
     pub(crate) queue: vk::Queue,
+    /// held while the queue is submitted to or presented on: the renderer
+    /// works on a thread of its own, the presenter on the window's.
+    pub(crate) queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// whether the device does logic ops, and counts pipeline statistics.
     pub(crate) logic_ops: bool,
     pub(crate) statistics: bool,

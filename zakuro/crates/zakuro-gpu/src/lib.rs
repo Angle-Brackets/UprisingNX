@@ -138,7 +138,18 @@ pub struct ScreenRef {
     pub(crate) columns: u32,
 }
 
+/// what the frontend and the GPU's thread tell each other without waiting for
+/// one another: whether the game is in play, and whether a big dialogue
+/// portrait was seen since it was last asked.
+#[derive(Default)]
+pub struct Flags {
+    pub in_play: std::sync::atomic::AtomicBool,
+    pub big_portrait: std::sync::atomic::AtomicBool,
+}
+
 pub struct Gpu {
+    /// the flags, see Flags, shared with the frontend.
+    pub flags: std::sync::Arc<Flags>,
     /// external registers, 0x1EF00000 upwards, indexed by word.
     pub external: Box<[u32]>,
     /// PICA internal registers, written by command lists.
@@ -191,6 +202,7 @@ impl Default for Gpu {
 impl Gpu {
     pub fn new() -> Gpu {
         Gpu {
+            flags: Default::default(),
             external: vec![0; EXTERNAL_REGISTER_WORDS].into_boxed_slice(),
             internal: vec![0; INTERNAL_REGISTER_WORDS].into_boxed_slice(),
             vertex_shader: shader::ShaderUnit::new(),
@@ -355,6 +367,7 @@ impl Gpu {
         output_dimensions: u32,
         flags: u32,
     ) {
+        self.take_flags();
         let input_width = input_dimensions & 0xFFFF;
         let input_height = input_dimensions >> 16;
         // the portraits the bottom screen drew last frame go into the top
@@ -602,8 +615,10 @@ impl Gpu {
         size: u32,
     ) {
         let start = std::time::Instant::now();
+        self.take_flags();
         self.resources.textures.begin_list();
         self.run_command_list(memory, renderer, paddr, size);
+        self.give_flags();
         self.busy += start.elapsed();
     }
 
@@ -689,13 +704,29 @@ impl Gpu {
     /// portraits are dialogue that ZAKURO_PORTRAITS puts on the top screen;
     /// out of play, in menus, pictures of their kind are not taken.
     pub fn set_in_play(&mut self, on: bool) {
+        self.flags.in_play.store(on, std::sync::atomic::Ordering::Relaxed);
         self.resources.portraits.in_play = on;
+    }
+
+    /// takes the frontend's flags before the GPU works on a command, in
+    /// order, as they stand then.
+    fn take_flags(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.resources.portraits.in_play = self.flags.in_play.load(Relaxed);
+    }
+
+    /// hands what the GPU noted for the frontend over, after a command.
+    fn give_flags(&mut self) {
+        if std::mem::take(&mut self.resources.portraits.big_portrait) {
+            self.flags.big_portrait.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// whether the bottom screen drew a large dialogue portrait since this
     /// was last asked, out of play: a conversation at the start of a battle.
     pub fn take_big_portrait(&mut self) -> bool {
-        std::mem::take(&mut self.resources.portraits.big_portrait)
+        self.give_flags();
+        self.flags.big_portrait.swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// whether frame interpolation is on.

@@ -246,9 +246,9 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     // overrides say which it is, in the host mailbox, as the desktop does.
     let said = std::mem::take(&mut unx.system.memory.host_mailbox[3]);
     unx.out_of_play = if said != 0 { 0 } else { unx.out_of_play.saturating_add(1) };
-    unx.since_portrait = if unx.system.gpu.take_big_portrait() { 0 } else { unx.since_portrait.saturating_add(1) };
+    unx.since_portrait = if unx.system.gpu.flags().big_portrait.swap(false, std::sync::atomic::Ordering::Relaxed) { 0 } else { unx.since_portrait.saturating_add(1) };
     let in_play = unx.out_of_play <= IN_PLAY_QUIET || unx.since_portrait <= PORTRAIT_QUIET;
-    unx.system.gpu.set_in_play(in_play);
+    unx.system.gpu.flags().in_play.store(in_play, std::sync::atomic::Ordering::Relaxed);
     if said != 0 && unx.frame % 120 == 0 {
         log::info!("unx: overrides say {said} (frame {})", unx.frame);
     }

@@ -6,6 +6,7 @@ pub mod cheats;
 pub mod enhancements;
 pub mod cro;
 pub mod download_play;
+pub mod gpu_thread;
 pub mod hints;
 pub mod idle;
 pub mod kernel;
@@ -24,6 +25,7 @@ use zakuro_common::memory_map::*;
 use zakuro_common::ConsoleModel;
 use zakuro_cpu::{Cpu, Exit};
 use zakuro_fs::Title;
+use gpu_thread::Gx;
 use zakuro_gpu::{Gpu, GpuMemory, Renderer, SoftwareRenderer};
 
 use kernel::thread::{ThreadId, WaitResult, WaitSyscall, THREAD_EXIT_MAGIC};
@@ -159,7 +161,7 @@ pub struct System {
     pub memory: Memory,
     pub kernel: Kernel,
     pub services: ServiceState,
-    pub gpu: Gpu,
+    pub gpu: gpu_thread::GpuCell,
     pub renderer: Box<dyn Renderer>,
     pub title: Option<Title>,
     /// the title's downloadable content.
@@ -268,7 +270,7 @@ impl System {
             memory: Memory::new(config.new3ds, app_bytes),
             kernel: Kernel::new(0, memory::MemoryRegion::Application, linear_heap_base(0)),
             services,
-            gpu: Gpu::new(),
+            gpu: gpu_thread::GpuCell::new(Gpu::new(), gpu_thread_wanted()),
             renderer: Box::new(SoftwareRenderer::default()),
             title: None,
             dlc: Vec::new(),
@@ -372,6 +374,9 @@ impl System {
             return StepOutcome::Faulted;
         }
 
+        // what the GPU's thread finished since, the title hears of now
+        self.raise_gpu_interrupts();
+
         // fire the end-of-frame work on schedule even when a tool is stepping,
         // or a title waiting on vertical blank would never be woken.
         if self.cpu.cycles >= self.next_frame_boundary {
@@ -395,7 +400,14 @@ impl System {
         }
 
         if self.kernel.current_thread.is_none() {
-            // everything is blocked.
+            // everything is blocked. when it waits for the GPU, which has
+            // an interrupt to give, time does not go on while it draws
+            if self.gpu.busy() {
+                self.gpu.wait_done();
+                self.raise_gpu_interrupts();
+                self.kernel.reschedule_pending = true;
+                return StepOutcome::Ran;
+            }
             let mut limit = deadline.unwrap_or(self.cpu.cycles + CYCLES_PER_FRAME);
             // an audio thread waits on the DSP's interrupt, which only fires
             // at an audio frame boundary, skipping past one would lose it.
@@ -518,11 +530,11 @@ impl System {
                         hints.interpreted(pc, thumb);
                     }
                 }
-                let gpu = &mut self.gpu as *mut Gpu as *mut ();
+                let gpu = &mut self.gpu as *mut gpu_thread::GpuCell as *mut ();
                 let linear_base = self.kernel.linear_base;
                 // SAFETY: the GPU stays where it is, and nothing but the CPU's
                 // reads and writes follow the pointer, until the step is over
-                unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write }) };
+                unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write, wait: wait_for_gpu }) };
                 let exit = self.cpu.step(&mut self.memory);
                 self.memory.clear_gpu_sync();
                 exit
@@ -609,10 +621,10 @@ impl System {
         let budget = limit.saturating_sub(self.cpu.cycles).max(1);
         // a read of the CPU from where the GPU drew has that come down
         // first, with nothing else holding the GPU until the run is over
-        let gpu = &mut self.gpu as *mut Gpu as *mut ();
+        let gpu = &mut self.gpu as *mut gpu_thread::GpuCell as *mut ();
         let linear_base = self.kernel.linear_base;
         // SAFETY: as in step, until the run is over
-        unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write }) };
+        unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write, wait: wait_for_gpu }) };
         let (ran, stop) = library.run(&mut self.cpu, &mut self.memory, budget);
         self.memory.clear_gpu_sync();
         self.recompiled_instructions += ran;
@@ -751,12 +763,12 @@ impl System {
             }
         }
 
-        self.renderer.end_frame();
+        self.queue_gx(Gx::EndFrame, None);
 
         // pick up any buffer swap the game queued directly in GSP shared
         // memory before the LCDs latch whatever is currently configured.
         services::gsp::refresh(self);
-        if self.gpu.interpolates() {
+        if self.gpu.interpolating() {
             self.pace();
         }
 
@@ -805,7 +817,9 @@ impl System {
     /// whether it does, it takes the host's GPU showing the screens.
     pub fn set_interpolation(&mut self, on: bool) -> bool {
         self.pacing = Pacing::default();
-        self.gpu.set_interpolation(on)
+        let on = self.gpu.set_interpolation(on);
+        self.gpu.set_interpolating(self.gpu.interpolates());
+        on
     }
 
     /// how the draws of the last frame matched the frame before's, for frame
@@ -868,7 +882,7 @@ impl System {
     }
 
     pub fn gpu_write_register(&mut self, offset: u32, value: u32) {
-        self.gpu.write_external(offset, value);
+        self.queue_gx(Gx::Register { offset, value }, None);
     }
 
     pub fn set_framebuffer(
@@ -880,18 +894,33 @@ impl System {
         stride: u32,
         format: u32,
     ) {
-        self.gpu
-            .set_framebuffer(screen, active, left, right, stride, format);
+        self.queue_gx(Gx::Framebuffer { screen, active, left, right, stride, format }, None);
     }
 
-    pub fn submit_command_list(&mut self, paddr: u32, size: u32) {
-        let linear_base = self.kernel.linear_base;
-        let mut guest = GuestMemory {
-            linear_base,
+    /// has the GPU do something, after what it was asked before. with the
+    /// GPU on a thread, the interrupt comes when it is done, else at once.
+    pub(crate) fn queue_gx(&mut self, gx: Gx, interrupt: Option<services::gsp::InterruptId>) {
+        let job = gpu_thread::Job {
+            gx,
+            interrupt,
             memory: &mut self.memory,
+            renderer: self.renderer.as_mut(),
+            linear_base: self.kernel.linear_base,
         };
-        self.gpu
-            .process_command_list(&mut guest, self.renderer.as_mut(), paddr, size);
+        if let Some(interrupt) = self.gpu.submit(job) {
+            services::gsp::signal_interrupt(self, interrupt);
+        }
+    }
+
+    /// raises the interrupts of what the GPU's thread finished.
+    fn raise_gpu_interrupts(&mut self) {
+        for interrupt in self.gpu.take_done() {
+            services::gsp::signal_interrupt(self, interrupt);
+        }
+    }
+
+    pub fn submit_command_list(&mut self, paddr: u32, size: u32, interrupt: Option<services::gsp::InterruptId>) {
+        self.queue_gx(Gx::List { paddr, size }, interrupt);
     }
 
     /// makes guest memory hold what the host GPU drew over a range, before
@@ -916,13 +945,8 @@ impl System {
         self.memory.write_bytes(addr, data);
     }
 
-    pub fn memory_fill(&mut self, start: u32, end: u32, value: u32, width: u32) {
-        let linear_base = self.kernel.linear_base;
-        let mut guest = GuestMemory {
-            linear_base,
-            memory: &mut self.memory,
-        };
-        self.gpu.memory_fill(&mut guest, start, end, value, width);
+    pub fn memory_fill(&mut self, start: u32, end: u32, value: u32, width: u32, interrupt: Option<services::gsp::InterruptId>) {
+        self.queue_gx(Gx::Fill { start, end, value, width }, interrupt);
     }
 
     pub fn display_transfer(
@@ -932,20 +956,9 @@ impl System {
         input_dimensions: u32,
         output_dimensions: u32,
         flags: u32,
+        interrupt: Option<services::gsp::InterruptId>,
     ) {
-        let linear_base = self.kernel.linear_base;
-        let mut guest = GuestMemory {
-            linear_base,
-            memory: &mut self.memory,
-        };
-        self.gpu.display_transfer(
-            &mut guest,
-            input,
-            output,
-            input_dimensions,
-            output_dimensions,
-            flags,
-        );
+        self.queue_gx(Gx::Display { input, output, input_dimensions, output_dimensions, flags }, interrupt);
     }
 
     pub fn texture_copy(
@@ -955,14 +968,9 @@ impl System {
         size: u32,
         input_gap: u32,
         output_gap: u32,
+        interrupt: Option<services::gsp::InterruptId>,
     ) {
-        let linear_base = self.kernel.linear_base;
-        let mut guest = GuestMemory {
-            linear_base,
-            memory: &mut self.memory,
-        };
-        self.gpu
-            .texture_copy(&mut guest, input, output, size, input_gap, output_gap);
+        self.queue_gx(Gx::Copy { input, output, size, input_gap, output_gap }, interrupt);
     }
 
     /// the nine words gsp::ImportDisplayCaptureInfo returns, the addresses
@@ -1268,7 +1276,7 @@ unsafe fn sync_for_cpu(gpu: *mut (), linear_base: u32, memory: &mut Memory, addr
     );
     let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::SYNC);
     zakuro_gpu::stats::SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let gpu = unsafe { &mut *(gpu as *mut Gpu) };
+    let gpu: &mut Gpu = unsafe { &mut *(gpu as *mut gpu_thread::GpuCell) };
     gpu.sync_depth(&mut GuestMemory { memory, linear_base }, addr, len);
 }
 
@@ -1286,13 +1294,29 @@ unsafe fn sync_for_cpu_write(gpu: *mut (), linear_base: u32, memory: &mut Memory
     );
     let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::SYNC);
     zakuro_gpu::stats::SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let gpu = unsafe { &mut *(gpu as *mut Gpu) };
+    let gpu: &mut Gpu = unsafe { &mut *(gpu as *mut gpu_thread::GpuCell) };
     gpu.sync_memory(&mut GuestMemory { memory, linear_base }, addr, len);
+}
+
+/// waits for the GPU's thread, before the CPU's side touches the guards the
+/// thread sets.
+///
+/// # Safety
+///
+/// as sync_for_cpu.
+unsafe fn wait_for_gpu(gpu: *mut ()) {
+    unsafe { &*(gpu as *mut gpu_thread::GpuCell) }.wait_idle();
+}
+
+fn gpu_thread_wanted() -> bool {
+    std::env::var("ZAKURO_GPU_THREAD").is_ok_and(|value| value != "0")
 }
 
 impl Drop for System {
     /// what the interpreter ran lasts past the run.
     fn drop(&mut self) {
+        // the GPU's thread works on memory, which goes first
+        self.gpu.wait_idle();
         if let Some(hints) = &mut self.hints {
             hints.save();
         }

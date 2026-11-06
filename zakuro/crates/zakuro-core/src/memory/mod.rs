@@ -156,6 +156,13 @@ pub struct GpuSync {
     ///
     /// as sync.
     pub sync_write: unsafe fn(gpu: *mut (), linear_base: u32, memory: &mut Memory, addr: VAddr, len: u32),
+    /// waits for the GPU to stop working on its own, before the guards it
+    /// sets are looked at, which it sets while it works.
+    ///
+    /// # Safety
+    ///
+    /// as sync.
+    pub wait: unsafe fn(gpu: *mut ()),
 }
 
 // SAFETY: the pointers in the page tables all point into allocations owned by
@@ -686,6 +693,8 @@ impl Memory {
     /// they stay guarded.
     fn unguard(&mut self, addr: VAddr, len: u32) {
         let Some(sync) = self.gpu_sync else { return };
+        // SAFETY: as below
+        unsafe { (sync.wait)(sync.gpu) };
         for (from, to) in take_guards(&mut self.guards, addr, len) {
             // SAFETY: the system set it while it runs the CPU, which is the
             // only thing reading through this
@@ -720,6 +729,8 @@ impl Memory {
     /// as unguard does for reads, before the write lands over it.
     fn unguard_writes(&mut self, addr: VAddr, len: u32) {
         let Some(sync) = self.gpu_sync else { return };
+        // SAFETY: as in unguard
+        unsafe { (sync.wait)(sync.gpu) };
         for (from, to) in take_guards(&mut self.write_guards, addr, len) {
             // SAFETY: as in unguard
             unsafe { (sync.sync_write)(sync.gpu, sync.linear_base, self, from, to - from) };
@@ -928,6 +939,8 @@ mod tests {
         asked: u32,
     }
 
+    unsafe fn no_wait(_gpu: *mut ()) {}
+
     unsafe fn write_back(gpu: *mut (), _linear_base: u32, memory: &mut Memory, addr: VAddr, len: u32) {
         let drawn = unsafe { &mut *(gpu as *mut Drawn) };
         drawn.asked += 1;
@@ -948,7 +961,7 @@ mod tests {
         let mut drawn = Drawn { asked: 0 };
         let gpu = &mut drawn as *mut Drawn as *mut ();
         // SAFETY: drawn outlives the reads below, which are all that use it
-        unsafe { memory.set_gpu_sync(GpuSync { gpu, linear_base: 0, sync: write_back, sync_write: write_back }) };
+        unsafe { memory.set_gpu_sync(GpuSync { gpu, linear_base: 0, sync: write_back, sync_write: write_back, wait: no_wait }) };
         let mut bytes = [0u8; 4];
         memory.read_bytes(0x1F00_1000, &mut bytes);
         assert_eq!(bytes, [0; 4]);
@@ -1000,7 +1013,7 @@ mod tests {
         let mut drawn = Drawn { asked: 0 };
         let gpu = &mut drawn as *mut Drawn as *mut ();
         // SAFETY: drawn outlives the writes below, which are all that use it
-        unsafe { memory.set_gpu_sync(GpuSync { gpu, linear_base: 0, sync: write_back, sync_write: write_back }) };
+        unsafe { memory.set_gpu_sync(GpuSync { gpu, linear_base: 0, sync: write_back, sync_write: write_back, wait: no_wait }) };
         assert_eq!(memory.read32(0x1F00_1000), 0);
         memory.write32(0x1F00_0FFC, 1);
         assert_eq!(drawn.asked, 0);

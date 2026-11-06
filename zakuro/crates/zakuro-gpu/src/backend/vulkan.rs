@@ -946,6 +946,9 @@ impl Presenter for VulkanPresenter {
             .wait_dst_stage_mask(&stages)
             .command_buffers(&buffers)
             .signal_semaphores(&signal);
+        // the renderer submits on its own thread to the same queue
+        let queue_lock = self.shared.as_ref().map(|shared| shared.queue_lock.clone());
+        let _queue = queue_lock.as_ref().map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit], fence)
@@ -959,6 +962,7 @@ impl Presenter for VulkanPresenter {
             .swapchains(&swapchains)
             .image_indices(&indices);
         let result = unsafe { self.swapchain_device.queue_present(self.queue, &present) };
+        drop(_queue);
 
         self.frame = (self.frame + 1) % FRAMES_IN_FLIGHT;
 
