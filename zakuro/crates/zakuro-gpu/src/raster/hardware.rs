@@ -756,7 +756,7 @@ const STATISTICS: vk::QueryPipelineStatisticFlags = vk::QueryPipelineStatisticFl
 /// timestamps a batch can take.
 const TIMESTAMPS: u32 = 4096;
 /// batches the times are added up over before they are logged.
-const TIMED_BATCHES: u32 = 600;
+const TIMED_BATCHES: u32 = 30;
 
 /// the GPU's time per kind of work, from timestamps written whenever the
 /// work changes kind, ZAKURO_GPU_TIMES=1 turns it on.
