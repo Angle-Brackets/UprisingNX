@@ -3489,6 +3489,24 @@ impl Hardware {
             _ => self.translation(unit, key),
         };
         self.last_translation = Some((key, translation));
+        {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+            let slot = match translation {
+                Translation::Pending => 0,
+                Translation::Failed => 1,
+                Translation::Done(_) => 2,
+            };
+            COUNTS[slot].fetch_add(1, Relaxed);
+            if (COUNTS[0].load(Relaxed) + COUNTS[1].load(Relaxed) + COUNTS[2].load(Relaxed)) % 3000 == 0 {
+                let (pending, failed, done) = (COUNTS[0].swap(0, Relaxed), COUNTS[1].swap(0, Relaxed), COUNTS[2].swap(0, Relaxed));
+                let kinds = self.translated.values().fold([0; 3], |mut n, t| {
+                    n[match t { Translation::Pending => 0, Translation::Failed => 1, Translation::Done(_) => 2 }] += 1;
+                    n
+                });
+                log::info!(target: "zakuro_gpu::diag", "3000 GPU-shaded draws: {pending} pending, {failed} interpreted for good, {done} translated; programs now {} pending, {} failed, {} done", kinds[0], kinds[1], kinds[2]);
+            }
+        }
         match translation {
             Translation::Pending => (VertexStage::Interpreted, true),
             Translation::Failed => (VertexStage::Interpreted, false),
