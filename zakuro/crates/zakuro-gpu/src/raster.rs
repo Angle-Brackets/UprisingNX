@@ -840,7 +840,7 @@ fn shade_with<T: Send + Default + Clone>(
     inputs: &[[Vec4; shader::INPUT_REGISTERS]],
     then: impl Fn(&[Vec4; shader::OUTPUT_REGISTERS]) -> T + Sync,
 ) -> Vec<T> {
-    if inputs.len() < parallel_vertices() {
+    if inputs.len() < parallel_vertices() || crate::shade_queue::IN_JOB.with(|flag| flag.get()) {
         return shader::run_vertices_mapped(unit, inputs, then);
     }
     let pool = shader_pool();
@@ -1166,7 +1166,7 @@ pub(crate) enum Pass {
 pub struct Resources {
     /// the draw whose vertices a helper is shading, which is drawn once the
     /// next one has gone to shade too, see finish_pending.
-    pending: Option<Pending>,
+    pending: std::collections::VecDeque<Pending>,
     pub textures: TextureCache,
     pub light_tables: Tables,
     pub proctex_tables: crate::proctex::Tables,
@@ -3071,11 +3071,23 @@ fn looks_at_vertices(registers: &[u32]) -> bool {
 
 /// draws the draw that waits for its vertices, once they are shaded.
 pub(crate) fn finish_pending<M: GpuMemory>(memory: &mut M, resources: &mut Resources) {
-    let Some(pending) = resources.pending.take() else { return };
+    while finish_oldest(memory, resources) {}
+}
+
+/// draws the oldest of the draws that wait for their vertices. whether there was one.
+fn finish_oldest<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bool {
+    let Some(pending) = resources.pending.pop_front() else { return false };
     let waited = std::time::Instant::now();
     let shaded = pending.shaded.recv().unwrap_or_default();
     crate::stats::SHADE_WAIT.fetch_add(waited.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     rasterize_now(&pending.registers, memory, resources, Vertices::Shaded(&shaded));
+    true
+}
+
+/// how many draws may wait for their vertices at once, ZAKURO_SHADE_DEPTH.
+fn shade_depth() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("ZAKURO_SHADE_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(2).max(1))
 }
 
 pub fn draw<M: GpuMemory>(
@@ -3236,17 +3248,23 @@ pub fn draw<M: GpuMemory>(
         let (inputs, copied, order) = (scratch.inputs.clone(), registers.to_vec(), order.map(<[usize]>::to_vec));
         let (send, shaded) = std::sync::mpsc::channel();
         let shading_registers = copied.clone();
-        shader_pool().spawn(move || {
+        crate::shade_queue::submit(Box::new(move || {
+            crate::shade_queue::IN_JOB.with(|flag| flag.set(true));
             let (shaded, order) = process_vertices(&shading_registers, &unit, &unit, &inputs, order.as_deref());
+            crate::shade_queue::IN_JOB.with(|flag| flag.set(false));
             let in_order = match order {
                 Some(order) => order.iter().map(|&i| shaded[i]).collect(),
                 None => shaded,
             };
             let _ = send.send(in_order);
-        });
+        }));
         resources.scratch = scratch;
-        finish_pending(memory, resources);
-        resources.pending = Some(Pending { registers: copied, shaded });
+        // the draws before this one are drawn while it and the one before
+        // it are shaded, up to as many as may wait
+        resources.pending.push_back(Pending { registers: copied, shaded });
+        while resources.pending.len() > shade_depth() {
+            finish_oldest(memory, resources);
+        }
         return vertex_count;
     }
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &scratch.inputs, order };

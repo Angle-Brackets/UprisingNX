@@ -15,6 +15,7 @@ pub mod raster;
 pub mod registers;
 pub mod renderer;
 pub mod shader;
+pub mod shade_queue;
 pub mod state;
 pub mod stats;
 pub mod tev;

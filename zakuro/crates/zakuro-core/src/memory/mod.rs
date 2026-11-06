@@ -802,12 +802,70 @@ fn add_guard(guards: &mut BTreeMap<VAddr, VAddr>, table: &mut [*mut u8], vaddr: 
     table[pages].fill(std::ptr::null_mut());
 }
 
+/// a lock for what takes a few microseconds to do, which the GPU's thread
+/// and the CPU's side both take often: a contended std mutex goes through the
+/// kernel on the Switch, which costs far more than the wait, so this spins,
+/// and gives the core up if it has to for long.
+pub struct Spin<T> {
+    locked: std::sync::atomic::AtomicBool,
+    value: std::cell::UnsafeCell<T>,
+}
+
+// SAFETY: one holder at a time, by the flag
+unsafe impl<T: Send> Sync for Spin<T> {}
+unsafe impl<T: Send> Send for Spin<T> {}
+
+impl<T: Default> Default for Spin<T> {
+    fn default() -> Self {
+        Spin { locked: std::sync::atomic::AtomicBool::new(false), value: Default::default() }
+    }
+}
+
+pub struct SpinGuard<'a, T>(&'a Spin<T>);
+
+impl<T> Spin<T> {
+    fn lock(&self) -> SpinGuard<'_, T> {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        let mut spins = 0u32;
+        while self.locked.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+            spins += 1;
+            if spins < 2000 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        SpinGuard(self)
+    }
+}
+
+impl<T> std::ops::Deref for SpinGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: held
+        unsafe { &*self.0.value.get() }
+    }
+}
+
+impl<T> std::ops::DerefMut for SpinGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: held
+        unsafe { &mut *self.0.value.get() }
+    }
+}
+
+impl<T> Drop for SpinGuard<'_, T> {
+    fn drop(&mut self) {
+        self.0.locked.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// the ranges the GPU drew over that guest memory lacks, which the GPU's thread
 /// adds to as it draws and the CPU's side takes from as it reads.
-type Guards = std::sync::Mutex<BTreeMap<VAddr, VAddr>>;
+type Guards = Spin<BTreeMap<VAddr, VAddr>>;
 
-fn lock(guards: &Guards) -> std::sync::MutexGuard<'_, BTreeMap<VAddr, VAddr>> {
-    guards.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock(guards: &Guards) -> SpinGuard<'_, BTreeMap<VAddr, VAddr>> {
+    guards.lock()
 }
 
 /// whether any of a page is still guarded.

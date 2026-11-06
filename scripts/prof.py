@@ -23,10 +23,14 @@ def load(path, main_addr):
     runtime address of main(), whose ELF address gives the load base."""
     d = open(path, "rb").read()
     magic, ver, count, failed = struct.unpack_from("<4I", d, 0)
-    assert magic == 0x464F5250 and ver == 2, "not a v2 prof.bin"
+    assert magic == 0x464F5250 and ver in (2, 3), "not a v2/v3 prof.bin"
+    stride = 16 if ver == 2 else 48
     base = struct.unpack_from("<Q", d, 16)[0] - main_addr
     off = lambda a: (a - base) & 0xFFFFFFFFFFFFFFFF
-    raw = [struct.unpack_from("<QQ", d, 24 + 16 * i) for i in range(count)]
+    raw = [struct.unpack_from("<QQ", d, 24 + stride * i) for i in range(count)]
+    # v3 also has four callers up the frame pointers; load_stacks gives them
+    load.stacks = [struct.unpack_from("<4Q", d, 24 + stride * i + 16) for i in range(count)] if ver == 3 else []
+    load.off = off
     # the thread's number is in the top bits of the pc, 0 for the game's
     return [((pc >> 56, off(pc & ((1 << 56) - 1))), off(lr)) for pc, lr in raw], failed
 

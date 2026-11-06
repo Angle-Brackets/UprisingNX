@@ -10,12 +10,13 @@
 #include <switch.h>
 
 #define PROF_PATH "sdmc:/switch/uprisingnx/prof.bin"
-#define PROF_MAX (1 << 16)  // 64k samples, ~65 s at 1 kHz, 1 MB
+#define PROF_MAX (1 << 15)  // 32k samples, ~32 s at 1 kHz over two threads, 1.5 MB
 #define PROF_DUMP_EVERY 10000
 
 int main(int argc, char **argv);
 
-typedef struct { u64 pc, lr; } Sample;
+// the pc, lr and up to four callers further up by the frame pointers
+typedef struct { u64 pc, lr, up[4]; } Sample;
 static Sample samples[PROF_MAX];
 static u32 count, failed;  // count: samples ever taken; the ring holds the last PROF_MAX
 #define PROF_THREADS 4
@@ -28,7 +29,7 @@ static void dump(void) {
     FILE *f = fopen(PROF_PATH ".tmp", "wb");
     if (!f) return;
     u32 kept = count < PROF_MAX ? count : PROF_MAX;
-    u32 header[4] = {0x464f5250 /* PROF */, 2, kept, failed};
+    u32 header[4] = {0x464f5250 /* PROF */, 3, kept, failed};
     u64 anchor = (u64)&main;
     fwrite(header, sizeof header, 1, f);
     fwrite(&anchor, sizeof anchor, 1, f);
@@ -51,7 +52,17 @@ static void sample_loop(void *arg) {
             Result rc = svcGetThreadContext3(&ctx, targets[t]);
             svcSetThreadActivity(targets[t], ThreadActivity_Runnable);
             if (R_FAILED(rc)) { failed++; continue; }
-            samples[count++ % PROF_MAX] = (Sample){ctx.pc.x | ((u64)t << 56), ctx.lr};
+            Sample *out = &samples[count++ % PROF_MAX];
+            *out = (Sample){ctx.pc.x | ((u64)t << 56), ctx.lr, {0, 0, 0, 0}};
+            // up the frame records ({previous fp, return address}) while they stay on the
+            // thread's stack, which is paused, to say who called what it was in
+            u64 fp = ctx.fp, sp = ctx.sp;
+            for (int d = 0; d < 4 && fp >= sp && fp < sp + (4u << 20) && (fp & 15) == 0; d++) {
+                u64 *frame = (u64 *)fp;
+                out->up[d] = frame[1];
+                if (frame[0] <= fp) break;
+                fp = frame[0];
+            }
         }
         if (++since_dump >= PROF_DUMP_EVERY) { since_dump = 0; dump(); }
     }

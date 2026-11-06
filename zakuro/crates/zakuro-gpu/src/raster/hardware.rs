@@ -175,6 +175,41 @@ struct Recorded {
     count: u32,
 }
 
+/// what a draw sets besides its pipeline and what it reads, as bits to compare.
+#[derive(Clone, Copy, PartialEq)]
+struct DrawState {
+    viewport: [u32; 6],
+    scissor: [i32; 4],
+    cull: u32,
+    depth: (bool, i32, bool),
+    stencil_test: bool,
+    stencil: (u32, u32),
+    writable: bool,
+    blend_constants: [u32; 4],
+    blend: Option<u32>,
+    color_mask: u32,
+    logic_op: Option<LogicOp>,
+}
+
+impl DrawState {
+    fn of(r: &Recorded) -> DrawState {
+        let v = &r.viewport;
+        DrawState {
+            viewport: [v.x.to_bits(), v.y.to_bits(), v.width.to_bits(), v.height.to_bits(), v.min_depth.to_bits(), v.max_depth.to_bits()],
+            scissor: [r.scissor.offset.x, r.scissor.offset.y, r.scissor.extent.width as i32, r.scissor.extent.height as i32],
+            cull: r.cull.as_raw(),
+            depth: (r.depth_test, r.depth_compare.as_raw(), r.depth_write),
+            stencil_test: r.stencil_test,
+            stencil: r.stencil,
+            writable: r.writable,
+            blend_constants: r.blend_constants.map(f32::to_bits),
+            blend: r.blend,
+            color_mask: r.color_mask,
+            logic_op: r.logic_op,
+        }
+    }
+}
+
 /// the triangles of a draw.
 #[derive(Clone, Copy)]
 pub(super) enum Geometry<'a> {
@@ -1580,6 +1615,10 @@ pub struct Hardware {
     unfenced: bool,
     renderings: u64,
     draws: u64,
+    /// the dynamic state and graphics pipeline the last draw in this command
+    /// buffer left set, which the next one skips setting again when it is
+    /// the same, none after anything that could have changed them.
+    last_draw_state: Option<(vk::Pipeline, DrawState)>,
     /// the pipelines compiled before, kept on disk between runs, so a
     /// combination of fragment stages seen once does not stall again.
     pipeline_cache: vk::PipelineCache,
@@ -1826,6 +1865,7 @@ impl Hardware {
                 unfenced: true,
                 renderings: 0,
                 draws: 0,
+                last_draw_state: None,
                 pipeline_cache,
                 kept_pipelines,
                 known_keys: std::collections::HashSet::new(),
@@ -2069,6 +2109,7 @@ impl Hardware {
                     .map_err(vk_error("begin a command buffer"))?;
             }
             self.recording = true;
+            self.last_draw_state = None;
             self.start_timing()?;
             // the batch before may still be running
             self.unfenced = true;
@@ -4040,35 +4081,59 @@ impl Hardware {
         // reads staged in the ring and every image in the general layout
         unsafe {
             let device = &self.device;
-            device.cmd_bind_pipeline(commands, vk::PipelineBindPoint::GRAPHICS, r.pipeline);
-            device.cmd_set_viewport(commands, 0, &[r.viewport]);
-            device.cmd_set_cull_mode(commands, r.cull);
-            device.cmd_set_scissor(commands, 0, &[r.scissor]);
-            device.cmd_set_depth_test_enable(commands, r.depth_test);
-            device.cmd_set_depth_compare_op(commands, r.depth_compare);
-            device.cmd_set_depth_write_enable(commands, r.depth_write);
-            device.cmd_set_stencil_test_enable(commands, r.stencil_test);
-            device.cmd_set_stencil_op(
-                commands,
-                face,
-                stencil_op(op),
-                stencil_op(op >> 8),
-                stencil_op(op >> 4),
-                COMPARES[((test >> 4) & 7) as usize],
-            );
-            device.cmd_set_stencil_compare_mask(commands, face, (test >> 24) & 0xFF);
-            device.cmd_set_stencil_write_mask(commands, face, if r.writable { (test >> 8) & 0xFF } else { 0 });
-            device.cmd_set_stencil_reference(commands, face, (test >> 16) & 0xFF);
-            device.cmd_set_blend_constants(commands, &r.blend_constants);
+            let now = DrawState::of(r);
+            // the pipeline and the state the draw before it in this command
+            // buffer set stay set, what is the same is not set again
+            let before = self.last_draw_state;
+            if before.map(|(pipeline, _)| pipeline) != Some(r.pipeline) {
+                device.cmd_bind_pipeline(commands, vk::PipelineBindPoint::GRAPHICS, r.pipeline);
+            }
+            let changed = |differs: fn(&DrawState, &DrawState) -> bool| before.is_none_or(|(_, last)| differs(&last, &now));
+            if changed(|a, b| a.viewport != b.viewport) {
+                device.cmd_set_viewport(commands, 0, &[r.viewport]);
+            }
+            if changed(|a, b| a.cull != b.cull) {
+                device.cmd_set_cull_mode(commands, r.cull);
+            }
+            if changed(|a, b| a.scissor != b.scissor) {
+                device.cmd_set_scissor(commands, 0, &[r.scissor]);
+            }
+            if changed(|a, b| a.depth != b.depth) {
+                device.cmd_set_depth_test_enable(commands, r.depth_test);
+                device.cmd_set_depth_compare_op(commands, r.depth_compare);
+                device.cmd_set_depth_write_enable(commands, r.depth_write);
+            }
+            if changed(|a, b| (a.stencil_test, a.stencil, a.writable) != (b.stencil_test, b.stencil, b.writable)) {
+                device.cmd_set_stencil_test_enable(commands, r.stencil_test);
+                device.cmd_set_stencil_op(
+                    commands,
+                    face,
+                    stencil_op(op),
+                    stencil_op(op >> 8),
+                    stencil_op(op >> 4),
+                    COMPARES[((test >> 4) & 7) as usize],
+                );
+                device.cmd_set_stencil_compare_mask(commands, face, (test >> 24) & 0xFF);
+                device.cmd_set_stencil_write_mask(commands, face, if r.writable { (test >> 8) & 0xFF } else { 0 });
+                device.cmd_set_stencil_reference(commands, face, (test >> 16) & 0xFF);
+            }
+            if changed(|a, b| a.blend_constants != b.blend_constants) {
+                device.cmd_set_blend_constants(commands, &r.blend_constants);
+            }
             if let Some(state) = &self.blend_state {
-                state.cmd_set_color_blend_enable(commands, 0, &[r.blend.is_some().into()]);
-                state.cmd_set_color_blend_equation(commands, 0, &[blend_equation(r.blend.unwrap_or(0))]);
-                state.cmd_set_color_write_mask(commands, 0, &[vk::ColorComponentFlags::from_raw(r.color_mask)]);
+                if changed(|a, b| (a.blend, a.color_mask) != (b.blend, b.color_mask)) {
+                    state.cmd_set_color_blend_enable(commands, 0, &[r.blend.is_some().into()]);
+                    state.cmd_set_color_blend_equation(commands, 0, &[blend_equation(r.blend.unwrap_or(0))]);
+                    state.cmd_set_color_write_mask(commands, 0, &[vk::ColorComponentFlags::from_raw(r.color_mask)]);
+                }
                 if let Some(ops) = &self.logic_op_state {
-                    state.cmd_set_logic_op_enable(commands, r.logic_op.is_some());
-                    ops.cmd_set_logic_op(commands, r.logic_op.map_or(vk::LogicOp::COPY, self::logic_op));
+                    if changed(|a, b| a.logic_op != b.logic_op) {
+                        state.cmd_set_logic_op_enable(commands, r.logic_op.is_some());
+                        ops.cmd_set_logic_op(commands, r.logic_op.map_or(vk::LogicOp::COPY, self::logic_op));
+                    }
                 }
             }
+            self.last_draw_state = Some((r.pipeline, now));
             self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, writes);
             self.draws += 1;
             match vertex_infos {
@@ -4095,6 +4160,7 @@ impl Hardware {
     /// image and its depth surface's or their twins.
     fn begin_rendering_into(&mut self, color: usize, color_view: vk::ImageView, depth_view: Option<vk::ImageView>) {
         self.renderings += 1;
+        self.last_draw_state = None;
         let surface = &self.surfaces[color];
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -4320,6 +4386,7 @@ impl Hardware {
         // SAFETY: recording, outside rendering, on images in the general
         // layout made for storage
         unsafe {
+            self.last_draw_state = None;
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
@@ -4547,6 +4614,7 @@ impl Hardware {
             self.unfenced = true;
             self.device.cmd_copy_image_to_buffer(self.commands, image, vk::ImageLayout::GENERAL, samples, &regions);
             self.barrier();
+            self.last_draw_state = None;
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &constants);
@@ -4636,6 +4704,7 @@ impl Hardware {
         // layout into a buffer the size of the screen, which the host reads
         // only once this batch is done
         unsafe {
+            self.last_draw_state = None;
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &constants);
@@ -4700,6 +4769,7 @@ impl Hardware {
         // general layout, the presenter reads the target only in a later
         // submission, behind a barrier of its own
         unsafe {
+            self.last_draw_state = None;
             self.device.cmd_bind_pipeline(self.commands, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &constants);

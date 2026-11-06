@@ -52,6 +52,9 @@ pub struct ShaderUnit {
     pub descriptors: Box<[u32; DESCRIPTOR_SIZE]>,
     pub float_uniforms: Box<[Vec4; FLOAT_UNIFORMS]>,
     pub wide_uniforms: Box<[batch::Wide; FLOAT_UNIFORMS]>,
+    /// what wide_uniforms were last made from, to see which of the uniforms
+    /// changed without the unit being told, see sync_wide_uniforms.
+    wide_source: Box<[Vec4; FLOAT_UNIFORMS]>,
     pub int_uniforms: [[u8; 4]; 4],
     pub bool_uniforms: u16,
     pub entry_point: u32,
@@ -81,6 +84,7 @@ impl ShaderUnit {
             descriptors: self.descriptors.clone(),
             float_uniforms: self.float_uniforms.clone(),
             wide_uniforms: self.wide_uniforms.clone(),
+            wide_source: self.wide_source.clone(),
             int_uniforms: self.int_uniforms,
             bool_uniforms: self.bool_uniforms,
             entry_point: self.entry_point,
@@ -109,6 +113,7 @@ impl ShaderUnit {
             descriptors: Box::new([0; DESCRIPTOR_SIZE]),
             float_uniforms: Box::new([ZERO; FLOAT_UNIFORMS]),
             wide_uniforms: Box::new([batch::ZERO; FLOAT_UNIFORMS]),
+            wide_source: Box::new([ZERO; FLOAT_UNIFORMS]),
             int_uniforms: [[0; 4]; 4],
             bool_uniforms: 0,
             entry_point: 0,
@@ -150,9 +155,7 @@ impl ShaderUnit {
         self.program.copy_from_slice(&state.program);
         self.descriptors.copy_from_slice(&state.descriptors);
         self.float_uniforms.copy_from_slice(&state.float_uniforms);
-        for i in 0..FLOAT_UNIFORMS {
-            self.wide_uniforms[i] = self.float_uniforms[i].map(wide::f32x8::splat);
-        }
+        self.sync_wide_uniforms();
         self.int_uniforms = state.int_uniforms;
         self.bool_uniforms = state.bool_uniforms;
         self.entry_point = state.entry_point;
@@ -328,14 +331,22 @@ impl ShaderUnit {
         if self.float_uniform_index < FLOAT_UNIFORMS {
             self.float_uniforms[self.float_uniform_index] = value;
             self.wide_uniforms[self.float_uniform_index] = value.map(wide::f32x8::splat);
+            self.wide_source[self.float_uniform_index] = value;
         }
         self.float_uniform_index += 1;
     }
 
     /// synchronizes the wide SIMD uniform cache with float_uniforms.
     pub fn sync_wide_uniforms(&mut self) {
+        // most draws change few, and some code sets float_uniforms directly,
+        // so the ones that differ from what wide_uniforms were made of are
+        // made again, and the others left
         for i in 0..FLOAT_UNIFORMS {
-            self.wide_uniforms[i] = self.float_uniforms[i].map(wide::f32x8::splat);
+            let now = self.float_uniforms[i];
+            if now != self.wide_source[i] {
+                self.wide_uniforms[i] = now.map(wide::f32x8::splat);
+                self.wide_source[i] = now;
+            }
         }
     }
 

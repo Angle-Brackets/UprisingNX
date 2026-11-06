@@ -225,9 +225,17 @@ impl GpuCell {
     }
 
     fn wait_idle_slow(&self) {
-        let mut guard = self.shared.idle.lock().unwrap_or_else(|p| p.into_inner());
         while self.shared.pending.load(Ordering::Acquire) != 0 {
-            guard = self.shared.idle_changed.wait(guard).unwrap_or_else(|p| p.into_inner());
+            // the CPU's side has nothing to do but wait, and shades vertices
+            // for the thread meanwhile, see zakuro_gpu::shade_queue
+            if zakuro_gpu::shade_queue::help() {
+                continue;
+            }
+            let guard = self.shared.idle.lock().unwrap_or_else(|p| p.into_inner());
+            if self.shared.pending.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            let _ = self.shared.idle_changed.wait_timeout(guard, std::time::Duration::from_micros(200));
         }
     }
 
@@ -241,9 +249,15 @@ impl GpuCell {
     }
 
     fn wait_done_slow(&self) {
-        let mut guard = self.shared.idle.lock().unwrap_or_else(|p| p.into_inner());
         while !self.shared.done_any.load(Ordering::Acquire) && self.shared.pending.load(Ordering::Acquire) != 0 {
-            guard = self.shared.idle_changed.wait(guard).unwrap_or_else(|p| p.into_inner());
+            if zakuro_gpu::shade_queue::help() {
+                continue;
+            }
+            let guard = self.shared.idle.lock().unwrap_or_else(|p| p.into_inner());
+            if self.shared.done_any.load(Ordering::Acquire) || self.shared.pending.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            let _ = self.shared.idle_changed.wait_timeout(guard, std::time::Duration::from_micros(200));
         }
     }
 
