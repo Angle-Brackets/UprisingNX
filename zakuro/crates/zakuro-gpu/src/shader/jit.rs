@@ -370,6 +370,8 @@ fn compile_logged(program: &Program, entry: u32) -> Option<Arc<Compiled>> {
     #[cfg(target_os = "horizon")]
     if let Some(compiled) = kept(program.fingerprint, entry) {
         log::info!(target: "zakuro_gpu::shader::jit", "the program {:016X} at {entry} read back in {:?}", program.fingerprint, start.elapsed());
+        crate::stats::JIT_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::stats::JIT_PROGRAMS.fetch_add(1, Ordering::Relaxed);
         return Some(Arc::new(compiled));
     }
     let found = match compile(program, entry) {
@@ -379,6 +381,8 @@ fn compile_logged(program: &Program, entry: u32) -> Option<Arc<Compiled>> {
             None
         }
     };
+    crate::stats::JIT_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    crate::stats::JIT_PROGRAMS.fetch_add(1, Ordering::Relaxed);
     let instructions = program.ops.iter().filter(|op| op.opcode != OpCode::Nop && op.instruction.0 != 0).count();
     if found.is_some() {
         log::info!(

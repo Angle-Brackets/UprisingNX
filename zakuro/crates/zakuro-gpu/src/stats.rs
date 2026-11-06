@@ -25,6 +25,11 @@ pub static HARDWARE: AtomicU64 = AtomicU64::new(0);
 /// time the GPU's thread waited for vertices a helper was shading, see
 /// raster::finish_pending.
 pub static SHADE_WAIT: AtomicU64 = AtomicU64::new(0);
+/// time the shader compile thread spent compiling or reading back code, and
+/// how many programs, since the last take: not on the GPU's thread, but on
+/// the cores it shares.
+pub static JIT_NS: AtomicU64 = AtomicU64::new(0);
+pub static JIT_PROGRAMS: AtomicU64 = AtomicU64::new(0);
 /// the renderer waiting for the Vulkan queue the presenter holds, in
 /// nanoseconds, and how long the presenter held it.
 pub static QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +76,8 @@ pub struct Spent {
     pub write_back: f64,
     pub hardware: f64,
     pub shade_wait: f64,
+    pub jit: f64,
+    pub jit_programs: u64,
 }
 
 /// what was spent since the last take, starting afresh.
@@ -92,6 +99,8 @@ pub fn take() -> Spent {
         write_back: ms(&WRITE_BACK),
         hardware: ms(&HARDWARE),
         shade_wait: ms(&SHADE_WAIT),
+        jit: ms(&JIT_NS),
+        jit_programs: JIT_PROGRAMS.swap(0, Ordering::Relaxed),
     }
 }
 

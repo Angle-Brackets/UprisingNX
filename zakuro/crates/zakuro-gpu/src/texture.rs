@@ -109,7 +109,29 @@ fn per_texel() -> bool {
 /// texel instead.
 pub fn decode_tile(tile: &[u8], format: TextureFormat, texels: &mut [[u8; 4]], width: u32, tile_x: u32, tile_y: u32) -> bool {
     let bits = format.bits_per_pixel();
-    if per_texel() || bits < 8 || matches!(format, TextureFormat::Etc1 | TextureFormat::Etc1A4) {
+    if per_texel() {
+        return false;
+    }
+    if matches!(format, TextureFormat::Etc1 | TextureFormat::Etc1A4) {
+        // four blocks of 4x4, two across, in the tile's order
+        let size = if format == TextureFormat::Etc1A4 { 16 } else { 8 };
+        if tile.len() < 4 * size {
+            return false;
+        }
+        let (left, top, width) = (tile_x as usize, tile_y as usize, width as usize);
+        let mut block = [[0u8; 4]; 16];
+        for sub in 0..4 {
+            let bytes = &tile[sub * size..(sub + 1) * size];
+            let (alpha, color) = if size == 16 { (Some(&bytes[..8]), &bytes[8..]) } else { (None, bytes) };
+            decode_etc1_block_all(color, alpha, &mut block);
+            let (bx, by) = (left + (sub % 2) * 4, top + (sub / 2) * 4);
+            for y in 0..4 {
+                texels[(by + y) * width + bx..(by + y) * width + bx + 4].copy_from_slice(&block[y * 4..y * 4 + 4]);
+            }
+        }
+        return true;
+    }
+    if bits < 8 {
         return false;
     }
     let bytes = (bits / 8) as usize;
@@ -128,9 +150,10 @@ pub fn decode_tile(tile: &[u8], format: TextureFormat, texels: &mut [[u8; 4]], w
 /// the format and size allow, texel by texel otherwise.
 pub fn decode_texture(data: &[u8], format: TextureFormat, width: u32, height: u32) -> Vec<[u8; 4]> {
     let bits = format.bits_per_pixel() as usize;
+    // ETC1's 4 and 8 bits a pixel are of 4x4 blocks, which tile like the rest
+    let etc = matches!(format, TextureFormat::Etc1 | TextureFormat::Etc1A4);
     let tiled = !per_texel()
-        && width.is_multiple_of(8) && height.is_multiple_of(8) && bits >= 8
-        && !matches!(format, TextureFormat::Etc1 | TextureFormat::Etc1A4)
+        && width.is_multiple_of(8) && height.is_multiple_of(8) && (bits >= 8 || etc)
         && data.len() >= (width * height) as usize * bits / 8;
     if !tiled {
         return (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).map(|(x, y)| sample_texel(data, format, width, x, y)).collect();
@@ -351,6 +374,51 @@ fn decode_etc1_block(block: &[u8], x: u32, y: u32) -> [u8; 3] {
     ]
 }
 
+/// decodes all 16 pixels of an ETC1 block, `out[y * 4 + x]`, the header read
+/// once, with the 8 bytes of 4-bit alpha before it for ETC1A4.
+fn decode_etc1_block_all(block: &[u8], alpha: Option<&[u8]>, out: &mut [[u8; 4]; 16]) {
+    let word = u64::from_le_bytes(block[..8].try_into().unwrap());
+    let low = (word & 0xFFFF_FFFF) as u32;
+    let high = (word >> 32) as u32;
+    let flip = high & 1 != 0;
+    let diff = high & 2 != 0;
+    let (base0, base1) = if diff {
+        let (r0, g0, b0) = (((high >> 27) & 0x1F) as i32, ((high >> 19) & 0x1F) as i32, ((high >> 11) & 0x1F) as i32);
+        let (dr, dg, db) = (sign_extend_3((high >> 24) & 0x7), sign_extend_3((high >> 16) & 0x7), sign_extend_3((high >> 8) & 0x7));
+        (
+            [expand5(r0 as u8), expand5(g0 as u8), expand5(b0 as u8)],
+            [expand5((r0 + dr).clamp(0, 31) as u8), expand5((g0 + dg).clamp(0, 31) as u8), expand5((b0 + db).clamp(0, 31) as u8)],
+        )
+    } else {
+        (
+            [expand4(((high >> 28) & 0xF) as u8), expand4(((high >> 20) & 0xF) as u8), expand4(((high >> 12) & 0xF) as u8)],
+            [expand4(((high >> 24) & 0xF) as u8), expand4(((high >> 16) & 0xF) as u8), expand4(((high >> 8) & 0xF) as u8)],
+        )
+    };
+    let table0 = &ETC1_MODIFIERS[((high >> 5) & 0x7) as usize];
+    let table1 = &ETC1_MODIFIERS[((high >> 2) & 0x7) as usize];
+    let alpha_word = alpha.map(|a| u64::from_le_bytes(a[..8].try_into().unwrap()));
+    for y in 0..4u32 {
+        for x in 0..4u32 {
+            let (base, table) = if (if flip { y < 2 } else { x < 2 }) { (&base0, table0) } else { (&base1, table1) };
+            let pixel_index = x * 4 + y;
+            let msb = (low >> (pixel_index + 16)) & 1;
+            let lsb = (low >> pixel_index) & 1;
+            let delta = table[((msb << 1) | lsb) as usize];
+            let a = match alpha_word {
+                Some(word) => expand4(((word >> (pixel_index * 4)) & 0xF) as u8),
+                None => 0xFF,
+            };
+            out[(y * 4 + x) as usize] = [
+                (base[0] as i32 + delta).clamp(0, 255) as u8,
+                (base[1] as i32 + delta).clamp(0, 255) as u8,
+                (base[2] as i32 + delta).clamp(0, 255) as u8,
+                a,
+            ];
+        }
+    }
+}
+
 /// decodes one pixel's alpha from ETC1A4's 8-byte, 4-bit-per-texel alpha plane.
 fn decode_etc1a4_alpha(block: &[u8], x: u32, y: u32) -> u8 {
     let word = u64::from_le_bytes(block.try_into().unwrap());
@@ -392,7 +460,7 @@ mod tests {
     #[test]
     fn whole_textures_decode_like_single_texels() {
         let (width, height) = (24u32, 16u32);
-        for format in [TextureFormat::Rgba8, TextureFormat::Rgb8, TextureFormat::Rgba5551, TextureFormat::Rgb565, TextureFormat::Rgba4, TextureFormat::La8, TextureFormat::L8, TextureFormat::L4, TextureFormat::Etc1] {
+        for format in [TextureFormat::Rgba8, TextureFormat::Rgb8, TextureFormat::Rgba5551, TextureFormat::Rgb565, TextureFormat::Rgba4, TextureFormat::La8, TextureFormat::L8, TextureFormat::L4, TextureFormat::Etc1, TextureFormat::Etc1A4] {
             let len = (width * height * format.bits_per_pixel() / 8) as usize;
             let data: Vec<u8> = (0..len).map(|i| (i * 37 + i / 5) as u8).collect();
             let expected: Vec<[u8; 4]> = (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).map(|(x, y)| sample_texel(&data, format, width, x, y)).collect();

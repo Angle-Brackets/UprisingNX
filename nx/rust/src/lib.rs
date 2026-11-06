@@ -162,7 +162,9 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             // where the linked code still leaves the interpreter, for
             // 3dsrecomp to make functions of (Zakuro only sets this up where
             // it finds a library dir, which Horizon has none of)
-            if system.recompiled.is_some() && system.hints.is_none() {
+            // recording where the interpreter ran is for finding code to recompile, and
+    // writes a file to the SD card every minute: only with ZAKURO_HINTS=1
+    if std::env::var_os("ZAKURO_HINTS").is_some() && system.recompiled.is_some() && system.hints.is_none() {
                 if let Some(title) = &system.title {
                     let text = &title.exheader.text;
                     let range = text.address..text.address + text.num_pages * 0x1000;
@@ -274,6 +276,16 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         nx_audio_play(audio.as_ptr() as *const i16, audio.len() as u32);
     }
     let gpu = zakuro_gpu::stats::take();
+    // a slow frame says where it went, to find what the spikes are
+    if took.as_secs_f64() * 1000.0 > 45.0 && unx.frame > 600 {
+        println!(
+            "  slow frame {}: {:.0} ms | recompiled {:.1} draw {:.1} shade {:.1} tex {:.1} hw {:.1} wait {:.1} sync {:.1} writeback {:.1} | shader jit {:.0} ms for {} programs | in play {}",
+            unx.frame,
+            took.as_secs_f64() * 1000.0,
+            gpu.recompiled, gpu.drawing, gpu.shading, gpu.textures, gpu.hardware, gpu.waiting, gpu.sync, gpu.write_back,
+            gpu.jit, gpu.jit_programs, unx.in_play,
+        );
+    }
     for (sum, ms) in unx.spent.iter_mut().zip([
         gpu.recompiled, gpu.services, gpu.drawing, gpu.shading, gpu.textures, gpu.waiting, gpu.sync, gpu.frame_end, gpu.audio,
     ]) {
