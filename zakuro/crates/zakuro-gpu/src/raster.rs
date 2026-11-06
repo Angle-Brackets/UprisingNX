@@ -239,6 +239,7 @@ impl InputPlan {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     fn fetch_into<M: GpuMemory>(&self, memory: &mut M, base: u32, vertex_index: u32, input: &mut [Vec4; shader::INPUT_REGISTERS]) {
         for loader in &self.loaders {
             // base is physical, and a loader's offset can carry it from one
@@ -970,8 +971,11 @@ pub(crate) struct Screen {
     /// the value the depth buffer holds.
     pub(crate) z: f32,
     pub(crate) inv_w: f32,
+    #[allow(dead_code)]
     pub(crate) clip_x: f32,
+    #[allow(dead_code)]
     pub(crate) clip_y: f32,
+    #[allow(dead_code)]
     pub(crate) w: f32,
     pub(crate) color: Vec4,
     pub(crate) texcoords: [[f32; 2]; 3],
@@ -989,9 +993,15 @@ fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> 
     let ndc_x = vertex.clip[0] * inv_w;
     let ndc_y = vertex.clip[1] * inv_w;
 
+    #[cfg(target_os = "horizon")]
+    let (sx, sy) = (vx + (ndc_x * 0.5 + 0.5) * vw, vy + (ndc_y * 0.5 + 0.5) * vh);
+    #[cfg(not(target_os = "horizon"))]
+    let snap = |c: f32| (c * 16.0).round() * (1.0 / 16.0);
+    #[cfg(not(target_os = "horizon"))]
+    let (sx, sy) = (snap(vx + (ndc_x * 0.5 + 0.5) * vw), snap(vy + (ndc_y * 0.5 + 0.5) * vh));
     Some(Screen {
-        x: vx + (ndc_x * 0.5 + 0.5) * vw,
-        y: vy + (ndc_y * 0.5 + 0.5) * vh,
+        x: sx,
+        y: sy,
         z: vertex.clip[2] * inv_w,
         inv_w,
         clip_x: vertex.clip[0],
@@ -1183,6 +1193,11 @@ pub(crate) struct Portraits {
     /// whether the game is in play, a battle, where its bottom screen's
     /// portraits are dialogue; in menus the same kind of picture is not.
     pub(crate) in_play: bool,
+    /// whether the bottom screen drew a large dialogue portrait since the
+    /// frontend last asked, see note_big_portrait: a conversation in a
+    /// battle, before the player has control, that the game's overrides say
+    /// nothing of.
+    pub(crate) big_portrait: bool,
     /// whether this frame's portraits already went into the top screen,
     /// under the subtitles; else they go in before it goes out.
     pub(crate) flushed: bool,
@@ -1362,6 +1377,22 @@ fn is_bottom(registers: &[u32]) -> bool {
     height == 320 || read_float24(registers, REG_VIEWPORT_HEIGHT) == 160.0
 }
 
+/// whether a bottom-screen draw is left undrawn while in play: the bottom
+/// screen is not shown then, so only what is mirrored onto the top screen is
+/// needed, the portraits and the small pieces of the battle display. whole
+/// bottom-screen pictures and meshes that no one sees are skipped, which
+/// saves decoding, vertex setup and shading for them.
+fn skip_bottom_in_play(registers: &[u32], vertex_count: u32) -> bool {
+    if !on_bottom(registers) {
+        return true;
+    }
+    let base = TEXTURE_UNIT_BASES[0];
+    if TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4 {
+        return true;
+    }
+    !is_portrait(registers) && vertex_count > 16
+}
+
 /// a dialogue portrait as Kid Icarus Uprising draws it, an Etc1 256x256
 /// picture on the whole bottom screen.
 // ponytail: matched by its shape alone, a per-title list when another game
@@ -1482,6 +1513,29 @@ fn onto_top(registers: &[u32], [address, format, dimensions]: [u32; 3], scale: f
     patched
 }
 
+/// notes a portrait that fills much of the bottom screen, as a character's
+/// does in a conversation, where the chapter select's pictures of chapters,
+/// as alike in shape, are small.
+fn note_big_portrait(registers: &[u32], resources: &mut Resources, vertices: &Vertices) {
+    let vertices: Vec<Vertex> = match vertices {
+        Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
+            let (shaded, order) = process_vertices(registers, vertex_shader, geometry_shader, inputs, *order);
+            match order {
+                Some(order) => order.iter().map(|&i| shaded[i]).collect(),
+                None => shaded,
+            }
+        }
+        Vertices::Shaded(shaded) => shaded.to_vec(),
+        #[cfg(feature = "vulkan")]
+        Vertices::Raw { .. } => return,
+    };
+    let Some((low, high)) = bottom_box(&vertices) else { return };
+    let share = (high[0] - low[0]) * (high[1] - low[1]) / (240.0 * 320.0);
+    if share >= 0.25 {
+        resources.portraits.big_portrait = true;
+    }
+}
+
 /// takes a bottom-screen portrait for the top screen's buffer, smaller, in
 /// the lower corner on its side, beside the subtitles. flush_portraits
 /// draws it there.
@@ -1496,6 +1550,10 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
     // the screen's edge cuts it, so that edge goes on the top screen's
     // bottom edge and the cut does not show
     let Some((low, high)) = bottom_box(&vertices) else { return };
+    // a conversation's portrait keeps the frontend in play while it is up
+    if (high[0] - low[0]) * (high[1] - low[1]) / (240.0 * 320.0) >= 0.25 {
+        resources.portraits.big_portrait = true;
+    }
     // its lowest x on the bottom edge, and its y against the end of its own
     // side of the top screen's 400; y runs leftward from the screen's right
     // edge on both screens, so a low y is on the right
@@ -1505,12 +1563,33 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
         true => MARGIN - low[1] * SCALE,
         false => 400.0 - MARGIN - high[1] * SCALE,
     };
-    let mut registers = onto_top(registers, top, SCALE, x, y);
-    // the title's pictures stop at the bottom screen's top edge, some cut
-    // there, Medusa's snakes; on the top screen that edge fades out
-    let vertices = faded_top(registers[REG_PRIMITIVE_CONFIG] >> 8 & 3, &vertices);
-    registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
-    resources.portraits.sides[!right as usize].incoming.push(PortraitDraw { registers, vertices });
+    #[cfg(target_os = "horizon")]
+    {
+        let mut vertices = faded_top(registers[REG_PRIMITIVE_CONFIG] >> 8 & 3, &vertices);
+        for vertex in &mut vertices {
+            let w = vertex.clip[3];
+            let below_x = (vertex.clip[0] / w * 0.5 + 0.5) * 240.0;
+            let below_y = (vertex.clip[1] / w * 0.5 + 0.5) * 320.0;
+            let above_x = x + below_x * SCALE;
+            let above_y = y + below_y * SCALE;
+            vertex.clip[0] = (above_x / 120.0 - 1.0) * w;
+            vertex.clip[1] = (above_y / 200.0 - 1.0) * w;
+        }
+        let mut registers = onto_top(registers, top, 1.0, 0.0, 0.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(200.0);
+        registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
+        resources.portraits.sides[!right as usize].incoming.push(PortraitDraw { registers, vertices });
+        return;
+    }
+    #[cfg(not(target_os = "horizon"))]
+    {
+        let mut registers = onto_top(registers, top, SCALE, x, y);
+        // the title's pictures stop at the bottom screen's top edge, some cut
+        // there, Medusa's snakes; on the top screen that edge fades out
+        let vertices = faded_top(registers[REG_PRIMITIVE_CONFIG] >> 8 & 3, &vertices);
+        registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
+        resources.portraits.sides[!right as usize].incoming.push(PortraitDraw { registers, vertices });
+    }
 }
 
 /// how many of the bottom screen's rows below its top edge a portrait fades
@@ -1524,6 +1603,14 @@ const PORTRAIT_FADE: f32 = 24.0;
 // ponytail: fades by the vertices' alpha, so only a draw that blends by it
 // fades, as Kid Icarus Uprising's portraits do.
 fn faded_top(topology: u32, vertices: &[Vertex]) -> Vec<Vertex> {
+    if cfg!(target_os = "horizon") {
+        let mut faded = vertices.to_vec();
+        for vertex in &mut faded {
+            let row = (vertex.clip[0] / vertex.clip[3] * 0.5 + 0.5) * 240.0;
+            vertex.color[3] *= ((240.0 - row) / PORTRAIT_FADE).clamp(0.0, 1.0);
+        }
+        return faded;
+    }
     // where an edge crosses the band's lower edge, in clip space, so the
     // cut is where it is however far the vertex is
     let edge = (240.0 - PORTRAIT_FADE) / 120.0 - 1.0;
@@ -1618,6 +1705,10 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
     resources.portraits.hud.push(PortraitDraw { registers, vertices });
 }
 
+/// how much of a portrait shows over what is behind it once it has faded in,
+/// slightly less than all so the scene can be seen through it.
+const PORTRAIT_ALPHA: f32 = 0.85;
+
 /// draws the portraits the bottom screen took last frame into the top
 /// screen's buffer, fading in a new one over the one before, and out one the
 /// game stopped drawing. whether it drew any. once a frame: under the
@@ -1633,7 +1724,7 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
             // the same picture, where the game has it now
             (false, Some(shown)) if shown.draws.first().map(PortraitDraw::picture) == incoming.first().map(PortraitDraw::picture) => {
                 shown.draws = incoming;
-                shown.alpha = (shown.alpha + step).min(1.0);
+                shown.alpha = (shown.alpha + step).min(PORTRAIT_ALPHA);
             }
             // a new one, over the one before
             (false, _) => {
@@ -2949,20 +3040,8 @@ pub fn draw<M: GpuMemory>(
     if vertex_count == 0 || vertex_count > 0x1_0000 {
         return 0;
     }
-    if is_bottom(registers) {
-        if !resources.portraits.in_play {
-            return vertex_count;
-        }
-        if !on_bottom(registers) {
-            return vertex_count;
-        }
-        let base = TEXTURE_UNIT_BASES[0];
-        if TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4 {
-            return vertex_count;
-        }
-        if !is_portrait(registers) && vertex_count > 16 {
-            return vertex_count;
-        }
+    if is_bottom(registers) && resources.portraits.in_play && skip_bottom_in_play(registers, vertex_count) {
+        return vertex_count;
     }
 
     let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
@@ -3021,7 +3100,7 @@ pub fn draw<M: GpuMemory>(
         } else {
             (first_vertex, vertex_count)
         };
-        if raw_inputs(plan, memory, attribute_base, first, span, &mut scratch.raw) {
+        if !is_bottom(registers) && raw_inputs(plan, memory, attribute_base, first, span, &mut scratch.raw) {
             scratch.relative.clear();
             if indexed {
                 // straight from the index buffer, the draw needs its indices
@@ -3057,11 +3136,34 @@ pub fn draw<M: GpuMemory>(
     }
     let plan = scratch.plans.current();
     scratch.inputs.clear();
-    scratch.inputs.reserve(scratch.unique.len());
-    for &vertex_index in &scratch.unique {
-        let mut input = plan.template;
-        plan.fetch_into(memory, attribute_base, vertex_index, &mut input);
-        scratch.inputs.push(input);
+    scratch.inputs.resize(scratch.unique.len(), plan.template);
+    let max_index = scratch.unique.iter().copied().max().unwrap_or(0);
+    for loader in &plan.loaders {
+        let array_vaddr = memory.translate(attribute_base + loader.offset);
+        let array_bytes = (max_index as usize + 1) * loader.stride as usize;
+        if let Some(slice) = memory.slice(array_vaddr, array_bytes) {
+            let size = loader.size as usize;
+            let stride = loader.stride as usize;
+            for (i, &vertex_index) in scratch.unique.iter().enumerate() {
+                let at = vertex_index as usize * stride;
+                if at + size <= slice.len() {
+                    loader.place(&slice[at..at + size], &mut scratch.inputs[i]);
+                }
+            }
+        } else {
+            for (i, &vertex_index) in scratch.unique.iter().enumerate() {
+                let vertex = memory.translate(attribute_base + loader.offset + vertex_index * loader.stride);
+                let size = loader.size as usize;
+                match memory.slice(vertex, size) {
+                    Some(bytes) => loader.place(bytes, &mut scratch.inputs[i]),
+                    None => {
+                        let mut bytes = [0u8; 256];
+                        memory.read(vertex, &mut bytes[..size]);
+                        loader.place(&bytes[..size], &mut scratch.inputs[i]);
+                    }
+                }
+            }
+        }
     }
     let order = indexed.then_some(&scratch.order[..]);
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &scratch.inputs, order };
@@ -3080,20 +3182,8 @@ pub fn draw_immediate<M: GpuMemory>(
     resources: &mut Resources,
     vertices: &[[Vec4; 16]],
 ) -> u32 {
-    if is_bottom(registers) {
-        if !resources.portraits.in_play {
-            return vertices.len() as u32;
-        }
-        if !on_bottom(registers) {
-            return vertices.len() as u32;
-        }
-        let base = TEXTURE_UNIT_BASES[0];
-        if TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4 {
-            return vertices.len() as u32;
-        }
-        if !is_portrait(registers) && vertices.len() > 16 {
-            return vertices.len() as u32;
-        }
+    if is_bottom(registers) && resources.portraits.in_play && skip_bottom_in_play(registers, vertices.len() as u32) {
+        return vertices.len() as u32;
     }
     // immediate mode sizes its vertices by GPUREG_VSH_NUM_ATTR.
     let count = ((registers[REG_VS_ATTRIBUTE_COUNT] & 0xF) + 1) as usize;
@@ -3266,19 +3356,29 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             }
             note_text(registers, resources, vertices);
         } else if on_bottom(registers) || is_bottom(registers) {
-            // the CPU decodes its arrays then, and its vertices say where it is
+            let portrait = on_bottom(registers) && is_portrait(registers);
+            // the CPU decodes its arrays then, and its vertices say where it is.
+            // out of play only a portrait's are looked at, to see whether it is
+            // a big one, a conversation
             #[cfg(feature = "vulkan")]
-            if matches!(vertices, Vertices::Raw { .. }) {
+            if (resources.portraits.in_play || portrait) && matches!(vertices, Vertices::Raw { .. }) {
                 return None;
             }
-            if on_bottom(registers) {
-                if is_portrait(registers) {
-                    mirror_portrait(registers, resources, vertices);
-                } else if resources.portraits.in_play {
-                    mirror_hud(registers, resources, vertices);
-                }
+            if !resources.portraits.in_play && portrait {
+                note_big_portrait(registers, resources, &vertices);
             }
-            return Some(0);
+            // in play the bottom screen is not shown, so what it draws goes
+            // onto the top screen or nowhere; in a menu it is drawn as it is
+            if resources.portraits.in_play {
+                if on_bottom(registers) {
+                    if portrait {
+                        mirror_portrait(registers, resources, vertices);
+                    } else {
+                        mirror_hud(registers, resources, vertices);
+                    }
+                }
+                return Some(0);
+            }
         }
     }
     let vertex_count = vertices.len();
@@ -3475,9 +3575,19 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     slots.reserve(shaded.len());
     indices.reserve(triangle_count * 3);
 
+    #[cfg(feature = "vulkan")]
+    let use_hardware = resources.hardware.is_some();
+    #[cfg(not(feature = "vulkan"))]
+    let use_hardware = false;
+
     let mut all_inside = true;
     for vertex in shaded {
-        if inside(vertex) {
+        let valid = if use_hardware {
+            vertex.clip[3] >= 1e-5
+        } else {
+            inside(vertex)
+        };
+        if valid {
             if let Some(screen) = to_screen(vertex, viewport) {
                 placed.push(screen);
                 slots.push(placed.len() as u32 - 1);
@@ -3513,6 +3623,10 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 } else {
                     indices.extend([sa, sb, sc]);
                 }
+                continue;
+            }
+            if use_hardware && shaded[a].clip[3] < 1e-5 && shaded[b].clip[3] < 1e-5 && shaded[c].clip[3] < 1e-5 {
+                clipped_away += 1;
                 continue;
             }
             let polygon = clip_triangle([shaded[a], shaded[b], shaded[c]]);

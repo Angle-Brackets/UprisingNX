@@ -692,6 +692,12 @@ impl Gpu {
         self.resources.portraits.in_play = on;
     }
 
+    /// whether the bottom screen drew a large dialogue portrait since this
+    /// was last asked, out of play: a conversation at the start of a battle.
+    pub fn take_big_portrait(&mut self) -> bool {
+        std::mem::take(&mut self.resources.portraits.big_portrait)
+    }
+
     /// whether frame interpolation is on.
     pub fn interpolates(&self) -> bool {
         self.interpolation.is_some()

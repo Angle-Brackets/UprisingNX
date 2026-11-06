@@ -3332,7 +3332,7 @@ impl Hardware {
     /// copies the vertices the CPU shaded and placed into the batch, with
     /// the target's pixels as clip space and w kept for perspective, then
     /// the indices of the triangles, and says where both start.
-    fn place(&mut self, vertices: &[Screen], indices: &[u32], (_width, _height): (f32, f32), depth_map: DepthMap) -> Result<(u64, u64), String> {
+    fn place(&mut self, vertices: &[Screen], indices: &[u32], (width, height): (f32, f32), depth_map: DepthMap) -> Result<(u64, u64), String> {
         let index_bytes = (indices.len() * 4) as u64;
         let index_offset = self.stage(index_bytes, 4)?;
         let staging = self.ring(index_offset, index_bytes);
@@ -3346,25 +3346,26 @@ impl Hardware {
         // Vulkan to the one on its right or further down the image, so the
         // images run bottom up
         let staging = self.ring(vertex_offset, vertex_bytes);
-        for (out, v) in staging.as_chunks_mut::<VERTEX_SIZE>().0.iter_mut().zip(vertices) {
+        let out_slice = unsafe {
+            std::slice::from_raw_parts_mut(staging.as_mut_ptr() as *mut [f32; 24], vertices.len())
+        };
+        // window coordinates back to the target's clip space, the viewport
+        // is not always the whole target, so the shader's own clip x and y
+        // are not the target's
+        let (inv_width_2, inv_height_2) = (2.0 / width, 2.0 / height);
+        for (out_f32, v) in out_slice.iter_mut().zip(vertices) {
             let depth = v.z * depth_map.scale + depth_map.offset;
-            let out_f32 = unsafe { &mut *(out.as_mut_ptr() as *mut [f32; 24]) };
-            out_f32[0] = v.clip_x;
-            out_f32[1] = v.clip_y;
-            out_f32[2] = 0.0;
-            out_f32[3] = v.w;
-            out_f32[4..8].copy_from_slice(&v.color);
-            out_f32[8] = v.texcoords[0][0];
-            out_f32[9] = v.texcoords[0][1];
-            out_f32[10] = v.texcoords[1][0];
-            out_f32[11] = v.texcoords[1][1];
-            out_f32[12] = v.texcoords[2][0];
-            out_f32[13] = v.texcoords[2][1];
-            out_f32[14] = depth;
-            out_f32[15] = 0.0;
-            out_f32[16..20].copy_from_slice(&v.quaternion);
-            out_f32[20..23].copy_from_slice(&v.view);
-            out_f32[23] = 0.0;
+            let w = 1.0 / v.inv_w;
+            *out_f32 = [
+                (v.x * inv_width_2 - 1.0) * w, (v.y * inv_height_2 - 1.0) * w, 0.0, w,
+                v.color[0], v.color[1], v.color[2], v.color[3],
+                v.texcoords[0][0], v.texcoords[0][1],
+                v.texcoords[1][0], v.texcoords[1][1],
+                v.texcoords[2][0], v.texcoords[2][1],
+                depth, 0.0,
+                v.quaternion[0], v.quaternion[1], v.quaternion[2], v.quaternion[3],
+                v.view[0], v.view[1], v.view[2], 0.0,
+            ];
         }
         Ok((vertex_offset, index_offset))
     }
@@ -4274,7 +4275,9 @@ impl Hardware {
         self.surfaces[target].changed();
         self.surfaces[target].guard_writes(memory);
         self.overdrawn(target, (0, self.surfaces[target].height), None);
-        self.capture(target)?;
+        if !self.direct {
+            self.capture(target)?;
+        }
         // turned upright for showing at any scale, at the console's own too
         // that beats the CPU waiting for the GPU and decoding the buffer.
         // a tiled output is never a screen buffer.

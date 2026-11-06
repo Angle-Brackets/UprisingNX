@@ -68,7 +68,21 @@ pub struct Unx {
     syncs: u64,
     write_backs: [u64; 6],
     write_back: f64,
+    /// frames since the game's overrides last said it was in play (a battle),
+    /// see IN_PLAY_QUIET; the layout follows it
+    out_of_play: u32,
+    /// frames since the bottom screen drew a large dialogue portrait
+    since_portrait: u32,
+    in_play: bool,
 }
+
+/// frames the overrides may stay quiet before the game counts as out of play
+/// (a menu, a cutscene), as in Zakuro's desktop frontend
+const IN_PLAY_QUIET: u32 = 10;
+/// frames a conversation's big portrait may go undrawn before the game counts
+/// as out of play: a battle's dialogue, before the player has control, while
+/// the overrides are quiet; it is seen again each frame the portrait is up
+const PORTRAIT_QUIET: u32 = 120;
 
 extern "C" {
     fn nx_audio_init();
@@ -111,7 +125,8 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         }
     };
     log::info!("unx: presenter {} up in {:?}", presenter.name(), started.elapsed());
-    presenter.set_layout(ScreenLayout::TopOnly);
+    // out of play until the game's overrides say otherwise, see unx_frame
+    presenter.set_layout(ScreenLayout::BottomOverTop);
     presenter.set_scaling(ScreenFilter::Smooth, false);
     nx_audio_init();
 
@@ -172,6 +187,9 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         syncs: 0,
         write_backs: [0; 6],
         write_back: 0.0,
+        out_of_play: u32::MAX,
+        since_portrait: u32::MAX,
+        in_play: false,
     }))
 }
 
@@ -205,10 +223,24 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         });
     }
 
-    // Switch is a single-screen console: hybrid in-play extraction is always active.
-    // Bottom-screen dialogue portraits and HUD islands are mirrored to top screen,
-    // and bottom-screen rasterization is completely bypassed.
-    unx.system.gpu.set_in_play(true);
+    // In a battle the bottom screen is never drawn: its portraits and the
+    // battle display (hearts, powers) are drawn onto the top screen instead,
+    // see zakuro_gpu::raster::mirror_portrait. In menus the game is played on
+    // the bottom screen, so it is shown over the top one. the game's
+    // overrides say which it is, in the host mailbox, as the desktop does.
+    let said = std::mem::take(&mut unx.system.memory.host_mailbox[3]);
+    unx.out_of_play = if said != 0 { 0 } else { unx.out_of_play.saturating_add(1) };
+    unx.since_portrait = if unx.system.gpu.take_big_portrait() { 0 } else { unx.since_portrait.saturating_add(1) };
+    let in_play = unx.out_of_play <= IN_PLAY_QUIET || unx.since_portrait <= PORTRAIT_QUIET;
+    unx.system.gpu.set_in_play(in_play);
+    if said != 0 && unx.frame % 120 == 0 {
+        log::info!("unx: overrides say {said} (frame {})", unx.frame);
+    }
+    if in_play != unx.in_play {
+        log::info!("unx: {} at frame {} (said {said}, quiet for {})", if in_play { "in play" } else { "out of play" }, unx.frame, unx.out_of_play);
+        unx.in_play = in_play;
+        unx.presenter.set_layout(if in_play { ScreenLayout::TopOnly } else { ScreenLayout::BottomOverTop });
+    }
 
     let started = Instant::now();
     let outcome = unx.system.run_frame();
@@ -231,11 +263,30 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     }
     unx.write_back += gpu.write_back;
     let presenting = Instant::now();
+    // debug: with sdmc:/switch/uprisingnx/dump_top present, the top screen's own
+    // picture (before the presenter crops or scales it) goes to top.ppm and
+    // bottom.ppm every 2 s, to tell what the game draws from what is shown
+    if unx.frame % 120 == 0 && std::path::Path::new("sdmc:/switch/uprisingnx/dump_top").exists() {
+        for (screen, name) in [(Screen::Top, "top"), (Screen::Bottom, "bottom")] {
+            if let Some((px, w, h)) = unx.system.upright_screen(screen, false) {
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                for p in px.chunks_exact(4) {
+                    out.extend_from_slice(&p[..3]);
+                }
+                let _ = std::fs::write(format!("sdmc:/switch/uprisingnx/{name}.ppm"), out);
+            }
+        }
+    }
 
     let top = shown(&mut unx.system, Screen::Top);
     let blank = std::sync::Arc::new(Vec::new());
     let ((top_px, tw, th), top_gpu) = top;
-    let (bottom_px, bw, bh, bottom_gpu) = (blank.clone(), 0, 0, None);
+    // the bottom screen is only drawn out of play
+    let ((bottom_px, bw, bh), bottom_gpu) = if unx.in_play {
+        (((blank.clone()), 0, 0), None)
+    } else {
+        shown(&mut unx.system, Screen::Bottom)
+    };
     let result = unx.presenter.present(
         ScreenImage { width: tw, height: th, pixels: &top_px, gpu: top_gpu },
         ScreenImage { width: bw, height: bh, pixels: &bottom_px, gpu: bottom_gpu },
