@@ -3848,9 +3848,30 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 resources.shaded_indices = indices;
                 return Some(0);
             }
-            let geometry = hardware::Geometry::Placed { vertices: &placed, indices: &indices };
             let hardware_timer = crate::stats::time(&crate::stats::HARDWARE);
-            let drawn_on_gpu = hardware.draw(memory, &state.hardware(registers, geometry));
+            // ZAKURO_SELF_CHUNKS=N: a draw reading the buffer it draws into
+            // goes in N runs of triangles, each reading what the one before
+            // drew, as the console's tile by tile drawing does (a test)
+            static CHUNKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let chunks = *CHUNKS.get_or_init(|| std::env::var("ZAKURO_SELF_CHUNKS").ok().and_then(|v| v.parse().ok()).unwrap_or(1));
+            let own = chunks > 1
+                && state.textures[0].as_ref().and_then(|t| t.drawn).is_some_and(|d| d.addr & 0x00FF_FFFF == (registers[REG_COLOR_BUFFER_ADDRESS] << 3) & 0x00FF_FFFF);
+            let drawn_on_gpu = if own {
+                let triangles = indices.len() / 3;
+                let per = triangles.div_ceil(chunks).max(1);
+                let mut result = Ok(());
+                for run in indices.chunks(per * 3) {
+                    let geometry = hardware::Geometry::Placed { vertices: &placed, indices: run };
+                    result = hardware.draw(memory, &state.hardware(registers, geometry));
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                result
+            } else {
+                let geometry = hardware::Geometry::Placed { vertices: &placed, indices: &indices };
+                hardware.draw(memory, &state.hardware(registers, geometry))
+            };
             drop(hardware_timer);
             match drawn_on_gpu {
                 Ok(()) => {
