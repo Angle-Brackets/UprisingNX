@@ -731,6 +731,10 @@ pub fn run_vertices_mapped<T>(
 }
 
 /// runs the vertex shader over inputs, writing mapped outputs directly into an existing slice without allocating.
+thread_local! {
+    static JIT_SHADED: std::cell::RefCell<Vec<[Vec4; OUTPUT_REGISTERS]>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub fn run_vertices_into<T>(
     unit: &ShaderUnit,
     inputs: &[[Vec4; INPUT_REGISTERS]],
@@ -749,17 +753,23 @@ pub fn run_vertices_into<T>(
     let trace_nan = log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace);
     #[cfg(feature = "jit")]
     if let Some(compiled) = unit.decoded.as_ref().filter(|_| !trace_nan).and_then(|program| jit::compiled(unit, program)) {
-        let mut shaded = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
-        let mut batch = batch::Batch::new();
-        let (mut blocks, mut forks) = (Vec::with_capacity(16), Vec::new());
-        let mut uniforms = None;
-        jit::run_vertices(&compiled, unit, program, inputs, &mut shaded, |inputs, outputs| {
-            let uniforms = uniforms.get_or_insert_with(|| batch::Uniforms::new(unit));
-            batch::run(unit, uniforms, program, inputs, outputs, &mut batch, &mut blocks, &mut forks);
+        // the buffers live on the thread, one allocation for all the calls
+        JIT_SHADED.with_borrow_mut(|shaded| {
+            shaded.clear();
+            shaded.resize(inputs.len(), [ZERO; OUTPUT_REGISTERS]);
+            SHADER_SCRATCH.with_borrow_mut(|(batch, blocks, forks, _)| {
+                blocks.clear();
+                forks.clear();
+                let mut uniforms = None;
+                jit::run_vertices(&compiled, unit, program, inputs, shaded, |inputs, outputs| {
+                    let uniforms = uniforms.get_or_insert_with(|| batch::Uniforms::new(unit));
+                    batch::run(unit, uniforms, program, inputs, outputs, batch, blocks, forks);
+                });
+            });
+            for (slot, output) in outputs.iter_mut().zip(shaded.iter()) {
+                *slot = map(output);
+            }
         });
-        for (slot, output) in outputs.iter_mut().zip(&shaded) {
-            *slot = map(output);
-        }
         return;
     }
     let uniforms = batch::Uniforms::new(unit);
