@@ -170,7 +170,17 @@ impl<'a> Translator<'a> {
         }
 
         let mut out = String::with_capacity(run.len() + 8192);
-        out.push_str(HEADER);
+        // ZAKURO_FAST_MUL=1: products without the NaN guard (0 * inf is NaN on
+        // the host, 0 on the console), a test of what the guard costs the GPU
+        static FAST_MUL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FAST_MUL.get_or_init(|| std::env::var_os("ZAKURO_FAST_MUL").is_some()) {
+            out.push_str(&HEADER.replace(
+                "    float product = a * b;\n    return isnan(product) && !isnan(a) && !isnan(b) ? 0.0 : product;",
+                "    return a * b;",
+            ));
+        } else {
+            out.push_str(HEADER);
+        }
         if flows {
             out.push_str(BLOCKS);
         }
