@@ -176,6 +176,10 @@ pub struct Gpu {
     /// counters for the diagnostics overlay.
     pub command_lists: u64,
     pub draw_calls: u64,
+    /// the frame being built is thrown away, draws and the transfers and swaps
+    /// that would show it, so the title's logic runs at full speed while
+    /// the picture updates every other frame, see zakuro-core's gpu_thread.
+    pub skip_frame: bool,
     pub fills: u64,
     pub transfers: u64,
     /// vertices actually rasterized, as opposed to draw calls issued, a
@@ -216,6 +220,7 @@ impl Gpu {
             framebuffers: [FramebufferConfig::default(); 2],
             command_lists: 0,
             draw_calls: 0,
+            skip_frame: false,
             fills: 0,
             transfers: 0,
             vertices_drawn: 0,
@@ -279,6 +284,9 @@ impl Gpu {
         stride: u32,
         format: u32,
     ) {
+        if self.skip_frame {
+            return;
+        }
         let base = match screen {
             0 => LCD_TOP_BASE,
             1 => LCD_BOTTOM_BASE,
@@ -371,6 +379,17 @@ impl Gpu {
     ) {
         self.take_flags();
         self.flush_draws(memory);
+        if self.skip_frame {
+            let screens = [
+                self.framebuffers[0].address_a_left,
+                self.framebuffers[0].address_b_left,
+                self.framebuffers[1].address_a_left,
+                self.framebuffers[1].address_b_left,
+            ];
+            if screens.contains(&output_paddr) {
+                return;
+            }
+        }
         let input_width = input_dimensions & 0xFFFF;
         let input_height = input_dimensions >> 16;
         // the portraits the bottom screen drew last frame go into the top
@@ -1135,6 +1154,9 @@ impl Gpu {
     #[inline(never)]
     fn draw<M: GpuMemory>(&mut self, memory: &mut M, renderer: &mut dyn Renderer, indexed: bool) {
         self.draw_calls += 1;
+        if self.skip_frame {
+            return;
+        }
         renderer.draw(DrawCall {
             indexed,
             registers: &self.internal,

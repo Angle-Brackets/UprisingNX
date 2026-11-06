@@ -75,14 +75,46 @@ pub(crate) fn execute(gpu: &mut Gpu, job: Job) -> Option<InterruptId> {
     // SAFETY: see Job
     let (memory, renderer) = unsafe { (&mut *job.memory, &mut *job.renderer) };
     let mut guest = GuestMemory { linear_base: job.linear_base, memory };
-    match job.gx {
-        Gx::List { paddr, size } => gpu.process_command_list(&mut guest, renderer, paddr, size),
-        Gx::Fill { start, end, value, width } => gpu.memory_fill(&mut guest, start, end, value, width),
+    // ZAKURO_FRAME_SKIP=<ms>: when what the GPU did for a frame took longer
+    // than that, the next frame is thrown away, drawn nowhere and shown
+    // never, so the title's logic gets the time back and runs at full speed
+    // with the picture updating every other frame. a test, off by default
+    static LIMIT: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| std::env::var("ZAKURO_FRAME_SKIP").ok().and_then(|v| v.parse::<f64>().ok()));
+    let started = limit.map(|_| std::time::Instant::now());
+    let is_end = matches!(job.gx, Gx::EndFrame);
+    execute_job(gpu, job.gx, &mut guest, renderer);
+    if let (Some(limit), Some(started)) = (limit, started) {
+        static BUSY_US: AtomicUsize = AtomicUsize::new(0);
+        let spent = started.elapsed().as_micros() as usize;
+        let total = (BUSY_US.fetch_add(spent, Ordering::Relaxed) + spent) as f64 / 1000.0;
+        if is_end {
+            gpu.skip_frame = !gpu.skip_frame && total > limit;
+            static ENDS: AtomicUsize = AtomicUsize::new(0);
+            static SKIPS: AtomicUsize = AtomicUsize::new(0);
+            static MAX_US: AtomicUsize = AtomicUsize::new(0);
+            MAX_US.fetch_max((total * 1000.0) as usize, Ordering::Relaxed);
+            if gpu.skip_frame {
+                SKIPS.fetch_add(1, Ordering::Relaxed);
+            }
+            if ENDS.fetch_add(1, Ordering::Relaxed) % 120 == 119 {
+                log::info!(target: "zakuro_gpu::diag", "frame skip: {} of the last 120 frame ends set it, the longest frame took {:.1} ms", SKIPS.swap(0, Ordering::Relaxed), MAX_US.swap(0, Ordering::Relaxed) as f64 / 1000.0);
+            }
+            BUSY_US.store(0, Ordering::Relaxed);
+        }
+    }
+    job.interrupt
+}
+
+fn execute_job(gpu: &mut Gpu, gx: Gx, guest: &mut GuestMemory<'_>, renderer: &mut dyn Renderer) {
+    match gx {
+        Gx::List { paddr, size } => gpu.process_command_list(guest, renderer, paddr, size),
+        Gx::Fill { start, end, value, width } => gpu.memory_fill(guest, start, end, value, width),
         Gx::Display { input, output, input_dimensions, output_dimensions, flags } => {
-            gpu.display_transfer(&mut guest, input, output, input_dimensions, output_dimensions, flags)
+            gpu.display_transfer(guest, input, output, input_dimensions, output_dimensions, flags)
         }
         Gx::Copy { input, output, size, input_gap, output_gap } => {
-            gpu.texture_copy(&mut guest, input, output, size, input_gap, output_gap)
+            gpu.texture_copy(guest, input, output, size, input_gap, output_gap)
         }
         Gx::Dma { source, dest, size } => {
             if size >= 0x10000 {
@@ -93,8 +125,8 @@ pub(crate) fn execute(gpu: &mut Gpu, job: Job) -> Option<InterruptId> {
             }
             static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if size < 0x10000 || !*FAST.get_or_init(|| std::env::var_os("ZAKURO_FAST_COPY").is_some()) {
-                gpu.sync_memory(&mut guest, source, size);
-                gpu.sync_memory(&mut guest, dest, size);
+                gpu.sync_memory(guest, source, size);
+                gpu.sync_memory(guest, dest, size);
             }
             let mut data = vec![0u8; size as usize];
             guest.read(source, &mut data);
@@ -106,7 +138,6 @@ pub(crate) fn execute(gpu: &mut Gpu, job: Job) -> Option<InterruptId> {
         Gx::Register { offset, value } => gpu.write_external(offset, value),
         Gx::EndFrame => renderer.end_frame(),
     }
-    job.interrupt
 }
 
 struct Shared {
