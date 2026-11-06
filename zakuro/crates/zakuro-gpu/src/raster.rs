@@ -1233,6 +1233,10 @@ pub(crate) struct Portraits {
     /// battle, before the player has control, that the game's overrides say
     /// nothing of.
     pub(crate) big_portrait: bool,
+    /// which of the battle display's islands the bottom screen drew this
+    /// frame while the game was thought to be out of play, see
+    /// note_battle_display.
+    hud_islands: u8,
     /// whether this frame's portraits already went into the top screen,
     /// under the subtitles; else they go in before it goes out.
     pub(crate) flushed: bool,
@@ -1571,6 +1575,44 @@ fn note_big_portrait(registers: &[u32], resources: &mut Resources, vertices: &Ve
     }
 }
 
+/// ZAKURO_BATTLE_DETECT=1 turns on note_battle_display, not yet checked on
+/// the console against the menus.
+fn battle_detection() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZAKURO_BATTLE_DETECT").is_some())
+}
+
+/// a land battle's bottom screen, which the game's overrides say nothing of
+/// while the player stands still, draws the counters in the corner and the
+/// items in the lower left, the two islands of the battle display together,
+/// as no menu does. seen in one frame they say it is a battle.
+fn note_battle_display(registers: &[u32], resources: &mut Resources, vertices: &Vertices) {
+    let vertices: Vec<Vertex> = match vertices {
+        Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
+            let (shaded, order) = process_vertices(registers, vertex_shader, geometry_shader, inputs, *order);
+            match order {
+                Some(order) => order.iter().map(|&i| shaded[i]).collect(),
+                None => shaded,
+            }
+        }
+        Vertices::Shaded(shaded) => shaded.to_vec(),
+        #[cfg(feature = "vulkan")]
+        Vertices::Raw { .. } => return,
+    };
+    let Some((low, high)) = bottom_box(&vertices) else { return };
+    let [left, upper, right, lower] = [320.0 - high[1], 240.0 - high[0], 320.0 - low[1], 240.0 - low[0]];
+    const SLACK: f32 = 2.0;
+    for (index, island) in ISLANDS.iter().enumerate() {
+        let [x0, y0, x1, y1] = island.from;
+        if left >= x0 - SLACK && upper >= y0 - SLACK && right <= x1 + SLACK && lower <= y1 + SLACK {
+            resources.portraits.hud_islands |= 1 << index;
+        }
+    }
+    if resources.portraits.hud_islands == 0b11 {
+        resources.portraits.big_portrait = true;
+    }
+}
+
 /// takes a bottom-screen portrait for the top screen's buffer, smaller, in
 /// the lower corner on its side, beside the subtitles. flush_portraits
 /// draws it there.
@@ -1751,6 +1793,7 @@ const PORTRAIT_ALPHA: f32 = 0.85;
 pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bool {
     // how much of a portrait fades in or out each frame, 8 frames in all
     let step = 1.0 / 8.0;
+    resources.portraits.hud_islands = 0;
     let mut sides = std::mem::take(&mut resources.portraits.sides);
     let mut drew = false;
     for side in &mut sides {
@@ -3495,6 +3538,14 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             }
             if !resources.portraits.in_play && portrait {
                 note_big_portrait(registers, resources, &vertices);
+            }
+            if !resources.portraits.in_play && !portrait && on_bottom(registers) && vertices.len() <= 16 && battle_detection() {
+                // a sprite of the battle display, looked at on the CPU
+                #[cfg(feature = "vulkan")]
+                if matches!(vertices, Vertices::Raw { .. }) {
+                    return None;
+                }
+                note_battle_display(registers, resources, &vertices);
             }
             // in play the bottom screen is not shown, so what it draws goes
             // onto the top screen or nowhere; in a menu it is drawn as it is
