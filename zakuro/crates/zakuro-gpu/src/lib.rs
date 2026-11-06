@@ -832,7 +832,14 @@ impl Gpu {
 
     /// makes guest memory right over a range something other than a draw
     /// is about to read or write, the host GPU keeps what it draws until then.
+    #[track_caller]
     pub fn sync_memory<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        if len == 0x5dc00 {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 5 == 0 {
+                log::info!(target: "zakuro_gpu::diag", "sync_memory of a top screen's worth at {addr:08x}, called from {}", std::panic::Location::caller());
+            }
+        }
         self.flush_draws(memory);
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {

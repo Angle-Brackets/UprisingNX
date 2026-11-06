@@ -4318,10 +4318,12 @@ impl Hardware {
             static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 40 == 0 {
                 let what: Vec<String> =
-                    dirty.iter().map(|&i| format!("{:08x} {}x{} {:?}", self.surfaces[i].addr, self.surfaces[i].width, self.surfaces[i].height, self.surfaces[i].kind)).collect();
+                    dirty.iter().map(|&i| format!("{:08x} {}x{} {:?} tiled {}", self.surfaces[i].addr, self.surfaces[i].width, self.surfaces[i].height, self.surfaces[i].kind, self.surfaces[i].tiled)).collect();
                 log::info!(target: "zakuro_gpu::diag", "{why} sync write-back for {addr:08x}+{len:x}: [{}]", what.join(", "));
             }
         }
+        static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dirty = if len == 0x5dc00 && *SKIP.get_or_init(|| std::env::var_os("ZAKURO_SKIP_SCREEN_SYNC").is_some()) { Vec::new() } else { dirty };
         self.write_back(memory, dirty)?;
         for i in overlapping {
             self.surfaces[i].checked = true;
@@ -4346,7 +4348,7 @@ impl Hardware {
         // rows, which the CPU puts where they go
         let short = t.flip && t.copy.1 < t.output_height;
         if t.copy.0 == 0 || t.copy.1 == 0 || (t.output_tiled && !whole) || short {
-            return Ok(false);
+            { transfer_refused(1, t); return Ok(false); }
         }
         // the input rows read, from the first, which can start some rows into
         // a buffer the GPU holds, titles draw both screens into one, a tiled
@@ -4367,7 +4369,7 @@ impl Hardware {
             .max_by_key(|&(s, row)| newest(s, (row, row + rows)))
             .map(|(s, row)| (s.addr, (s.width, s.height), row))
         else {
-            return Ok(false);
+            { transfer_refused(2, t); return Ok(false); }
         };
         // rows read where the output goes, the CPU does in order. the rest
         // of the input's buffer can be under the output, Monster Hunter 3
@@ -4378,7 +4380,7 @@ impl Hardware {
         let read_end = read_start + rows as u64 * row_bytes;
         let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
         if read_start < output_end && (t.output as u64) < read_end {
-            return Ok(false);
+            { transfer_refused(3, t); return Ok(false); }
         }
         self.begin()?;
         // a flush looking one of them up drops what the other had checked
@@ -6279,5 +6281,18 @@ mod tests {
             let depth = f32::from_bits(bits);
             assert_eq!(shader(depth), d24_from_float(depth), "{depth:e}");
         }
+    }
+}
+
+
+/// says, now and then, which of display_transfer's checks sent a transfer to the CPU.
+fn transfer_refused(site: u32, t: &Transfer) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
+        log::info!(
+            target: "zakuro_gpu::diag",
+            "display transfer to the CPU (check {site}): in {:08x} {}x? {:?} linear {} -> out {:08x} {}x{} {:?} tiled {} copy {:?} flip {} scale {:?}",
+            t.input, t.input_width, t.input_format, t.input_linear, t.output, t.output_width, t.output_height, t.output_format, t.output_tiled, t.copy, t.flip, t.scale
+        );
     }
 }

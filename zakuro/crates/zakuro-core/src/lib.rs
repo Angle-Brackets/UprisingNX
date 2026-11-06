@@ -955,6 +955,7 @@ impl System {
 
     /// makes guest memory hold what the host GPU drew over a range, before
     /// something other than a draw reads or writes it.
+    #[track_caller]
     pub fn sync_gpu(&mut self, addr: u32, len: u32) {
         let linear_base = self.kernel.linear_base;
         let mut guest = GuestMemory {
@@ -1189,6 +1190,12 @@ impl System {
 
         let base = services::gsp::physical_to_virtual(self, address);
         let source_len = (stride * width) as usize;
+        {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 300 == 0 {
+                log::info!(target: "zakuro_gpu::diag", "CPU screen read {screen:?}: addr {address:08x} virt {base:08x} stride {} format {:?} {width}x{height}", config.stride, format);
+            }
+        }
         self.sync_gpu(base, source_len as u32);
         let mut source = vec![0u8; source_len];
         self.memory.read_bytes(base, &mut source);

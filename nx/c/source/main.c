@@ -82,6 +82,10 @@ struct args { const char *rom; u32 interpret; };
 static void load_env(void) {
     // the GPU on a thread of its own, unless env.txt says ZAKURO_GPU_THREAD=0
     setenv("ZAKURO_GPU_THREAD", "1", 0);
+    // the top screen's read-back to guest memory is skipped (the picture is shown
+    // from the GPU), 22 -> 30 fps in the land battle; ZAKURO_SKIP_SCREEN_SYNC is
+    // read by presence, so env.txt cannot turn it off: remove this line to
+    setenv("ZAKURO_SKIP_SCREEN_SYNC", "1", 0);
     FILE *f = fopen("sdmc:/switch/uprisingnx/env.txt", "r");
     if (!f) return;
     char line[256];
