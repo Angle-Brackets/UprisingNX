@@ -3840,6 +3840,46 @@ impl Hardware {
                 None => samplers[unit] = self.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0)?,
             }
         }
+        static DRAW_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DRAW_LOG.get_or_init(|| std::env::var_os("ZAKURO_DRAW_LOG").is_some()) {
+            // an inventory of the kinds of draw, each logged the first time
+            // it is seen: what the target, the textures, the combiner and
+            // the blend registers are
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            let mut mix = |v: u64| hash = (hash ^ v).wrapping_mul(0x100_0000_01b3);
+            for r in 0x0C0..0x104 {
+                mix(draw.registers[r] as u64);
+            }
+            for texture in draw.textures {
+                match texture {
+                    Some(t) => {
+                        mix(t.width as u64);
+                        mix(t.height as u64);
+                        mix(t.linear as u64 | (t.min_linear as u64) << 1);
+                    }
+                    None => mix(0),
+                }
+            }
+            mix(draw.lighting.is_some() as u64 | (draw.fog as u64) << 1 | (draw.proctex as u64) << 2);
+            mix((draw.width as u64) << 16 | draw.height as u64);
+            let mut seen = SEEN.lock().unwrap();
+            let seen = seen.get_or_insert_with(Default::default);
+            if seen.len() < 600 && seen.insert(hash) {
+                let tex: Vec<String> = draw
+                    .textures
+                    .iter()
+                    .map(|t| t.as_ref().map_or("-".to_owned(), |t| format!("{}x{}{}{}", t.width, t.height, if t.linear { "L" } else { "n" }, if t.min_linear { "l" } else { "n" })))
+                    .collect();
+                log::info!(
+                    target: "zakuro_gpu::diag",
+                    "draw kind {hash:016x}: target {}x{} tex [{}] light {} fog {} proc {} blend {:08x} {:08x} func {:08x} tev0 {:08x} {:08x} {:08x} {:08x} env {:08x}",
+                    draw.width, draw.height, tex.join(" "), draw.lighting.is_some(), draw.fog, draw.proctex,
+                    draw.registers[0x100], draw.registers[0x101], draw.registers[0x102],
+                    draw.registers[0x0C0], draw.registers[0x0C1], draw.registers[0x0C2], draw.registers[0x0C3], draw.registers[0x0C4],
+                );
+            }
+        }
         let tables = match draw.lighting.is_some() || draw.proctex || draw.fog {
             true => self.tables(draw.tables, draw.proctex_tables, draw.fog_table)?,
             false => 0,
