@@ -144,6 +144,29 @@ int main(int argc, char **argv) {
     nx_tls_init();
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("uprising_nx: starting\n");
+    // read-only: which mode and clocks this run has
+    {
+        printf("clocks: operation mode %d\n", (int)appletGetOperationMode());
+        if (R_SUCCEEDED(apmInitialize())) {
+            ApmPerformanceMode pm;
+            if (R_SUCCEEDED(apmGetPerformanceMode(&pm))) printf("clocks: apm performance mode %d (0 handheld, 1 docked)\n", (int)pm);
+            apmExit();
+        }
+        if (R_SUCCEEDED(clkrstInitialize())) {
+            const PcvModule mods[] = {PcvModule_CpuBus, PcvModule_GPU, PcvModule_EMC};
+            const char *names[] = {"cpu", "gpu", "emc"};
+            for (int i = 0; i < 3; i++) {
+                ClkrstSession sess;
+                u32 hz = 0;
+                if (R_SUCCEEDED(clkrstOpenSession(&sess, mods[i], 3)) ) {
+                    clkrstGetClockRate(&sess, &hz);
+                    clkrstCloseSession(&sess);
+                    printf("clocks: %s %u MHz\n", names[i], hz / 1000000);
+                } else printf("clocks: %s session refused\n", names[i]);
+            }
+            clkrstExit();
+        } else printf("clocks: clkrst unavailable\n");
+    }
 
     struct args args = {
         argc > 1 ? argv[1] : "sdmc:/switch/dekopon/roms/Kid Icarus Uprising (USA).cci",
