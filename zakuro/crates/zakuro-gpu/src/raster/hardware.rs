@@ -4292,18 +4292,19 @@ impl Hardware {
     /// is about to read or write, what the GPU drew there comes down, and
     /// the next draw looks at the memory again.
     pub(crate) fn sync<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
-        self.sync_where(memory, addr, len, |_| true)
+        self.sync_where("memory", memory, addr, len, |_| true)
     }
 
     /// the same over the depth buffers alone, for the CPU reading where a
     /// depth buffer was drawn. the color buffers there it reads as memory
     /// holds them, see draw, even over memory a depth buffer had before.
     pub(crate) fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
-        self.sync_where(memory, addr, len, |surface| matches!(surface.kind, Kind::Depth(_)))
+        self.sync_where("depth", memory, addr, len, |surface| matches!(surface.kind, Kind::Depth(_)))
     }
 
     fn sync_where<M: GpuMemory>(
         &mut self,
+        why: &str,
         memory: &mut M,
         addr: u32,
         len: u32,
@@ -4315,10 +4316,10 @@ impl Hardware {
         crate::stats::write_back(crate::stats::BACK_SYNC, dirty.len());
         if !dirty.is_empty() {
             static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 200 == 0 {
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 40 == 0 {
                 let what: Vec<String> =
                     dirty.iter().map(|&i| format!("{:08x} {}x{} {:?}", self.surfaces[i].addr, self.surfaces[i].width, self.surfaces[i].height, self.surfaces[i].kind)).collect();
-                log::info!(target: "zakuro_gpu::diag", "sync write-back for {addr:08x}+{len:x}: [{}]", what.join(", "));
+                log::info!(target: "zakuro_gpu::diag", "{why} sync write-back for {addr:08x}+{len:x}: [{}]", what.join(", "));
             }
         }
         self.write_back(memory, dirty)?;

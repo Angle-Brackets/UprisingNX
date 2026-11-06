@@ -91,8 +91,11 @@ pub(crate) fn execute(gpu: &mut Gpu, job: Job) -> Option<InterruptId> {
                     log::info!(target: "zakuro_gpu::diag", "big DMA {source:08x} -> {dest:08x}, {size:x} bytes");
                 }
             }
-            gpu.sync_memory(&mut guest, source, size);
-            gpu.sync_memory(&mut guest, dest, size);
+            static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if size < 0x10000 || !*FAST.get_or_init(|| std::env::var_os("ZAKURO_FAST_COPY").is_some()) {
+                gpu.sync_memory(&mut guest, source, size);
+                gpu.sync_memory(&mut guest, dest, size);
+            }
             let mut data = vec![0u8; size as usize];
             guest.read(source, &mut data);
             guest.write(dest, &data);

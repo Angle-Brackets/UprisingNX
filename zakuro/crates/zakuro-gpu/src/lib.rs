@@ -583,7 +583,9 @@ impl Gpu {
         }
         let output_width = (output_gap & 0xFFFF) * 16;
         let output_skip = (output_gap >> 16) * 16;
-        self.sync_memory(memory, output, span(output_width, output_skip));
+        if size < 0x10000 || !*FAST_COPY.get_or_init(|| std::env::var_os("ZAKURO_FAST_COPY").is_some()) {
+            self.sync_memory(memory, output, span(output_width, output_skip));
+        }
 
         log::debug!(
             "texture copy: 0x{input_paddr:08X} -> 0x{output_paddr:08X} size 0x{size:X}"
