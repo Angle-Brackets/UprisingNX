@@ -10,7 +10,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 zakuro-core = { path = "../../zakuro/crates/zakuro-core" }
-zakuro-gpu = { path = "../../zakuro/crates/zakuro-gpu", default-features = false, features = ["vulkan"] }
+zakuro-gpu = { path = "../../zakuro/crates/zakuro-gpu", default-features = false, features = ["vulkan", "jit"] }
 zakuro-common = { path = "../../zakuro/crates/zakuro-common" }
 log = "0.4"
 
@@ -21,3 +21,5 @@ debug = 1
 
 [patch.crates-io]
 libc = { path = "../../build/vendor/libc" }
+# knows the Switch target, see patches/target-lexicon-switch.patch
+target-lexicon = { path = "../../build/vendor/target-lexicon" }

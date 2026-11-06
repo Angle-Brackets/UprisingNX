@@ -33,14 +33,16 @@ naga = { version = "30.0.1", optional = true, features = ["glsl-in", "wgsl-in", 
 # 0.135 is the last that builds with Rust 1.95
 cranelift-codegen = { version = "0.135", optional = true }
 cranelift-frontend = { version = "0.135", optional = true }
-cranelift-jit = { version = "0.135", optional = true }
-cranelift-module = { version = "0.135", optional = true }
 cranelift-native = { version = "0.135", optional = true }
 
 # Vulkan through the system's loader on desktops. Horizon has no loader and no
 # dlopen: the driver (mesa-switch NVK) is a static libvulkan.a linked in.
 [target.'cfg(not(target_os = "horizon"))'.dependencies]
 ash = { version = "0.38", optional = true, default-features = false, features = ["loaded", "std"] }
+# these place the code in memory with mmap, which Horizon has not, see
+# shader/jit.rs for what it does there
+cranelift-jit = { version = "0.135", optional = true }
+cranelift-module = { version = "0.135", optional = true }
 
 [target.'cfg(target_os = "horizon")'.dependencies]
 ash = { version = "0.38", optional = true, default-features = false, features = ["linked", "std"] }

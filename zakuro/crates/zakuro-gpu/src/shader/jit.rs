@@ -16,7 +16,9 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{types, AbiParam, Block, FuncRef, InstBuilder, MemFlagsData, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+#[cfg(not(target_os = "horizon"))]
 use cranelift_jit::{JITBuilder, JITModule};
+#[cfg(not(target_os = "horizon"))]
 use cranelift_module::{Linkage, Module};
 
 use super::batch::Triangle;
@@ -200,6 +202,7 @@ extern "C" fn emit(context: *mut Context) {
 
 /// a program compiled for one entry point.
 pub(super) struct Compiled {
+    #[cfg(not(target_os = "horizon"))]
     module: Option<JITModule>,
     function: unsafe extern "C" fn(*mut Context) -> u32,
     /// the batches it ran and gave back, it gives up on a program whose
@@ -216,6 +219,7 @@ pub(super) struct Compiled {
 unsafe impl Send for Compiled {}
 unsafe impl Sync for Compiled {}
 
+#[cfg(not(target_os = "horizon"))]
 impl Drop for Compiled {
     fn drop(&mut self) {
         if let Some(module) = self.module.take() {
@@ -308,15 +312,56 @@ pub(super) fn compiled(unit: &ShaderUnit, program: &Arc<Program>) -> Option<Arc<
     kept.insert(key, Slot::Compiling);
     drop(kept);
     let program = program.clone();
-    let spawned = std::thread::Builder::new().name("shader jit".to_owned()).spawn(move || {
-        let found = compile_logged(&program, key.1);
-        codes().insert(key, Slot::Done(found));
-    });
-    if let Err(error) = spawned {
-        log::warn!("could not start compiling a shader, {error}");
-        codes().insert(key, Slot::Done(None));
+    // the Switch has three cores for everything, programs wait their turn on
+    // one thread, with the stack Cranelift needs
+    #[cfg(target_os = "horizon")]
+    {
+        queue_compile(key, program);
+        return None;
     }
-    None
+    #[cfg(not(target_os = "horizon"))]
+    {
+        let spawned = std::thread::Builder::new().name("shader jit".to_owned()).spawn(move || {
+            let found = compile_logged(&program, key.1);
+            codes().insert(key, Slot::Done(found));
+        });
+        if let Err(error) = spawned {
+            log::warn!("could not start compiling a shader, {error}");
+            codes().insert(key, Slot::Done(None));
+        }
+        None
+    }
+}
+
+/// the programs waiting to be compiled, one at a time.
+#[cfg(target_os = "horizon")]
+fn queue_compile(key: (u64, u32), program: Arc<Program>) {
+    use std::collections::VecDeque;
+    use std::sync::Condvar;
+    type Waiting = (Mutex<VecDeque<((u64, u32), Arc<Program>)>>, Condvar);
+    static QUEUE: OnceLock<&'static Waiting> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let queue: &'static Waiting = Box::leak(Box::new((Mutex::new(VecDeque::new()), Condvar::new())));
+        let spawned = std::thread::Builder::new().name("shader jit".to_owned()).stack_size(8 << 20).spawn(move || loop {
+            let (key, program) = {
+                let mut waiting = queue.0.lock().unwrap_or_else(|p| p.into_inner());
+                loop {
+                    if let Some(next) = waiting.pop_front() {
+                        break next;
+                    }
+                    waiting = queue.1.wait(waiting).unwrap_or_else(|p| p.into_inner());
+                }
+            };
+            let found = compile_logged(&program, key.1);
+            codes().insert(key, Slot::Done(found));
+        });
+        if let Err(error) = spawned {
+            log::warn!("could not start compiling shaders, {error}");
+        }
+        queue
+    });
+    queue.0.lock().unwrap_or_else(|p| p.into_inner()).push_back((key, program));
+    queue.1.notify_one();
 }
 
 /// compiles the program for an entry point, saying why not when it can't.
@@ -325,17 +370,19 @@ fn compile_logged(program: &Program, entry: u32) -> Option<Arc<Compiled>> {
     let found = match compile(program, entry) {
         Ok(compiled) => Some(Arc::new(compiled)),
         Err(error) => {
-            log::debug!(target: "zakuro_gpu::shader::jit", "the program {:016X} at {entry} is not compiled, {error}", program.fingerprint);
+            log::info!(target: "zakuro_gpu::shader::jit", "the program {:016X} at {entry} is not compiled, {error}", program.fingerprint);
             None
         }
     };
-    log::trace!(
-        target: "zakuro_gpu::shader::jit",
-        "the program {:016X} at {entry} took {:?}, {} instructions",
-        program.fingerprint,
-        start.elapsed(),
-        program.ops.iter().filter(|op| op.opcode != OpCode::Nop && op.instruction.0 != 0).count()
-    );
+    let instructions = program.ops.iter().filter(|op| op.opcode != OpCode::Nop && op.instruction.0 != 0).count();
+    if found.is_some() {
+        log::info!(
+            target: "zakuro_gpu::shader::jit",
+            "the program {:016X} at {entry} compiled in {:?}, {instructions} instructions",
+            program.fingerprint,
+            start.elapsed(),
+        );
+    }
     found
 }
 
@@ -349,6 +396,8 @@ pub(super) fn run_vertices(
     outputs: &mut [[Vec4; OUTPUT_REGISTERS]],
     mut fallback: impl FnMut(&[[Vec4; INPUT_REGISTERS]], &mut [[Vec4; OUTPUT_REGISTERS]]),
 ) {
+    #[cfg(target_os = "horizon")]
+    let _running = CODE_MEMORY.read().unwrap_or_else(|p| p.into_inner());
     let mut context = Context::new(unit);
     let (mut runs, mut returned) = (0, 0);
     for (inputs, outputs) in inputs.chunks(LANES).zip(outputs.chunks_mut(LANES)) {
@@ -375,6 +424,8 @@ pub(super) fn run_geometry(
     triangles: &mut Vec<Vec<Triangle>>,
     mut fallback: impl FnMut(&[[Vec4; INPUT_REGISTERS]], &mut Vec<Vec<Triangle>>),
 ) {
+    #[cfg(target_os = "horizon")]
+    let _running = CODE_MEMORY.read().unwrap_or_else(|p| p.into_inner());
     let mut context = Context::new(unit);
     let (mut runs, mut returned) = (0, 0);
     for inputs in inputs.chunks(LANES) {
@@ -420,6 +471,7 @@ struct Helpers {
 
 /// compiles the program for an entry point, why not when the host has no
 /// backend or the program goes too many ways.
+#[cfg(not(target_os = "horizon"))]
 pub(super) fn compile(program: &Program, entry: u32) -> Result<Compiled, String> {
     let mut flags = settings::builder();
     // the verifier looks the code over for Cranelift's own sake, a quarter
@@ -490,6 +542,96 @@ pub(super) fn compile(program: &Program, entry: u32) -> Result<Compiled, String>
     let function = unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut Context) -> u32>(code) };
     Ok(Compiled {
         module: Some(module),
+        function,
+        runs: AtomicU32::new(0),
+        returned: AtomicU32::new(0),
+        parted: AtomicU32::new(0),
+        given_up: AtomicBool::new(false),
+    })
+}
+
+extern "C" {
+    /// the Switch frontend's: a copy of the code in a memory that runs, its
+    /// address, none when the console does not let the program.
+    #[cfg(target_os = "horizon")]
+    fn unx_jit_make(code: *const u8, len: usize) -> *const u8;
+}
+
+/// held for writing while code is put in the memory that runs it, which cannot
+/// run while it is written, and for reading while compiled code runs.
+#[cfg(target_os = "horizon")]
+static CODE_MEMORY: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// the same on the Switch, which has no mmap to put code in memory with, nor
+/// the crates that would: Cranelift gives the code and what in it is to be
+/// pointed at the helpers, and the frontend's libnx makes it run.
+#[cfg(target_os = "horizon")]
+pub(super) fn compile(program: &Program, entry: u32) -> Result<Compiled, String> {
+    use cranelift_codegen::binemit::Reloc;
+    use cranelift_codegen::control::ControlPlane;
+    use cranelift_codegen::ir::{ExtFuncData, ExternalName, Signature, UserExternalName};
+    use cranelift_codegen::{Context as Cranelift, FinalizedRelocTarget};
+
+    let mut flags = settings::builder();
+    for (name, value) in [("opt_level", "speed"), ("use_colocated_libcalls", "false"), ("is_pic", "false"), ("enable_verifier", "false")] {
+        flags.set(name, value).map_err(|error| format!("{name}, {error}"))?;
+    }
+    let isa = cranelift_native::builder()?.finish(settings::Flags::new(flags)).map_err(|error| error.to_string())?;
+    if isa.pointer_type() != types::I64 {
+        return Err("the host's pointers are not 64-bit".to_owned());
+    }
+    let pointer = types::I64;
+    let call_conv = isa.default_call_conv();
+    let helpers: [*const u8; 6] =
+        [floor as *const u8, exp2 as *const u8, log2 as *const u8, lit as *const u8, set_emit as *const u8, emit as *const u8];
+
+    let mut context = Cranelift::new();
+    context.func.signature = Signature::new(call_conv);
+    context.func.signature.params.push(AbiParam::new(pointer));
+    context.func.signature.returns.push(AbiParam::new(types::I32));
+    let mut on_context = Signature::new(call_conv);
+    on_context.params.push(AbiParam::new(pointer));
+    let mut on_slot = on_context.clone();
+    on_slot.params.extend([AbiParam::new(types::I32), AbiParam::new(types::I32)]);
+    let mut imports = Vec::new();
+    for (index, signature) in [&on_context, &on_context, &on_context, &on_context, &on_slot, &on_context].into_iter().enumerate() {
+        let signature = context.func.import_signature(signature.clone());
+        let name = context.func.declare_imported_user_function(UserExternalName::new(0, index as u32));
+        imports.push(context.func.import_function(ExtFuncData { name: ExternalName::user(name), signature, colocated: false, patchable: false }));
+    }
+    let mut functions = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut context.func, &mut functions);
+    let [floor, exp2, log2, lit, set_emit, emit] = [imports[0], imports[1], imports[2], imports[3], imports[4], imports[5]];
+    let helpers_in_function = Helpers { floor, exp2, log2, lit, set_emit, emit };
+    Compiler::build(&mut builder, program, entry, helpers_in_function).ok_or("it goes too many ways or too deep")?;
+    builder.seal_all_blocks();
+    builder.finalize(isa.frontend_config());
+
+    let names = context.func.params.user_named_funcs().clone();
+    let code = context.compile(&*isa, &mut ControlPlane::default()).map_err(|error| format!("{:?}", error.inner))?;
+    let mut bytes = code.code_buffer().to_vec();
+    for reloc in code.buffer.relocs() {
+        // helpers are not colocated, they are loaded by address and called
+        let (Reloc::Abs8, FinalizedRelocTarget::ExternalName(ExternalName::User(name))) = (reloc.kind, &reloc.target) else {
+            return Err(format!("a relocation it does not do, {:?}", reloc.kind));
+        };
+        let index = names[*name].index as usize;
+        let address = (helpers[index] as i64 + reloc.addend) as u64;
+        let at = reloc.offset as usize;
+        bytes[at..at + 8].copy_from_slice(&address.to_le_bytes());
+    }
+    // SAFETY: the frontend's, which has it linked in, with no code running
+    let code = {
+        let _writing = CODE_MEMORY.write().unwrap_or_else(|p| p.into_inner());
+        unsafe { unx_jit_make(bytes.as_ptr(), bytes.len()) }
+    };
+    if code.is_null() {
+        return Err("the console would not run it".to_owned());
+    }
+    // SAFETY: the function takes a pointer to a context and gives back a
+    // 32-bit word, as its signature says
+    let function = unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut Context) -> u32>(code) };
+    Ok(Compiled {
         function,
         runs: AtomicU32::new(0),
         returned: AtomicU32::new(0),

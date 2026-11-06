@@ -1,0 +1,13 @@
+--- a/build.rs	2006-07-23 18:21:28.000000000 -0700
++++ build/vendor/target-lexicon/build.rs	2026-11-05 21:37:40.769514189 -0800
+@@ -48,6 +48,10 @@
+         env::var_os("OUT_DIR").expect("The OUT_DIR environment variable must be set"),
+     );
+     let target = env::var("TARGET").expect("The TARGET environment variable must be set");
++    // the Nintendo Switch's Rust target (aarch64-nintendo-switch-freestanding)
++    // is not one this knows, its CPU is a plain aarch64, which is all that
++    // cranelift-native asks of the host
++    let target = if target.contains("nintendo-switch") { "aarch64-unknown-none".to_string() } else { target };
+     let triple =
+         Triple::from_str(&target).unwrap_or_else(|_| panic!("Invalid target name: '{}'", target));
+     let out = File::create(out_dir.join("host.rs")).expect("error creating host.rs");
