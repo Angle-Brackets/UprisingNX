@@ -817,6 +817,13 @@ const PARALLEL_VERTICES: usize = 32;
 /// shader's.
 const PARALLEL_CHUNK: usize = 16;
 
+/// vertices a draw needs before shading goes over threads, PARALLEL_VERTICES
+/// unless ZAKURO_PARALLEL_VERTICES says another number, to try them on a device.
+fn parallel_vertices() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("ZAKURO_PARALLEL_VERTICES").ok().and_then(|v| v.parse().ok()).unwrap_or(PARALLEL_VERTICES))
+}
+
 fn shade(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Vec<[Vec4; 16]> {
     let mask = registers[REG_VS_OUTPUT_MASK];
     shade_with(unit, inputs, |outputs| pack_outputs(outputs, mask))
@@ -830,21 +837,28 @@ fn shade_with<T: Send + Default + Clone>(
     inputs: &[[Vec4; shader::INPUT_REGISTERS]],
     then: impl Fn(&[Vec4; shader::OUTPUT_REGISTERS]) -> T + Sync,
 ) -> Vec<T> {
-    if inputs.len() < PARALLEL_VERTICES {
+    if inputs.len() < parallel_vertices() {
         return shader::run_vertices_mapped(unit, inputs, then);
     }
     let pool = shader_pool();
-    let chunk = (inputs.len() / (pool.current_num_threads() * 2)).next_multiple_of(8).max(PARALLEL_CHUNK);
+    // one share for each worker and one for this thread, which works too
+    // instead of waiting for them to wake up and finish
+    let shares = pool.current_num_threads() + 1;
+    let chunk = inputs.len().div_ceil(shares).next_multiple_of(8).max(PARALLEL_CHUNK);
     let mut outputs: Vec<T> = vec![T::default(); inputs.len()];
-    pool.install(|| {
-        use rayon::prelude::*;
-        outputs
-            .par_chunks_mut(chunk)
-            .zip(inputs.par_chunks(chunk))
-            .for_each(|(out_chunk, in_chunk)| {
+    {
+        let mut work = outputs.chunks_mut(chunk).zip(inputs.chunks(chunk));
+        let first = work.next();
+        pool.in_place_scope(|scope| {
+            for (out_chunk, in_chunk) in work {
+                let then = &then;
+                scope.spawn(move |_| shader::run_vertices_into(unit, in_chunk, out_chunk, then));
+            }
+            if let Some((out_chunk, in_chunk)) = first {
                 shader::run_vertices_into(unit, in_chunk, out_chunk, &then);
-            });
-    });
+            }
+        });
+    }
     outputs
 }
 
@@ -6853,16 +6867,16 @@ mod tests {
             resources.portraits.sides[0].incoming.push(draw(1));
             flush_portraits(&mut memory, &mut resources);
         }
-        assert_eq!(alphas(&resources), (Some(1.0), None));
+        assert_eq!(alphas(&resources), (Some(PORTRAIT_ALPHA), None), "it stops short of all, to see through");
 
         resources.portraits.sides[0].incoming.push(draw(2));
         flush_portraits(&mut memory, &mut resources);
-        assert_eq!(alphas(&resources), (Some(0.125), Some(0.875)), "the new one over the old");
+        assert_eq!(alphas(&resources), (Some(0.125), Some(PORTRAIT_ALPHA - 0.125)), "the new one over the old");
 
-        // the game stops: the new one had an eighth to lose, the old one 7
+        // the game stops: the new one had an eighth to lose, the old one the rest
         assert!(flush_portraits(&mut memory, &mut resources));
-        assert_eq!(alphas(&resources), (None, Some(0.75)));
-        for _ in 0..5 {
+        assert_eq!(alphas(&resources), (None, Some(PORTRAIT_ALPHA - 0.25)));
+        for _ in 0..4 {
             assert!(flush_portraits(&mut memory, &mut resources));
         }
         assert!(!flush_portraits(&mut memory, &mut resources), "the last step leaves nothing to draw");
