@@ -126,7 +126,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     };
     log::info!("unx: presenter {} up in {:?}", presenter.name(), started.elapsed());
     // out of play until the game's overrides say otherwise, see unx_frame
-    presenter.set_layout(ScreenLayout::BottomOverTop);
+    presenter.set_layout(ScreenLayout::LargeTop);
     presenter.set_scaling(ScreenFilter::Smooth, false);
     nx_audio_init();
 
@@ -203,6 +203,22 @@ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<za
     (system.read_screen_scaled(screen), None)
 }
 
+/// where a touch on the 1280x720 screen lands on the 3DS bottom screen's 320x240,
+/// if it does. in play the bottom screen is not shown, and the touch aims the
+/// reticle over a 4:3 area in the middle of the screen; in a menu it is the
+/// small bottom screen of the layout, and only a touch there counts.
+fn touch_on_bottom(in_play: bool, x: u16, y: u16) -> Option<(u16, u16)> {
+    let (x, y) = (x as f32, y as f32);
+    let (left, top, width, height) = if in_play {
+        (160.0, 0.0, 960.0, 720.0)
+    } else {
+        let bottom = zakuro_gpu::layout(1280, 720, ScreenLayout::LargeTop, zakuro_gpu::backend::TOP_WIDTH, false).1?;
+        (bottom.x, bottom.y, bottom.width, bottom.height)
+    };
+    let (u, v) = ((x - left) / width, (y - top) / height);
+    ((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v)).then(|| ((u * 320.0) as u16, (v * 240.0) as u16))
+}
+
 /// runs one emulated frame and presents it. 0 to go on, 1 when the game
 /// exited or faulted.
 ///
@@ -218,7 +234,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             circle_y: input.circle_y,
             c_stick_x: input.c_stick_x,
             c_stick_y: input.c_stick_y,
-            touch: (input.touching != 0).then_some((input.touch_x, input.touch_y)),
+            touch: (input.touching != 0).then(|| touch_on_bottom(unx.in_play, input.touch_x, input.touch_y)).flatten(),
             tilt: [0.0, 0.0],
         });
     }
@@ -239,7 +255,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     if in_play != unx.in_play {
         log::info!("unx: {} at frame {} (said {said}, quiet for {})", if in_play { "in play" } else { "out of play" }, unx.frame, unx.out_of_play);
         unx.in_play = in_play;
-        unx.presenter.set_layout(if in_play { ScreenLayout::TopOnly } else { ScreenLayout::BottomOverTop });
+        unx.presenter.set_layout(if in_play { ScreenLayout::TopOnly } else { ScreenLayout::LargeTop });
     }
 
     let started = Instant::now();

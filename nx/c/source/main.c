@@ -63,13 +63,13 @@ static void read_input(PadState *pad, UnxInput *in) {
     HidAnalogStickState l = padGetStickPos(pad, 0), r = padGetStickPos(pad, 1);
     in->circle_x = axis(l.x); in->circle_y = axis(l.y);
     in->c_stick_x = axis(r.x); in->c_stick_y = axis(r.y);
-    // handheld touchscreen as the 3DS bottom screen, 320x240 centered for now
+    // the touchscreen's first finger, in pixels of the 1280x720 screen; the
+    // Rust side maps it onto the 3DS bottom screen for the layout on show
     HidTouchScreenState touch = {0};
     if (hidGetTouchScreenStates(&touch, 1) && touch.count > 0) {
-        int x = (int)touch.touches[0].x - (1280 - 960) / 2, y = (int)touch.touches[0].y;
-        if (x >= 0 && x < 960 && y >= 0 && y < 720) {
-            in->touching = 1; in->touch_x = (u16)(x / 3); in->touch_y = (u16)(y / 3);
-        }
+        in->touching = 1;
+        in->touch_x = (u16)touch.touches[0].x;
+        in->touch_y = (u16)touch.touches[0].y;
     }
 }
 
