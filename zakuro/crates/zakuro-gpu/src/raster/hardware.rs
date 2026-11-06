@@ -3834,7 +3834,16 @@ impl Hardware {
                             smallest
                         }
                     };
-                    samplers[unit] = self.sampler(bound.linear as u8 | (bound.min_linear as u8) << 1, bound.wrap_s, bound.wrap_t, smallest)?;
+                    // ZAKURO_SELF_LINEAR=1: a draw reading the target it draws
+                    // into (the sky's ripple) is filtered linearly
+                    let mut filters = bound.linear as u8 | (bound.min_linear as u8) << 1;
+                    static SELF_LINEAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *SELF_LINEAR.get_or_init(|| std::env::var_os("ZAKURO_SELF_LINEAR").is_some())
+                        && bound.drawn.is_some_and(|d| d.addr & 0x00FF_FFFF == (draw.registers[0x11D] << 3) & 0x00FF_FFFF)
+                    {
+                        filters = 3;
+                    }
+                    samplers[unit] = self.sampler(filters, bound.wrap_s, bound.wrap_t, smallest)?;
                     enabled |= 1 << unit;
                 }
                 None => samplers[unit] = self.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0)?,
