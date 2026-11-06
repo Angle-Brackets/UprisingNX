@@ -637,186 +637,33 @@ impl VertexPlan {
 /// each vertex comes from when an index buffer repeats them, and comes back
 /// to say which of the vertices made each one is, none for the geometry
 /// shader's, which come in order.
-fn cull_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // off unless asked for: it saves shading time but its own copies cost more
-    *ON.get_or_init(|| std::env::var_os("ZAKURO_CULL").is_some())
+/// vertices kept for a draw that may be reused once more.
+struct Reuse {
+    vertices: std::sync::Arc<Vec<Vertex>>,
+    samples: [Vertex; 3],
+    age: u8,
 }
 
-/// the matrix that takes a draw's vertex position (input register 0) to its
-/// clip position, found by shading sixteen of its vertices and fitting, and
-/// checked on six more it was not fitted to. None when the draw's
-/// positions are not an affine function of that register (skinning, say).
-static FIT_WORST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FIT_FAILS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-fn fit_clip(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> Option<[[f64; 4]; 4]> {
-    let fail = |why: usize| -> Option<[[f64; 4]; 4]> {
-        FIT_FAILS[why].fetch_add(inputs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        None
-    };
-    let n = inputs.len();
-    // one pass over the positions: they must be plain points, and the
-    // extremes on each axis are the first vertices to fit
-    let mut low = [(f32::INFINITY, 0usize); 3];
-    let mut high = [(f32::NEG_INFINITY, 0usize); 3];
-    let mut plain = true;
-    for (i, input) in inputs.iter().enumerate() {
-        let p = &input[0];
-        plain &= p[3] == 1.0 && p[0].is_finite() && p[1].is_finite() && p[2].is_finite();
-        for axis in 0..3 {
-            if p[axis] < low[axis].0 {
-                low[axis] = (p[axis], i);
-            }
-            if p[axis] > high[axis].0 {
-                high[axis] = (p[axis], i);
-            }
-        }
-    }
-    if !plain {
-        return fail(0);
-    }
-    let mut picks: Vec<usize> = Vec::with_capacity(24);
-    for axis in 0..3 {
-        picks.push(low[axis].1);
-        picks.push(high[axis].1);
-    }
-    for i in 0..10 {
-        picks.push(i * (n - 1) / 9);
-    }
-    let fitted = picks.len();
-    for i in 0..6 {
-        picks.push((2 * i + 1) * (n - 1) / 12);
-    }
-    let samples: Vec<_> = picks.iter().map(|&i| inputs[i]).collect();
-    let plan = VertexPlan::new(&read_output_map(registers), registers[REG_VS_OUTPUT_MASK]);
-    let shaded = shade_with(unit, &samples, |outputs| plan.vertex(outputs).clip);
-    if shaded.iter().any(|clip| !clip.iter().all(|v| v.is_finite())) {
-        return fail(1);
-    }
-    // positions centred and scaled before fitting, so the ridge below is
-    // small next to every column whatever the mesh's coordinates are
-    let mut centre = [0.0f64; 3];
-    for sample in &samples[..fitted] {
-        for i in 0..3 {
-            centre[i] += sample[0][i] as f64 / fitted as f64;
-        }
-    }
-    let scale = samples[..fitted]
-        .iter()
-        .flat_map(|sample| (0..3).map(move |i| sample[0][i] as f64))
-        .zip(centre.iter().cycle())
-        .map(|(v, c)| (v - c).abs())
-        .fold(1e-9f64, f64::max);
-    let row = |k: usize| {
-        let p = &samples[k][0];
-        [(p[0] as f64 - centre[0]) / scale, (p[1] as f64 - centre[1]) / scale, (p[2] as f64 - centre[2]) / scale, 1.0]
-    };
-    // normal equations with a little ridge, which keeps a flat mesh (every
-    // z the same) solvable and right on its own plane
-    let mut normal = [[0.0f64; 4]; 4];
-    let mut rhs = [[0.0f64; 4]; 4];
-    for k in 0..fitted {
-        let a = row(k);
-        for i in 0..4 {
-            for j in 0..4 {
-                normal[i][j] += a[i] * a[j];
-            }
-            for c in 0..4 {
-                rhs[c][i] += a[i] * shaded[k][c] as f64;
-            }
-        }
-    }
-    for i in 0..4 {
-        normal[i][i] += normal[i][i] * 1e-9 + 1e-12;
-    }
-    let mut matrix = [[0.0f64; 4]; 4];
-    for c in 0..4 {
-        // gaussian elimination on [normal | rhs[c]]
-        let mut m = [[0.0f64; 5]; 4];
-        for i in 0..4 {
-            m[i][..4].copy_from_slice(&normal[i]);
-            m[i][4] = rhs[c][i];
-        }
-        for col in 0..4 {
-            let pivot = (col..4).max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))?;
-            if m[pivot][col].abs() < 1e-18 {
-                return fail(2);
-            }
-            m.swap(col, pivot);
-            for r in 0..4 {
-                if r != col {
-                    let f = m[r][col] / m[col][col];
-                    for k in col..5 {
-                        m[r][k] -= f * m[col][k];
-                    }
-                }
-            }
-        }
-        for i in 0..4 {
-            matrix[c][i] = m[i][4] / m[i][i];
-        }
-    }
-    let mut worst = 0.0f64;
-    for k in 0..samples.len() {
-        let a = row(k);
-        let size = (shaded[k][3].abs() as f64).max(1.0);
-        for c in 0..4 {
-            let predicted: f64 = (0..4).map(|i| matrix[c][i] * a[i]).sum();
-            let error = (predicted - shaded[k][c] as f64).abs() / size;
-            worst = if error.is_nan() { f64::INFINITY } else { worst.max(error) };
-        }
-    }
-    FIT_WORST.fetch_max((worst.min(1e6) * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
-    if worst > 2e-3 {
-        return fail(3);
-    }
-    // back to the input's own coordinates
-    let mut raw = [[0.0f64; 4]; 4];
-    for c in 0..4 {
-        for i in 0..3 {
-            raw[c][i] = matrix[c][i] / scale;
-        }
-        raw[c][3] = matrix[c][3] - (0..3).map(|i| matrix[c][i] * centre[i] / scale).sum::<f64>();
-    }
-    Some(raw)
+fn reuse_pixels() -> f32 {
+    static N: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("ZAKURO_REUSE_PX").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
 }
 
-/// which vertices a draw needs shaded: every one a triangle that might be
-/// seen uses. A triangle whose three vertices all lie well outside one side
-/// of the view by the fitted matrix is left out.
-fn needed_vertices(
-    matrix: &[[f64; 4]; 4],
-    inputs: &[[Vec4; shader::INPUT_REGISTERS]],
-    topology: u32,
-    order: Option<&[usize]>,
-) -> Vec<bool> {
-    let m: [[f32; 4]; 4] = std::array::from_fn(|c| std::array::from_fn(|i| matrix[c][i] as f32));
-    let side = |input: &[Vec4; shader::INPUT_REGISTERS]| -> u8 {
-        let p = &input[0];
-        let x = m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2] + m[0][3];
-        let y = m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2] + m[1][3];
-        let w = m[3][0] * p[0] + m[3][1] * p[1] + m[3][2] * p[2] + m[3][3];
-        let margin = 0.05 * w.abs() + 1e-3;
-        ((x < -w - margin) as u8) | ((x > w + margin) as u8) << 1 | ((y < -w - margin) as u8) << 2 | ((y > w + margin) as u8) << 3 | ((w < -margin) as u8) << 4
-    };
-    let sides: Vec<u8> = inputs.iter().map(side).collect();
-    let count = order.map_or(inputs.len(), <[usize]>::len);
-    let at = |i: usize| order.map_or(i, |order| order[i]);
-    let mut needed = vec![false; inputs.len()];
-    for (ia, ib, ic) in assemble(topology, count) {
-        let (a, b, c) = (at(ia), at(ib), at(ic));
-        if sides[a] & sides[b] & sides[c] == 0 {
-            needed[a] = true;
-            needed[b] = true;
-            needed[c] = true;
+/// whether three vertices shaded now sit where, and look as, those the
+/// draw was last shaded with, to within a pixel and a little colour.
+fn barely_moved(now: &[Vertex; 3], before: &[Vertex; 3], half_width: f32, half_height: f32) -> bool {
+    let tolerance = reuse_pixels();
+    now.iter().zip(before).all(|(a, b)| {
+        let (wa, wb) = (a.clip[3], b.clip[3]);
+        if !(wa >= 1e-3 && wb >= 1e-3) || (wa - wb).abs() > 0.01 * wa {
+            return false;
         }
-    }
-    // vertices no triangle names are not drawn either way
-    needed
-}
-
-fn hit_was_computed(key: &Option<u64>, cache: &std::collections::HashMap<u64, Vec<Vertex>>) -> bool {
-    key.is_some_and(|key| !cache.contains_key(&key))
+        let dx = (a.clip[0] / wa - b.clip[0] / wb) * half_width;
+        let dy = (a.clip[1] / wa - b.clip[1] / wb) * half_height;
+        let colour = a.color.iter().zip(&b.color).all(|(x, y)| (x - y).abs() < 0.02);
+        let uv = a.texcoords[0].iter().zip(&b.texcoords[0]).all(|(x, y)| (x - y).abs() < 0.002);
+        dx.abs() < tolerance && dy.abs() < tolerance && colour && uv
+    })
 }
 
 fn vcache_enabled() -> bool {
@@ -1441,9 +1288,12 @@ pub struct Resources {
     /// vertices shaded last time for draws whose program, uniforms and
     /// inputs were exactly these, by a hash of them, to reuse when nothing
     /// changed (a still camera).
-    vcache: std::collections::HashMap<u64, Vec<Vertex>>,
+    vcache: std::collections::HashMap<u64, std::sync::Arc<Vec<Vertex>>>,
     /// the generation before it, for draws that came back after a few others.
-    vcache_old: std::collections::HashMap<u64, Vec<Vertex>>,
+    vcache_old: std::collections::HashMap<u64, std::sync::Arc<Vec<Vertex>>>,
+    /// by draw signature, the vertices last shaded for it and three of them to
+    /// compare against, for reusing them when the draw barely moved.
+    vreuse: std::collections::HashMap<u64, Reuse>,
     /// per draw signature, how many recent lookups it hit (to three) and a counter.
     vcache_score: std::collections::HashMap<u64, (u8, u8)>,
     /// the draw whose vertices a helper is shading, which is drawn once the
@@ -4026,81 +3876,63 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             }
         }
     }
-    let processed;
+    let held: std::sync::Arc<Vec<Vertex>>;
     let (shaded, order) = match vertices {
         Vertices::Shaded(shaded) => (shaded, None),
         Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
-            let eligible = cull_enabled() && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 && inputs.len() >= 128 && !looks_at_vertices(registers);
-            let fitted = eligible.then(|| fit_clip(registers, vertex_shader, inputs)).flatten();
-            let culled = fitted
-                .map(|matrix| (needed_vertices(&matrix, inputs, topology, order), matrix))
-                .filter(|(needed, _)| needed.iter().filter(|&&n| !n).count() * 5 >= needed.len());
-            if std::env::var_os("ZAKURO_DRAW_LOG").is_some() {
-                use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-                static C: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-                C[0].fetch_add(1, Relaxed);
-                C[1].fetch_add(eligible as u64 * inputs.len() as u64, Relaxed);
-                C[2].fetch_add(fitted.is_some() as u64 * inputs.len() as u64, Relaxed);
-                if let Some((needed, _)) = &culled {
-                    C[3].fetch_add(needed.iter().filter(|&&n| !n).count() as u64, Relaxed);
-                    C[4].fetch_add(needed.len() as u64, Relaxed);
-                }
-                if C[0].load(Relaxed) % 2000 == 0 {
-                    log::info!(target: "zakuro_gpu::diag", "cull: worst fit error {}e-6 of w; fails w!=1 {} nonfinite {} singular {} mismatch {}; {} draws, eligible vertices {}, fitted {}, skipped {} of {}", FIT_WORST.swap(0, Relaxed), FIT_FAILS[0].swap(0, Relaxed), FIT_FAILS[1].swap(0, Relaxed), FIT_FAILS[2].swap(0, Relaxed), FIT_FAILS[3].swap(0, Relaxed), C[0].load(Relaxed), C[1].swap(0, Relaxed), C[2].swap(0, Relaxed), C[3].swap(0, Relaxed), C[4].swap(0, Relaxed));
-                    C[0].store(1, Relaxed);
-                }
-            }
-            let signature = (culled.is_none() && vcache_enabled() && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 && inputs.len() >= 128 && !looks_at_vertices(registers))
+            let signature = (vcache_enabled() && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 && inputs.len() >= 128 && !looks_at_vertices(registers))
                 .then(|| draw_signature(vertex_shader, inputs));
+            // 1. what shading reads is exactly as some recent frame had it
             let cache_key = signature.filter(|&signature| vcache_worth(&mut resources.vcache_score, signature)).map(|_| shading_key(registers, vertex_shader, inputs));
-            let hit = cache_key.and_then(|key| resources.vcache.get(&key).or_else(|| resources.vcache_old.get(&key))).map(|hit| (hit.clone(), order));
-            if std::env::var_os("ZAKURO_DRAW_LOG").is_some() {
-                use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-                static C: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-                C[0].fetch_add(signature.is_some() as u64, Relaxed);
-                C[1].fetch_add(cache_key.is_some() as u64, Relaxed);
-                C[2].fetch_add(hit.is_some() as u64, Relaxed);
-                if C[0].load(Relaxed) % 1000 == 999 {
-                    log::info!(target: "zakuro_gpu::diag", "vcache: eligible {} probed {} hit {}", C[0].swap(0, Relaxed), C[1].swap(0, Relaxed), C[2].swap(0, Relaxed));
-                }
-            }
+            let mut found = cache_key.and_then(|key| resources.vcache.get(&key).or_else(|| resources.vcache_old.get(&key))).cloned();
             if let (Some(signature), Some(_)) = (signature, cache_key) {
-                vcache_note(&mut resources.vcache_score, signature, hit.is_some());
+                vcache_note(&mut resources.vcache_score, signature, found.is_some());
             }
-            processed = if let Some(hit) = hit { hit } else { match culled {
-                Some((needed, matrix)) => {
-                    // only the vertices something visible uses are shaded, the
-                    // rest stay as they were made, a default vertex no drawn
-                    // triangle reads
-                    let kept: Vec<usize> = (0..inputs.len()).filter(|&i| needed[i]).collect();
-                    let subset: Vec<_> = kept.iter().map(|&i| inputs[i]).collect();
-                    let (shaded, _) = process_vertices(registers, vertex_shader, geometry_shader, &subset, None);
-                    let m: [[f32; 4]; 4] = std::array::from_fn(|c| std::array::from_fn(|i| matrix[c][i] as f32));
-                    let mut shaded = shaded.into_iter();
-                    let mut full: Vec<Vertex> = Vec::with_capacity(inputs.len());
-                    for (i, input) in inputs.iter().enumerate() {
-                        if needed[i] {
-                            full.push(shaded.next().unwrap_or_default());
+            // 2. the draw barely moved since it was last shaded: shade three
+            // of its vertices, and if they are where they were, use those
+            // shaded then, once, so such a draw is shaded every other frame
+            let plan = signature.map(|_| VertexPlan::new(&read_output_map(registers), registers[REG_VS_OUTPUT_MASK]));
+            let mut samples_now = None;
+            if found.is_none() {
+                if let (Some(signature), Some(plan)) = (signature, &plan) {
+                    if let Some(entry) = resources.vreuse.get_mut(&signature).filter(|entry| entry.age < 1) {
+                        let last = inputs.len() - 1;
+                        let picks = [inputs[0], inputs[last / 2], inputs[last]];
+                        let now = shade_with(vertex_shader, &picks, |outputs| plan.vertex(outputs));
+                        let now: [Vertex; 3] = [now[0], now[1], now[2]];
+                        if barely_moved(&now, &entry.samples, viewport_width / 2.0, viewport_height / 2.0) {
+                            entry.age += 1;
+                            found = Some(entry.vertices.clone());
                         } else {
-                            // where the fit puts it, so a triangle that mixes it
-                            // with shaded vertices stays off the screen as it was
-                            let p = &input[0];
-                            let mut vertex = Vertex::default();
-                            vertex.clip = std::array::from_fn(|c| m[c][0] * p[0] + m[c][1] * p[1] + m[c][2] * p[2] + m[c][3]);
-                            full.push(vertex);
+                            samples_now = Some(now);
                         }
                     }
-                    (full, order)
                 }
-                None => process_vertices(registers, vertex_shader, geometry_shader, inputs, order),
-            } };
-            if let (Some(key), true) = (cache_key, hit_was_computed(&cache_key, &resources.vcache)) {
+            }
+            let reused = found.is_some();
+            held = match found {
+                Some(vertices) => vertices,
+                None => {
+                    let (vertices, _) = process_vertices(registers, vertex_shader, geometry_shader, inputs, order);
+                    std::sync::Arc::new(vertices)
+                }
+            };
+            if let (Some(key), false) = (cache_key, reused) {
                 if resources.vcache.len() >= 40 {
                     resources.vcache_old = std::mem::take(&mut resources.vcache);
                 }
-                resources.vcache.insert(key, processed.0.clone());
+                resources.vcache.insert(key, held.clone());
             }
-            (&processed.0[..], processed.1)
+            if let (Some(signature), false) = (signature, reused) {
+                let last = held.len() - 1;
+                let samples = [held[0], held[last / 2], held[last]];
+                let _ = samples_now;
+                if resources.vreuse.len() > 256 {
+                    resources.vreuse.clear();
+                }
+                resources.vreuse.insert(signature, Reuse { vertices: held.clone(), samples, age: 0 });
+            }
+            (&held[..], order)
         }
         // arrays the GPU did not draw, which the CPU decodes first
         #[cfg(feature = "vulkan")]
