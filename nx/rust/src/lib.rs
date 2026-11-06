@@ -349,6 +349,17 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             .filter(|(_, n)| *n > 0)
             .map(|(name, n)| format!("{name} {:.1}", n as f64 / frames))
             .collect();
+        let waits: Vec<String> = zakuro_gpu::stats::BARRIER_NAMES
+            .iter()
+            .enumerate()
+            .filter_map(|(i, name)| {
+                let (ns, n) = (zakuro_gpu::stats::BARRIER_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed), zakuro_gpu::stats::BARRIER_COUNT[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+                (n > 0).then(|| format!("{name} {:.1} ms in {:.1}", ns as f64 / 1e6 / frames, n as f64 / frames))
+            })
+            .collect();
+        if !waits.is_empty() {
+            println!("  waits for the GPU thread per frame: {}", waits.join(", "));
+        }
         if !backs.is_empty() {
             println!("  write-backs per frame: {} ({:.1} ms)", backs.join(", "), unx.write_back / frames);
         }

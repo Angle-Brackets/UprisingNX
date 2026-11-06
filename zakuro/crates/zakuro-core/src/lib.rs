@@ -1305,7 +1305,7 @@ unsafe fn sync_for_cpu_write(gpu: *mut (), linear_base: u32, memory: &mut Memory
 ///
 /// as sync_for_cpu.
 unsafe fn wait_for_gpu(gpu: *mut ()) {
-    unsafe { &*(gpu as *mut gpu_thread::GpuCell) }.wait_idle();
+    unsafe { &*(gpu as *mut gpu_thread::GpuCell) }.wait_idle_as(1);
 }
 
 fn gpu_thread_wanted() -> bool {

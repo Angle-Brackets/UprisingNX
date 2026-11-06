@@ -793,7 +793,10 @@ impl LastSemantics {
 fn shader_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = if cfg!(target_os = "horizon") {
+        let wanted = std::env::var("ZAKURO_SHADER_THREADS").ok().and_then(|v| v.parse::<usize>().ok());
+        let threads = if let Some(wanted) = wanted {
+            wanted.max(1)
+        } else if cfg!(target_os = "horizon") {
             2
         } else {
             std::thread::available_parallelism().map_or(2, |c| (c.get() / 2).clamp(1, 4))

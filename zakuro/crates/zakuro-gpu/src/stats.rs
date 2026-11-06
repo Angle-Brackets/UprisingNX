@@ -19,6 +19,12 @@ pub static AUDIO: AtomicU64 = AtomicU64::new(0);
 /// what the GPU drew brought back for the CPU's reads and writes, and how often.
 pub static SYNC: AtomicU64 = AtomicU64::new(0);
 pub static SYNCS: AtomicU64 = AtomicU64::new(0);
+/// the CPU's side waiting for the GPU's thread to finish, by who waits: the
+/// scheduler with everything blocked, a guarded read or write, anything that
+/// reaches for the GPU, and how long, in nanoseconds, and how often.
+pub static BARRIER_NS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub static BARRIER_COUNT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub const BARRIER_NAMES: [&str; 3] = ["idle", "guard", "deref"];
 /// write-backs of what the GPU drew to guest memory, each a wait for the
 /// GPU, by what asked for them (see WRITE_BACK_NAMES), and their time.
 pub static WRITE_BACKS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];

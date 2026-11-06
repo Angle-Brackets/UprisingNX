@@ -182,9 +182,21 @@ impl GpuCell {
 
     /// waits for the thread to finish every job queued.
     pub fn wait_idle(&self) {
+        self.wait_idle_as(2);
+    }
+
+    /// the same, counted under who waits, see zakuro_gpu::stats::BARRIER_NAMES.
+    pub fn wait_idle_as(&self, who: usize) {
         if self.shared.pending.load(Ordering::Acquire) == 0 {
             return;
         }
+        let started = std::time::Instant::now();
+        self.wait_idle_slow();
+        zakuro_gpu::stats::BARRIER_NS[who].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        zakuro_gpu::stats::BARRIER_COUNT[who].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn wait_idle_slow(&self) {
         let mut guard = self.shared.idle.lock().unwrap_or_else(|p| p.into_inner());
         while self.shared.pending.load(Ordering::Acquire) != 0 {
             guard = self.shared.idle_changed.wait(guard).unwrap_or_else(|p| p.into_inner());
@@ -194,6 +206,13 @@ impl GpuCell {
     /// waits for a job to finish that has an interrupt to give, or for none
     /// to be left.
     pub fn wait_done(&self) {
+        let started = std::time::Instant::now();
+        self.wait_done_slow();
+        zakuro_gpu::stats::BARRIER_NS[0].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        zakuro_gpu::stats::BARRIER_COUNT[0].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn wait_done_slow(&self) {
         let mut guard = self.shared.idle.lock().unwrap_or_else(|p| p.into_inner());
         while !self.shared.done_any.load(Ordering::Acquire) && self.shared.pending.load(Ordering::Acquire) != 0 {
             guard = self.shared.idle_changed.wait(guard).unwrap_or_else(|p| p.into_inner());
