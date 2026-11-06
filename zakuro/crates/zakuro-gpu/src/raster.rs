@@ -3293,6 +3293,18 @@ pub fn draw<M: GpuMemory>(
         scratch.unique.clear();
         scratch.unique.extend((0..vertex_count).map(|i| first_vertex + i));
     }
+    {
+        static ON2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON2.get_or_init(|| std::env::var_os("ZAKURO_DRAW_LOG").is_some()) {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static UNIQUE: AtomicU64 = AtomicU64::new(0);
+            static DRAWS: AtomicU64 = AtomicU64::new(0);
+            UNIQUE.fetch_add(scratch.unique.len() as u64, Relaxed);
+            if DRAWS.fetch_add(1, Relaxed) % 2000 == 1999 {
+                log::info!(target: "zakuro_gpu::diag", "2000 draws: {} unique vertices shaded", UNIQUE.swap(0, Relaxed));
+            }
+        }
+    }
     let plan = scratch.plans.current();
     scratch.inputs.clear();
     scratch.inputs.resize(scratch.unique.len(), plan.template);
