@@ -367,6 +367,11 @@ fn queue_compile(key: (u64, u32), program: Arc<Program>) {
 /// compiles the program for an entry point, saying why not when it can't.
 fn compile_logged(program: &Program, entry: u32) -> Option<Arc<Compiled>> {
     let start = std::time::Instant::now();
+    #[cfg(target_os = "horizon")]
+    if let Some(compiled) = kept(program.fingerprint, entry) {
+        log::info!(target: "zakuro_gpu::shader::jit", "the program {:016X} at {entry} read back in {:?}", program.fingerprint, start.elapsed());
+        return Some(Arc::new(compiled));
+    }
     let found = match compile(program, entry) {
         Ok(compiled) => Some(Arc::new(compiled)),
         Err(error) => {
@@ -609,16 +614,35 @@ pub(super) fn compile(program: &Program, entry: u32) -> Result<Compiled, String>
 
     let names = context.func.params.user_named_funcs().clone();
     let code = context.compile(&*isa, &mut ControlPlane::default()).map_err(|error| format!("{:?}", error.inner))?;
-    let mut bytes = code.code_buffer().to_vec();
+    let bytes = code.code_buffer().to_vec();
+    let mut relocs = Vec::new();
     for reloc in code.buffer.relocs() {
         // helpers are not colocated, they are loaded by address and called
         let (Reloc::Abs8, FinalizedRelocTarget::ExternalName(ExternalName::User(name))) = (reloc.kind, &reloc.target) else {
             return Err(format!("a relocation it does not do, {:?}", reloc.kind));
         };
-        let index = names[*name].index as usize;
-        let address = (helpers[index] as i64 + reloc.addend) as u64;
-        let at = reloc.offset as usize;
-        bytes[at..at + 8].copy_from_slice(&address.to_le_bytes());
+        relocs.push((reloc.offset, names[*name].index, reloc.addend));
+    }
+    let compiled = install(&bytes, &relocs)?;
+    store(program.fingerprint, entry, &bytes, &relocs);
+    Ok(compiled)
+}
+
+/// the helpers' addresses, by the number the code names each by.
+#[cfg(target_os = "horizon")]
+fn helper_address(index: u32) -> Option<usize> {
+    [floor as usize, exp2 as usize, log2 as usize, lit as usize, set_emit as usize, emit as usize].get(index as usize).copied()
+}
+
+/// code from Cranelift, or from the file it was kept in, made to run: the
+/// helpers it calls put in, and a copy of it in memory that runs.
+#[cfg(target_os = "horizon")]
+fn install(bytes: &[u8], relocs: &[(u32, u32, i64)]) -> Result<Compiled, String> {
+    let mut bytes = bytes.to_vec();
+    for &(offset, helper, addend) in relocs {
+        let address = helper_address(helper).ok_or("a helper that is not")? as i64 + addend;
+        let at = offset as usize;
+        bytes.get_mut(at..at + 8).ok_or("a relocation past the code")?.copy_from_slice(&(address as u64).to_le_bytes());
     }
     // SAFETY: the frontend's, which has it linked in, with no code running
     let code = {
@@ -638,6 +662,64 @@ pub(super) fn compile(program: &Program, entry: u32) -> Result<Compiled, String>
         parted: AtomicU32::new(0),
         given_up: AtomicBool::new(false),
     })
+}
+
+/// where a program's code is kept between runs, by what the code depends on:
+/// the program and entry, and this file, whose changes change the code.
+#[cfg(target_os = "horizon")]
+fn cache_path(fingerprint: u64, entry: u32) -> String {
+    static BUILD: OnceLock<u64> = OnceLock::new();
+    let build = *BUILD.get_or_init(|| {
+        include_bytes!("jit.rs").iter().fold(0xCBF2_9CE4_8422_2325u64, |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01B3))
+            ^ std::mem::size_of::<Context>() as u64
+    });
+    format!("sdmc:/switch/uprisingnx/jit/{build:016X}/{fingerprint:016X}-{entry}.bin")
+}
+
+#[cfg(target_os = "horizon")]
+fn store(fingerprint: u64, entry: u32, bytes: &[u8], relocs: &[(u32, u32, i64)]) {
+    let path = cache_path(fingerprint, entry);
+    let mut out = Vec::with_capacity(bytes.len() + relocs.len() * 16 + 16);
+    out.extend_from_slice(b"ZJIT");
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(relocs.len() as u32).to_le_bytes());
+    for &(offset, helper, addend) in relocs {
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.extend_from_slice(&helper.to_le_bytes());
+        out.extend_from_slice(&addend.to_le_bytes());
+    }
+    out.extend_from_slice(bytes);
+    let directory = std::path::Path::new(&path).parent().map(std::path::Path::to_path_buf);
+    if let Some(directory) = directory {
+        let _ = std::fs::create_dir_all(directory);
+    }
+    // written whole before it is named, a run that stops half way leaves nothing to read
+    let partial = format!("{path}.partial");
+    if std::fs::write(&partial, out).and_then(|()| std::fs::rename(&partial, &path)).is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+}
+
+/// the program as an earlier run kept it, if one did.
+#[cfg(target_os = "horizon")]
+fn kept(fingerprint: u64, entry: u32) -> Option<Compiled> {
+    let data = std::fs::read(cache_path(fingerprint, entry)).ok()?;
+    if data.get(..4)? != b"ZJIT" {
+        return None;
+    }
+    let length = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize;
+    let count = u32::from_le_bytes(data.get(8..12)?.try_into().ok()?) as usize;
+    let mut relocs = Vec::with_capacity(count);
+    let mut at = 12;
+    for _ in 0..count {
+        let offset = u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?);
+        let helper = u32::from_le_bytes(data.get(at + 4..at + 8)?.try_into().ok()?);
+        let addend = i64::from_le_bytes(data.get(at + 8..at + 16)?.try_into().ok()?);
+        relocs.push((offset, helper, addend));
+        at += 16;
+    }
+    let bytes = data.get(at..at + length)?;
+    install(bytes, &relocs).ok()
 }
 
 /// the memory the code reads that nothing writes while it runs.

@@ -1619,6 +1619,8 @@ pub struct Hardware {
     /// buffer left set, which the next one skips setting again when it is
     /// the same, none after anything that could have changed them.
     last_draw_state: Option<(vk::Pipeline, DrawState)>,
+    /// the vertices of a draw as made, before they go to the staging buffer.
+    vertex_scratch: Vec<[f32; 24]>,
     /// the pipelines compiled before, kept on disk between runs, so a
     /// combination of fragment stages seen once does not stall again.
     pipeline_cache: vk::PipelineCache,
@@ -1866,6 +1868,7 @@ impl Hardware {
                 renderings: 0,
                 draws: 0,
                 last_draw_state: None,
+                vertex_scratch: Vec::new(),
                 pipeline_cache,
                 kept_pipelines,
                 known_keys: std::collections::HashSet::new(),
@@ -2352,6 +2355,14 @@ impl Hardware {
             return Ok(at);
         }
         let offset = self.stage(size, align)?;
+        // the words as they lie in memory, which is little-endian where this
+        // runs, copied in one go: the staging buffer is not cached memory
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: the ring range was staged for these words
+            unsafe { std::ptr::copy_nonoverlapping(block.words.as_ptr() as *const u8, self.ring(offset, size).as_mut_ptr(), size as usize) };
+        }
+        #[cfg(not(target_endian = "little"))]
         for (out, word) in self.ring(offset, size).as_chunks_mut::<4>().0.iter_mut().zip(&block.words) {
             *out = word.to_le_bytes();
         }
@@ -3390,10 +3401,13 @@ impl Hardware {
         // on its right, or above it for a flat edge, on the PICA, and in
         // Vulkan to the one on its right or further down the image, so the
         // images run bottom up
-        let staging = self.ring(vertex_offset, vertex_bytes);
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut(staging.as_mut_ptr() as *mut [f32; 24], vertices.len())
-        };
+        // made in memory the CPU caches, and copied to the staging buffer in
+        // one go: that memory is not cached, and a store of each float to
+        // it costs far more than the vertex's making
+        let mut made = std::mem::take(&mut self.vertex_scratch);
+        made.clear();
+        made.resize(vertices.len(), [0.0f32; 24]);
+        let out_slice = &mut made[..];
         // window coordinates back to the target's clip space, the viewport
         // is not always the whole target, so the shader's own clip x and y
         // are not the target's
@@ -3412,6 +3426,12 @@ impl Hardware {
                 v.view[0], v.view[1], v.view[2], 0.0,
             ];
         }
+        let staging = self.ring(vertex_offset, vertex_bytes);
+        // SAFETY: the staging buffer was sized for these vertices
+        unsafe {
+            std::ptr::copy_nonoverlapping(made.as_ptr() as *const u8, staging.as_mut_ptr(), vertex_bytes as usize);
+        }
+        self.vertex_scratch = made;
         Ok((vertex_offset, index_offset))
     }
 

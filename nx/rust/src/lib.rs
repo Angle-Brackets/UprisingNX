@@ -80,13 +80,14 @@ pub struct Unx {
     in_play: bool,
 }
 
-/// frames the overrides may stay quiet before the game counts as out of play
+/// frames the overrides may stay quiet (8 s) before the game counts as out of play,
+/// long, so that a quiet moment in a battle never brings the bottom screen up
 /// (a menu, a cutscene), as in Zakuro's desktop frontend
-const IN_PLAY_QUIET: u32 = 10;
+const IN_PLAY_QUIET: u32 = 480;
 /// frames a conversation's big portrait may go undrawn before the game counts
 /// as out of play: a battle's dialogue, before the player has control, while
 /// the overrides are quiet; it is seen again each frame the portrait is up
-const PORTRAIT_QUIET: u32 = 120;
+const PORTRAIT_QUIET: u32 = 480;
 
 extern "C" {
     fn nx_audio_init();
