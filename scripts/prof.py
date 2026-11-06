@@ -3,7 +3,8 @@
 
   scripts/prof.py prof.bin nx/c/uprising_nx.elf [top=40]
 
-Each sample is the game thread's PC and LR as offsets into the image. PCs are
+Each sample is a thread's PC and LR as offsets into the image; the game thread's
+by default, the GPU's with a fourth argument, 1. PCs are
 mapped to the enclosing symbol from `nm` (the real, non-inlined function;
 recompiled guest code shows as f_XXXXXXXX), grouped by component, and the
 hottest few get their inline chain from addr2line.
@@ -25,7 +26,9 @@ def load(path, main_addr):
     assert magic == 0x464F5250 and ver == 2, "not a v2 prof.bin"
     base = struct.unpack_from("<Q", d, 16)[0] - main_addr
     off = lambda a: (a - base) & 0xFFFFFFFFFFFFFFFF
-    return [tuple(off(a) for a in struct.unpack_from("<QQ", d, 24 + 16 * i)) for i in range(count)], failed
+    raw = [struct.unpack_from("<QQ", d, 24 + 16 * i) for i in range(count)]
+    # the thread's number is in the top bits of the pc, 0 for the game's
+    return [((pc >> 56, off(pc & ((1 << 56) - 1))), off(lr)) for pc, lr in raw], failed
 
 
 def symbols(elf):
@@ -62,6 +65,9 @@ def main():
     top = int(sys.argv[3]) if len(sys.argv) > 3 else 40
     addrs, names = symbols(elf)
     samples, failed = load(sys.argv[1], addrs[names.index("main")])
+    # prof.py prof.bin elf [top] [thread]: thread 0 is the game's, 1 the GPU's
+    want = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    samples = [(pc, lr) for (tid, pc), lr in samples if tid == want]
 
     def sym(a):
         i = bisect.bisect_right(addrs, a) - 1

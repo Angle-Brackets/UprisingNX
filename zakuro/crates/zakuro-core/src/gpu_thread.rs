@@ -260,7 +260,18 @@ impl Drop for GpuCell {
     }
 }
 
+#[cfg(target_os = "horizon")]
+extern "C" {
+    /// the Switch frontend's profiler, which samples the threads that ask.
+    fn prof_add_thread();
+}
+
 fn work(shared: &Shared) {
+    #[cfg(target_os = "horizon")]
+    // SAFETY: the frontend's, which has it linked in
+    unsafe {
+        prof_add_thread()
+    };
     loop {
         let job = {
             let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());

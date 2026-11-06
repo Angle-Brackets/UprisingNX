@@ -18,7 +18,9 @@ int main(int argc, char **argv);
 typedef struct { u64 pc, lr; } Sample;
 static Sample samples[PROF_MAX];
 static u32 count, failed;  // count: samples ever taken; the ring holds the last PROF_MAX
-static Handle target;
+#define PROF_THREADS 4
+static Handle targets[PROF_THREADS];
+static u32 ntargets, nextra;
 static Thread sampler;
 static volatile bool running;
 
@@ -41,20 +43,37 @@ static void sample_loop(void *arg) {
     u32 since_dump = 0;
     while (running) {
         svcSleepThread(1000000);
-        if (R_FAILED(svcSetThreadActivity(target, ThreadActivity_Paused))) { failed++; continue; }
-        ThreadContext ctx;
-        Result rc = svcGetThreadContext3(&ctx, target);
-        svcSetThreadActivity(target, ThreadActivity_Runnable);
-        if (R_FAILED(rc)) { failed++; continue; }
-        samples[count++ % PROF_MAX] = (Sample){ctx.pc.x, ctx.lr};
+        // every thread registered, one after another; the thread's number goes
+        // in the top bits of the pc (addresses are below 2^48), see prof.py
+        for (u32 t = 0; t < ntargets; t++) {
+            if (R_FAILED(svcSetThreadActivity(targets[t], ThreadActivity_Paused))) { failed++; continue; }
+            ThreadContext ctx;
+            Result rc = svcGetThreadContext3(&ctx, targets[t]);
+            svcSetThreadActivity(targets[t], ThreadActivity_Runnable);
+            if (R_FAILED(rc)) { failed++; continue; }
+            samples[count++ % PROF_MAX] = (Sample){ctx.pc.x | ((u64)t << 56), ctx.lr};
+        }
         if (++since_dump >= PROF_DUMP_EVERY) { since_dump = 0; dump(); }
     }
     dump();
 }
 
+// called on a thread to profile besides the one that starts the profiler: the
+// GPU's, from zakuro-core. thread 0 is the game's, the others come after
+void prof_add_thread(void) {
+    u32 i = 1 + __atomic_fetch_add(&nextra, 1, __ATOMIC_RELAXED);
+    if (i < PROF_THREADS) {
+        targets[i] = threadGetCurHandle();
+        u32 n = __atomic_load_n(&ntargets, __ATOMIC_RELAXED);
+        while (n < i + 1 && !__atomic_compare_exchange_n(&ntargets, &n, i + 1, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
+    }
+}
+
 // called on the thread to profile
 void prof_start(void) {
-    target = threadGetCurHandle();
+    targets[0] = threadGetCurHandle();
+    u32 n = __atomic_load_n(&ntargets, __ATOMIC_RELAXED);
+    while (n < 1 && !__atomic_compare_exchange_n(&ntargets, &n, 1, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
     running = true;
     // core 2, out of the way of the game (core 0) and the renderer's threads
     if (R_FAILED(threadCreate(&sampler, sample_loop, NULL, NULL, 0x10000, 0x2C, 2)) || R_FAILED(threadStart(&sampler))) {

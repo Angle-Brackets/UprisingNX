@@ -80,6 +80,8 @@ struct args { const char *rom; u32 interpret; };
 // ZAKURO_GPU_SHADERS, RUST_LOG...), to try them without a rebuild. # starts a
 // comment.
 static void load_env(void) {
+    // the GPU on a thread of its own, unless env.txt says ZAKURO_GPU_THREAD=0
+    setenv("ZAKURO_GPU_THREAD", "1", 0);
     FILE *f = fopen("sdmc:/switch/uprisingnx/env.txt", "r");
     if (!f) return;
     char line[256];
