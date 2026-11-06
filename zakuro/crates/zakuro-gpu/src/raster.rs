@@ -1131,12 +1131,13 @@ pub(crate) struct DrawnTexture {
 
 /// how a texture minifies: the magnification filter's bit says it by default
 /// (as it always has), ZAKURO_FILTER=split reads the minification bit as the
-/// console does, =any is linear when either asks.
+/// console does, =any is linear when either asks, =linear forces both (a test).
 fn filter_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("ZAKURO_FILTER").as_deref() {
         Ok("split") => 0,
         Ok("any") => 2,
+        Ok("linear") => 3,
         _ => 1,
     })
 }
@@ -2260,8 +2261,9 @@ fn bind_texture<M: GpuMemory>(
     Some(BoundTexture {
         texels,
         drawn,
-        linear: config & 0x2 != 0,
+        linear: config & 0x2 != 0 || filter_mode() == 3,
         min_linear: match filter_mode() {
+            3 => true,
             1 => config & 0x2 != 0,
             2 => config & 0x6 != 0,
             _ => config & 0x4 != 0,
