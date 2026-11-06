@@ -40,6 +40,22 @@ pub(crate) enum Gx {
     EndFrame,
 }
 
+impl Gx {
+    /// the kind's bit in ZAKURO_GPU_ASYNC.
+    fn bit(&self) -> u32 {
+        1 << match self {
+            Gx::List { .. } => 0,
+            Gx::Display { .. } => 1,
+            Gx::Framebuffer { .. } => 2,
+            Gx::Register { .. } => 3,
+            Gx::EndFrame => 4,
+            Gx::Fill { .. } => 5,
+            Gx::Copy { .. } => 6,
+            Gx::Dma { .. } => 7,
+        }
+    }
+}
+
 /// a command with what it works on and the interrupt that says it is done.
 pub(crate) struct Job {
     pub gx: Gx,
@@ -112,6 +128,10 @@ pub struct GpuCell {
     flags: Arc<zakuro_gpu::Flags>,
     /// whether frame interpolation is on, kept here to ask without waiting.
     interpolating: AtomicBool,
+    /// which kinds of job go to the thread, by Gx::bit, the others run at once
+    /// after the thread is done with what it has. ZAKURO_GPU_ASYNC, in hex,
+    /// to find which one a title cannot take late; all by default.
+    asynchronous: u32,
 }
 
 impl GpuCell {
@@ -140,7 +160,8 @@ impl GpuCell {
         if threaded {
             log::info!("the GPU runs on a thread of its own");
         }
-        GpuCell { gpu, shared, worker, flags, interpolating: AtomicBool::new(false) }
+        let asynchronous = std::env::var("ZAKURO_GPU_ASYNC").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(!0);
+        GpuCell { gpu, shared, worker, flags, interpolating: AtomicBool::new(false), asynchronous }
     }
 
     /// whether the GPU has a thread.
@@ -165,8 +186,15 @@ impl GpuCell {
     /// queues a job, or runs it, and gives the interrupt if it ran. else it
     /// comes with take_done.
     pub(crate) fn submit(&self, job: Job) -> Option<InterruptId> {
-        if self.worker.is_none() {
-            // SAFETY: no thread, and the caller holds the only handle
+        // what titles take to be done at once, DMA, fills and copies, is, after
+        // what the thread has to do before it: they wait for it and go on
+        // from here, as the thread would run them, and their interrupt is
+        // the CPU's side to give at once
+        let at_once = matches!(job.gx, Gx::Dma { .. } | Gx::Fill { .. } | Gx::Copy { .. })
+            || self.asynchronous & job.gx.bit() == 0;
+        if self.worker.is_none() || at_once {
+            self.wait_idle();
+            // SAFETY: no thread at work, and the caller holds the only handle
             return execute(unsafe { &mut *self.gpu.get() }, job);
         }
         self.shared.pending.fetch_add(1, Ordering::AcqRel);
@@ -217,6 +245,14 @@ impl GpuCell {
         while !self.shared.done_any.load(Ordering::Acquire) && self.shared.pending.load(Ordering::Acquire) != 0 {
             guard = self.shared.idle_changed.wait(guard).unwrap_or_else(|p| p.into_inner());
         }
+    }
+
+    /// jobs queued or running, and interrupts done and not raised yet, for logs.
+    pub fn state(&self) -> (usize, usize) {
+        (
+            self.shared.pending.load(Ordering::Acquire),
+            self.shared.done.lock().unwrap_or_else(|p| p.into_inner()).len(),
+        )
     }
 
     /// the interrupts of the jobs done since this was last asked, in order.

@@ -19,6 +19,10 @@ pub static AUDIO: AtomicU64 = AtomicU64::new(0);
 /// what the GPU drew brought back for the CPU's reads and writes, and how often.
 pub static SYNC: AtomicU64 = AtomicU64::new(0);
 pub static SYNCS: AtomicU64 = AtomicU64::new(0);
+/// the renderer waiting for the Vulkan queue the presenter holds, in
+/// nanoseconds, and how long the presenter held it.
+pub static QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+pub static QUEUE_HELD_NS: AtomicU64 = AtomicU64::new(0);
 /// the CPU's side waiting for the GPU's thread to finish, by who waits: the
 /// scheduler with everything blocked, a guarded read or write, anything that
 /// reaches for the GPU, and how long, in nanoseconds, and how often.

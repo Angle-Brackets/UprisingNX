@@ -5058,7 +5058,9 @@ impl Hardware {
             let buffers = [self.commands];
             let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
             let started = std::time::Instant::now();
+            let waited = std::time::Instant::now();
             let _queue = self.queue_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::stats::QUEUE_WAIT_NS.fetch_add(waited.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             self.device.queue_submit(self.queue, &submit, self.fence).map_err(vk_error("submit"))?;
             let took = started.elapsed().as_secs_f64() * 1000.0;
             if took >= 20.0 {

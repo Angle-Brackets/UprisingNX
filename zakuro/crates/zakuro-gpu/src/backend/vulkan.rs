@@ -949,6 +949,7 @@ impl Presenter for VulkanPresenter {
         // the renderer submits on its own thread to the same queue
         let queue_lock = self.shared.as_ref().map(|shared| shared.queue_lock.clone());
         let _queue = queue_lock.as_ref().map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        let held = std::time::Instant::now();
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit], fence)
@@ -963,6 +964,7 @@ impl Presenter for VulkanPresenter {
             .image_indices(&indices);
         let result = unsafe { self.swapchain_device.queue_present(self.queue, &present) };
         drop(_queue);
+        crate::stats::QUEUE_HELD_NS.fetch_add(held.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
         self.frame = (self.frame + 1) % FRAMES_IN_FLIGHT;
 

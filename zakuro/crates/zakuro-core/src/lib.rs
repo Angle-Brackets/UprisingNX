@@ -912,6 +912,34 @@ impl System {
         }
     }
 
+    /// what each of the title's threads is doing, and for a wait what it
+    /// waits on, for a log when the title goes quiet.
+    pub fn debug_threads(&self) -> Vec<String> {
+        let gsp = self.services.gsp.interrupt_event_object;
+        let mut lines = vec![format!(
+            "cycles {} next frame {} reschedule pending {} current {:?} gsp interrupt event {:?}",
+            self.cpu.cycles, self.next_frame_boundary, self.kernel.reschedule_pending, self.kernel.current_thread, gsp
+        )];
+        lines.extend(self.kernel
+            .threads
+            .iter()
+            .filter(|thread| thread.status != kernel::thread::ThreadStatus::Dormant)
+            .map(|thread| {
+                let waits: Vec<String> = thread
+                    .wait_objects
+                    .iter()
+                    .map(|&object| match self.kernel.objects.get(object) {
+                        Some(kernel::object::KObject::Event(event)) => format!("event {object:?} signaled {} {:?}", event.signaled, event.reset_type),
+                        Some(other) => format!("{} {object:?}", other.type_name()),
+                        None => format!("gone {object:?}"),
+                    })
+                    .collect();
+                let current = if self.kernel.current_thread == Some(thread.id) { " <- running" } else { "" };
+                format!("{:?} {:?} {:?} pc {:08X} prio {} wakeup {:?} waits [{}]{current}", thread.id, thread.name, thread.status, thread.context.regs[15], thread.priority, thread.wakeup_at, waits.join(", "))
+            }));
+        lines
+    }
+
     /// raises the interrupts of what the GPU's thread finished.
     fn raise_gpu_interrupts(&mut self) {
         for interrupt in self.gpu.take_done() {

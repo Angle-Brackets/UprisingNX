@@ -357,6 +357,21 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 (n > 0).then(|| format!("{name} {:.1} ms in {:.1}", ns as f64 / 1e6 / frames, n as f64 / frames))
             })
             .collect();
+        let (queue_wait, queue_held) = (
+            zakuro_gpu::stats::QUEUE_WAIT_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
+            zakuro_gpu::stats::QUEUE_HELD_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        );
+        println!("  vulkan queue per frame: renderer waited {:.2} ms, presenter held {:.2} ms", queue_wait as f64 / 1e6 / frames, queue_held as f64 / 1e6 / frames);
+        if unx.window_emulating.as_secs_f64() * 1000.0 / frames < 2.0 && unx.frame % 600 < frames as u64 {
+            println!("  the game is quiet, its threads:");
+            for line in unx.system.debug_threads() {
+                println!("    {line}");
+            }
+        }
+        let (pending, unraised) = unx.system.gpu.state();
+        if pending != 0 || unraised != 0 {
+            println!("  GPU thread: {pending} jobs pending, {unraised} interrupts not raised");
+        }
         if !waits.is_empty() {
             println!("  waits for the GPU thread per frame: {}", waits.join(", "));
         }
