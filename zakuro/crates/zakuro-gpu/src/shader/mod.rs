@@ -70,6 +70,32 @@ pub struct ShaderUnit {
     decoded_before: HashMap<u64, Arc<Program>>,
 }
 
+impl ShaderUnit {
+    /// a copy to shade a draw's vertices with on another thread while the
+    /// unit goes on to the next draw: what shading reads, the program as
+    /// decoded and the uniforms, and nothing of the decoded programs kept
+    /// for later. call prepare first.
+    pub fn snapshot(&self) -> ShaderUnit {
+        ShaderUnit {
+            program: self.program.clone(),
+            descriptors: self.descriptors.clone(),
+            float_uniforms: self.float_uniforms.clone(),
+            wide_uniforms: self.wide_uniforms.clone(),
+            int_uniforms: self.int_uniforms,
+            bool_uniforms: self.bool_uniforms,
+            entry_point: self.entry_point,
+            program_write_offset: self.program_write_offset,
+            descriptor_write_offset: self.descriptor_write_offset,
+            float_uniform_index: self.float_uniform_index,
+            float_uniform_component: self.float_uniform_component,
+            float_uniform_wide: self.float_uniform_wide,
+            float_uniform_staging: self.float_uniform_staging,
+            decoded: self.decoded.clone(),
+            decoded_before: HashMap::new(),
+        }
+    }
+}
+
 impl Default for ShaderUnit {
     fn default() -> Self {
         Self::new()

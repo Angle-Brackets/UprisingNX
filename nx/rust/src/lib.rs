@@ -68,6 +68,10 @@ pub struct Unx {
     syncs: u64,
     write_backs: [u64; 6],
     write_back: f64,
+    /// ms in the host GPU's side of the draws, see zakuro_gpu::stats::HARDWARE
+    hardware: f64,
+    /// ms the GPU's thread waited for vertices a helper shaded
+    shade_wait: f64,
     /// frames since the game's overrides last said it was in play (a battle),
     /// see IN_PLAY_QUIET; the layout follows it
     out_of_play: u32,
@@ -187,6 +191,8 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         syncs: 0,
         write_backs: [0; 6],
         write_back: 0.0,
+        hardware: 0.0,
+        shade_wait: 0.0,
         out_of_play: u32::MAX,
         since_portrait: u32::MAX,
         in_play: false,
@@ -278,6 +284,8 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         *sum += n;
     }
     unx.write_back += gpu.write_back;
+    unx.hardware += gpu.hardware;
+    unx.shade_wait += gpu.shade_wait;
     let presenting = Instant::now();
     // debug: with sdmc:/switch/uprisingnx/dump_top present, the top screen's own
     // picture (before the presenter crops or scales it) goes to top.ppm and
@@ -357,6 +365,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 (n > 0).then(|| format!("{name} {:.1} ms in {:.1}", ns as f64 / 1e6 / frames, n as f64 / frames))
             })
             .collect();
+        println!("  gpu thread per frame: draw {:.1} ms of which shading {:.1}, the host GPU's side {:.1}, textures {:.1}, waiting for shaded vertices {:.1}", unx.spent[2] / frames, unx.spent[3] / frames, unx.hardware / frames, unx.spent[4] / frames, unx.shade_wait / frames);
         let (queue_wait, queue_held) = (
             zakuro_gpu::stats::QUEUE_WAIT_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
             zakuro_gpu::stats::QUEUE_HELD_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
@@ -392,6 +401,8 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         unx.syncs = 0;
         unx.write_backs = [0; 6];
         unx.write_back = 0.0;
+        unx.hardware = 0.0;
+        unx.shade_wait = 0.0;
         unx.window_presenting = Duration::ZERO;
         unx.window_start = Instant::now();
         unx.window_frames = 0;

@@ -314,6 +314,7 @@ impl Gpu {
         value: u32,
         width: u32,
     ) {
+        self.flush_draws(memory);
         if end <= start {
             return;
         }
@@ -368,6 +369,7 @@ impl Gpu {
         flags: u32,
     ) {
         self.take_flags();
+        self.flush_draws(memory);
         let input_width = input_dimensions & 0xFFFF;
         let input_height = input_dimensions >> 16;
         // the portraits the bottom screen drew last frame go into the top
@@ -565,6 +567,7 @@ impl Gpu {
         input_gap: u32,
         output_gap: u32,
     ) {
+        self.flush_draws(memory);
         let input_width = (input_gap & 0xFFFF) * 16;
         let input_skip = (input_gap >> 16) * 16;
         // every line and the gaps between them
@@ -821,6 +824,7 @@ impl Gpu {
     /// makes guest memory right over a range something other than a draw
     /// is about to read or write, the host GPU keeps what it draws until then.
     pub fn sync_memory<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        self.flush_draws(memory);
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.sync(memory, addr, len) {
@@ -835,6 +839,7 @@ impl Gpu {
     /// over a range, for the CPU reading there. the CPU reads color buffers
     /// as memory holds them.
     pub fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        self.flush_draws(memory);
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.sync_depth(memory, addr, len) {
@@ -911,6 +916,7 @@ impl Gpu {
         self.resources.words = words;
 
         self.flush_immediate(memory);
+        self.flush_draws(memory);
         self.command_lists += 1;
     }
 
@@ -1040,18 +1046,21 @@ impl Gpu {
             }
             lighting::REG_TABLE_DATA..=lighting::REG_TABLE_DATA_END if last <= lighting::REG_TABLE_DATA_END => {
                 self.flush_immediate(memory);
+                self.flush_draws(memory);
                 for &word in words() {
                     self.resources.light_tables.write(&mut self.internal, word);
                 }
             }
             proctex::REG_TABLE_DATA..=proctex::REG_TABLE_DATA_END if last <= proctex::REG_TABLE_DATA_END => {
                 self.flush_immediate(memory);
+                self.flush_draws(memory);
                 for &word in words() {
                     self.resources.proctex_tables.write(&mut self.internal, word);
                 }
             }
             fog::REG_TABLE_DATA..=fog::REG_TABLE_DATA_END if last <= fog::REG_TABLE_DATA_END => {
                 self.flush_immediate(memory);
+                self.flush_draws(memory);
                 for &word in words() {
                     self.resources.fog_table.write(&mut self.internal, word);
                 }
@@ -1097,6 +1106,13 @@ impl Gpu {
         }
     }
 
+    /// draws the draw still waiting for its vertices to be shaded, before
+    /// anything that looks at what the draws drew or changes what they use.
+    #[inline]
+    fn flush_draws<M: GpuMemory>(&mut self, memory: &mut M) {
+        raster::finish_pending(memory, &mut self.resources);
+    }
+
     /// draws what the registers describe, the vertices of the arrays in
     /// order or the ones the index buffer picks. kept out of write_internal,
     /// where every write paid for the stack a draw needs.
@@ -1124,6 +1140,7 @@ impl Gpu {
             memory,
             &mut self.resources,
             indexed,
+            self.interpolation.is_none(),
         );
         if let Some(mut between) = between {
             self.swap_uniforms(&mut between);
@@ -1136,6 +1153,7 @@ impl Gpu {
                 memory,
                 &mut self.resources,
                 indexed,
+                false,
             );
             self.swap_uniforms(&mut between);
             if let Some(interpolation) = &mut self.interpolation {
@@ -1250,12 +1268,15 @@ impl Gpu {
             }
 
             lighting::REG_TABLE_DATA..=lighting::REG_TABLE_DATA_END => {
+                self.flush_draws(memory);
                 self.resources.light_tables.write(&mut self.internal, new);
             }
             proctex::REG_TABLE_DATA..=proctex::REG_TABLE_DATA_END => {
+                self.flush_draws(memory);
                 self.resources.proctex_tables.write(&mut self.internal, new);
             }
             fog::REG_TABLE_DATA..=fog::REG_TABLE_DATA_END => {
+                self.flush_draws(memory);
                 self.resources.fog_table.write(&mut self.internal, new);
             }
             REG_GS_BLOCK..=REG_GS_BLOCK_END => {

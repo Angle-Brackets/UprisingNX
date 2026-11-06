@@ -19,6 +19,12 @@ pub static AUDIO: AtomicU64 = AtomicU64::new(0);
 /// what the GPU drew brought back for the CPU's reads and writes, and how often.
 pub static SYNC: AtomicU64 = AtomicU64::new(0);
 pub static SYNCS: AtomicU64 = AtomicU64::new(0);
+/// time in the host GPU's side of a draw (Hardware::draw: state, pipelines,
+/// uploads, the Vulkan recording), inside DRAWING.
+pub static HARDWARE: AtomicU64 = AtomicU64::new(0);
+/// time the GPU's thread waited for vertices a helper was shading, see
+/// raster::finish_pending.
+pub static SHADE_WAIT: AtomicU64 = AtomicU64::new(0);
 /// the renderer waiting for the Vulkan queue the presenter holds, in
 /// nanoseconds, and how long the presenter held it.
 pub static QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +69,8 @@ pub struct Spent {
     pub syncs: u64,
     pub write_backs: [u64; 6],
     pub write_back: f64,
+    pub hardware: f64,
+    pub shade_wait: f64,
 }
 
 /// what was spent since the last take, starting afresh.
@@ -82,6 +90,8 @@ pub fn take() -> Spent {
         syncs: SYNCS.swap(0, Ordering::Relaxed),
         write_backs: std::array::from_fn(|i| WRITE_BACKS[i].swap(0, Ordering::Relaxed)),
         write_back: ms(&WRITE_BACK),
+        hardware: ms(&HARDWARE),
+        shade_wait: ms(&SHADE_WAIT),
     }
 }
 

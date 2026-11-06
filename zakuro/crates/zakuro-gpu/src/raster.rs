@@ -1164,6 +1164,9 @@ pub(crate) enum Pass {
 /// what draws keep from one to the next.
 #[derive(Default)]
 pub struct Resources {
+    /// the draw whose vertices a helper is shading, which is drawn once the
+    /// next one has gone to shade too, see finish_pending.
+    pending: Option<Pending>,
     pub textures: TextureCache,
     pub light_tables: Tables,
     pub proctex_tables: crate::proctex::Tables,
@@ -3041,6 +3044,40 @@ impl Edge {
 
 /// executes a draw call, fetches vertices, shades them, assembles triangles
 /// and fills them. Returns the number of vertices processed.
+/// a draw whose vertices go through the vertex shader on a helper thread, and
+/// the registers it is drawn with, copied, as the next draws change them.
+struct Pending {
+    registers: Vec<u32>,
+    shaded: std::sync::mpsc::Receiver<Vec<Vertex>>,
+}
+
+/// whether draws shade ahead, ZAKURO_SHADE_AHEAD=0 for one at a time.
+fn shade_ahead_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZAKURO_SHADE_AHEAD").is_ok_and(|value| value != "0"))
+}
+
+/// whether a draw has anything of its own to do before its vertices are
+/// shaded, the portraits and text of the bottom screen and the subtitles,
+/// which look at them.
+fn looks_at_vertices(registers: &[u32]) -> bool {
+    let top = read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0;
+    if top {
+        is_subtitle(registers)
+    } else {
+        is_text_buffer(registers) || on_bottom(registers) || is_bottom(registers)
+    }
+}
+
+/// draws the draw that waits for its vertices, once they are shaded.
+pub(crate) fn finish_pending<M: GpuMemory>(memory: &mut M, resources: &mut Resources) {
+    let Some(pending) = resources.pending.take() else { return };
+    let waited = std::time::Instant::now();
+    let shaded = pending.shaded.recv().unwrap_or_default();
+    crate::stats::SHADE_WAIT.fetch_add(waited.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    rasterize_now(&pending.registers, memory, resources, Vertices::Shaded(&shaded));
+}
+
 pub fn draw<M: GpuMemory>(
     registers: &[u32],
     vertex_shader: &ShaderUnit,
@@ -3049,6 +3086,7 @@ pub fn draw<M: GpuMemory>(
     memory: &mut M,
     resources: &mut Resources,
     indexed: bool,
+    ahead: bool,
 ) -> u32 {
     let _timer = crate::stats::time(&crate::stats::DRAWING);
     crate::stats::DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3183,6 +3221,34 @@ pub fn draw<M: GpuMemory>(
         }
     }
     let order = indexed.then_some(&scratch.order[..]);
+    #[cfg(feature = "vulkan")]
+    let ahead = ahead
+        && shade_ahead_wanted()
+        && resources.hardware.as_ref().is_some_and(|hardware| !hardware.shades())
+        && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2
+        && !looks_at_vertices(registers);
+    #[cfg(not(feature = "vulkan"))]
+    let ahead = false;
+    if ahead {
+        // the vertices go to a helper with what shades them, as the unit is
+        // by now, while the draw before them is drawn here
+        let unit = vertex_shader.snapshot();
+        let (inputs, copied, order) = (scratch.inputs.clone(), registers.to_vec(), order.map(<[usize]>::to_vec));
+        let (send, shaded) = std::sync::mpsc::channel();
+        let shading_registers = copied.clone();
+        shader_pool().spawn(move || {
+            let (shaded, order) = process_vertices(&shading_registers, &unit, &unit, &inputs, order.as_deref());
+            let in_order = match order {
+                Some(order) => order.iter().map(|&i| shaded[i]).collect(),
+                None => shaded,
+            };
+            let _ = send.send(in_order);
+        });
+        resources.scratch = scratch;
+        finish_pending(memory, resources);
+        resources.pending = Some(Pending { registers: copied, shaded });
+        return vertex_count;
+    }
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &scratch.inputs, order };
     rasterize(registers, memory, resources, vertices);
     resources.scratch = scratch;
@@ -3335,7 +3401,13 @@ fn assemble(topology: u32, count: usize) -> impl Iterator<Item = (usize, usize, 
 /// says, and fills them with the current back-end state.
 /// the triangles drawn, none for arrays the GPU could not decode, which the
 /// CPU decodes then.
+/// draws vertices, after the draw before them, which may still wait for its.
 fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
+    finish_pending(memory, resources);
+    rasterize_now(registers, memory, resources, vertices)
+}
+
+fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
     if portraits_on() && !resources.portraits.adding {
         if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0 {
             note_top_buffer(registers, resources);
@@ -3686,7 +3758,10 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 return Some(0);
             }
             let geometry = hardware::Geometry::Placed { vertices: &placed, indices: &indices };
-            match hardware.draw(memory, &state.hardware(registers, geometry)) {
+            let hardware_timer = crate::stats::time(&crate::stats::HARDWARE);
+            let drawn_on_gpu = hardware.draw(memory, &state.hardware(registers, geometry));
+            drop(hardware_timer);
+            match drawn_on_gpu {
                 Ok(()) => {
                     resources.placed = placed;
                     resources.slots = slots;
