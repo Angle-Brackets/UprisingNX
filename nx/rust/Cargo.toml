@@ -18,6 +18,8 @@ log = "0.4"
 opt-level = 3
 panic = "abort"
 debug = 1
+lto = "fat"
+codegen-units = 1
 
 [patch.crates-io]
 libc = { path = "../../build/vendor/libc" }
