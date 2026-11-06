@@ -3848,8 +3848,12 @@ impl Hardware {
             static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
             let mut hash = 0xcbf2_9ce4_8422_2325u64;
             let mut mix = |v: u64| hash = (hash ^ v).wrapping_mul(0x100_0000_01b3);
+            // the combiner's constants change every frame in a fade, so
+            // they stay out of the kind
             for r in 0x0C0..0x104 {
-                mix(draw.registers[r] as u64);
+                if r % 8 != 3 {
+                    mix(draw.registers[r] as u64);
+                }
             }
             for texture in draw.textures {
                 match texture {
@@ -3863,9 +3867,12 @@ impl Hardware {
             }
             mix(draw.lighting.is_some() as u64 | (draw.fog as u64) << 1 | (draw.proctex as u64) << 2);
             mix((draw.width as u64) << 16 | draw.height as u64);
+            mix(draw.registers[0x085] as u64);
+            mix(draw.registers[0x11C] as u64);
+            mix(draw.registers[0x11D] as u64);
             let mut seen = SEEN.lock().unwrap();
             let seen = seen.get_or_insert_with(Default::default);
-            if seen.len() < 600 && seen.insert(hash) {
+            if draw.textures[0].as_ref().is_some_and(|t| t.width == 256 && t.height == 512) && seen.len() < 600 && seen.insert(hash) {
                 let tex: Vec<String> = draw
                     .textures
                     .iter()
@@ -3873,10 +3880,11 @@ impl Hardware {
                     .collect();
                 log::info!(
                     target: "zakuro_gpu::diag",
-                    "draw kind {hash:016x}: target {}x{} tex [{}] light {} fog {} proc {} blend {:08x} {:08x} func {:08x} tev0 {:08x} {:08x} {:08x} {:08x} env {:08x}",
+                    "draw kind {hash:016x}: target {}x{} tex [{}] light {} fog {} proc {} blend {:08x} {:08x} func {:08x} tev0 {:08x} {:08x} {:08x} {:08x} env {:08x} tex0 at {:08x} fmt {:x} depth buf {:08x} color buf {:08x}",
                     draw.width, draw.height, tex.join(" "), draw.lighting.is_some(), draw.fog, draw.proctex,
                     draw.registers[0x100], draw.registers[0x101], draw.registers[0x102],
                     draw.registers[0x0C0], draw.registers[0x0C1], draw.registers[0x0C2], draw.registers[0x0C3], draw.registers[0x0C4],
+                    draw.registers[0x085] << 3, draw.registers[0x08E] & 0xF, draw.registers[0x11C] << 3, draw.registers[0x11D] << 3,
                 );
             }
         }
