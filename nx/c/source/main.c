@@ -86,6 +86,9 @@ static void load_env(void) {
     // from the GPU), 22 -> 30 fps in the land battle; ZAKURO_SKIP_SCREEN_SYNC is
     // read by presence, so env.txt cannot turn it off: remove this line to
     setenv("ZAKURO_SKIP_SCREEN_SYNC", "1", 0);
+    // self-sampling draws (the water/ripple moire) issued in 8 runs so each
+    // run sees the image the earlier ones drew; ZAKURO_SELF_CHUNKS=1 turns it off
+    setenv("ZAKURO_SELF_CHUNKS", "8", 0);
     FILE *f = fopen("sdmc:/switch/uprisingnx/env.txt", "r");
     if (!f) return;
     char line[256];
