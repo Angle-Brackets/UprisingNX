@@ -666,6 +666,28 @@ fn barely_moved(now: &[Vertex; 3], before: &[Vertex; 3], half_width: f32, half_h
     })
 }
 
+/// the vertices of an earlier frame's shading of this draw, when three of
+/// its vertices shaded now are where those were; at most once in a row.
+fn try_reuse(
+    resources: &mut Resources,
+    registers: &[u32],
+    unit: &ShaderUnit,
+    signature: u64,
+    picks: &[[Vec4; shader::INPUT_REGISTERS]; 3],
+) -> Option<std::sync::Arc<Vec<Vertex>>> {
+    let entry = resources.vreuse.get_mut(&signature).filter(|entry| entry.age < 1)?;
+    let plan = VertexPlan::new(&read_output_map(registers), registers[REG_VS_OUTPUT_MASK]);
+    let now = shade_with(unit, picks, |outputs| plan.vertex(outputs));
+    let now: [Vertex; 3] = [now[0], now[1], now[2]];
+    let (half_width, half_height) = (read_float24(registers, REG_VIEWPORT_WIDTH), read_float24(registers, REG_VIEWPORT_HEIGHT));
+    if barely_moved(&now, &entry.samples, half_width, half_height) {
+        entry.age += 1;
+        Some(entry.vertices.clone())
+    } else {
+        None
+    }
+}
+
 fn vcache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("ZAKURO_NO_VCACHE").is_none())
@@ -674,13 +696,19 @@ fn vcache_enabled() -> bool {
 /// what tells a draw from the others from one frame to the next, cheaply:
 /// its program, size and a few of its vertices' positions.
 fn draw_signature(unit: &ShaderUnit, inputs: &[[Vec4; shader::INPUT_REGISTERS]]) -> u64 {
+    let last = inputs.len() - 1;
+    draw_signature_of(unit, inputs.len(), &[inputs[0], inputs[inputs.len() / 2], inputs[last]])
+}
+
+/// the same from the size and the three vertices (the first, middle and last).
+fn draw_signature_of(unit: &ShaderUnit, count: usize, picks: &[[Vec4; shader::INPUT_REGISTERS]; 3]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64 ^ unit.entry_point as u64;
     let mut mix = |value: u32| {
         hash = (hash ^ value as u64).wrapping_mul(0x100000001b3);
     };
-    mix(inputs.len() as u32);
-    for at in [0, inputs.len() / 2, inputs.len() - 1] {
-        for value in &inputs[at][0] {
+    mix(count as u32);
+    for pick in picks {
+        for value in &pick[0] {
             mix(value.to_bits());
         }
     }
@@ -799,6 +827,9 @@ enum Vertices<'a> {
         vertices: &'a [u32],
     },
     Shaded(&'a [Vertex]),
+    /// vertices shaded once for each input, with the order an index buffer
+    /// takes them in, as the reuse of an earlier frame's has them.
+    ShadedOrdered { shaded: &'a [Vertex], order: Option<&'a [usize]> },
 }
 
 impl Vertices<'_> {
@@ -808,6 +839,7 @@ impl Vertices<'_> {
             #[cfg(feature = "vulkan")]
             Vertices::Raw { vertices, .. } => vertices.len(),
             Vertices::Shaded(shaded) => shaded.len(),
+            Vertices::ShadedOrdered { shaded, order } => order.map_or(shaded.len(), <[usize]>::len),
         }
     }
 }
@@ -1633,6 +1665,10 @@ fn shaded_in_order(registers: &[u32], vertices: Vertices) -> Option<Vec<Vertex>>
             })
         }
         Vertices::Shaded(shaded) => Some(shaded.to_vec()),
+        Vertices::ShadedOrdered { shaded, order } => Some(match order {
+            Some(order) => order.iter().map(|&i| shaded[i]).collect(),
+            None => shaded.to_vec(),
+        }),
         #[cfg(feature = "vulkan")]
         Vertices::Raw { .. } => None,
     }
@@ -1682,6 +1718,7 @@ fn note_big_portrait(registers: &[u32], resources: &mut Resources, vertices: &Ve
             }
         }
         Vertices::Shaded(shaded) => shaded.to_vec(),
+        Vertices::ShadedOrdered { .. } => return,
         #[cfg(feature = "vulkan")]
         Vertices::Raw { .. } => return,
     };
@@ -1713,6 +1750,7 @@ fn note_battle_display(registers: &[u32], resources: &mut Resources, vertices: &
             }
         }
         Vertices::Shaded(shaded) => shaded.to_vec(),
+        Vertices::ShadedOrdered { .. } => return,
         #[cfg(feature = "vulkan")]
         Vertices::Raw { .. } => return,
     };
@@ -3425,6 +3463,43 @@ pub fn draw<M: GpuMemory>(
         }
     }
     let plan = scratch.plans.current();
+    // a draw that barely moved since it was shaded is not even gathered:
+    // three of its vertices say so, and the rest are the last frame's
+    #[cfg(feature = "vulkan")]
+    let gpu_shades = resources.hardware.as_ref().is_some_and(|hardware| hardware.shades());
+    #[cfg(not(feature = "vulkan"))]
+    let gpu_shades = false;
+    if scratch.unique.len() >= 128
+        && vcache_enabled()
+        && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2
+        && !looks_at_vertices(registers)
+        && !gpu_shades
+    {
+        let n = scratch.unique.len();
+        let mut picks = [plan.template; 3];
+        for (input, at) in picks.iter_mut().zip([0, n / 2, n - 1]) {
+            let vertex_index = scratch.unique[at];
+            for loader in &plan.loaders {
+                let size = loader.size as usize;
+                let vertex = memory.translate(attribute_base + loader.offset + vertex_index * loader.stride);
+                match memory.slice(vertex, size) {
+                    Some(bytes) => loader.place(bytes, input),
+                    None => {
+                        let mut bytes = [0u8; 256];
+                        memory.read(vertex, &mut bytes[..size]);
+                        loader.place(&bytes[..size], input);
+                    }
+                }
+            }
+        }
+        let signature = draw_signature_of(vertex_shader, n, &picks);
+        if let Some(vertices) = try_reuse(resources, registers, vertex_shader, signature, &picks) {
+            let order = indexed.then_some(&scratch.order[..]);
+            rasterize(registers, memory, resources, Vertices::ShadedOrdered { shaded: &vertices, order });
+            resources.scratch = scratch;
+            return vertex_count;
+        }
+    }
     scratch.inputs.clear();
     scratch.inputs.resize(scratch.unique.len(), plan.template);
     let max_index = scratch.unique.iter().copied().max().unwrap_or(0);
@@ -3854,7 +3929,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 Some((vertex_shader, hardware::Inputs::Decoded(inputs), order, None))
             }
             Vertices::Raw { vertex_shader, raw, vertices } => Some((vertex_shader, hardware::Inputs::Raw(raw), None, Some(vertices))),
-            Vertices::Shaded(_) => None,
+            Vertices::Shaded(_) | Vertices::ShadedOrdered { .. } => None,
         };
         if let Some((unit, inputs, order, raw)) = unshaded.filter(|_| hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2) {
             let mut assembled = std::mem::take(&mut resources.triangles);
@@ -3879,35 +3954,15 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
     let held: std::sync::Arc<Vec<Vertex>>;
     let (shaded, order) = match vertices {
         Vertices::Shaded(shaded) => (shaded, None),
+        Vertices::ShadedOrdered { shaded, order } => (shaded, order),
         Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
             let signature = (vcache_enabled() && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 && inputs.len() >= 128 && !looks_at_vertices(registers))
                 .then(|| draw_signature(vertex_shader, inputs));
             // 1. what shading reads is exactly as some recent frame had it
             let cache_key = signature.filter(|&signature| vcache_worth(&mut resources.vcache_score, signature)).map(|_| shading_key(registers, vertex_shader, inputs));
-            let mut found = cache_key.and_then(|key| resources.vcache.get(&key).or_else(|| resources.vcache_old.get(&key))).cloned();
+            let found = cache_key.and_then(|key| resources.vcache.get(&key).or_else(|| resources.vcache_old.get(&key))).cloned();
             if let (Some(signature), Some(_)) = (signature, cache_key) {
                 vcache_note(&mut resources.vcache_score, signature, found.is_some());
-            }
-            // 2. the draw barely moved since it was last shaded: shade three
-            // of its vertices, and if they are where they were, use those
-            // shaded then, once, so such a draw is shaded every other frame
-            let plan = signature.map(|_| VertexPlan::new(&read_output_map(registers), registers[REG_VS_OUTPUT_MASK]));
-            let mut samples_now = None;
-            if found.is_none() {
-                if let (Some(signature), Some(plan)) = (signature, &plan) {
-                    if let Some(entry) = resources.vreuse.get_mut(&signature).filter(|entry| entry.age < 1) {
-                        let last = inputs.len() - 1;
-                        let picks = [inputs[0], inputs[last / 2], inputs[last]];
-                        let now = shade_with(vertex_shader, &picks, |outputs| plan.vertex(outputs));
-                        let now: [Vertex; 3] = [now[0], now[1], now[2]];
-                        if barely_moved(&now, &entry.samples, viewport_width / 2.0, viewport_height / 2.0) {
-                            entry.age += 1;
-                            found = Some(entry.vertices.clone());
-                        } else {
-                            samples_now = Some(now);
-                        }
-                    }
-                }
             }
             let reused = found.is_some();
             held = match found {
@@ -3926,7 +3981,6 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             if let (Some(signature), false) = (signature, reused) {
                 let last = held.len() - 1;
                 let samples = [held[0], held[last / 2], held[last]];
-                let _ = samples_now;
                 if resources.vreuse.len() > 256 {
                     resources.vreuse.clear();
                 }
