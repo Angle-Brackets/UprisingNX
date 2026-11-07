@@ -3980,7 +3980,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             }
             if let (Some(signature), false) = (signature, reused) {
                 let last = held.len() - 1;
-                let samples = [held[0], held[last / 2], held[last]];
+                let samples = [held[0], held[held.len() / 2], held[last]];
                 if resources.vreuse.len() > 256 {
                     resources.vreuse.clear();
                 }
