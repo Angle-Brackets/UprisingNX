@@ -127,6 +127,29 @@ static void *game(void *p) {
     appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
 
     load_env();
+    // UNX_CLOCKS=docked (or a hex PerformanceConfiguration such as 0x92220008) asks apm for
+    // the docked clocks (CPU 1020 MHz, GPU 768 MHz, stock docked values) while running
+    // handheld; the session stays open for the run, since the setting may go with it
+    {
+        const char *want = getenv("UNX_CLOCKS");
+        if (want && *want) {
+            u32 config = !strcmp(want, "docked") ? 0x92220008u : (u32)strtoul(want, NULL, 0);
+            Result rc = apmInitialize();
+            printf("clocks: apmInitialize %08x\n", (unsigned)rc);
+            if (R_SUCCEEDED(rc)) {
+                Result a = apmSetPerformanceConfiguration(ApmPerformanceMode_Normal, config);
+                Result b = apmSetPerformanceConfiguration(ApmPerformanceMode_Boost, config);
+                printf("clocks: asked for config %08x: normal %08x, boost %08x\n", (unsigned)config, (unsigned)a, (unsigned)b);
+                u32 got = 0;
+                for (int m = 0; m < 2; m++) {
+                    Result g = apmGetPerformanceConfiguration((ApmPerformanceMode)m, &got);
+                    printf("clocks: mode %d config now %08x (%08x)\n", m, (unsigned)got, (unsigned)g);
+                }
+                u32 cur = 0;
+                if (R_SUCCEEDED(appletGetCurrentPerformanceConfiguration(&cur))) printf("clocks: applet current config %08x\n", (unsigned)cur);
+            }
+        }
+    }
     // the Switch's own system font stands in for the 3DS shared font unless
     // the user placed a shared_font.bin or font.ttf (UNX_SYSTEM_FONT=0 to skip)
     if (!getenv("UNX_SYSTEM_FONT") || strcmp(getenv("UNX_SYSTEM_FONT"), "0")) {
