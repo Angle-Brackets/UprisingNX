@@ -564,7 +564,7 @@ fn surface_image(kind: Kind, depth_format: vk::Format) -> (vk::Format, vk::Image
     let (format, usage, aspect) = match kind {
         Kind::Color(_) => (
             COLOR_FORMAT,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
             vk::ImageAspectFlags::COLOR,
         ),
         Kind::Depth(_) => (
@@ -1621,6 +1621,9 @@ pub struct Hardware {
     last_draw_state: Option<(vk::Pipeline, DrawState)>,
     /// the vertices of a draw as made, before they go to the staging buffer.
     vertex_scratch: Vec<[f32; 24]>,
+    /// the texture units whose coordinate v the next placed vertices flip, for
+    /// draws sampling the target they draw into directly.
+    flip_v: u8,
     /// the pipelines compiled before, kept on disk between runs, so a
     /// combination of fragment stages seen once does not stall again.
     pipeline_cache: vk::PipelineCache,
@@ -1869,6 +1872,7 @@ impl Hardware {
                 draws: 0,
                 last_draw_state: None,
                 vertex_scratch: Vec::new(),
+                flip_v: 0,
                 pipeline_cache,
                 kept_pipelines,
                 known_keys: std::collections::HashSet::new(),
@@ -3418,15 +3422,16 @@ impl Hardware {
         // are not the target's
         let (inv_width_2, inv_height_2) = (2.0 / width, 2.0 / height);
         // pushed rather than zero-filled and then written over
+        let flip = std::mem::take(&mut self.flip_v);
         made.extend(vertices.iter().map(|v| {
             let depth = v.z * depth_map.scale + depth_map.offset;
             let w = 1.0 / v.inv_w;
             [
                 (v.x * inv_width_2 - 1.0) * w, (v.y * inv_height_2 - 1.0) * w, 0.0, w,
                 v.color[0], v.color[1], v.color[2], v.color[3],
-                v.texcoords[0][0], v.texcoords[0][1],
-                v.texcoords[1][0], v.texcoords[1][1],
-                v.texcoords[2][0], v.texcoords[2][1],
+                v.texcoords[0][0], if flip & 1 != 0 { 1.0 - v.texcoords[0][1] } else { v.texcoords[0][1] },
+                v.texcoords[1][0], if flip & 2 != 0 { 1.0 - v.texcoords[1][1] } else { v.texcoords[1][1] },
+                v.texcoords[2][0], if flip & 4 != 0 { 1.0 - v.texcoords[2][1] } else { v.texcoords[2][1] },
                 depth, 0.0,
                 v.quaternion[0], v.quaternion[1], v.quaternion[2], v.quaternion[3],
                 v.view[0], v.view[1], v.view[2], 0.0,
@@ -3828,6 +3833,7 @@ impl Hardware {
         let real = pass != Pass::Twin;
         let twin = twinned && pass != Pass::Twinned;
 
+        let mut flip = 0u8;
         let mut views = [self.blank.view; 3];
         let mut twin_views = [self.blank.view; 3];
         let mut samplers = [vk::Sampler::null(); 3];
@@ -3838,7 +3844,23 @@ impl Hardware {
                     let smallest = match bound.drawn {
                         Some(drawn) => {
                             if real {
-                                views[unit] = self.copy_texture(&drawn, bound, false)?;
+                                // ZAKURO_FEEDBACK_LOOP=1: a draw reading the target it draws into
+                                // samples that image as it is being drawn, without a snapshot
+                                // copy, its v flipped as the surface's rows run the other way
+                                let direct = super::feedback_loop()
+                                    && !twinned
+                                    && matches!(self.surfaces[color].kind, Kind::Color(_))
+                                    && self.texture_source(&drawn) == Some((color, 0))
+                                    && self.surfaces[color].width == drawn.width
+                                    && self.surfaces[color].height == drawn.height;
+                                if direct {
+                                    views[unit] = self.surfaces[color].image.view;
+                                    if std::env::var("ZAKURO_FEEDBACK_LOOP").as_deref() != Ok("noflip") {
+                                        flip |= 1 << unit;
+                                    }
+                                } else {
+                                    views[unit] = self.copy_texture(&drawn, bound, false)?;
+                                }
                             }
                             if twin {
                                 twin_views[unit] = self.copy_texture(&drawn, bound, true)?;
@@ -3924,6 +3946,7 @@ impl Hardware {
         self.collect();
         let (vertex_count, (vertex_offset, index_offset), shaded, (vertex, translating)) = match draw.geometry {
             Geometry::Placed { vertices, indices } => {
+                self.flip_v = flip;
                 let offsets = self.place(vertices, indices, (width, height), depth_map)?;
                 (indices.len(), offsets, None, (VertexStage::Placed, false))
             }
