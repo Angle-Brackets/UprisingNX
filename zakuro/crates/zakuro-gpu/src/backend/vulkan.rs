@@ -242,6 +242,17 @@ impl VulkanPresenter {
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let sharing = if shared.is_some() { ", the renderer's device too" } else { "" };
         log::info!("Vulkan on {}{sharing}", name.to_string_lossy());
+        // which of the extensions that would let a draw read the image it
+        // draws into the driver has
+        if let Ok(extensions) = unsafe { instance.enumerate_device_extension_properties(physical_device) } {
+            let wanted = ["VK_EXT_attachment_feedback_loop_layout", "VK_KHR_dynamic_rendering_local_read", "VK_EXT_attachment_feedback_loop_dynamic_state", "VK_KHR_dynamic_rendering", "VK_EXT_rasterization_order_attachment_access"];
+            let has: Vec<&str> = wanted
+                .iter()
+                .copied()
+                .filter(|want| extensions.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }.to_str() == Ok(*want)))
+                .collect();
+            log::info!("Vulkan device has, of the feedback-loop ones: {has:?} ({} extensions in all)", extensions.len());
+        }
 
         let swapchain_device = ash::khr::swapchain::Device::new(&instance, &device);
         let surface_format = choose_format(&surface_instance, physical_device, surface)?;
