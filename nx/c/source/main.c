@@ -33,6 +33,7 @@ extern const u8 recomp_entries, recomp_modules;
 void *unx_create(void *nwindow, const char *rom, const char *data_dir, const UnxRecomp *recomp);
 u32 unx_frame(void *unx, const UnxInput *input);
 void unx_destroy(void *unx);
+void unx_set_font(const u8 *data, size_t len);
 void nx_tls_init(void);
 void prof_start(void);
 void prof_stop(void);
@@ -89,6 +90,9 @@ static void load_env(void) {
     // self-sampling draws (the water/ripple moire) issued in 8 runs so each
     // run sees the image the earlier ones drew; ZAKURO_SELF_CHUNKS=1 turns it off
     setenv("ZAKURO_SELF_CHUNKS", "8", 0);
+    // aiming with the left stick, see nx/rust/src/aim.rs: 0 off, 1 on (default),
+    // 2 flying aims only while the modifier (UNX_AIM_MODIFIER, default ZL) is held
+    setenv("UNX_LEFT_STICK_AIM", "1", 0);
     FILE *f = fopen("sdmc:/switch/uprisingnx/env.txt", "r");
     if (!f) return;
     char line[256];
@@ -123,6 +127,18 @@ static void *game(void *p) {
     appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
 
     load_env();
+    // the Switch's own system font stands in for the 3DS shared font unless
+    // the user placed a shared_font.bin or font.ttf (UNX_SYSTEM_FONT=0 to skip)
+    if (!getenv("UNX_SYSTEM_FONT") || strcmp(getenv("UNX_SYSTEM_FONT"), "0")) {
+        if (R_SUCCEEDED(plInitialize(PlServiceType_User))) {
+            PlFontData font;
+            if (R_SUCCEEDED(plGetSharedFontByType(&font, PlSharedFontType_Standard))) {
+                printf("font: Switch standard system font, %u bytes\n", font.size);
+                unx_set_font(font.address, font.size);
+            } else printf("font: plGetSharedFontByType failed\n");
+            plExit();
+        } else printf("font: pl:u unavailable\n");
+    }
     void *unx = unx_create(nwindowGetDefault(), args->rom, "sdmc:/switch/uprisingnx/data", recomp);
     if (getenv("UNX_PROF")) prof_start();
     if (!unx) {

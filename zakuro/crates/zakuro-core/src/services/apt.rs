@@ -63,6 +63,15 @@ const SHARED_FONT_PATHS: &[&str] = &[
     "shared_font.bin",
 ];
 
+/// absolute places too, for the Switch's SD card: next to the data
+/// directory, and in the sysdata folder a Dekopon/Azahar install keeps
+/// (a guess at Dekopon's layout).
+const SHARED_FONT_ABSOLUTE: &[&str] = &[
+    "sdmc:/switch/uprisingnx/shared_font.bin",
+    "sdmc:/switch/uprisingnx/sysdata/shared_font.bin",
+    "sdmc:/switch/dekopon/sysdata/shared_font.bin",
+];
+
 /// maps the system's shared font, if the user has dumped it.
 fn shared_font(system: &mut System) -> Option<(u32, u32)> {
     if let Some(cached) = system.services.apt.shared_font {
@@ -74,7 +83,12 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
         .iter()
         .map(std::path::PathBuf::from)
         .chain(SHARED_FONT_PATHS.iter().filter_map(|path| Some(data_dir.as_ref()?.join(path))))
-        .find_map(|path| std::fs::read(path).ok());
+        .chain(SHARED_FONT_ABSOLUTE.iter().map(std::path::PathBuf::from))
+        .find_map(|path| {
+            let data = std::fs::read(&path).ok()?;
+            log::info!("shared font dump found at {}", path.display());
+            Some(data)
+        });
 
     let data = match dump {
         Some(mut data) if data.len() > 0x84 && matches!(&data[0x80..0x84], b"CFNU" | b"CFNT") => {
@@ -91,7 +105,10 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
             // a title does not just use the font, it parses it, an empty block
             // fails that parse and the title never gets going. it is built
             // again for its address once there is one.
-            log::info!("no shared font file found; using the generated stand-in");
+            log::info!(
+                "no shared font dump found (shared_font.bin under {:?}, or {:?}); using the generated stand-in",
+                data_dir, SHARED_FONT_ABSOLUTE
+            );
             Vec::new()
         }
     };

@@ -2,6 +2,8 @@
 //! the process, the window, input and nxlink; this side loads the game, runs
 //! frames and presents them through NVK.
 
+mod aim;
+
 use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -78,6 +80,7 @@ pub struct Unx {
     /// frames since the bottom screen drew a large dialogue portrait
     since_portrait: u32,
     in_play: bool,
+    aim: aim::Aim,
 }
 
 /// frames the overrides may stay quiet (8 s) before the game counts as out of play,
@@ -101,6 +104,19 @@ fn cstr(p: *const c_char) -> Option<String> {
     }
     // SAFETY: the C shell passes NUL-terminated strings
     Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+}
+
+/// hands Zakuro a TrueType font (the Switch's own system font, from libnx's
+/// pl:u) for the stand-in of the 3DS shared font, see zakuro-core
+/// services/shared_font.rs. call before unx_create; the data is copied.
+///
+/// # Safety
+/// `data` points to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn unx_set_font(data: *const u8, len: usize) {
+    if !data.is_null() && len > 0 {
+        zakuro_core::services::shared_font::set_frontend_font(std::slice::from_raw_parts(data, len));
+    }
 }
 
 /// starts Zakuro on the ROM at `rom`, presenting to `nwindow` (libnx's
@@ -199,6 +215,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         out_of_play: u32::MAX,
         since_portrait: u32::MAX,
         in_play: false,
+        aim: aim::Aim::from_env(),
     }))
 }
 
@@ -236,8 +253,12 @@ fn touch_on_bottom(in_play: bool, x: u16, y: u16) -> Option<(u16, u16)> {
 #[no_mangle]
 pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32 {
     let unx = &mut *unx;
+    // what the game's overrides say it is doing this frame (see below)
+    let said = std::mem::take(&mut unx.system.memory.host_mailbox[3]);
+    unx.aim.said(said);
+    let mut look = (0.0, 0.0);
     if let Some(input) = input.as_ref() {
-        unx.system.set_input(InputState {
+        let mut state = InputState {
             buttons: PadState::from_bits_truncate(input.buttons),
             circle_x: input.circle_x,
             circle_y: input.circle_y,
@@ -245,15 +266,19 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             c_stick_y: input.c_stick_y,
             touch: (input.touching != 0).then(|| touch_on_bottom(unx.in_play, input.touch_x, input.touch_y)).flatten(),
             tilt: [0.0, 0.0],
-        });
+        };
+        // left stick aiming, see aim.rs
+        look = unx.aim.apply(&mut state);
+        unx.system.set_input(state);
     }
+    // on foot the game's mouse-look override reads the camera's turn from here
+    unx.aim.feed(&mut unx.system.memory.host_mailbox, look);
 
     // In a battle the bottom screen is never drawn: its portraits and the
     // battle display (hearts, powers) are drawn onto the top screen instead,
     // see zakuro_gpu::raster::mirror_portrait. In menus the game is played on
     // the bottom screen, so it is shown over the top one. the game's
     // overrides say which it is, in the host mailbox, as the desktop does.
-    let said = std::mem::take(&mut unx.system.memory.host_mailbox[3]);
     unx.out_of_play = if said != 0 { 0 } else { unx.out_of_play.saturating_add(1) };
     unx.since_portrait = if unx.system.gpu.flags().big_portrait.swap(false, std::sync::atomic::Ordering::Relaxed) { 0 } else { unx.since_portrait.saturating_add(1) };
     let in_play = unx.out_of_play <= IN_PLAY_QUIET || unx.since_portrait <= PORTRAIT_QUIET;
