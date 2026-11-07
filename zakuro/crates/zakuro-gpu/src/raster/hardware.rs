@@ -4608,6 +4608,23 @@ impl Hardware {
             None
         };
         let batch = self.batch;
+        {
+            static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *LOG.get_or_init(|| std::env::var_os("ZAKURO_COPY_LOG").is_some()) {
+                use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Relaxed) % 200 == 0 {
+                    let cached = self.copies(twin).get(texture).map(|copy| (copy.surface, copy.generation));
+                    let surface = &self.surfaces[source];
+                    log::info!(
+                        target: "zakuro_gpu::diag",
+                        "copy_texture: tex {:08x} {}x{} {:?} <- surface {} addr {:08x} {}x{} kind {:?} tiled {} row {} rows {} generation {} cached {:?}",
+                        texture.addr, texture.width, texture.height, texture.format, source, surface.addr, surface.width, surface.height,
+                        surface.kind, surface.tiled, row, rows, generation, cached
+                    );
+                }
+            }
+        }
         if let Some(copy) = self.copies(twin).get_mut(texture) {
             let same_memory = match (&copy.memory, &memory) {
                 (Some(kept), Some(now)) => Arc::ptr_eq(kept, now),
