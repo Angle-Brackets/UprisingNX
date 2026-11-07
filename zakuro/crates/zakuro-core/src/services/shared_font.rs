@@ -371,9 +371,46 @@ fn rasterize(data: &[u8]) -> Option<Face> {
     Some(Face { glyphs, baseline: HOST_BASELINE, advance })
 }
 
+/// a font the embedding frontend hands over (the Switch's own system font,
+/// read from its `pl:u` service), tried after any font file the user placed.
+static FRONTEND_FONT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// gives the stand-in a TrueType font from the frontend. call before the
+/// title first asks for the shared font; the data is copied.
+pub fn set_frontend_font(data: &[u8]) {
+    let _ = FRONTEND_FONT.set(data.to_vec());
+}
+
+/// font files the user may place by hand: the ZAKURO_FONT variable first,
+/// then these. any TrueType/OpenType font with kana in it will do.
+const USER_FONT_PATHS: &[&str] = &[
+    "sdmc:/switch/uprisingnx/data/font.ttf",
+    "sdmc:/switch/uprisingnx/data/font.otf",
+    "sdmc:/switch/uprisingnx/data/font.ttc",
+    "sdmc:/switch/uprisingnx/font.ttf",
+];
+
 /// the first font for Japanese the host has, and where it is.
 fn host_font() -> Option<(std::path::PathBuf, Vec<u8>)> {
-    font_candidates().into_iter().find_map(|path| Some((path.clone(), std::fs::read(&path).ok()?)))
+    let user = std::env::var_os("ZAKURO_FONT")
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .chain(USER_FONT_PATHS.iter().map(std::path::PathBuf::from));
+    let files = user.chain(font_candidates()).find_map(|path| {
+        let data = std::fs::read(&path).ok()?;
+        // a file that does not parse or lacks kana falls through to the next
+        usable(&data).then_some((path, data))
+    });
+    files.or_else(|| {
+        let data = FRONTEND_FONT.get()?;
+        usable(data).then(|| ("the frontend's system font".into(), data.clone()))
+    })
+}
+
+/// whether a font file is one the stand-in can use.
+fn usable(data: &[u8]) -> bool {
+    use ab_glyph::{Font, FontRef};
+    FontRef::try_from_slice_and_index(data, 0).is_ok_and(|font| font.glyph_id('\u{3042}').0 != 0)
 }
 
 /// where Windows keeps its fonts for Japanese.
