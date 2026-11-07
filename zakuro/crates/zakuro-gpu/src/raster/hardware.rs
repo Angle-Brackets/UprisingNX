@@ -3413,16 +3413,15 @@ impl Hardware {
         // it costs far more than the vertex's making
         let mut made = std::mem::take(&mut self.vertex_scratch);
         made.clear();
-        made.resize(vertices.len(), [0.0f32; 24]);
-        let out_slice = &mut made[..];
         // window coordinates back to the target's clip space, the viewport
         // is not always the whole target, so the shader's own clip x and y
         // are not the target's
         let (inv_width_2, inv_height_2) = (2.0 / width, 2.0 / height);
-        for (out_f32, v) in out_slice.iter_mut().zip(vertices) {
+        // pushed rather than zero-filled and then written over
+        made.extend(vertices.iter().map(|v| {
             let depth = v.z * depth_map.scale + depth_map.offset;
             let w = 1.0 / v.inv_w;
-            *out_f32 = [
+            [
                 (v.x * inv_width_2 - 1.0) * w, (v.y * inv_height_2 - 1.0) * w, 0.0, w,
                 v.color[0], v.color[1], v.color[2], v.color[3],
                 v.texcoords[0][0], v.texcoords[0][1],
@@ -3431,8 +3430,8 @@ impl Hardware {
                 depth, 0.0,
                 v.quaternion[0], v.quaternion[1], v.quaternion[2], v.quaternion[3],
                 v.view[0], v.view[1], v.view[2], 0.0,
-            ];
-        }
+            ]
+        }));
         let staging = self.ring(vertex_offset, vertex_bytes);
         // SAFETY: the staging buffer was sized for these vertices
         unsafe {
