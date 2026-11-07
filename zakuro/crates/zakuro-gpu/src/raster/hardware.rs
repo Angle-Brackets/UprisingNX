@@ -4678,7 +4678,13 @@ impl Hardware {
             // the texture's rows run top first, the surface's bottom first,
             // so the copy flips them, and its pixels round to the format as
             // memory would have them
-            let format = format_index(texture.format);
+            let mut format = format_index(texture.format);
+            // ZAKURO_COPY_ALPHA1=1: a snapshot of the scene target is read as a format with
+            // no alpha, so its alpha is 1 (a test for the translucent Pit's grey)
+            static ALPHA1: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ALPHA1.get_or_init(|| std::env::var_os("ZAKURO_COPY_ALPHA1").is_some()) && texture.format == ColorFormat::Rgba8 && texture.width >= 128 {
+                format = format_index(ColorFormat::Rgb8);
+            }
             let n = self.scale;
             let (width, height) = ((texture.width * n) as i32, (rows * n) as i32);
             let (row, source_height) = ((row * n) as i32, (self.surfaces[source].height * n) as i32);
