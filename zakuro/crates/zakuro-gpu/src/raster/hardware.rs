@@ -772,8 +772,14 @@ struct Timing {
     /// nanoseconds a tick of the GPU's clock lasts.
     period: f64,
     /// each command buffer's timestamps, and the work between them.
-    pools: HashMap<vk::CommandBuffer, (vk::QueryPool, Vec<Work>)>,
+    pools: HashMap<vk::CommandBuffer, (vk::QueryPool, Vec<(Work, u32)>)>,
     current: Work,
+    /// ZAKURO_GPU_DRAW_TIMES=1: a stamp after every draw, and the kind of
+    /// draw the work since the last stamp was (see Hardware::draw_class),
+    /// with the milliseconds and draws of each kind
+    per_draw: bool,
+    current_class: u32,
+    by_class: HashMap<u32, (f64, u32)>,
     /// milliseconds per kind of work.
     totals: [f64; WORK_NAMES.len()],
     batches: u32,
@@ -795,6 +801,10 @@ struct Timing {
     gaps: f64,
     longest_gap: f64,
 }
+
+/// where renderings were ended, by the line that ended them, for
+/// ZAKURO_GPU_TIMES.
+static RENDER_ENDS: std::sync::Mutex<std::collections::BTreeMap<u32, u32>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// what the host waited for the GPU for.
 #[derive(Clone, Copy)]
@@ -928,13 +938,16 @@ struct PipelineKey {
 
 /// the fragment shader's specialization constants, as raster.frag numbers
 /// them, the last one making it the generic shader.
-const FRAGMENT_CONSTANTS: usize = 30;
+const FRAGMENT_CONSTANTS: usize = 32;
+
+/// the constant that makes raster.frag the generic shader.
+const DYNAMIC_CONSTANT: usize = 29;
 
 /// the generic fragment shader's specialization, which reads what the
 /// others have as constants from the draw's registers.
 const GENERIC: [u32; FRAGMENT_CONSTANTS] = {
     let mut constants = [0; FRAGMENT_CONSTANTS];
-    constants[FRAGMENT_CONSTANTS - 1] = 1;
+    constants[DYNAMIC_CONSTANT] = 1;
     constants
 };
 
@@ -978,7 +991,9 @@ const KEY_BYTES: usize = 12 + 4 * FRAGMENT_CONSTANTS;
 
 /// where the pipelines a title used are listed, beside its cache.
 fn keys_path(cache: &std::path::Path) -> std::path::PathBuf {
-    cache.with_extension("keys")
+    // the keys grew with the lighting's constants, a list of the old size
+    // is left alone
+    cache.with_extension("keys32")
 }
 
 /// a key as it is kept, none for a translated program's, whose module is
@@ -1014,7 +1029,7 @@ fn key_from_bytes(bytes: &[u8]) -> Option<PipelineKey> {
         n => Some(*LogicOp::ALL.get(n as usize - 1)?),
     };
     let mut fragment = [0; FRAGMENT_CONSTANTS];
-    for (constant, at) in fragment.iter_mut().zip((12..KEY_BYTES).step_by(4)) {
+    for (constant, at) in fragment.iter_mut().zip((12..bytes.len()).step_by(4)) {
         *constant = word(at);
     }
     let blend = (bytes[4] != 0).then(|| word(0));
@@ -1025,9 +1040,18 @@ fn key_from_bytes(bytes: &[u8]) -> Option<PipelineKey> {
 /// once, none when there is no list or it is unreadable.
 fn read_keys(cache: &std::path::Path) -> Vec<PipelineKey> {
     let bytes = std::fs::read(keys_path(cache)).unwrap_or_default();
+    // the list from before the lighting's constants, its keys without them
+    let old = std::fs::read(cache.with_extension("keys")).unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
-    bytes.chunks_exact(KEY_BYTES).filter_map(key_from_bytes).filter(|key| seen.insert(*key)).collect()
+    old.chunks_exact(OLD_KEY_BYTES)
+        .filter_map(key_from_bytes)
+        .chain(bytes.chunks_exact(KEY_BYTES).filter_map(key_from_bytes))
+        .filter(|key| seen.insert(*key))
+        .collect()
 }
+
+/// a key on disk before the lighting's two constants.
+const OLD_KEY_BYTES: usize = 12 + 4 * 30;
 
 fn generic_keys(shades: bool) -> Vec<PipelineKey> {
     let vertices: &[VertexStage] = if shades { &[VertexStage::Interpreted, VertexStage::Placed] } else { &[VertexStage::Placed] };
@@ -1645,6 +1669,11 @@ pub struct Hardware {
     unfenced: bool,
     renderings: u64,
     draws: u64,
+    /// the kind of the draw being recorded, for ZAKURO_GPU_DRAW_TIMES:
+    /// bit 0 lighting, 1 depth from the shader, 2-4 texture units, 5 the
+    /// procedural texture, 6 the alpha test, 7 blending, 8-15 the target's
+    /// width / 8, 16-23 its height / 8
+    draw_class: u32,
     /// the dynamic state and graphics pipeline the last draw in this command
     /// buffer left set, which the next one skips setting again when it is
     /// the same, none after anything that could have changed them.
@@ -1890,6 +1919,9 @@ impl Hardware {
                         period: properties.limits.timestamp_period as f64,
                         pools: HashMap::new(),
                         current: Work::Other,
+                        per_draw: std::env::var_os("ZAKURO_GPU_DRAW_TIMES").is_some(),
+                        current_class: u32::MAX,
+                        by_class: HashMap::new(),
                         totals: [0.0; WORK_NAMES.len()],
                         batches: 0,
                         barriers: 0,
@@ -1907,6 +1939,7 @@ impl Hardware {
                 unfenced: true,
                 renderings: 0,
                 draws: 0,
+                draw_class: u32::MAX,
                 last_draw_state: None,
                 vertex_scratch: Vec::new(),
                 flip_v: 0,
@@ -2180,6 +2213,7 @@ impl Hardware {
             }
         };
         timing.current = Work::Other;
+        timing.current_class = u32::MAX;
         // SAFETY: recording, outside rendering
         unsafe {
             self.device.cmd_reset_query_pool(commands, pool, 0, TIMESTAMPS);
@@ -2220,10 +2254,11 @@ impl Hardware {
             if (marks.len() as u32) + 1 < TIMESTAMPS {
                 // SAFETY: recording, the query was reset when the batch began
                 unsafe { self.device.cmd_write_timestamp2(commands, vk::PipelineStageFlags2::ALL_COMMANDS, *pool, marks.len() as u32 + 1) };
-                marks.push(timing.current);
+                marks.push((timing.current, timing.current_class));
             }
         }
         timing.current = work;
+        timing.current_class = if work == Work::Draw { self.draw_class } else { u32::MAX };
     }
 
     /// adds up a finished batch's times, and logs them every so many.
@@ -2241,8 +2276,14 @@ impl Hardware {
                     .get_query_pool_results(*pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)
                     .map_err(vk_error("read timestamps"))?;
             }
-            for (i, &work) in marks.iter().enumerate() {
-                timing.totals[work as usize] += stamps[i + 1].wrapping_sub(stamps[i]) as f64 * timing.period / 1e6;
+            for (i, &(work, class)) in marks.iter().enumerate() {
+                let ms = stamps[i + 1].wrapping_sub(stamps[i]) as f64 * timing.period / 1e6;
+                timing.totals[work as usize] += ms;
+                if timing.per_draw && work == Work::Draw {
+                    let entry = timing.by_class.entry(class).or_insert((0.0, 0));
+                    entry.0 += ms;
+                    entry.1 += 1;
+                }
             }
             // the GPU's time between the last batch's end and this one's
             // start, and from the first batch logged to this one's end
@@ -2312,6 +2353,32 @@ impl Hardware {
                 timing.renderings,
                 timing.draws
             );
+            {
+                let mut ends = RENDER_ENDS.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut list: Vec<(u32, u32)> = std::mem::take(&mut *ends).into_iter().collect();
+                list.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+                let list: Vec<String> = list.iter().map(|(line, n)| format!("line {line}: {n}")).collect();
+                log::info!(target: "zakuro_gpu::times", "renderings ended by hardware.rs {}", list.join(", "));
+            }
+            if timing.per_draw {
+                let mut classes: Vec<(u32, (f64, u32))> = timing.by_class.drain().collect();
+                classes.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+                for (class, (ms, draws)) in classes.iter().take(14) {
+                    log::info!(
+                        target: "zakuro_gpu::times",
+                        "  draws {ms:.1} ms in {draws} ({:.0} us each): lighting {} depth-in-shader {} units {:03b} proctex {} alpha test {} blend {} target {}x{}",
+                        ms * 1000.0 / *draws as f64,
+                        class & 1,
+                        (class >> 1) & 1,
+                        (class >> 2) & 7,
+                        (class >> 5) & 1,
+                        (class >> 6) & 1,
+                        (class >> 7) & 1,
+                        ((class >> 8) & 0xFF) * 8,
+                        ((class >> 16) & 0xFF) * 8,
+                    );
+                }
+            }
             timing.waited = [(0.0, 0); 2];
             timing.totals = [0.0; WORK_NAMES.len()];
             timing.batches = 0;
@@ -2329,11 +2396,32 @@ impl Hardware {
         if !std::mem::take(&mut self.unfenced) {
             return;
         }
-        let barrier = [vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)];
+        // ZAKURO_NARROW_BARRIER=1 names the writes the GPU makes, drawing,
+        // copying and its compute shaders, and the reads and writes after
+        // them, rather than all memory, so a driver can leave the caches
+        // nothing wrote alone (a test of what the broad one costs)
+        static NARROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let barrier = if *NARROW.get_or_init(|| std::env::var_os("ZAKURO_NARROW_BARRIER").is_some()) {
+            use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
+            [vk::MemoryBarrier2::default()
+                .src_stage_mask(S::COLOR_ATTACHMENT_OUTPUT | S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS | S::ALL_TRANSFER | S::COMPUTE_SHADER)
+                .src_access_mask(A::COLOR_ATTACHMENT_WRITE | A::DEPTH_STENCIL_ATTACHMENT_WRITE | A::TRANSFER_WRITE | A::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(
+                    S::VERTEX_INPUT | S::VERTEX_SHADER | S::FRAGMENT_SHADER | S::COLOR_ATTACHMENT_OUTPUT | S::EARLY_FRAGMENT_TESTS
+                        | S::LATE_FRAGMENT_TESTS | S::ALL_TRANSFER | S::COMPUTE_SHADER,
+                )
+                .dst_access_mask(
+                    A::VERTEX_ATTRIBUTE_READ | A::INDEX_READ | A::UNIFORM_READ | A::SHADER_SAMPLED_READ | A::SHADER_STORAGE_READ
+                        | A::SHADER_STORAGE_WRITE | A::COLOR_ATTACHMENT_READ | A::COLOR_ATTACHMENT_WRITE
+                        | A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE | A::TRANSFER_READ | A::TRANSFER_WRITE,
+                )]
+        } else {
+            [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)]
+        };
         self.barriers += 1;
         // what it takes is timed on its own, then the work before goes on
         let work = self.timing.as_ref().map(|timing| timing.current);
@@ -2347,8 +2435,14 @@ impl Hardware {
 
     /// ends the rendering, and draws what waits to go into twins, before
     /// anything else reads or writes them.
+    #[track_caller]
     fn end_rendering(&mut self) {
         if self.rendering.take().is_some() {
+            if self.timing.is_some() {
+                let line = std::panic::Location::caller().line();
+                let mut ends = RENDER_ENDS.lock().unwrap_or_else(PoisonError::into_inner);
+                *ends.entry(line).or_insert(0) += 1;
+            }
             // SAFETY: rendering was begun in this command buffer
             unsafe { self.device.cmd_end_rendering(self.commands) };
         }
@@ -3279,6 +3373,19 @@ impl Hardware {
                 return self.pipeline(interpreted);
             }
         }
+        // the one without the lighting's constants, the uniforms giving
+        // the lighting, made before those constants were, which draws the
+        // same and far faster than the generic shader
+        if key.fragment[30] != 0 || key.fragment[31] != 0 {
+            let mut fragment = key.fragment;
+            fragment[30] = 0;
+            fragment[31] = 0;
+            for vertex in [key.vertex, VertexStage::Interpreted] {
+                if let Some(&pipeline) = self.pipelines.get(&PipelineKey { vertex, fragment, ..key }) {
+                    return Ok(pipeline);
+                }
+            }
+        }
         self.pipeline(generic)
     }
 
@@ -4110,6 +4217,14 @@ impl Hardware {
         // ZAKURO_NO_LIGHTING=1: no fragment lighting, a test of what it costs
         static NO_LIGHTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         fragment[26] = (draw.lighting.is_some() && !*NO_LIGHTING.get_or_init(|| std::env::var_os("ZAKURO_NO_LIGHTING").is_some())) as u32;
+        // the lighting's shape as constants too, ZAKURO_DYNAMIC_LIGHTING=1
+        // leaves it to the uniforms as before
+        static DYNAMIC_LIGHTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if fragment[26] != 0 && !*DYNAMIC_LIGHTING.get_or_init(|| std::env::var_os("ZAKURO_DYNAMIC_LIGHTING").is_some()) {
+            if let Some(lighting) = &draw.lighting {
+                [fragment[30], fragment[31]] = lighting.shape();
+            }
+        }
         fragment[27] = r[REG_ALPHA_TEST] & 0x71;
         fragment[28] = depth_flags | ((writes_depth as u32) * WRITES_DEPTH);
         // what stands in for a translated program's pipeline, the
@@ -4125,6 +4240,17 @@ impl Hardware {
             fragment,
         };
         let pipeline = self.pipeline_for(key, translating)?;
+        if self.timing.as_ref().is_some_and(|timing| timing.per_draw) {
+            let surface = &self.surfaces[color];
+            self.draw_class = (fragment[26] & 1)
+                | (((fragment[28] & WRITES_DEPTH) != 0) as u32) << 1
+                | (fragment[25] & 7) << 2
+                | (((fragment[25] & 0x400) != 0) as u32) << 5
+                | (fragment[27] & 1) << 6
+                | (blend.is_some() as u32) << 7
+                | ((surface.width / 8).min(255)) << 8
+                | ((surface.height / 8).min(255)) << 16;
+        }
 
         self.mark(Work::Draw, false);
         if self.uploads {
@@ -4284,6 +4410,9 @@ impl Hardware {
             count += 1;
         }
         let writes = &writes[..count];
+        if self.timing.as_ref().is_some_and(|timing| timing.per_draw) {
+            self.mark(Work::Draw, true);
+        }
         let commands = self.commands;
         let face = vk::StencilFaceFlags::FRONT_AND_BACK;
         let (test, op) = r.stencil;

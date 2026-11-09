@@ -229,7 +229,18 @@ pub struct System {
     /// diagnostics: what the recompiled code leaves to it).
     pub interpreted_pcs: Option<std::collections::HashMap<u32, u64>>,
     pub recompiled_instructions: u64,
+    /// when each command list still on the GPU's thread was handed to it,
+    /// in cycles, and at which frame, oldest first (see PACING).
+    p3d_submits: std::collections::VecDeque<(u64, u64)>,
 }
+
+/// UprisingNX diagnostics: whether a title drawing every other refresh does
+/// so of its own accord. idle cycles are those every thread waited through,
+/// the P3D ones how long after its command list the title heard it was
+/// drawn, in emulated cycles, and how many it heard of after a frame
+/// boundary it was handed over before. index: 0 idle cycles, 1 lists, 2
+/// latency sum, 3 latency max, 4 lists late past a boundary.
+pub static PACING: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// cycles in one frame of the screens, which refresh at 268111856 / 4481136,
 /// about 59.83 Hz and not 60. a title that keeps time by frames runs that
@@ -310,6 +321,7 @@ impl System {
             interpreted_instructions: 0,
             interpreted_pcs: None,
             recompiled_instructions: 0,
+            p3d_submits: Default::default(),
         }
     }
 
@@ -420,10 +432,12 @@ impl System {
             if self.services.dsp.running {
                 limit = limit.min(self.next_audio_frame);
             }
+            let before = self.cpu.cycles;
             match self.kernel.next_event() {
                 Some(tick) if tick > self.cpu.cycles => self.cpu.cycles = tick.min(limit),
                 _ => self.cpu.cycles = limit,
             }
+            PACING[0].fetch_add(self.cpu.cycles.saturating_sub(before), std::sync::atomic::Ordering::Relaxed);
             self.kernel.reschedule_pending = true;
             return StepOutcome::Ran;
         }
@@ -952,11 +966,26 @@ impl System {
     /// raises the interrupts of what the GPU's thread finished.
     fn raise_gpu_interrupts(&mut self) {
         for interrupt in self.gpu.take_done() {
+            if interrupt == services::gsp::InterruptId::P3d {
+                if let Some((at, frame)) = self.p3d_submits.pop_front() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let latency = self.cpu.cycles.saturating_sub(at);
+                    PACING[1].fetch_add(1, Relaxed);
+                    PACING[2].fetch_add(latency, Relaxed);
+                    PACING[3].fetch_max(latency, Relaxed);
+                    if self.frames != frame {
+                        PACING[4].fetch_add(1, Relaxed);
+                    }
+                }
+            }
             services::gsp::signal_interrupt(self, interrupt);
         }
     }
 
     pub fn submit_command_list(&mut self, paddr: u32, size: u32, interrupt: Option<services::gsp::InterruptId>) {
+        if interrupt == Some(services::gsp::InterruptId::P3d) {
+            self.p3d_submits.push_back((self.cpu.cycles, self.frames));
+        }
         self.queue_gx(Gx::List { paddr, size }, interrupt);
     }
 
@@ -1089,6 +1118,12 @@ impl System {
             return None;
         }
         self.gpu_picture(zakuro_common::Screen::Top, true)
+    }
+
+    /// whether the screens show frame interpolation's pictures in between
+    /// at this refresh, and so the title's own at the next.
+    pub fn showing_between(&self) -> bool {
+        self.pacing.between
     }
 
     fn gpu_picture(&mut self, screen: zakuro_common::Screen, right: bool) -> Option<zakuro_gpu::GpuScreen> {

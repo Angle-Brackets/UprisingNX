@@ -384,6 +384,47 @@ impl Lighting {
         read
     }
 
+    /// what the hardware renderer's fragment shader takes as constants of
+    /// the lighting, so a pipeline drops the tables, lights and dot
+    /// products it goes without: bit 0 set, 1-4 how many lights, 5-11
+    /// which of the seven tables are read, 12-18 which take the absolute
+    /// value, 19-22 the configuration, 23 the half vector, 24 the view
+    /// vector, 25-26 the bump mode, 27 the shadow, 28 and 29 the fresnel
+    /// into the primary and secondary alpha, 30 clamping highlights; then
+    /// each table's input, three bits each.
+    pub(crate) fn shape(&self) -> [u32; 2] {
+        let tables = [self.distribution0, self.distribution1, self.fresnel]
+            .into_iter()
+            .chain(self.reflect)
+            .chain([Some(self.spotlight)]);
+        let (mut read, mut absolute, mut inputs) = (0u32, 0u32, 0u32);
+        for (i, table) in tables.enumerate() {
+            if let Some(table) = table {
+                read |= 1 << i;
+                absolute |= (table.absolute as u32) << i;
+                inputs |= (table.input & 7) << (3 * i);
+            }
+        }
+        let bump = match self.bump {
+            Bump::None => 0,
+            Bump::Normal(..) => 1,
+            Bump::Tangent(_) => 2,
+        };
+        let shape = 1
+            | (self.light_count as u32 & 0xF) << 1
+            | read << 5
+            | absolute << 12
+            | (self.config & 0xF) << 19
+            | (self.needs_half as u32) << 23
+            | (self.needs_view as u32) << 24
+            | bump << 25
+            | (self.shadow.is_some() as u32) << 27
+            | (self.fresnel_primary as u32) << 28
+            | (self.fresnel_secondary as u32) << 29
+            | (self.clamp_highlights as u32) << 30;
+        [shape, inputs]
+    }
+
     /// the lighting as the words of the hardware renderer's uniform block,
     /// in the order its shader declares them.
     pub(crate) fn pack(&self, words: &mut Vec<u32>) {

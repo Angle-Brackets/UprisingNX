@@ -54,6 +54,14 @@ layout(constant_id = 28) const uint DEPTH_MODE = 0u;
 // without when they are off. it masks the rest as hardware.rs masks the
 // constants, so the two draw the same
 layout(constant_id = 29) const uint DYNAMIC = 0u;
+// the lighting's shape, see Lighting::shape, zero where the uniforms have it:
+// bit 0 set, 1-4 the lights, 5-11 the tables read, 12-18 which take the
+// absolute value, 19-22 the configuration, 23 the half vector, 24 the view
+// vector, 25-26 the bump mode, 27 the shadow, 28-29 the fresnel into the
+// primary and secondary alpha, 30 clamping highlights; then the tables'
+// inputs, three bits each
+layout(constant_id = 30) const uint LIGHT_SHAPE = 0u;
+layout(constant_id = 31) const uint LIGHT_INPUTS = 0u;
 
 layout(set = 0, binding = 0) uniform sampler2D texture0;
 layout(set = 0, binding = 1) uniform sampler2D texture1;
@@ -300,15 +308,36 @@ precise float quantize(float c) {
     return floor(clamp(c, 0.0, 1.0) * 255.0) / 255.0;
 }
 
+// the lighting's shape from the pipeline's constants when it has them,
+// else from the uniforms
+// a function rather than a constant of the two, which drivers fold the same
+bool light_constant() {
+    return DYNAMIC == 0u && (LIGHT_SHAPE & 1u) != 0u;
+}
+#define LIGHT_CONSTANT light_constant()
+bool table_read(uint i) {
+    return LIGHT_CONSTANT ? ((LIGHT_SHAPE >> (5u + i)) & 1u) != 0u : lookups[i].x != 0u;
+}
+uint table_input(uint i) {
+    return LIGHT_CONSTANT ? (LIGHT_INPUTS >> (3u * i)) & 7u : lookups[i].y;
+}
+bool table_absolute(uint i) {
+    return LIGHT_CONSTANT ? ((LIGHT_SHAPE >> (12u + i)) & 1u) != 0u : lookups[i].z != 0u;
+}
+bool light_bit(uint bit, uint dynamic_value) {
+    return LIGHT_CONSTANT ? ((LIGHT_SHAPE >> bit) & 1u) != 0u : dynamic_value != 0u;
+}
+
 // what fragment lighting leaves in the primary and secondary colors
 void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
-    uint config = light_config.x;
+    uint config = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 19) & 0xFu : light_config.x;
     float length_q = length(in_quaternion);
     vec4 q = length_q > 0.0 ? in_quaternion / length_q : vec4(0.0, 0.0, 0.0, 1.0);
 
     uint shadow_word = light_config.w;
     vec4 shadow = vec4(1.0);
-    if ((shadow_word & 1u) != 0u) {
+    bool shadow_on = light_bit(27u, shadow_word & 1u);
+    if (shadow_on) {
         shadow = textures[(shadow_word >> 4) & 3u];
         if ((shadow_word & 0x100u) != 0u) {
             shadow = vec4(1.0) - shadow;
@@ -318,7 +347,7 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     vec3 surface_normal = vec3(0.0, 0.0, 1.0);
     vec3 surface_tangent = vec3(1.0, 0.0, 0.0);
     uint bump = light_config.z;
-    uint bump_mode = bump & 3u;
+    uint bump_mode = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 25) & 3u : bump & 3u;
     if (bump_mode == 1u) {
         surface_normal = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
         if ((bump & 0x100u) != 0u) {
@@ -329,14 +358,17 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     }
     vec3 normal = rotate(q, surface_normal);
     vec3 tangent = config == 8u ? rotate(q, surface_tangent) : surface_tangent;
-    bool needs_half = (light_flags.w & 1u) != 0u;
-    bool needs_view = (light_flags.w & 2u) != 0u;
+    bool needs_half = light_bit(23u, light_flags.w & 1u);
+    bool needs_view = light_bit(24u, light_flags.w & 2u);
+    bool fresnel_primary = light_bit(28u, light_flags.x);
+    bool fresnel_secondary = light_bit(29u, light_flags.y);
+    bool clamp_highlights = light_bit(30u, light_flags.z);
     vec3 view = in_view;
     vec3 norm_view = needs_view ? normalize(view) : vec3(0.0);
 
     precise vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
     precise vec4 specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
-    uint count = light_config.y;
+    uint count = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 1) & 0xFu : light_config.y;
     for (uint slot = 0u; slot < count; slot++) {
         Light light = lights[slot];
         uint flags = light.flags.x;
@@ -361,12 +393,11 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
         float values[7];
         for (uint i = 0u; i < 7u; i++) {
             values[i] = 1.0;
-            uvec4 l = lookups[i];
-            if (l.x == 0u || (i == 6u && (flags & 32u) == 0u)) {
+            if (!table_read(i) || (i == 6u && (flags & 32u) == 0u)) {
                 continue;
             }
             float result = 0.0;
-            switch (l.y) {
+            switch (table_input(i)) {
                 case 0u: result = dot(normal, half_unit); break;
                 case 1u: result = dot(norm_view, half_unit); break;
                 case 2u: result = dot(normal, norm_view); break;
@@ -382,7 +413,7 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
             }
             uint entry;
             float delta;
-            if (l.z != 0u) {
+            if (table_absolute(i)) {
                 result = two_sided ? abs(result) : max(result, 0.0);
                 float e = clamp(floor(result * 256.0), 0.0, 255.0);
                 entry = uint(e);
@@ -400,28 +431,28 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
                 : i == 4u ? REFLECT_GREEN
                 : i == 5u ? REFLECT_BLUE
                 : SPOTLIGHT + number;
-            values[i] = uintBitsToFloat(l.w) * lookup(table, entry, delta);
+            values[i] = uintBitsToFloat(lookups[i].w) * lookup(table, entry, delta);
         }
 
         float spot = values[6];
         float red = values[3];
-        vec3 reflect_color = vec3(red, lookups[4].x != 0u ? values[4] : red, lookups[5].x != 0u ? values[5] : red);
+        vec3 reflect_color = vec3(red, table_read(4u) ? values[4] : red, table_read(5u) ? values[5] : red);
         vec3 specular0 = light.specular0.rgb * values[0];
         vec3 specular1 = values[1] * reflect_color * light.specular1.rgb;
 
         // only the last light applies fresnel
-        if (slot == count - 1u && lookups[2].x != 0u) {
-            if (light_flags.x != 0u) {
+        if (slot == count - 1u && table_read(2u)) {
+            if (fresnel_primary) {
                 diffuse_sum.a = values[2];
             }
-            if (light_flags.y != 0u) {
+            if (fresnel_secondary) {
                 specular_sum.a = values[2];
             }
         }
 
         float facing = dot(light_vector, normal);
         facing = two_sided ? abs(facing) : max(facing, 0.0);
-        float highlights = light_flags.z != 0u && facing == 0.0 ? 0.0 : 1.0;
+        float highlights = clamp_highlights && facing == 0.0 ? 0.0 : 1.0;
         if ((flags & 12u) != 0u) {
             float length2 = dot(half_vector, half_vector);
             float factor = length2 == 0.0 ? 0.0 : min(facing / length2, 1.0);
@@ -433,7 +464,7 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
             }
         }
 
-        bool shadowed = (flags & 64u) != 0u && (shadow_word & 1u) != 0u;
+        bool shadowed = (flags & 64u) != 0u && shadow_on;
         vec3 shadow_primary = shadowed && (shadow_word & 0x200u) != 0u ? shadow.rgb : vec3(1.0);
         vec3 shadow_secondary = shadowed && (shadow_word & 0x400u) != 0u ? shadow.rgb : vec3(1.0);
         vec3 diffuse = (light.diffuse.rgb * facing + light.ambient.rgb) * distance * spot;
@@ -442,11 +473,11 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
         specular_sum.rgb += specular * shadow_secondary;
     }
 
-    if ((shadow_word & 0x800u) != 0u) {
-        if (light_flags.x != 0u) {
+    if (shadow_on && (shadow_word & 0x800u) != 0u) {
+        if (fresnel_primary) {
             diffuse_sum.a *= shadow.a;
         }
-        if (light_flags.y != 0u) {
+        if (fresnel_secondary) {
             specular_sum.a *= shadow.a;
         }
     }

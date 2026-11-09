@@ -123,6 +123,8 @@ pub struct Unx {
     /// last new one came, the wall-clock gaps between new ones this window,
     /// a running average of those gaps, and vblanks that drew anything
     seen_swaps: u64,
+    /// the last refresh showed frame interpolation's picture in between
+    last_between: bool,
     /// when unx_frame last returned, to see time spent outside it
     last_exit: Option<Instant>,
     last_picture: Option<Instant>,
@@ -241,6 +243,9 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         resolution,
         device: presenter.shared_device(),
         linked,
+        // a picture in between each two of the game's, which draws every
+        // other refresh: ZAKURO_INTERPOLATE=1
+        interpolate: std::env::var("ZAKURO_INTERPOLATE").is_ok_and(|v| v == "1"),
         find_recompiled: false,
         username: "Pit".into(),
         ..Config::default()
@@ -279,6 +284,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         window_start: Instant::now(),
         window_frames: 0,
         seen_swaps: 0,
+        last_between: false,
         last_exit: None,
         last_picture: None,
         picture_gaps: Vec::with_capacity(256),
@@ -488,7 +494,10 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     if gpu.draws > 0 {
         unx.window_drawn += 1;
     }
-    if swaps != unx.seen_swaps {
+    // with interpolation, the refresh after one showing a picture in
+    // between shows the game's own, a new one with no swap of its own
+    let after_between = std::mem::replace(&mut unx.last_between, unx.system.showing_between());
+    if swaps != unx.seen_swaps || after_between {
         unx.seen_swaps = swaps;
         let now = Instant::now();
         if let Some(last) = unx.last_picture {
@@ -542,6 +551,22 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             );
             report!("{line}");
             report_line(format!("frame {} {line}", unx.frame));
+            // whether the title waits a refresh of its own accord: emulated
+            // cycles it was busy for per picture, against the 4.48M of one
+            // refresh, and how late it heard its command lists were drawn
+            let take = |i: usize| zakuro_core::PACING[i].swap(0, std::sync::atomic::Ordering::Relaxed);
+            let (idle, lists, latency, worst, late) = (take(0), take(1), take(2), take(3), take(4));
+            let all = frames * zakuro_core::CYCLES_PER_FRAME as f64;
+            let pictures = gaps.len().max(1) as f64;
+            report!(
+                "  pacing: guest busy {:.0}% of emulated time, {:.2}M cycles per picture (a refresh is 4.48M), {} P3D lists, {:.0}k cycles to done avg, {:.0}k worst, {} heard after a refresh",
+                100.0 * (1.0 - idle as f64 / all),
+                (all - idle as f64) / pictures / 1e6,
+                lists,
+                if lists > 0 { latency as f64 / lists as f64 / 1000.0 } else { 0.0 },
+                worst as f64 / 1000.0,
+                late,
+            );
             gaps.clear();
             unx.picture_gaps = gaps;
             unx.window_drawn = 0;
