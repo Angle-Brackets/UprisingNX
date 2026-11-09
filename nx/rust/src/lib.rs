@@ -43,7 +43,10 @@ fn report_line(line: String) {
             let mut fps_log: Option<std::fs::File> = None;
             let mut fresh = true;
             for line in receive {
-                if line.starts_with("frame ") || line.starts_with("  hitch") {
+                // the reports and their indented lines, slow frames among
+                // them, so a session played away from nxlink says where its
+                // time went
+                if line.starts_with("frame ") || line.starts_with("  ") {
                     // opened at the first line, the SD card is mounted by then
                     if fps_log.is_none() {
                         if fresh {
