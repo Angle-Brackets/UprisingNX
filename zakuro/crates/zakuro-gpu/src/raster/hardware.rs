@@ -3938,6 +3938,19 @@ impl Hardware {
                 );
             }
         }
+        // test switch: ZAKURO_SKIP_TEX=<hex prefix>,... drops the draws whose
+        // texture 0 address starts with one of them, to find which draw makes
+        // what on screen
+        static SKIP_TEX: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let skip = SKIP_TEX.get_or_init(|| {
+            std::env::var("ZAKURO_SKIP_TEX").map(|v| v.split(',').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect()).unwrap_or_default()
+        });
+        if !skip.is_empty() && draw.textures[0].is_some() {
+            let address = format!("{:08x}", draw.registers[0x085] << 3);
+            if skip.iter().any(|prefix| address.starts_with(prefix.as_str())) {
+                return Ok(());
+            }
+        }
         let tables = match draw.lighting.is_some() || draw.proctex || draw.fog {
             true => self.tables(draw.tables, draw.proctex_tables, draw.fog_table)?,
             false => 0,
