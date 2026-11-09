@@ -102,8 +102,14 @@ impl System {
         self.kernel.reschedule_pending = true;
         // what the host's GPU drew comes down first, so that memory holds
         // all of it
-        let linear_base = self.kernel.linear_base;
-        self.gpu.write_back_all(&mut GuestMemory { memory: &mut self.memory, linear_base });
+        // only with ZAKURO_STATE_WRITEBACK=1: a write-back of everything also
+        // writes surfaces the title has since reused the memory of, and the
+        // running game then hangs on its overwritten data (Chapter 6). without
+        // it a loaded state has last frames' render targets until redrawn
+        if std::env::var("ZAKURO_STATE_WRITEBACK").is_ok_and(|v| v == "1") {
+            let linear_base = self.kernel.linear_base;
+            self.gpu.write_back_all(&mut GuestMemory { memory: &mut self.memory, linear_base });
+        }
         let (images, layers) = images(self);
         let mut files = Vec::with_capacity(self.services.fs.files.len());
         for (&handle, file) in &self.services.fs.files {
@@ -188,7 +194,12 @@ impl System {
             files.insert(handle, file);
         }
 
-        // all of it read, the console takes it
+        // all of it read, the console takes it. the GPU's thread finishes the
+        // jobs of the console as it was first: one still running would write
+        // into the state's memory, and its interrupts, raised after, would
+        // wake the state's threads for jobs they never queued
+        self.gpu.wait_idle();
+        let _ = self.gpu.take_done();
         let phys = &mut self.memory.phys;
         for (memory, store) in memories.iter().zip([&mut phys.fcram, &mut phys.vram, &mut phys.dsp_ram, &mut phys.axi_wram]) {
             store.copy_from_slice(memory);

@@ -3918,9 +3918,11 @@ impl Hardware {
             mix(draw.registers[0x085] as u64);
             mix(draw.registers[0x11C] as u64);
             mix(draw.registers[0x11D] as u64);
+            mix(draw.registers[0x104] as u64);
+            mix(draw.registers[0x107] as u64);
             let mut seen = SEEN.lock().unwrap();
             let seen = seen.get_or_insert_with(Default::default);
-            if draw.textures[0].as_ref().is_some_and(|t| t.width == 256 && t.height == 512) && seen.len() < 600 && seen.insert(hash) {
+            if seen.len() < 600 && seen.insert(hash) {
                 let tex: Vec<String> = draw
                     .textures
                     .iter()
@@ -3928,11 +3930,11 @@ impl Hardware {
                     .collect();
                 log::info!(
                     target: "zakuro_gpu::diag",
-                    "draw kind {hash:016x}: target {}x{} tex [{}] light {} fog {} proc {} blend {:08x} {:08x} func {:08x} tev0 {:08x} {:08x} {:08x} {:08x} env {:08x} tex0 at {:08x} fmt {:x} depth buf {:08x} color buf {:08x}",
+                    "draw kind {hash:016x}: target {}x{} tex [{}] light {} fog {} proc {} blend {:08x} {:08x} func {:08x} tev0 {:08x} {:08x} {:08x} {:08x} env {:08x} tex0 at {:08x} fmt {:x} depth buf {:08x} color buf {:08x} alpha {:08x} depthreg {:08x}",
                     draw.width, draw.height, tex.join(" "), draw.lighting.is_some(), draw.fog, draw.proctex,
                     draw.registers[0x100], draw.registers[0x101], draw.registers[0x102],
                     draw.registers[0x0C0], draw.registers[0x0C1], draw.registers[0x0C2], draw.registers[0x0C3], draw.registers[0x0C4],
-                    draw.registers[0x085] << 3, draw.registers[0x08E] & 0xF, draw.registers[0x11C] << 3, draw.registers[0x11D] << 3,
+                    draw.registers[0x085] << 3, draw.registers[0x08E] & 0xF, draw.registers[0x11C] << 3, draw.registers[0x11D] << 3, draw.registers[0x104], draw.registers[0x107],
                 );
             }
         }
@@ -4122,7 +4124,13 @@ impl Hardware {
             // with the test off the PICA still writes depth, which Vulkan
             // only does while testing
             depth_test: depth.is_some() && (depth_test || depth_write),
-            depth_compare: if depth_test { COMPARES[((mask >> 4) & 7) as usize] } else { vk::CompareOp::ALWAYS },
+            // test switch: ZAKURO_DEPTH_TEST_NOWRITE=0 draws what tests depth
+            // without writing it (the translucent layers) over everything
+            depth_compare: if depth_test && (depth_write || nowrite_tests()) {
+                COMPARES[((mask >> 4) & 7) as usize]
+            } else {
+                vk::CompareOp::ALWAYS
+            },
             depth_write: depth.is_some() && depth_write,
             stencil_test,
             stencil: (r[REG_STENCIL_TEST], r[REG_STENCIL_OP]),
@@ -6367,4 +6375,11 @@ fn transfer_refused(site: u32, t: &Transfer) {
             t.input, t.input_width, t.input_format, t.input_linear, t.output, t.output_width, t.output_height, t.output_format, t.output_tiled, t.copy, t.flip, t.scale
         );
     }
+}
+
+/// whether draws that test depth without writing it test it, see
+/// ZAKURO_DEPTH_TEST_NOWRITE.
+fn nowrite_tests() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZAKURO_DEPTH_TEST_NOWRITE").map_or(true, |v| v != "0"))
 }
