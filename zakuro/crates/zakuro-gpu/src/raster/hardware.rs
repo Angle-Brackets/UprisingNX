@@ -558,6 +558,14 @@ impl Surface {
     }
 }
 
+/// ZAKURO_TRANSFER_BLIT=0: every display transfer and texture copy on the
+/// transfer shader, none as a blit.
+static TRANSFER_BLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn transfer_blit() -> bool {
+    std::env::var("ZAKURO_TRANSFER_BLIT").map_or(true, |v| v != "0")
+}
+
 /// the format, the uses and the aspects of the image a surface of a kind
 /// draws into, depth buffers in the depth format given.
 fn surface_image(kind: Kind, depth_format: vk::Format) -> (vk::Format, vk::ImageUsageFlags, vk::ImageAspectFlags) {
@@ -780,6 +788,12 @@ struct Timing {
     /// milliseconds the host waited for the GPU and how many times, for a
     /// batch to record the next in, then for what it needed done.
     waited: [(f64, u32); 2],
+    /// GPU ticks: the last batch's end, the first logged batch's start;
+    /// milliseconds between batches, the longest.
+    last_end: u64,
+    span_start: u64,
+    gaps: f64,
+    longest_gap: f64,
 }
 
 /// what the host waited for the GPU for.
@@ -1884,6 +1898,10 @@ impl Hardware {
                         statistics: statistics.then(HashMap::new),
                         counts: [0; 4],
                         waited: [(0.0, 0); 2],
+                        last_end: 0,
+                        span_start: 0,
+                        gaps: 0.0,
+                        longest_gap: 0.0,
                     }),
                 barriers: 0,
                 unfenced: true,
@@ -2226,6 +2244,18 @@ impl Hardware {
             for (i, &work) in marks.iter().enumerate() {
                 timing.totals[work as usize] += stamps[i + 1].wrapping_sub(stamps[i]) as f64 * timing.period / 1e6;
             }
+            // the GPU's time between the last batch's end and this one's
+            // start, and from the first batch logged to this one's end
+            let (first, last) = (stamps[0], stamps[marks.len()]);
+            if timing.last_end != 0 && first > timing.last_end {
+                let gap = (first - timing.last_end) as f64 * timing.period / 1e6;
+                timing.gaps += gap;
+                timing.longest_gap = timing.longest_gap.max(gap);
+            }
+            if timing.span_start == 0 {
+                timing.span_start = first;
+            }
+            timing.last_end = last;
             marks.clear();
         }
         if let Some(&pool) = timing.statistics.as_ref().and_then(|statistics| statistics.get(&commands)) {
@@ -2263,6 +2293,16 @@ impl Hardware {
                 None => String::new(),
             };
             let [(room, rooms), (done, dones)] = timing.waited;
+            let span = timing.last_end.wrapping_sub(timing.span_start) as f64 * timing.period / 1e6;
+            log::info!(
+                target: "zakuro_gpu::times",
+                "GPU span over {TIMED_BATCHES} batches: {span:.1} ms, between batches {:.1} ms, the longest gap {:.1} ms",
+                timing.gaps,
+                timing.longest_gap
+            );
+            timing.span_start = 0;
+            timing.gaps = 0.0;
+            timing.longest_gap = 0.0;
             log::info!(
                 target: "zakuro_gpu::times",
                 "GPU over {TIMED_BATCHES} batches: {total:.1} ms, {}, {} barriers, {} render passes, {} draws{shaded}, \
@@ -4067,7 +4107,9 @@ impl Hardware {
         }
         fragment[24] = r[REG_UPDATE_BUFFER] & 0xFF00;
         fragment[25] = texture_config & 0x2707;
-        fragment[26] = draw.lighting.is_some() as u32;
+        // ZAKURO_NO_LIGHTING=1: no fragment lighting, a test of what it costs
+        static NO_LIGHTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        fragment[26] = (draw.lighting.is_some() && !*NO_LIGHTING.get_or_init(|| std::env::var_os("ZAKURO_NO_LIGHTING").is_some())) as u32;
         fragment[27] = r[REG_ALPHA_TEST] & 0x71;
         fragment[28] = depth_flags | ((writes_depth as u32) * WRITES_DEPTH);
         // what stands in for a translated program's pipeline, the
@@ -4517,7 +4559,11 @@ impl Hardware {
             };
         let views = (self.surfaces[source].image.view, self.surfaces[target].image.view);
         let size = (t.copy.0 * self.scale, t.copy.1 * self.scale);
-        self.dispatch_transfer(views, constants, size)?;
+        // a plain copy, rows turned over or not, as a blit, which the GPU's
+        // texture and color paths do far faster than storage images
+        if twinned || !self.blit_transfer(source, target, constants, size, t.output_tiled) {
+            self.dispatch_transfer(views, constants, size)?;
+        }
         if twinned {
             self.dispatch_transfer((self.surface_view(source, true), self.surface_view(target, true)), constants, size)?;
             self.surfaces[target].twin_changed();
@@ -4541,13 +4587,88 @@ impl Hardware {
         Ok(true)
     }
 
+    /// a display transfer that only copies, one rgba8 pixel to one, as a
+    /// blit, the rows turned over as transfer.comp turns them. false, with
+    /// nothing recorded, for anything else. ZAKURO_TRANSFER_BLIT=0 keeps
+    /// every transfer on the shader.
+    fn blit_transfer(&mut self, source: usize, target: usize, constants: [i32; 11], size: (u32, u32), output_tiled: bool) -> bool {
+        if !*TRANSFER_BLIT.get_or_init(transfer_blit) {
+            return false;
+        }
+        let [_, _, input_height, output_height, scale_x, scale_y, flip, input_format, output_format, source_row, source_height] = constants;
+        // rgba8 to rgba8 copies every channel. into rgb8 the shader makes
+        // alpha one, which nothing can see in a buffer in plain rows: the
+        // screen shows rgb, memory keeps rgb, and the PICA reads such a
+        // buffer only through another transfer, which makes alpha one again
+        let formats = match (input_format, output_format) {
+            (0, 0) => true,
+            (0 | 1, 1) => !output_tiled,
+            _ => false,
+        };
+        if (scale_x, scale_y) != (1, 1) || !formats || size.0 == 0 || size.1 == 0 {
+            return false;
+        }
+        if source == target {
+            return false;
+        }
+        if !matches!(self.surfaces[source].kind, Kind::Color(_)) || !matches!(self.surfaces[target].kind, Kind::Color(_)) {
+            return false;
+        }
+        let (w, h) = (size.0 as i32, size.1 as i32);
+        let n = self.scale as i32;
+        let (source_width, source_rows) = (self.surfaces[source].width as i32 * n, self.surfaces[source].height as i32 * n);
+        let (target_width, target_rows) = (self.surfaces[target].width as i32 * n, self.surfaces[target].height as i32 * n);
+        // the source's image rows, its buffer row y at source_height - 1 -
+        // (source_row + y), turned over, input_height - 1 - y
+        let (source_y0, source_y1) = match flip != 0 {
+            false => (source_height - source_row - h, source_height - source_row),
+            true => (source_height - source_row - input_height, source_height - source_row - input_height + h),
+        };
+        let (target_y0, target_y1) = (output_height - h, output_height);
+        let inside = |y0: i32, y1: i32, rows: i32| y0 >= 0 && y1 <= rows && y0 < y1;
+        if w > source_width || w > target_width || source_height > source_rows || output_height > target_rows {
+            return false;
+        }
+        if !inside(source_y0, source_y1, source_rows) || !inside(target_y0, target_y1, target_rows) {
+            return false;
+        }
+        // turned over, the target's rows go the other way
+        let (target_y0, target_y1) = if flip != 0 { (target_y1, target_y0) } else { (target_y0, target_y1) };
+        let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
+        let region = vk::ImageBlit::default()
+            .src_subresource(layers)
+            .src_offsets([vk::Offset3D { x: 0, y: source_y0, z: 0 }, vk::Offset3D { x: w, y: source_y1, z: 1 }])
+            .dst_subresource(layers)
+            .dst_offsets([vk::Offset3D { x: 0, y: target_y0, z: 0 }, vk::Offset3D { x: w, y: target_y1, z: 1 }]);
+        self.end_rendering();
+        self.barrier();
+        self.mark(Work::Transfer, false);
+        // SAFETY: recording, outside rendering, both images made for
+        // transfers and kept in the general layout, the regions inside them
+        unsafe {
+            self.device.cmd_blit_image(
+                self.commands,
+                self.surfaces[source].image.image,
+                vk::ImageLayout::GENERAL,
+                self.surfaces[target].image.image,
+                vk::ImageLayout::GENERAL,
+                &[region],
+                vk::Filter::NEAREST,
+            );
+        }
+        self.unfenced = true;
+        self.mark(Work::Other, false);
+        true
+    }
+
     /// records the transfer shader going over size pixels, from one image
     /// to another, as the constants say.
     fn dispatch_transfer(&mut self, (source, target): (vk::ImageView, vk::ImageView), constants: [i32; 11], size: (u32, u32)) -> Result<(), String> {
-        self.mark(Work::Transfer, false);
+        self.mark(Work::Barrier, false);
         let (layout, pipeline) = self.transfer_pipeline()?;
         self.end_rendering();
         self.barrier();
+        self.mark(Work::Transfer, false);
         let infos = [source, target].map(|view| [vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL)]);
         let writes = [
             vk::WriteDescriptorSet::default()
@@ -4571,8 +4692,19 @@ impl Hardware {
             self.push.cmd_push_descriptor_set(self.commands, vk::PipelineBindPoint::COMPUTE, layout, 0, &writes);
             self.device.cmd_push_constants(self.commands, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
             self.unfenced = true;
-            self.device.cmd_dispatch(self.commands, size.0.div_ceil(8), size.1.div_ceil(8), 1);
         }
+        // ZAKURO_TRANSFER_PROBE=1: one workgroup first, timed as a copy, to
+        // tell a fixed cost from one per pixel
+        static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PROBE.get_or_init(|| std::env::var_os("ZAKURO_TRANSFER_PROBE").is_some()) {
+            self.mark(Work::Copy, false);
+            // SAFETY: as the dispatch below
+            unsafe { self.device.cmd_dispatch(self.commands, 1, 1, 1) };
+            self.mark(Work::Transfer, false);
+        }
+        // SAFETY: recording, outside rendering, the pipeline bound above
+        unsafe { self.device.cmd_dispatch(self.commands, size.0.div_ceil(8), size.1.div_ceil(8), 1) };
+        self.mark(Work::Other, false);
         Ok(())
     }
 
@@ -4734,8 +4866,37 @@ impl Hardware {
             let (width, height) = ((texture.width * n) as i32, (rows * n) as i32);
             let (row, source_height) = ((row * n) as i32, (self.surfaces[source].height * n) as i32);
             let constants = [width, height, height, height, 1, 1, 1, format, format, row, source_height];
-            let from = self.surface_view(source, twin);
-            self.dispatch_transfer((from, view), constants, (texture.width * n, rows * n))?;
+            // rgba8 rounds to nothing, a blit turning the rows over copies
+            // it the same, far faster than the shader's storage images: the
+            // surface's rows source_height - row - height up, into the copy
+            // from its row height down
+            let (surface_width, top) = ((self.surfaces[source].width * n) as i32, source_height - row);
+            let blit = format == 0 && width <= surface_width && top - height >= 0 && top <= source_height && height > 0 && width > 0;
+            if blit && *TRANSFER_BLIT.get_or_init(transfer_blit) {
+                let from = match &self.surfaces[source].twin {
+                    Some(twin_image) if twin && self.surfaces[source].twinned => twin_image.image,
+                    _ => self.surfaces[source].image.image,
+                };
+                let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
+                let region = vk::ImageBlit::default()
+                    .src_subresource(layers)
+                    .src_offsets([vk::Offset3D { x: 0, y: top - height, z: 0 }, vk::Offset3D { x: width, y: top, z: 1 }])
+                    .dst_subresource(layers)
+                    .dst_offsets([vk::Offset3D { x: 0, y: height, z: 0 }, vk::Offset3D { x: width, y: 0, z: 1 }]);
+                self.end_rendering();
+                self.barrier();
+                self.mark(Work::Transfer, false);
+                // SAFETY: recording, outside rendering, both color images in
+                // the general layout made for transfers, the regions inside
+                unsafe {
+                    self.device.cmd_blit_image(self.commands, from, vk::ImageLayout::GENERAL, image, vk::ImageLayout::GENERAL, &[region], vk::Filter::NEAREST);
+                }
+                self.unfenced = true;
+                self.mark(Work::Copy, false);
+            } else {
+                let from = self.surface_view(source, twin);
+                self.dispatch_transfer((from, view), constants, (texture.width * n, rows * n))?;
+            }
         }
         self.uploads = true;
         if let Some(copy) = self.copies(twin).get_mut(texture) {
