@@ -96,6 +96,13 @@ extern "C" {
     fn nx_audio_init();
     fn nx_audio_play(samples: *const i16, count: u32);
     fn nx_audio_exit();
+    fn unx_thread_role(role: *const c_char, index: i32);
+}
+
+fn place_thread(role: &str, index: usize) {
+    if let Ok(role) = std::ffi::CString::new(role) {
+        unsafe { unx_thread_role(role.as_ptr(), index as i32) };
+    }
 }
 
 fn cstr(p: *const c_char) -> Option<String> {
@@ -131,6 +138,7 @@ pub unsafe extern "C" fn unx_set_font(data: *const u8, len: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, data_dir: *const c_char, recomp: *const UnxRecomp) -> *mut Unx {
     let _ = log::set_logger(&LOGGER);
+    let _ = zakuro_gpu::THREAD_ROLE.set(place_thread);
     log::set_max_level(log::LevelFilter::Info);
     let (Some(rom), Some(data_dir)) = (cstr(rom), cstr(data_dir)) else {
         log::error!("unx: no ROM or data directory");

@@ -22,7 +22,9 @@ fn queue() -> &'static Queue {
             std::thread::Builder::new()
                 .name(format!("shade helper {index}"))
                 .stack_size(256 * 1024)
-                .spawn(move || loop {
+                .spawn(move || {
+                    crate::thread_role("shade", index);
+                    loop {
                     let job = {
                         let mut jobs = queue.jobs.lock().unwrap_or_else(|p| p.into_inner());
                         loop {
@@ -33,6 +35,7 @@ fn queue() -> &'static Queue {
                         }
                     };
                     job();
+                    }
                 })
                 .expect("a shading helper");
         }
@@ -50,6 +53,11 @@ pub(crate) fn submit(job: Job) {
 /// runs one waiting job on this thread, if there is one, for a thread with
 /// nothing to do. whether it did.
 pub fn help() -> bool {
+    // ZAKURO_GAME_HELPS=0 keeps the game's thread out of it
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("ZAKURO_GAME_HELPS").map_or(true, |v| v != "0")) {
+        return false;
+    }
     let queue = queue();
     let job = queue.jobs.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
     match job {

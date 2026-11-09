@@ -194,7 +194,10 @@ impl GpuCell {
             std::thread::Builder::new()
                 .name("gpu".into())
                 .stack_size(1 << 20)
-                .spawn(move || work(&shared))
+                .spawn(move || {
+                    zakuro_gpu::thread_role("gpu", 0);
+                    work(&shared)
+                })
                 .expect("the GPU's thread")
         });
         if threaded {

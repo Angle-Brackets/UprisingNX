@@ -16,6 +16,18 @@ pub mod registers;
 pub mod renderer;
 pub mod shader;
 pub mod shade_queue;
+
+/// a frontend's hook, called at the start of the threads that do the most,
+/// with what each is for ("gpu", "shader", "shade") and which of them it is,
+/// so it can place them on cores.
+pub static THREAD_ROLE: std::sync::OnceLock<fn(&str, usize)> = std::sync::OnceLock::new();
+
+/// tells the frontend's hook, if it has one, what this thread is for.
+pub fn thread_role(role: &str, index: usize) {
+    if let Some(hook) = THREAD_ROLE.get() {
+        hook(role, index);
+    }
+}
 pub mod state;
 pub mod stats;
 pub mod tev;
@@ -951,7 +963,12 @@ impl Gpu {
         self.resources.words = words;
 
         self.flush_immediate(memory);
-        self.flush_draws(memory);
+        // what reads the draws (transfers, fills, syncs, the frame's end)
+        // finishes them itself; ZAKURO_LIST_FLUSH=1 does at each list's end too
+        static LIST_FLUSH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LIST_FLUSH.get_or_init(|| std::env::var("ZAKURO_LIST_FLUSH").is_ok_and(|v| v != "0")) {
+            self.flush_draws(memory);
+        }
         self.command_lists += 1;
     }
 

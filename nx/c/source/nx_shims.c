@@ -33,6 +33,8 @@ long sysconf(int name) {
 // threads std/rayon spawn get it before their start routine. Threads made with
 // libnx threadCreate that call into Rust must call nx_tls_init() themselves.
 #include <pthread.h>
+#include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 void *__aarch64_read_tp(void);
@@ -54,9 +56,43 @@ static void *nx_thread_trampoline(void *p) {
     // Core 0 is dedicated to the main emulation thread. Worker and background
     // threads alternate between Core 1 and Core 2 (0x7 allows migration if needed).
     static int s_next_core = 0;
-    int core = 1 + (__atomic_fetch_add(&s_next_core, 1, __ATOMIC_RELAXED) % 2);
+    // UNX_CORES=3 spreads the threads over all three cores (the game's thread is idle
+    // most of the time, so core 0 is mostly wasted when it is kept for it alone)
+    static int s_spread = -1;
+    if (s_spread < 0) { const char *e = getenv("UNX_CORES"); s_spread = (e && e[0] == '3') ? 1 : 0; }
+    int slot = __atomic_fetch_add(&s_next_core, 1, __ATOMIC_RELAXED);
+    int core = s_spread ? slot % 3 : 1 + (slot % 2);
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 0x7);
     return start.fn(start.arg);
+}
+
+// UNX_PLACE=1: zakuro names its busy threads as they start (zakuro_gpu::thread_role),
+// and each goes on a core of its own choosing here, the GPU's thread alone on
+// UNX_PLACE_GPU (2) a step above the others' priority, the shader pool and the
+// shading helpers on the cores listed in UNX_PLACE_SHADER / UNX_PLACE_SHADE ("10").
+static int place_core(const char *list, int index, int fallback) {
+    if (!list || !list[0]) return fallback;
+    size_t n = strlen(list);
+    int c = list[index % n] - '0';
+    return (c >= 0 && c <= 2) ? c : fallback;
+}
+
+void unx_thread_role(const char *role, int index) {
+    const char *on = getenv("UNX_PLACE");
+    if (!on || on[0] != '1') return;
+    int core;
+    if (!strcmp(role, "gpu")) {
+        core = place_core(getenv("UNX_PLACE_GPU"), 0, 2);
+        svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2B);
+    } else if (!strcmp(role, "shader")) {
+        core = place_core(getenv("UNX_PLACE_SHADER"), index, index % 2 ? 0 : 1);
+    } else if (!strcmp(role, "shade")) {
+        core = place_core(getenv("UNX_PLACE_SHADE"), index, index % 2 ? 0 : 1);
+    } else {
+        return;
+    }
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
+    printf("place: %s %d on core %d\n", role, index, core);
 }
 
 int __real_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*fn)(void *), void *arg);

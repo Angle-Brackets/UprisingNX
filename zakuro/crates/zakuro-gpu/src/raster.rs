@@ -943,6 +943,7 @@ fn shader_pool() -> &'static rayon::ThreadPool {
             .num_threads(threads)
             .stack_size(256 * 1024)
             .thread_name(|i| format!("shader worker {i}"))
+            .start_handler(|i| crate::thread_role("shader", i))
             .build()
             .expect("shader pool")
     })
@@ -3275,7 +3276,12 @@ impl Edge {
 /// the registers it is drawn with, copied, as the next draws change them.
 struct Pending {
     registers: Vec<u32>,
-    shaded: std::sync::mpsc::Receiver<Vec<Vertex>>,
+    /// the vertices shaded once each, found in the cache or from a helper.
+    shaded: std::sync::mpsc::Receiver<std::sync::Arc<Vec<Vertex>>>,
+    order: Option<Vec<usize>>,
+    /// where a helper's vertices go in the caches, when they did not come from them.
+    cache_key: Option<u64>,
+    signature: Option<u64>,
 }
 
 /// whether draws shade ahead, ZAKURO_SHADE_AHEAD=0 for one at a time.
@@ -3307,8 +3313,29 @@ fn finish_oldest<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> boo
     let waited = std::time::Instant::now();
     let shaded = pending.shaded.recv().unwrap_or_default();
     crate::stats::SHADE_WAIT.fetch_add(waited.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-    rasterize_now(&pending.registers, memory, resources, Vertices::Shaded(&shaded));
+    if let Some(key) = pending.cache_key {
+        if resources.vcache.len() >= 40 {
+            resources.vcache_old = std::mem::take(&mut resources.vcache);
+        }
+        resources.vcache.insert(key, shaded.clone());
+    }
+    if let (Some(signature), false) = (pending.signature, shaded.is_empty()) {
+        let last = shaded.len() - 1;
+        let samples = [shaded[0], shaded[shaded.len() / 2], shaded[last]];
+        if resources.vreuse.len() > 256 {
+            resources.vreuse.clear();
+        }
+        resources.vreuse.insert(signature, Reuse { vertices: shaded.clone(), samples, age: 0 });
+    }
+    let order = pending.order.as_deref();
+    rasterize_now(&pending.registers, memory, resources, Vertices::ShadedOrdered { shaded: &shaded, order });
     true
+}
+
+/// how many vertices a shading job ahead takes at most, ZAKURO_SHADE_CHUNK.
+fn shade_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("ZAKURO_SHADE_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256).max(16))
 }
 
 /// how many draws may wait for their vertices at once, ZAKURO_SHADE_DEPTH.
@@ -3549,24 +3576,54 @@ pub fn draw<M: GpuMemory>(
     if ahead {
         // the vertices go to a helper with what shades them, as the unit is
         // by now, while the draw before them is drawn here
-        let unit = vertex_shader.snapshot();
-        let (inputs, copied, order) = (scratch.inputs.clone(), registers.to_vec(), order.map(<[usize]>::to_vec));
+        let inputs = &scratch.inputs;
+        // the exact cache first, as rasterize_now does
+        let signature = (vcache_enabled() && inputs.len() >= 128).then(|| draw_signature(vertex_shader, inputs));
+        let cache_key = signature
+            .filter(|&signature| vcache_worth(&mut resources.vcache_score, signature))
+            .map(|_| shading_key(registers, vertex_shader, inputs));
+        let found = cache_key.and_then(|key| resources.vcache.get(&key).or_else(|| resources.vcache_old.get(&key))).cloned();
+        if let (Some(signature), Some(_)) = (signature, cache_key) {
+            vcache_note(&mut resources.vcache_score, signature, found.is_some());
+        }
+        let (copied, order) = (registers.to_vec(), order.map(<[usize]>::to_vec));
         let (send, shaded) = std::sync::mpsc::channel();
-        let shading_registers = copied.clone();
-        crate::shade_queue::submit(Box::new(move || {
-            crate::shade_queue::IN_JOB.with(|flag| flag.set(true));
-            let (shaded, order) = process_vertices(&shading_registers, &unit, &unit, &inputs, order.as_deref());
-            crate::shade_queue::IN_JOB.with(|flag| flag.set(false));
-            let in_order = match order {
-                Some(order) => order.iter().map(|&i| shaded[i]).collect(),
-                None => shaded,
-            };
-            let _ = send.send(in_order);
-        }));
+        let pending = match found {
+            Some(vertices) => {
+                let _ = send.send(vertices);
+                Pending { registers: copied, shaded, order, cache_key: None, signature: None }
+            }
+            None => {
+                // in pieces, so the helpers share a big draw between them
+                let unit = std::sync::Arc::new(vertex_shader.snapshot());
+                let inputs = std::sync::Arc::new(inputs.clone());
+                let shading_registers = std::sync::Arc::new(copied.clone());
+                let chunk = shade_chunk();
+                let pieces = inputs.len().div_ceil(chunk).max(1);
+                let results = std::sync::Arc::new(std::sync::Mutex::new(vec![Vec::new(); pieces]));
+                let left = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(pieces));
+                for piece in 0..pieces {
+                    let (unit, inputs, shading_registers) = (unit.clone(), inputs.clone(), shading_registers.clone());
+                    let (results, left, send) = (results.clone(), left.clone(), send.clone());
+                    crate::shade_queue::submit(Box::new(move || {
+                        let range = piece * chunk..((piece + 1) * chunk).min(inputs.len());
+                        crate::shade_queue::IN_JOB.with(|flag| flag.set(true));
+                        let (shaded, _) = process_vertices(&shading_registers, &unit, &unit, &inputs[range], None);
+                        crate::shade_queue::IN_JOB.with(|flag| flag.set(false));
+                        results.lock().unwrap_or_else(|p| p.into_inner())[piece] = shaded;
+                        if left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                            let parts = std::mem::take(&mut *results.lock().unwrap_or_else(|p| p.into_inner()));
+                            let _ = send.send(std::sync::Arc::new(parts.concat()));
+                        }
+                    }));
+                }
+                Pending { registers: copied, shaded, order, cache_key, signature }
+            }
+        };
         resources.scratch = scratch;
         // the draws before this one are drawn while it and the one before
         // it are shaded, up to as many as may wait
-        resources.pending.push_back(Pending { registers: copied, shaded });
+        resources.pending.push_back(pending);
         while resources.pending.len() > shade_depth() {
             finish_oldest(memory, resources);
         }
