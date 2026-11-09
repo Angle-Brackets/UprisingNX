@@ -93,6 +93,11 @@ fn images(system: &System) -> Images {
 impl System {
     /// the console as it is, between frames, as a saved state.
     pub fn save_state(&mut self) -> Result<Vec<u8>, String> {
+        // the GPU's thread finishes what it was given, and the interrupts of
+        // those jobs go to the title now: a state taken with jobs queued
+        // loses them, and the title then waits forever for their interrupts
+        self.gpu.wait_idle();
+        self.raise_gpu_interrupts();
         // what the host's GPU drew comes down first, so that memory holds
         // all of it
         let linear_base = self.kernel.linear_base;
