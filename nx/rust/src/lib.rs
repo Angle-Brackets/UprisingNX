@@ -22,13 +22,71 @@ impl log::Log for Logger {
     }
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            println!("[{}] {}: {}", record.level(), record.target(), record.args());
+            report_line(format!("[{}] {}: {}", record.level(), record.target(), record.args()));
         }
     }
     fn flush(&self) {}
 }
 
 static LOGGER: Logger = Logger;
+
+/// lines to print, and the frame rate ones to keep in fps.log, handed to a
+/// thread of their own: printing goes over the network and the log to the
+/// SD card, 30 ms a report, which stalled the frame it came in.
+fn report_line(line: String) {
+    static LINES: std::sync::OnceLock<Option<std::sync::mpsc::Sender<String>>> = std::sync::OnceLock::new();
+    let sender = LINES.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::channel::<String>();
+        let spawned = std::thread::Builder::new().name("report".to_owned()).spawn(move || {
+            use std::io::Write;
+            let quiet = std::env::var_os("UNX_QUIET").is_some();
+            let mut fps_log: Option<std::fs::File> = None;
+            let mut fresh = true;
+            for line in receive {
+                if line.starts_with("frame ") || line.starts_with("  hitch") {
+                    // opened at the first line, the SD card is mounted by then
+                    if fps_log.is_none() {
+                        if fresh {
+                            let _ = std::fs::remove_file("sdmc:/switch/uprisingnx/fps.log");
+                        }
+                        fresh = false;
+                        fps_log = match std::fs::OpenOptions::new().create(true).append(true).open("sdmc:/switch/uprisingnx/fps.log") {
+                            Ok(file) => Some(file),
+                            Err(error) => {
+                                println!("[ERROR] fps.log: {error}");
+                                None
+                            }
+                        };
+                    }
+                    if let Some(log) = fps_log.as_mut() {
+                        let _ = writeln!(log, "{line}");
+                        let _ = log.flush();
+                    }
+                    if quiet {
+                        continue;
+                    }
+                }
+                // quiet: only the log's own lines go out
+                if quiet && !line.starts_with('[') {
+                    continue;
+                }
+                println!("{line}");
+            }
+        });
+        spawned.ok().map(|_| send)
+    });
+    match sender {
+        Some(sender) => {
+            let _ = sender.send(line);
+        }
+        None => println!("{line}"),
+    }
+}
+
+/// println, through the report thread.
+macro_rules! report {
+    ($($arg:tt)*) => { report_line(format!($($arg)*)) };
+}
 
 /// the tables 3dsrecomp writes beside the code (`recomp_abi`,
 /// `recomp_entries`, ...), from librecomp.a linked into the NRO.
@@ -61,6 +119,16 @@ pub struct Unx {
     frame: u64,
     window_start: Instant,
     window_frames: u32,
+    /// the pictures the player sees: TOP_SWAPS when last looked, when the
+    /// last new one came, the wall-clock gaps between new ones this window,
+    /// a running average of those gaps, and vblanks that drew anything
+    seen_swaps: u64,
+    /// when unx_frame last returned, to see time spent outside it
+    last_exit: Option<Instant>,
+    last_picture: Option<Instant>,
+    picture_gaps: Vec<f32>,
+    gap_average: f64,
+    window_drawn: u32,
     window_emulating: Duration,
     window_presenting: Duration,
     worst: Duration,
@@ -210,6 +278,12 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         frame: 0,
         window_start: Instant::now(),
         window_frames: 0,
+        seen_swaps: 0,
+        last_exit: None,
+        last_picture: None,
+        picture_gaps: Vec::with_capacity(256),
+        gap_average: 0.0,
+        window_drawn: 0,
         window_emulating: Duration::ZERO,
         window_presenting: Duration::ZERO,
         worst: Duration::ZERO,
@@ -253,6 +327,9 @@ fn touch_on_bottom(in_play: bool, x: u16, y: u16) -> Option<(u16, u16)> {
     ((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v)).then(|| ((u * 320.0) as u16, (v * 240.0) as u16))
 }
 
+/// how long the last 2 s report took, it runs between two frames.
+static REPORT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// runs one emulated frame and presents it. 0 to go on, 1 when the game
 /// exited or faulted.
 ///
@@ -261,6 +338,7 @@ fn touch_on_bottom(in_play: bool, x: u16, y: u16) -> Option<(u16, u16)> {
 #[no_mangle]
 pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32 {
     let unx = &mut *unx;
+    let entered = Instant::now();
     // what the game's overrides say it is doing this frame (see below)
     let said = std::mem::take(&mut unx.system.memory.host_mailbox[3]);
     unx.aim.said(said);
@@ -339,7 +417,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let gpu = zakuro_gpu::stats::take();
     // a slow frame says where it went, to find what the spikes are
     if took.as_secs_f64() * 1000.0 > 45.0 && unx.frame > 600 {
-        println!(
+        report!(
             "  slow frame {}: {:.0} ms | recompiled {:.1} draw {:.1} shade {:.1} tex {:.1} hw {:.1} wait {:.1} sync {:.1} writeback {:.1} | shader jit {:.0} ms for {} programs | in play {}",
             unx.frame,
             took.as_secs_f64() * 1000.0,
@@ -361,10 +439,14 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     unx.hardware += gpu.hardware;
     unx.shade_wait += gpu.shade_wait;
     let presenting = Instant::now();
-    // debug: with sdmc:/switch/uprisingnx/dump_top present, the top screen's own
+    // debug: with UNX_DUMP_TOP set, the top screen's own
     // picture (before the presenter crops or scales it) goes to top.ppm and
     // bottom.ppm every 2 s, to tell what the game draws from what is shown
-    if unx.frame % 120 == 0 && std::path::Path::new("sdmc:/switch/uprisingnx/dump_top").exists() {
+    // UNX_DUMP_TOP=1 only: reading both screens back and writing them out
+    // stalls the frame ~90 ms every 2 s (it was a file flag, left on the SD
+    // card, which made every session hitch)
+    static DUMP_TOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if unx.frame % 120 == 0 && *DUMP_TOP.get_or_init(|| std::env::var_os("UNX_DUMP_TOP").is_some()) {
         for (screen, name) in [(Screen::Top, "top"), (Screen::Bottom, "bottom")] {
             if let Some((px, w, h)) = unx.system.upright_screen(screen, false) {
                 let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
@@ -397,7 +479,26 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         }
     }
 
-    unx.window_presenting += presenting.elapsed();
+    let presented = presenting.elapsed();
+    unx.window_presenting += presented;
+
+    // a new picture is a swap of the top screen; the gap since the last one
+    // is what the player feels, whatever the vblank loop runs at
+    let swaps = zakuro_core::TOP_SWAPS.load(std::sync::atomic::Ordering::Relaxed);
+    if gpu.draws > 0 {
+        unx.window_drawn += 1;
+    }
+    if swaps != unx.seen_swaps {
+        unx.seen_swaps = swaps;
+        let now = Instant::now();
+        if let Some(last) = unx.last_picture {
+            let gap = (now - last).as_secs_f64() * 1000.0;
+            unx.picture_gaps.push(gap as f32);
+            // about the last half second of pictures
+            unx.gap_average = if unx.gap_average == 0.0 { gap } else { unx.gap_average * 0.94 + gap * 0.06 };
+        }
+        unx.last_picture = Some(now);
+    }
 
     // a line every 2 s: emulated frames per second, how long emulating took
     // on average and at worst, and the interpreter's share
@@ -406,9 +507,10 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     unx.worst = unx.worst.max(took);
     let window = unx.window_start.elapsed();
     if window >= Duration::from_secs(2) {
+        let reporting = Instant::now();
         let frames = unx.window_frames as f64;
         let fallbacks = unx.system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
-        println!(
+        report!(
             "unx: frame {} {:.1} fps, emulating {:.1} ms avg {:.1} ms worst, {} interpreted, {} recompiled, {} fallbacks",
             unx.frame,
             frames / window.as_secs_f64(),
@@ -418,8 +520,34 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             unx.system.recompiled_instructions,
             fallbacks,
         );
+        {
+            let mut gaps = std::mem::take(&mut unx.picture_gaps);
+            gaps.sort_by(|a, b| a.total_cmp(b));
+            let total: f64 = gaps.iter().map(|&g| g as f64).sum();
+            let at = |q: f64| gaps.get(((gaps.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or(0.0);
+            let line = format!(
+                "shown: {:.1} new pictures/s (avg gap {:.1} ms = {:.1} fps, running avg {:.1} ms = {:.1} fps, median {:.1}, 95th {:.1}, worst {:.1} ms), {} of {} vblanks drew, in play {}, the last report took {:.1} ms",
+                gaps.len() as f64 / window.as_secs_f64(),
+                if gaps.is_empty() { 0.0 } else { total / gaps.len() as f64 },
+                if total > 0.0 { gaps.len() as f64 * 1000.0 / total } else { 0.0 },
+                unx.gap_average,
+                if unx.gap_average > 0.0 { 1000.0 / unx.gap_average } else { 0.0 },
+                at(0.5),
+                at(0.95),
+                gaps.last().copied().unwrap_or(0.0),
+                unx.window_drawn,
+                unx.window_frames,
+                unx.in_play,
+                REPORT_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+            );
+            report!("{line}");
+            report_line(format!("frame {} {line}", unx.frame));
+            gaps.clear();
+            unx.picture_gaps = gaps;
+            unx.window_drawn = 0;
+        }
         let [recompiled, services, drawing, shading, textures, waiting, sync, frame_end, audio] = unx.spent.map(|ms| ms / frames);
-        println!(
+        report!(
             "  per frame ms: recompiled {recompiled:.1} services {services:.1} | gpu: draw {drawing:.1} shade {shading:.1} tex {textures:.1} wait {waiting:.1} sync {sync:.1} ({:.1} syncs) | frame end {frame_end:.1} audio {audio:.1} | present {:.1} | {:.0} draws",
             unx.syncs as f64 / frames,
             unx.window_presenting.as_secs_f64() * 1000.0 / frames,
@@ -439,27 +567,27 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 (n > 0).then(|| format!("{name} {:.1} ms in {:.1}", ns as f64 / 1e6 / frames, n as f64 / frames))
             })
             .collect();
-        println!("  gpu thread per frame: draw {:.1} ms of which shading {:.1}, the host GPU's side {:.1}, textures {:.1}, waiting for shaded vertices {:.1}", unx.spent[2] / frames, unx.spent[3] / frames, unx.hardware / frames, unx.spent[4] / frames, unx.shade_wait / frames);
+        report!("  gpu thread per frame: draw {:.1} ms of which shading {:.1}, the host GPU's side {:.1}, textures {:.1}, waiting for shaded vertices {:.1}", unx.spent[2] / frames, unx.spent[3] / frames, unx.hardware / frames, unx.spent[4] / frames, unx.shade_wait / frames);
         let (queue_wait, queue_held) = (
             zakuro_gpu::stats::QUEUE_WAIT_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
             zakuro_gpu::stats::QUEUE_HELD_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
         );
-        println!("  vulkan queue per frame: renderer waited {:.2} ms, presenter held {:.2} ms", queue_wait as f64 / 1e6 / frames, queue_held as f64 / 1e6 / frames);
+        report!("  vulkan queue per frame: renderer waited {:.2} ms, presenter held {:.2} ms", queue_wait as f64 / 1e6 / frames, queue_held as f64 / 1e6 / frames);
         if unx.window_emulating.as_secs_f64() * 1000.0 / frames < 2.0 && unx.frame % 600 < frames as u64 {
-            println!("  the game is quiet, its threads:");
+            report!("  the game is quiet, its threads:");
             for line in unx.system.debug_threads() {
-                println!("    {line}");
+                report!("    {line}");
             }
         }
         let (pending, unraised) = unx.system.gpu.state();
         if pending != 0 || unraised != 0 {
-            println!("  GPU thread: {pending} jobs pending, {unraised} interrupts not raised");
+            report!("  GPU thread: {pending} jobs pending, {unraised} interrupts not raised");
         }
         if !waits.is_empty() {
-            println!("  waits for the GPU thread per frame: {}", waits.join(", "));
+            report!("  waits for the GPU thread per frame: {}", waits.join(", "));
         }
         if !backs.is_empty() {
-            println!("  write-backs per frame: {} ({:.1} ms)", backs.join(", "), unx.write_back / frames);
+            report!("  write-backs per frame: {} ({:.1} ms)", backs.join(", "), unx.write_back / frames);
         }
         if unx.frame % 600 < frames as u64 {
             if let Some(pcs) = &mut unx.system.interpreted_pcs {
@@ -467,7 +595,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 top.sort_by(|a, b| b.1.cmp(&a.1));
                 let total: u64 = top.iter().map(|(_, n)| n).sum();
                 let list: Vec<String> = top.iter().take(12).map(|(pc, n)| format!("{pc:08X}:{n}")).collect();
-                println!("  interpreted in the last 10 s: {total} at {} PCs; top: {}", top.len(), list.join(" "));
+                report!("  interpreted in the last 10 s: {total} at {} PCs; top: {}", top.len(), list.join(" "));
             }
         }
         unx.spent = [0.0; 9];
@@ -482,7 +610,32 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         unx.window_frames = 0;
         unx.window_emulating = Duration::ZERO;
         unx.worst = Duration::ZERO;
+        REPORT_US.store(reporting.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
+
+    // a frame that kept the screen waiting says where the time went, in or
+    // out of emulating, presenting, or outside this call
+    let exiting = Instant::now();
+    if let Some(last) = unx.last_exit {
+        let total = exiting - last;
+        if total >= Duration::from_millis(50) && unx.frame > 300 {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            report!(
+                "  hitch frame {}: {:.1} ms since the last | outside unx_frame {:.1}, before emulating {:.1}, emulating {:.1}, after it {:.1}, present {:.1}, after present {:.1} | {} draws | in play {}",
+                unx.frame,
+                ms(total),
+                ms(entered - last),
+                ms(started - entered),
+                ms(took),
+                ms(presenting - started - took),
+                ms(presented),
+                ms(exiting - presenting - presented),
+                gpu.draws,
+                unx.in_play,
+            );
+        }
+    }
+    unx.last_exit = Some(Instant::now());
 
     match outcome {
         FrameOutcome::Completed => 0,

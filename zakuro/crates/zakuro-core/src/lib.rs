@@ -257,6 +257,10 @@ pub enum StepOutcome {
     Faulted,
 }
 
+/// how many times the title swapped the top screen to a new picture, the
+/// pictures a player sees, counted for the frontends' frame rate.
+pub static TOP_SWAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl System {
     pub fn new(config: Config) -> System {
         let boot_clock = config.clock.unwrap_or_else(memory::config::host_clock);
@@ -896,6 +900,9 @@ impl System {
         stride: u32,
         format: u32,
     ) {
+        if screen == 0 {
+            TOP_SWAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.queue_gx(Gx::Framebuffer { screen, active, left, right, stride, format }, None);
     }
 
