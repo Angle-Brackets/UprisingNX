@@ -98,6 +98,8 @@ impl System {
         // loses them, and the title then waits forever for their interrupts
         self.gpu.wait_idle();
         self.raise_gpu_interrupts();
+        // the threads those interrupts woke run next, as after any raise
+        self.kernel.reschedule_pending = true;
         // what the host's GPU drew comes down first, so that memory holds
         // all of it
         let linear_base = self.kernel.linear_base;
@@ -213,6 +215,8 @@ impl System {
             }
         }
         self.gpu.load_state(&saved.gpu)?;
+        // whichever thread should run now is picked again
+        self.kernel.reschedule_pending = true;
         let console = saved.console;
         self.exited = console.exited;
         self.broke = console.broke;
