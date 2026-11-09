@@ -1302,6 +1302,22 @@ fn work(
             // can cover for
             let source = std::panic::catch_unwind(|| glsl::translate(&program, key.1, &key.2))
                 .unwrap_or_else(|_| Err("the translation panicked".to_owned()));
+            // ZAKURO_DUMP_GLSL=<dir>: every translated source written there
+            if let (Ok(source), Some(dir)) = (&source, std::env::var_os("ZAKURO_DUMP_GLSL")) {
+                let path = std::path::Path::new(&dir).join(format!("{:016X}_{}.vert", key.0, key.1));
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(&path, source);
+                let words: Vec<u8> = program.words().iter().flat_map(|word| word.to_le_bytes()).collect();
+                let _ = std::fs::write(path.with_extension("bin"), words);
+                log::info!(
+                    target: "zakuro_gpu::programs",
+                    "program {:016X} from {}: {} bytes of GLSL, {}",
+                    key.0,
+                    key.1,
+                    source.len(),
+                    if source.contains("switch (pc)") { "dispatched" } else { "straight" }
+                );
+            }
             let made = source.and_then(|source| Ok((glsl::compile(&source)?, source)));
             match &made {
                 Ok(_) => log::debug!(
@@ -1686,13 +1702,16 @@ impl Hardware {
 
             // the fragment stages', then the program, what else it reads and
             // the inputs of the vertex shader
-            let bindings: Vec<_> = (0..8)
+            // 8, what 6 holds again as a uniform buffer, which translated
+            // programs read: Maxwell reads uniform buffers through its
+            // constant cache, storage buffers a global load at a time
+            let bindings: Vec<_> = (0..9)
                 .map(|binding| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(binding)
                         .descriptor_type(match binding {
                             0..=2 => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            3 => vk::DescriptorType::UNIFORM_BUFFER,
+                            3 | 8 => vk::DescriptorType::UNIFORM_BUFFER,
                             _ => vk::DescriptorType::STORAGE_BUFFER,
                         })
                         .descriptor_count(1)
@@ -3704,7 +3723,7 @@ impl Hardware {
         words.extend([x, y, width, height].map(f32::to_bits));
         words.extend_from_slice(attributes.as_flattened());
         words.extend(defaults.as_flattened().iter().map(|value| value.to_bits()));
-        let uniforms = self.stage_block(&mut block, SHADING_SIZE, self.storage_alignment);
+        let uniforms = self.stage_block(&mut block, SHADING_SIZE, self.storage_alignment.max(self.uniform_alignment));
         self.shading = block;
         let uniforms = uniforms?;
 
@@ -4183,7 +4202,7 @@ impl Hardware {
         let vertex_infos = r.shaded.map(|staged| {
             staged.map(|(offset, range)| [vk::DescriptorBufferInfo::default().buffer(self.ring.buffer).offset(offset).range(range)])
         });
-        let mut writes = [vk::WriteDescriptorSet::default(); 8];
+        let mut writes = [vk::WriteDescriptorSet::default(); 9];
         let fixed = [
             vk::WriteDescriptorSet::default()
                 .dst_binding(0)
@@ -4216,6 +4235,11 @@ impl Hardware {
                     .buffer_info(info);
                 count += 1;
             }
+            writes[count] = vk::WriteDescriptorSet::default()
+                .dst_binding(8)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&infos[1]);
+            count += 1;
         }
         let writes = &writes[..count];
         let commands = self.commands;

@@ -38,6 +38,10 @@ const LONGEST: usize = 1024;
 /// the blocks shade.vert's stack holds, pushes past them are dropped.
 const BLOCK_LIMIT: usize = 16;
 
+/// instructions, calls inlined, past which a program stays on the
+/// dispatcher instead of becoming structured code.
+const STRUCTURED_LONGEST: usize = 8192;
+
 /// the states, where execution is and the blocks open, the translation
 /// follows a program through before it leaves it to the interpreter.
 const STATES: usize = 1 << 16;
@@ -161,10 +165,28 @@ impl<'a> Translator<'a> {
     }
 
     fn shader(mut self, semantics: &[u32; SEMANTICS]) -> String {
-        let flows = self.flows();
+        let mut flows = self.flows();
         let mut run = String::new();
         if flows {
-            self.dispatch(&mut run);
+            // structured code when the flow nests as blocks do, which the
+            // host's compiler keeps in registers, otherwise the dispatcher.
+            // ZAKURO_GLSL_DISPATCH=1 keeps every program on the dispatcher
+            static DISPATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let read = self.read;
+            let structured = match *DISPATCH.get_or_init(|| std::env::var_os("ZAKURO_GLSL_DISPATCH").is_some()) {
+                true => Err("dispatch asked for".to_owned()),
+                false => self.structured(&mut run),
+            };
+            if structured.is_ok() {
+                flows = false;
+            } else {
+                if let Err(error) = &structured {
+                    log::info!(target: "zakuro_gpu::programs", "a program from {} stays on the dispatcher, {error}", self.entry);
+                }
+                run.clear();
+                self.read = read;
+                self.dispatch(&mut run);
+            }
         } else {
             self.straight(&mut run);
         }
@@ -233,6 +255,227 @@ impl<'a> Translator<'a> {
                 _ => break,
             }
         }
+    }
+
+    /// a program with flow as nested GLSL, when every block it opens
+    /// nests inside the one around it: a call inlined, an if as if and
+    /// else, a loop as a for, a break as a break, a jump forward within its
+    /// block as an if around what it skips, and one forward out of what an
+    /// enclosing jump skips as a flag the code up to its destination is
+    /// guarded by. anything else, or a program that might run past
+    /// shade.vert's budget, is an error and stays on the dispatcher.
+    fn structured(&mut self, out: &mut String) -> Result<(), String> {
+        let mut emitted = 0usize;
+        let mut flags = BTreeSet::new();
+        let mut body = String::new();
+        let mut pending = BTreeSet::new();
+        let cost = self.block(&mut body, self.entry, FINISHED, true, 0, false, 1, &mut emitted, &mut pending, &mut flags)?;
+        if !pending.is_empty() {
+            return Err("a jump goes past the program's end".to_owned());
+        }
+        if cost >= u64::from(BUDGET) {
+            return Err(format!("it may run {cost} instructions"));
+        }
+        for flag in flags {
+            let _ = writeln!(out, "    bool jumped{flag} = false;");
+        }
+        out.push_str(&body);
+        Ok(())
+    }
+
+    /// execution from one address until it reaches end, the end of the
+    /// block open innermost (FINISHED for none) when real, or of what an
+    /// enclosing jump skips, and the most instructions that can take.
+    /// pending holds the destinations of jumps out of what jumps skip that
+    /// execution has not reached yet.
+    #[allow(clippy::too_many_arguments)]
+    fn block(
+        &mut self,
+        out: &mut String,
+        from: u32,
+        end: u32,
+        real: bool,
+        depth: usize,
+        in_loop: bool,
+        level: usize,
+        emitted: &mut usize,
+        pending: &mut BTreeSet<u32>,
+        flags: &mut BTreeSet<u32>,
+    ) -> Result<u64, String> {
+        use OpCode::*;
+        let outer: BTreeSet<u32> = pending.clone();
+        // destinations whose code this level guards, innermost last
+        let mut guards: Vec<u32> = Vec::new();
+        let mut at = from;
+        let mut cost = 0u64;
+        let indent_of = |level: usize, guards: &Vec<u32>| "    ".repeat(level + guards.len());
+        loop {
+            // a guarded stretch over: on unguarded, the flag down again
+            // for a loop's next time round
+            while guards.last() == Some(&at) {
+                guards.pop();
+                let indent = indent_of(level, &guards);
+                let _ = writeln!(out, "{indent}}}");
+                let _ = writeln!(out, "{indent}jumped{at} = false;");
+                pending.remove(&at);
+            }
+            // reached right as what jumped out of ended
+            if !outer.contains(&at) && pending.remove(&at) {
+                let _ = writeln!(out, "{}jumped{at} = false;", indent_of(level, &guards));
+            }
+            if at == end {
+                break;
+            }
+            if end != FINISHED && at > end {
+                return Err(format!("execution passes the end of a block at {end}"));
+            }
+            if at as usize >= PROGRAM_SIZE || at as usize >= self.ops.len() {
+                if end != FINISHED || !guards.is_empty() {
+                    return Err("a block runs past the program".to_owned());
+                }
+                let _ = writeln!(out, "{}return;", indent_of(level, &guards));
+                break;
+            }
+            *emitted += 1;
+            if *emitted > STRUCTURED_LONGEST {
+                return Err(format!("more than {STRUCTURED_LONGEST} instructions inlined"));
+            }
+            let indent = indent_of(level, &guards);
+            let inner_level = level + guards.len() + 1;
+            let op = self.ops[at as usize];
+            let (destination, count) = op.instruction.flow_target();
+            let next = at + 1;
+            match op.opcode {
+                End | Break => {
+                    if op.opcode == Break && !in_loop {
+                        return Err(format!("a break at {at} outside a loop"));
+                    }
+                    let _ = writeln!(out, "{indent}{};", if op.opcode == End { "return" } else { "break" });
+                    cost += 1;
+                    // what follows runs only when jumped to
+                    match guards.last() {
+                        None => break,
+                        Some(&guard) => at = guard,
+                    }
+                    continue;
+                }
+                Call | CallC | CallU => {
+                    if depth >= BLOCK_LIMIT {
+                        return Err("calls nest past the block stack".to_owned());
+                    }
+                    let taken = taken(&op);
+                    let _ = writeln!(out, "{indent}if ({taken}) {{");
+                    let inner = self.block(out, destination, destination + count, true, depth + 1, in_loop, inner_level, emitted, pending, flags)?;
+                    let _ = writeln!(out, "{indent}}}");
+                    cost += 1 + inner;
+                    at = next;
+                }
+                IfU | IfC => {
+                    if depth >= BLOCK_LIMIT {
+                        return Err("ifs nest past the block stack".to_owned());
+                    }
+                    let body_end = next + (destination - next.min(destination));
+                    let after = destination + count;
+                    if after <= at {
+                        return Err(format!("an if at {at} goes back"));
+                    }
+                    let taken = taken(&op);
+                    let _ = writeln!(out, "{indent}if ({taken}) {{");
+                    let body = self.block(out, next, body_end, true, depth + 1, in_loop, inner_level, emitted, pending, flags)?;
+                    let _ = writeln!(out, "{indent}}} else {{");
+                    let otherwise = self.block(out, destination, after, true, depth + 1, in_loop, inner_level, emitted, pending, flags)?;
+                    let _ = writeln!(out, "{indent}}}");
+                    cost += 1 + body.max(otherwise);
+                    at = after;
+                }
+                JmpC | JmpU => {
+                    if destination <= at {
+                        return Err(format!("a jump at {at} goes back"));
+                    }
+                    let taken = taken(&op);
+                    if end == FINISHED || destination <= end {
+                        // what it skips, run when it is not taken
+                        let _ = writeln!(out, "{indent}if (!({taken})) {{");
+                        let skipped = self.block(out, next, destination, false, depth, in_loop, inner_level, emitted, pending, flags)?;
+                        let _ = writeln!(out, "{indent}}}");
+                        cost += 1 + skipped;
+                        at = destination;
+                    } else {
+                        // out of what an enclosing jump skips: a flag
+                        if real {
+                            return Err(format!("a jump at {at} leaves its block"));
+                        }
+                        let _ = writeln!(out, "{indent}if ({taken}) {{");
+                        let _ = writeln!(out, "{indent}    jumped{destination} = true;");
+                        let _ = writeln!(out, "{indent}}}");
+                        flags.insert(destination);
+                        pending.insert(destination);
+                        cost += 1;
+                        at = next;
+                    }
+                }
+                Loop => {
+                    if depth >= BLOCK_LIMIT {
+                        return Err("loops nest past the block stack".to_owned());
+                    }
+                    if destination < at {
+                        return Err(format!("a loop at {at} ends before it"));
+                    }
+                    let integer = op.instruction.integer_index();
+                    let _ = writeln!(out, "{indent}{{");
+                    let _ = writeln!(out, "{indent}    ivec4 integer{depth} = integers[{integer}];");
+                    let _ = writeln!(out, "{indent}    address.z = integer{depth}.y;");
+                    let _ = writeln!(out, "{indent}    uint repeat{depth} = uint(integer{depth}.x);");
+                    let _ = writeln!(out, "{indent}    for (uint n{depth} = 0u; n{depth} <= repeat{depth}; n{depth}++) {{");
+                    let body = self.block(out, next, destination + 1, true, depth + 1, true, inner_level + 1, emitted, pending, flags)?;
+                    let _ = writeln!(out, "{indent}        address.z += integer{depth}.z;");
+                    let _ = writeln!(out, "{indent}    }}");
+                    let _ = writeln!(out, "{indent}}}");
+                    // the PICA's counts are 8 bits
+                    cost += 1 + 256 * (body + 1);
+                    at = destination + 1;
+                }
+                BreakC => {
+                    if !in_loop {
+                        return Err(format!("a break at {at} outside a loop"));
+                    }
+                    let taken = taken(&op);
+                    let _ = writeln!(out, "{indent}if ({taken}) {{");
+                    let _ = writeln!(out, "{indent}    break;");
+                    let _ = writeln!(out, "{indent}}}");
+                    cost += 1;
+                    at = next;
+                }
+                _ => {
+                    self.instruction(out, at, &indent);
+                    cost += 1;
+                    at = next;
+                }
+            }
+            if let Some(&guard) = guards.last() {
+                if at > guard {
+                    return Err(format!("execution passes a jump's destination at {guard}"));
+                }
+            }
+            // jumps out of what was just run, not reached yet: the code up
+            // to their destinations guarded, the furthest outermost
+            let new: Vec<u32> = pending.iter().copied().filter(|t| !outer.contains(t) && !guards.contains(t) && *t > at).collect();
+            for target in new.into_iter().rev() {
+                if guards.last().is_some_and(|&guard| target > guard) {
+                    return Err(format!("jumps to {target} and {} cross", guards.last().unwrap()));
+                }
+                let _ = writeln!(out, "{}if (!jumped{target}) {{", indent_of(level, &guards));
+                guards.push(target);
+            }
+        }
+        // guards reaching past this level's end, left for the level around
+        while let Some(guard) = guards.pop() {
+            if real {
+                return Err(format!("a jump to {guard} leaves its block"));
+            }
+            let _ = writeln!(out, "{}}}", indent_of(level, &guards));
+        }
+        Ok(cost)
     }
 
     /// a program with flow, its runs picked by address, the block stack
@@ -632,7 +875,7 @@ fn broken(mut open: Vec<Open>, next: u32) -> (u32, Vec<Open>) {
 /// works it out, its fields folded in.
 fn taken(op: &Op) -> String {
     let instruction = op.instruction;
-    let set = format!("((bools & {}u) != 0u)", 1u32 << instruction.bool_index());
+    let set = format!("((flags.x & {}u) != 0u)", 1u32 << instruction.bool_index());
     match op.opcode {
         OpCode::Call | OpCode::Break => "true".to_owned(),
         OpCode::CallU | OpCode::IfU => set,
@@ -709,13 +952,12 @@ layout(location = 3) noperspective out float out_depth;
 layout(location = 4) out vec4 out_quaternion;
 layout(location = 5) out vec3 out_view;
 
-layout(std430, set = 0, binding = 6) readonly buffer Shading {
+layout(std140, set = 0, binding = 8) uniform Shading {
     vec4 floats[96];
     ivec4 integers[4];
-    uint bools;
-    uint entry;
-    uint pad[2];
-    uint semantics[24];
+    // x, the bools, y, the entry point, as binding 6 has them
+    uvec4 flags;
+    uvec4 semantics[6];
     vec4 depth_map;
     vec4 viewport;
     uvec4 attributes[16];
@@ -1003,6 +1245,7 @@ mod tests {
     fn programs_with_flow_compile() {
         let mut random = Random(12);
         let mut compiled = 0;
+        let mut structured = 0;
         for _ in 0..250 {
             let length = 4 + random.below(40);
             let mut program = Vec::new();
@@ -1016,11 +1259,14 @@ mod tests {
             // interpreter
             let semantics = semantics(&mut random);
             if unit.translate(&semantics).is_ok() {
-                compiles(&unit, &semantics);
+                let glsl = compiles(&unit, &semantics);
                 compiled += 1;
+                structured += usize::from(!glsl.contains("switch (pc)"));
             }
         }
         assert!(compiled > 150, "only {compiled} of 250 programs translated");
+        assert!(structured > 30, "only {structured} of {compiled} programs structured");
+        eprintln!("{structured} of {compiled} programs structured");
     }
 
     /// execution falling into the words after a program, which run to the
@@ -1048,7 +1294,9 @@ mod tests {
             *word = arithmetic(&mut random) & !(0x3F << 26) | (0x13 << 26);
         }
         let unit = unit(&program, 0, &mut random);
+        // the call's end, at the program's end, is reached before the
+        // program's end is looked at, so it returns, structured
         let glsl = compiles(&unit, &semantics(&mut random));
-        assert!(glsl.contains("pc = 4096u;"), "{glsl}");
+        assert!(!glsl.contains("switch (pc)"), "{glsl}");
     }
 }

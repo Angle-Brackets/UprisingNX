@@ -533,6 +533,11 @@ pub struct Program {
 }
 
 impl Program {
+    /// the instruction words it was decoded from, for dumps.
+    pub(crate) fn words(&self) -> Vec<u32> {
+        self.ops.iter().map(|op| op.instruction.0).collect()
+    }
+
     fn decode(unit: &ShaderUnit) -> Program {
         let ops: Box<[Op]> = unit.program.iter().map(|&word| Op::decode(Instruction(word), &unit.descriptors)).collect();
         let (mut inputs, mut outputs, mut temps) = (0u16, 0u16, 0u16);

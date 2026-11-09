@@ -6051,9 +6051,9 @@ mod tests {
             decoded.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
             raw.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
             let indexed = case.indices.is_some();
-            draw(&registers, &unit, &unit, &fixed, &mut decoded, &mut resources, indexed);
+            draw(&registers, &unit, &unit, &fixed, &mut decoded, &mut resources, indexed, false);
             resources.hardware.as_mut().unwrap().flush(&mut decoded).unwrap();
-            draw(&registers, &unit, &unit, &fixed, &mut raw, &mut resources, indexed);
+            draw(&registers, &unit, &unit, &fixed, &mut raw, &mut resources, indexed, false);
             resources.hardware.as_mut().unwrap().flush(&mut raw).unwrap();
             // the first array whole, from the first vertex used to the last
             let span = match indexed {
@@ -6209,12 +6209,16 @@ mod tests {
         let mut translators = Resources { hardware: Some(translating), ..Default::default() };
         let mut interpreters = Resources { hardware: Some(interpreting), ..Default::default() };
         let mut drawn = 0;
+        let mut structured = 0;
         for case in 0..cases {
             let (unit, program) = random_unit(&mut random, &program);
             // the only program left to the interpreter is one that can run
             // on into the words after it
-            if let Err(error) = unit.translate(&output_semantics(&registers)) {
-                assert!(error.contains("reachable instructions"), "case {case} not translated, {error}, program {program:08X?}");
+            match unit.translate(&output_semantics(&registers)) {
+                Err(error) => {
+                    assert!(error.contains("reachable instructions"), "case {case} not translated, {error}, program {program:08X?}")
+                }
+                Ok(glsl) => structured += usize::from(!glsl.contains("switch (pc)")),
             }
             let inputs = random_inputs(&mut random);
             let translated = draw_on_gpu(&registers, &mut translators, &unit, &inputs);
@@ -6224,7 +6228,7 @@ mod tests {
             drawn += translated[..bytes].chunks(4).filter(|pixel| *pixel != [0; 4]).count();
         }
         let translations = translators.hardware.as_ref().unwrap().translations();
-        eprintln!("{cases} programs, {translations} translated, {drawn} pixels drawn");
+        eprintln!("{cases} programs, {translations} translated, {structured} structured, {drawn} pixels drawn");
         assert!(drawn as u32 > cases * 40, "only {drawn} pixels drawn");
         assert!(translations as u32 >= least, "only {translations} of {cases} programs translated");
         assert_eq!(interpreters.hardware.as_ref().unwrap().translations(), 0);
@@ -6488,6 +6492,40 @@ mod tests {
                     13 => [0x2C, 0x2D][(random.next() % 2) as usize] << 26 | condition | forward << 10 | count,
                     14 => 0x29 << 26 | (random.next() % 4) << 22 | (at + 1 + random.next() % 3).min(length - 1) << 10,
                     _ => [0x20 << 26, 0x23 << 26 | condition][(random.next() % 2) as usize],
+                });
+            }
+            program.push(0x22 << 26);
+            program
+        });
+    }
+
+    /// programs of arithmetic, compares and forward jumps nesting inside
+    /// each other or crossing, many of them out of what an enclosing jump
+    /// skips to its end, as KIU's main vertex shader does, draw the same
+    /// translated as interpreted, to the bit.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn forward_jumps_draw_like_the_interpreter() {
+        draws_like_the_interpreter(200, 200, 24, |random| {
+            let length = 6 + random.next() % 30;
+            let mut program = vec![0x13 << 26];
+            // destinations of the jumps so far, which later ones often reuse
+            let mut ends: Vec<u32> = Vec::new();
+            for at in 1..length {
+                program.push(match random.next() % 8 {
+                    0..=3 => random.arithmetic(),
+                    // a compare, the conditions the jumps read
+                    4 => 0x2E << 26 | (random.next() % 6) << 24 | (random.next() % 6) << 21 | (random.next() % 0x80) << 12 | (random.next() % 0x20) << 7 | (1 + random.next() % 127),
+                    _ => {
+                        let reuse = ends.iter().copied().filter(|&end| end > at + 1).collect::<Vec<_>>();
+                        let destination = match reuse.is_empty() || random.next() % 2 == 0 {
+                            true => at + 1 + random.next() % (length - at),
+                            false => reuse[(random.next() as usize) % reuse.len()],
+                        };
+                        ends.push(destination);
+                        let condition = random.condition();
+                        [0x2C, 0x2D][(random.next() % 2) as usize] << 26 | condition | destination << 10 | (random.next() % 4)
+                    }
                 });
             }
             program.push(0x22 << 26);
