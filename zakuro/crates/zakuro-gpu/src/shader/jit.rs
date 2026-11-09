@@ -306,7 +306,7 @@ impl Compiled {
         let runs = self.runs.fetch_add(runs, Ordering::Relaxed) + runs;
         let returned = self.returned.fetch_add(returned, Ordering::Relaxed) + returned;
         if runs >= 64 && returned * 4 > runs && !self.given_up.swap(true, Ordering::Relaxed) {
-            log::debug!(target: "zakuro_gpu::shader::jit", "a program whose vertices part ways {returned} times in {runs} goes back to the interpreter");
+            log::info!(target: "zakuro_gpu::shader::jit", "a program whose vertices part ways {returned} times in {runs} goes back to the interpreter");
         }
     }
 }
@@ -332,6 +332,23 @@ fn codes() -> std::sync::MutexGuard<'static, HashMap<(u64, u32), Slot>> {
     KEPT.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// where a program's code is, and the batches it ran, gave back and parted
+/// at, for the logs.
+pub(super) fn report(unit: &ShaderUnit, program: &Program) -> String {
+    match codes().get(&(program.fingerprint, unit.entry_point)) {
+        None => "not asked for".to_owned(),
+        Some(Slot::Compiling) => "compiling".to_owned(),
+        Some(Slot::Done(None)) => "could not compile".to_owned(),
+        Some(Slot::Done(Some(compiled))) => format!(
+            "{} runs, {} given back, {} parted{}",
+            compiled.runs.load(Ordering::Relaxed),
+            compiled.returned.load(Ordering::Relaxed),
+            compiled.parted.load(Ordering::Relaxed),
+            if compiled.given_up.load(Ordering::Relaxed) { ", given up" } else { "" }
+        ),
+    }
+}
+
 /// the unit's program compiled for its entry point, none while it compiles,
 /// where it can't be, or where it gave up. the first time it is asked for
 /// it starts compiling on a thread of its own, a big program takes long
@@ -347,7 +364,11 @@ pub(super) fn compiled(unit: &ShaderUnit, program: &Arc<Program>) -> Option<Arc<
         Some(Slot::Compiling) => return None,
         None => {}
     }
-    if kept.len() >= KEPT {
+    // on the Switch code is never freed, so a clear would put every program
+    // read back again into new code memory, of which the kernel gives ten
+    // pieces; KIU has some thirty programs, far from the count, but kept
+    // there whatever the count
+    if kept.len() >= KEPT && !cfg!(target_os = "horizon") {
         kept.clear();
     }
     // the tests look at what the compiled code gives from the first run
@@ -389,18 +410,25 @@ fn queue_compile(key: (u64, u32), program: Arc<Program>) {
     static QUEUE: OnceLock<&'static Waiting> = OnceLock::new();
     let queue = QUEUE.get_or_init(|| {
         let queue: &'static Waiting = Box::leak(Box::new((Mutex::new(VecDeque::new()), Condvar::new())));
-        let spawned = std::thread::Builder::new().name("shader jit".to_owned()).stack_size(8 << 20).spawn(move || loop {
-            let (key, program) = {
-                let mut waiting = queue.0.lock().unwrap_or_else(|p| p.into_inner());
-                loop {
-                    if let Some(next) = waiting.pop_front() {
-                        break next;
+        let spawned = std::thread::Builder::new().name("shader jit".to_owned()).stack_size(8 << 20).spawn(move || {
+            preload();
+            loop {
+                let (key, program) = {
+                    let mut waiting = queue.0.lock().unwrap_or_else(|p| p.into_inner());
+                    loop {
+                        if let Some(next) = waiting.pop_front() {
+                            break next;
+                        }
+                        waiting = queue.1.wait(waiting).unwrap_or_else(|p| p.into_inner());
                     }
-                    waiting = queue.1.wait(waiting).unwrap_or_else(|p| p.into_inner());
+                };
+                // read back meanwhile by preload
+                if matches!(codes().get(&key), Some(Slot::Done(_))) {
+                    continue;
                 }
-            };
-            let found = compile_logged(&program, key.1);
-            codes().insert(key, Slot::Done(found));
+                let found = compile_logged(&program, key.1);
+                codes().insert(key, Slot::Done(found));
+            }
         });
         if let Err(error) = spawned {
             log::warn!("could not start compiling shaders, {error}");
@@ -409,6 +437,38 @@ fn queue_compile(key: (u64, u32), program: Arc<Program>) {
     });
     queue.0.lock().unwrap_or_else(|p| p.into_inner()).push_back((key, program));
     queue.1.notify_one();
+}
+
+/// every program an earlier run of this build compiled, read back before the
+/// title asks for them: asked for one at a time, each waited its turn behind
+/// the others while the interpreter, some hundred times slower, shaded its
+/// draws, which a new chapter's first seconds or minutes are full of.
+#[cfg(target_os = "horizon")]
+fn preload() {
+    let start = std::time::Instant::now();
+    let directory = cache_path(0, 0);
+    let Some(directory) = std::path::Path::new(&directory).parent() else { return };
+    let Ok(entries) = std::fs::read_dir(directory) else { return };
+    let (mut read, mut failed) = (0, 0);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str().and_then(|name| name.strip_suffix(".bin")) else { continue };
+        let Some((fingerprint, at)) = name.split_once('-') else { continue };
+        let (Ok(fingerprint), Ok(at)) = (u64::from_str_radix(fingerprint, 16), at.parse::<u32>()) else { continue };
+        let key = (fingerprint, at);
+        if matches!(codes().get(&key), Some(Slot::Done(_))) {
+            continue;
+        }
+        match kept(fingerprint, at) {
+            Some(compiled) => {
+                codes().insert(key, Slot::Done(Some(Arc::new(compiled))));
+                read += 1;
+            }
+            None => failed += 1,
+        }
+    }
+    crate::stats::JIT_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    log::info!(target: "zakuro_gpu::shader::jit", "read back {read} programs an earlier run compiled in {:?}, {failed} that would not", start.elapsed());
 }
 
 /// compiles the program for an entry point, saying why not when it can't.

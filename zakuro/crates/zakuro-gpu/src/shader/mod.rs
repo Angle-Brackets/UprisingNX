@@ -885,6 +885,49 @@ pub fn run_geometry_many(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]]) 
     triangles
 }
 
+/// ZAKURO_CPU_SHADE_LOG: what the compiled code of a geometry program has
+/// done and the program's flow from its entry, once for each program.
+pub fn geometry_report(unit: &ShaderUnit) -> Option<String> {
+    use std::fmt::Write;
+    // the first slow draw of each, and the 200th, once the code has run a while
+    static SEEN: std::sync::Mutex<Vec<((u64, u32), u32)>> = std::sync::Mutex::new(Vec::new());
+    let program = unit.decoded.as_ref()?;
+    {
+        let key = (program.fingerprint, unit.entry_point);
+        let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        let count = match seen.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, count)) => count,
+            None => {
+                seen.push((key, 0));
+                &mut seen.last_mut().unwrap().1
+            }
+        };
+        *count += 1;
+        if *count != 1 && *count != 200 {
+            return None;
+        }
+    }
+    let mut out = String::new();
+    #[cfg(feature = "jit")]
+    let _ = write!(out, "jit {}; ", jit::report(unit, program));
+    let _ = write!(out, "program {:016X} entry {}, bools 0x{:X}, ints {:?}, flow:", program.fingerprint, unit.entry_point, unit.bool_uniforms, unit.int_uniforms);
+    for (pc, op) in program.ops.iter().enumerate().skip(unit.entry_point as usize) {
+        let flow = matches!(
+            op.opcode,
+            OpCode::Break | OpCode::BreakC | OpCode::Call | OpCode::CallC | OpCode::CallU | OpCode::IfU | OpCode::IfC
+                | OpCode::Loop | OpCode::Emit | OpCode::SetEmit | OpCode::JmpC | OpCode::JmpU | OpCode::End | OpCode::Unknown(_)
+        );
+        if flow {
+            let (destination, count) = op.instruction.flow_target();
+            let _ = write!(out, " {pc}:{:?}({destination},{count},c{})", op.opcode, op.instruction.raw_condition());
+        }
+        if op.opcode == OpCode::End {
+            break;
+        }
+    }
+    Some(out)
+}
+
 /// runs a geometry shader over one primitive's worth of input, collecting
 /// what it emits.
 pub fn run_geometry(unit: &ShaderUnit, state: &mut ShaderState, emitter: &mut Emitter) {

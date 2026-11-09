@@ -827,6 +827,11 @@ fn process_vertices<'a>(
         };
         let vertices = geometry_stage(registers, geometry_shader, &map, outputs);
         slow("geometry", vertices.len(), vs_time);
+        if started.is_some_and(|s| s.elapsed().as_micros() >= 1000) {
+            if let Some(report) = shader::geometry_report(geometry_shader) {
+                log::info!(target: "zakuro_gpu::diag", "slow geometry program: {report}");
+            }
+        }
         return (vertices, None);
     }
     // each vertex made once, by the threads that shade it
