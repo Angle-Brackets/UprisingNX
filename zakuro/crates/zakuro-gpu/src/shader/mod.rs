@@ -817,6 +817,28 @@ pub fn run(unit: &ShaderUnit, state: &mut ShaderState) {
     }
 }
 
+/// the geometry shader's fixed primitive mode through the compiled program,
+/// one run for each primitive with its vertices put in the float uniforms
+/// from start on, every primitive's triangles one after another. none where
+/// the program isn't compiled or gave a run back.
+#[allow(unreachable_code)]
+pub fn run_geometry_fixed(unit: &ShaderUnit, start: usize, primitives: &[&[Vec4]]) -> Option<Vec<batch::Triangle>> {
+    #[cfg(feature = "jit")]
+    {
+        if log::log_enabled!(target: "zakuro_gpu::shader::nan", log::Level::Trace) {
+            return None;
+        }
+        let program = unit.decoded.as_ref()?;
+        if primitives.iter().any(|primitive| start + primitive.len() > FLOAT_UNIFORMS) {
+            return None;
+        }
+        let compiled = jit::compiled(unit, program)?;
+        let mut triangles = Vec::new();
+        return jit::run_geometry_fixed(&compiled, unit, program, start, primitives, &mut triangles).then_some(triangles);
+    }
+    None
+}
+
 /// runs a geometry shader over many primitives' inputs, a batch of them
 /// at a time, giving each one's triangles in order, what running it on
 /// each would give.
@@ -2002,5 +2024,54 @@ mod tests {
         assert_eq!(a[0], [1.0, 2.0, 0.0, 1.0]);
         assert_eq!(b[0], [11.0, 2.0, 0.0, 1.0]);
         assert_eq!(c[0], [1.0, 2.0, 0.0, 1.0]);
+    }
+
+    /// the fixed primitive mode's compiled run, all the primitives through
+    /// one context, makes what running each through the batched runner with
+    /// its own uniforms makes.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn fixed_primitives_compiled_match_one_run_each() {
+        let mov = |dest: u32, source: u32| (0x13 << 26) | (dest << 21) | (source << 12);
+        let add = |dest: u32, a: u32, b: u32| (dest << 21) | (a << 12) | (b << 7);
+        let setemit = |slot: u32, primitive: bool| (0x2B << 26) | (slot << 24) | ((primitive as u32) << 23);
+        let emit = 0x2A << 26;
+        let program = [
+            setemit(0, false),
+            mov(0, 0x24), // o0 = c4, the first vertex's position
+            add(1, 0x25, 0x20), // o1 = c5 + c0, its color and a constant
+            emit,
+            setemit(1, false),
+            mov(0, 0x26),
+            mov(1, 0x27),
+            emit,
+            setemit(2, true),
+            add(0, 0x24, 0x26),
+            mov(1, 0x27),
+            emit,
+            0x22 << 26,
+        ];
+        let mut unit = unit_with(&program, &[IDENTITY]);
+        unit.float_uniforms[0] = [0.5, 0.25, 0.125, 1.0];
+        unit.prepare();
+        let mut random = Random(7);
+        let attributes: Vec<Vec4> = (0..20 * 4).map(|_| std::array::from_fn(|_| (random.next() % 1000) as f32 / 10.0)).collect();
+        let primitives: Vec<&[Vec4]> = attributes.chunks_exact(4).collect();
+
+        let compiled = run_geometry_fixed(&unit, 4, &primitives).expect("the program compiles");
+        let mut expected = Vec::new();
+        for primitive in &primitives {
+            let mut patched = unit.clone();
+            patched.float_uniforms[4..8].copy_from_slice(primitive);
+            patched.sync_wide_uniforms();
+            patched.decoded = None;
+            expected.extend(run_geometry_many(&patched, &[[ZERO; INPUT_REGISTERS]]).into_iter().flatten());
+        }
+        assert_eq!((compiled.len(), expected.len()), (20, 20));
+        for (got, want) in compiled.iter().zip(&expected) {
+            for vertex in 0..3 {
+                assert_eq!(got[vertex][..2], want[vertex][..2]);
+            }
+        }
     }
 }

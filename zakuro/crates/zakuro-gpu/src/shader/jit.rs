@@ -167,6 +167,9 @@ fn registers(mut mask: u16) -> impl Iterator<Item = usize> {
 /// it for eight.
 pub(super) struct Emitted {
     outputs: u16,
+    /// the lanes that hold a primitive, the rest are filler whose
+    /// triangles no one takes.
+    lanes: usize,
     slot: [usize; LANES],
     completes: [bool; LANES],
     slots: [Triangle; LANES],
@@ -174,9 +177,10 @@ pub(super) struct Emitted {
 }
 
 impl Emitted {
-    fn new(outputs: u16) -> Emitted {
+    fn new(outputs: u16, lanes: usize) -> Emitted {
         Emitted {
             outputs,
+            lanes,
             slot: [0; LANES],
             completes: [false; LANES],
             slots: [[[[0.0; 4]; OUTPUT_REGISTERS]; 3]; LANES],
@@ -231,8 +235,9 @@ extern "C" fn emit(context: *mut Context) {
     let (outputs, emitted) = unsafe { (&(*context).outputs, (*context).emitted.as_mut()) };
     let Some(emitted) = emitted else { return };
     let written = emitted.outputs;
+    let live = emitted.lanes;
     let lanes = emitted.slots.iter_mut().zip(&mut emitted.triangles).zip(emitted.slot.iter().zip(&emitted.completes));
-    for (lane, ((slots, triangles), (&slot, &completes))) in lanes.enumerate() {
+    for (lane, ((slots, triangles), (&slot, &completes))) in lanes.enumerate().take(live) {
         for register in (0..OUTPUT_REGISTERS).filter(|register| written & (1 << register) != 0) {
             slots[slot][register] = std::array::from_fn(|component| outputs[register][component][lane]);
         }
@@ -481,7 +486,7 @@ pub(super) fn run_geometry(
     let (mut runs, mut returned) = (0, 0);
     for inputs in inputs.chunks(LANES) {
         context.fill(program.inputs, inputs);
-        let mut emitted = Emitted::new(program.outputs);
+        let mut emitted = Emitted::new(program.outputs, inputs.len());
         context.emitted = &mut emitted;
         runs += 1;
         let ran = compiled.run(&mut context);
@@ -494,6 +499,52 @@ pub(super) fn run_geometry(
         }
     }
     compiled.counted(runs, returned);
+}
+
+/// the geometry shader's fixed primitive mode, one run for each primitive
+/// with its vertices in the float uniforms from start on, all through one
+/// context, every triangle into triangles. false when the program gave a
+/// run back, triangles then as they were, for the caller to run them its
+/// own way.
+pub(super) fn run_geometry_fixed(
+    compiled: &Compiled,
+    unit: &ShaderUnit,
+    program: &Program,
+    start: usize,
+    primitives: &[&[Vec4]],
+    triangles: &mut Vec<Triangle>,
+) -> bool {
+    #[cfg(target_os = "horizon")]
+    let _running = CODE_MEMORY.read().unwrap_or_else(|p| p.into_inner());
+    let mut uniforms: [Vec4; FLOAT_UNIFORMS] = *unit.float_uniforms;
+    let mut context = Context::new(unit);
+    // no inputs of its own, every lane the same
+    context.fill(program.inputs, &[[super::ZERO; INPUT_REGISTERS]]);
+    let mut emitted = Emitted::new(program.outputs, 1);
+    emitted.triangles[0] = std::mem::take(triangles);
+    let before = emitted.triangles[0].len();
+    let mut runs = 0;
+    for primitive in primitives {
+        uniforms[start..start + primitive.len()].copy_from_slice(primitive);
+        // each primitive starts with its emitter as a new one would be
+        emitted.slot = [0; LANES];
+        emitted.completes = [false; LANES];
+        emitted.slots[0] = [[[0.0; 4]; OUTPUT_REGISTERS]; 3];
+        context.uniforms = uniforms.as_ptr();
+        context.emitted = &mut emitted;
+        runs += 1;
+        let ran = compiled.run(&mut context);
+        context.emitted = std::ptr::null_mut();
+        if !ran {
+            compiled.counted(runs, 1);
+            emitted.triangles[0].truncate(before);
+            *triangles = std::mem::take(&mut emitted.triangles[0]);
+            return false;
+        }
+    }
+    compiled.counted(runs, 0);
+    *triangles = std::mem::take(&mut emitted.triangles[0]);
+    true
 }
 
 /// a call, if or loop the program is in, as the interpreter's blocks keep

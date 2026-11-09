@@ -771,6 +771,11 @@ fn shading_key(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::IN
     hash
 }
 
+fn cpu_shade_log() -> bool {
+    static WHY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WHY.get_or_init(|| std::env::var_os("ZAKURO_CPU_SHADE_LOG").is_some())
+}
+
 fn process_vertices<'a>(
     registers: &[u32],
     vertex_shader: &ShaderUnit,
@@ -792,19 +797,42 @@ fn process_vertices<'a>(
         }
     }
     let map = read_output_map(registers);
+    // ZAKURO_CPU_SHADE_LOG=1: each draw that takes the CPU over a
+    // millisecond to shade
+    let started = cpu_shade_log().then(std::time::Instant::now);
+    let slow = |stage: &str, made: usize, vs_time: Option<std::time::Duration>| {
+        if let Some(elapsed) = started.map(|s| s.elapsed()).filter(|e| e.as_micros() >= 1000) {
+            log::info!(
+                target: "zakuro_gpu::diag",
+                "slow CPU shading: {:.2} ms ({stage}, vertex shader {:.2} ms), {} inputs, {} in order, {made} out, vs entry {}, gs entry {}, gs config 0x{:X}, gs input config 0x{:X}",
+                elapsed.as_secs_f64() * 1e3,
+                vs_time.map_or(0.0, |t| t.as_secs_f64() * 1e3),
+                inputs.len(),
+                order.map_or(0, <[usize]>::len),
+                vertex_shader.entry_point,
+                geometry_shader.entry_point,
+                registers[REG_GS_CONFIG],
+                registers[REG_GS_BLOCK + SHADER_INPUT_CONFIG],
+            );
+        }
+    };
     if registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2 {
         // the results in draw order, which repeats vertices an index buffer
         // names more than once
         let shaded = shade(registers, vertex_shader, inputs);
+        let vs_time = started.map(|s| s.elapsed());
         let outputs: Box<dyn Iterator<Item = [Vec4; 16]>> = match order {
             Some(order) => Box::new(order.iter().map(|&i| shaded[i])),
             None => Box::new(shaded.iter().copied()),
         };
-        return (geometry_stage(registers, geometry_shader, &map, outputs), None);
+        let vertices = geometry_stage(registers, geometry_shader, &map, outputs);
+        slow("geometry", vertices.len(), vs_time);
+        return (vertices, None);
     }
     // each vertex made once, by the threads that shade it
     let plan = VertexPlan::new(&map, registers[REG_VS_OUTPUT_MASK]);
     let vertices = shade_with(vertex_shader, inputs, |outputs| plan.vertex(outputs));
+    slow("vertex", vertices.len(), None);
     (vertices, order)
 }
 
@@ -1093,9 +1121,14 @@ fn fixed_primitives(
     }
     let attributes: Vec<Vec4> = vertex_outputs.flat_map(|outputs| outputs.into_iter().take(per_vertex)).collect();
     let primitives: Vec<&[Vec4]> = attributes.chunks_exact(per_primitive).collect();
-    // ponytail: one run a primitive, as the uniforms differ for each; uniforms
-    // a lane in the batched runner would take eight at once if this shows
-    let run = |chunk: &[&[Vec4]]| {
+    let plan = VertexPlan::new(map, registers[REG_GS_BLOCK + SHADER_OUTPUT_MASK]);
+    // the compiled program runs a share of the primitives through one
+    // context, with their vertices put in its uniforms, and the batched
+    // runner the ones it can't, one run a primitive
+    let run = |chunk: &[&[Vec4]]| -> Vec<Vertex> {
+        if let Some(triangles) = shader::run_geometry_fixed(unit, start, chunk) {
+            return triangles.iter().flatten().map(|outputs| plan.vertex(outputs)).collect();
+        }
         let mut patched = unit.clone();
         chunk
             .iter()
@@ -1106,15 +1139,33 @@ fn fixed_primitives(
                 }
                 shader::run_geometry_many(&patched, &[[shader::ZERO; shader::INPUT_REGISTERS]]).into_iter().flatten()
             })
-            .collect::<Vec<_>>()
+            .flatten()
+            .map(|outputs| plan.vertex(&outputs))
+            .collect()
     };
-    let triangles: Vec<_> = if cfg!(target_os = "horizon") || primitives.len() < PARALLEL_VERTICES / 4 {
-        run(&primitives)
-    } else {
-        primitives.par_chunks(PARALLEL_CHUNK).flat_map_iter(run).collect()
-    };
-    let plan = VertexPlan::new(map, registers[REG_GS_BLOCK + SHADER_OUTPUT_MASK]);
-    triangles.iter().flatten().map(|outputs| plan.vertex(outputs)).collect()
+    // a primitive makes many triangles, so a few of them are worth sharing
+    // out, a share each for the workers and this thread
+    if primitives.len() < 8 || crate::shade_queue::IN_JOB.with(|flag| flag.get()) {
+        return run(&primitives);
+    }
+    let pool = shader_pool();
+    let shares = pool.current_num_threads() + 1;
+    let chunk = primitives.len().div_ceil(shares);
+    let mut made: Vec<Vec<Vertex>> = vec![Vec::new(); primitives.len().div_ceil(chunk)];
+    {
+        let mut work = made.iter_mut().zip(primitives.chunks(chunk));
+        let first = work.next();
+        pool.in_place_scope(|scope| {
+            for (out, share) in work {
+                let run = &run;
+                scope.spawn(move |_| *out = run(share));
+            }
+            if let Some((out, share)) = first {
+                *out = run(share);
+            }
+        });
+    }
+    made.concat()
 }
 
 /// screen-space vertex, with every varying pre-divided by w so the
@@ -3995,6 +4046,31 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             Vertices::Raw { vertex_shader, raw, vertices } => Some((vertex_shader, hardware::Inputs::Raw(raw), None, Some(vertices))),
             Vertices::Shaded(_) | Vertices::ShadedOrdered { .. } => None,
         };
+        // ZAKURO_CPU_SHADE_LOG=1: why draws the GPU could shade are shaded
+        // on the CPU, and how many vertices
+        if hardware.shades() && cpu_shade_log() {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+            let reason = match () {
+                _ if unshaded.is_none() => Some(0),
+                _ if registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2 => Some(1),
+                _ if !whole => Some(2),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                COUNTS[reason * 2].fetch_add(1, Relaxed);
+                COUNTS[reason * 2 + 1].fetch_add(vertex_count as u64, Relaxed);
+                let total = COUNTS[0].load(Relaxed) + COUNTS[2].load(Relaxed) + COUNTS[4].load(Relaxed);
+                if total % 3000 == 0 {
+                    let c: Vec<u64> = COUNTS.iter().map(|count| count.swap(0, Relaxed)).collect();
+                    log::info!(
+                        target: "zakuro_gpu::diag",
+                        "CPU-shaded draws: {} already shaded ({} vertices), {} with a geometry shader ({}), {} into a buffer not of whole 8x8 tiles ({}, {}x{})",
+                        c[0], c[1], c[2], c[3], c[4], c[5], target.buffer_width, target.buffer_height
+                    );
+                }
+            }
+        }
         if let Some((unit, inputs, order, raw)) = unshaded.filter(|_| hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2) {
             let mut assembled = std::mem::take(&mut resources.triangles);
             let indices = triangle_indices(topology, vertex_count, raw, order, &mut assembled);
