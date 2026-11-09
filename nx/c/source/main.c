@@ -133,6 +133,13 @@ static void *game(void *p) {
     appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
 
     load_env();
+    // started in the dock, the docked clocks hold 2x (every bench state at
+    // 30), so it draws at 2x there and 1x handheld, unless env.txt sets
+    // ZAKURO_RESOLUTION; taken once, at start
+    if (appletGetOperationMode() == AppletOperationMode_Console && !getenv("ZAKURO_RESOLUTION")) {
+        setenv("ZAKURO_RESOLUTION", "2", 0);
+        printf("env: ZAKURO_RESOLUTION=2 (docked)\n");
+    }
     // UNX_CLOCKS=docked (or a hex PerformanceConfiguration such as 0x92220008) asks apm for
     // the docked clocks (CPU 1020 MHz, GPU 768 MHz, stock docked values) while running
     // handheld; the session stays open for the run, since the setting may go with it
