@@ -121,7 +121,7 @@ uvec4 stage_registers(uint stage, uvec4 constants) {
     return uvec4(registers.x & 0x0FFF0FFFu, registers.y & 0x00777FFFu, registers.z & 0x000F000Fu, tev[stage * 2u + 1u].x & 0x00030003u);
 }
 
-layout(std430, set = 0, binding = 4) readonly buffer Tables {
+layout(std430, set = 0, binding = 4) restrict readonly buffer Tables {
     // 24 tables of 256 entries, a value and the step to the next, then the
     // procedural texture's noise, color map and alpha map, 128 entries
     // each, and its 256 colors and their steps, two pairs an entry, then
@@ -328,6 +328,52 @@ bool light_bit(uint bit, uint dynamic_value) {
     return LIGHT_CONSTANT ? ((LIGHT_SHAPE >> bit) & 1u) != 0u : dynamic_value != 0u;
 }
 
+// one lighting table's value for a light, 1 for a table not read
+float table_value(
+    uint i, uint flags, uint number, uint config, bool two_sided,
+    vec3 normal, vec3 half_unit, vec3 norm_view, vec3 light_vector, vec3 spot_direction, vec3 tangent
+) {
+    if (!table_read(i) || (i == 6u && (flags & 32u) == 0u)) {
+        return 1.0;
+    }
+    float result = 0.0;
+    switch (table_input(i)) {
+        case 0u: result = dot(normal, half_unit); break;
+        case 1u: result = dot(norm_view, half_unit); break;
+        case 2u: result = dot(normal, norm_view); break;
+        case 3u: result = dot(light_vector, normal); break;
+        case 4u: result = dot(light_vector, spot_direction); break;
+        case 5u:
+            if (config == 8u) {
+                float along = dot(normal, half_unit);
+                result = dot(half_unit - normal * along, tangent);
+            }
+            break;
+        default: break;
+    }
+    uint entry;
+    float delta;
+    if (table_absolute(i)) {
+        result = two_sided ? abs(result) : max(result, 0.0);
+        float e = clamp(floor(result * 256.0), 0.0, 255.0);
+        entry = uint(e);
+        delta = result * 256.0 - e;
+    } else {
+        // the signed index wraps into the upper half of the table
+        float e = clamp(floor(result * 128.0), -128.0, 127.0);
+        entry = uint(int(e)) & 0xFFu;
+        delta = result * 128.0 - e;
+    }
+    uint table = i == 0u ? DISTRIBUTION0
+        : i == 1u ? DISTRIBUTION1
+        : i == 2u ? FRESNEL
+        : i == 3u ? REFLECT_RED
+        : i == 4u ? REFLECT_GREEN
+        : i == 5u ? REFLECT_BLUE
+        : SPOTLIGHT + number;
+    return uintBitsToFloat(lookups[i].w) * lookup(table, entry, delta);
+}
+
 // what fragment lighting leaves in the primary and secondary colors
 void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     uint config = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 19) & 0xFu : light_config.x;
@@ -390,49 +436,17 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
             distance = lookup(DISTANCE + number, uint(entry), place * 256.0 - entry);
         }
 
+        // each table by its own number, so a pipeline with the lighting's
+        // constants drops the ones it does not read, and no array of the
+        // values is indexed as the loop goes, which put it in memory
         float values[7];
-        for (uint i = 0u; i < 7u; i++) {
-            values[i] = 1.0;
-            if (!table_read(i) || (i == 6u && (flags & 32u) == 0u)) {
-                continue;
-            }
-            float result = 0.0;
-            switch (table_input(i)) {
-                case 0u: result = dot(normal, half_unit); break;
-                case 1u: result = dot(norm_view, half_unit); break;
-                case 2u: result = dot(normal, norm_view); break;
-                case 3u: result = dot(light_vector, normal); break;
-                case 4u: result = dot(light_vector, light.spot.xyz); break;
-                case 5u:
-                    if (config == 8u) {
-                        float along = dot(normal, half_unit);
-                        result = dot(half_unit - normal * along, tangent);
-                    }
-                    break;
-                default: break;
-            }
-            uint entry;
-            float delta;
-            if (table_absolute(i)) {
-                result = two_sided ? abs(result) : max(result, 0.0);
-                float e = clamp(floor(result * 256.0), 0.0, 255.0);
-                entry = uint(e);
-                delta = result * 256.0 - e;
-            } else {
-                // the signed index wraps into the upper half of the table
-                float e = clamp(floor(result * 128.0), -128.0, 127.0);
-                entry = uint(int(e)) & 0xFFu;
-                delta = result * 128.0 - e;
-            }
-            uint table = i == 0u ? DISTRIBUTION0
-                : i == 1u ? DISTRIBUTION1
-                : i == 2u ? FRESNEL
-                : i == 3u ? REFLECT_RED
-                : i == 4u ? REFLECT_GREEN
-                : i == 5u ? REFLECT_BLUE
-                : SPOTLIGHT + number;
-            values[i] = uintBitsToFloat(lookups[i].w) * lookup(table, entry, delta);
-        }
+        values[0] = table_value(0u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[1] = table_value(1u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[2] = table_value(2u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[3] = table_value(3u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[4] = table_value(4u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[5] = table_value(5u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[6] = table_value(6u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
 
         float spot = values[6];
         float red = values[3];

@@ -780,6 +780,11 @@ struct Timing {
     per_draw: bool,
     current_class: u32,
     by_class: HashMap<u32, (f64, u32)>,
+    /// with per_draw, each command buffer's pool of fragment counts, one
+    /// query a draw, and the kind of each draw counted; the fragments of
+    /// each kind
+    draw_counts: HashMap<vk::CommandBuffer, (vk::QueryPool, Vec<u32>)>,
+    class_fragments: HashMap<u32, u64>,
     /// milliseconds per kind of work.
     totals: [f64; WORK_NAMES.len()],
     batches: u32,
@@ -1387,6 +1392,31 @@ fn work(
     }
 }
 
+/// a lit pipeline's lighting shape, as it compiles (diagnostics).
+fn log_lit(key: &PipelineKey) {
+    if key.fragment[30] == 0 {
+        return;
+    }
+    let [shape, inputs] = [key.fragment[30], key.fragment[31]];
+    log::info!(
+        target: "zakuro_gpu::pipelines",
+        "lit pipeline: {} lights, tables {:07b} inputs {:o} abs {:07b}, config {}, half {} view {} bump {} shadow {} fresnel {}{} clamp {}, units {:03b}",
+        (shape >> 1) & 0xF,
+        (shape >> 5) & 0x7F,
+        inputs,
+        (shape >> 12) & 0x7F,
+        (shape >> 19) & 0xF,
+        (shape >> 23) & 1,
+        (shape >> 24) & 1,
+        (shape >> 25) & 3,
+        (shape >> 27) & 1,
+        (shape >> 28) & 1,
+        (shape >> 29) & 1,
+        (shape >> 30) & 1,
+        key.fragment[25] & 7,
+    );
+}
+
 /// a draw pipeline for a key, with its vertex and fragment shader modules,
 /// drawing depth in the depth format given.
 #[allow(clippy::too_many_arguments)]
@@ -1922,12 +1952,16 @@ impl Hardware {
                         per_draw: std::env::var_os("ZAKURO_GPU_DRAW_TIMES").is_some(),
                         current_class: u32::MAX,
                         by_class: HashMap::new(),
+                        draw_counts: HashMap::new(),
+                        class_fragments: HashMap::new(),
                         totals: [0.0; WORK_NAMES.len()],
                         batches: 0,
                         barriers: 0,
                         renderings: 0,
                         draws: 0,
-                        statistics: statistics.then(HashMap::new),
+                        // a query per draw counts the fragments then, and two
+                        // of a kind cannot be active at once
+                        statistics: (statistics && std::env::var_os("ZAKURO_GPU_DRAW_TIMES").is_none()).then(HashMap::new),
                         counts: [0; 4],
                         waited: [(0.0, 0); 2],
                         last_end: 0,
@@ -2214,6 +2248,26 @@ impl Hardware {
         };
         timing.current = Work::Other;
         timing.current_class = u32::MAX;
+        if timing.per_draw {
+            let pool = match timing.draw_counts.get_mut(&commands) {
+                Some((pool, classes)) => {
+                    classes.clear();
+                    *pool
+                }
+                None => {
+                    let info = vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::PIPELINE_STATISTICS)
+                        .query_count(TIMESTAMPS)
+                        .pipeline_statistics(vk::QueryPipelineStatisticFlags::FRAGMENT_SHADER_INVOCATIONS);
+                    // SAFETY: a pool of ours, made once per command buffer
+                    let pool = unsafe { self.device.create_query_pool(&info, None) }.map_err(vk_error("create a query pool"))?;
+                    timing.draw_counts.insert(commands, (pool, Vec::new()));
+                    pool
+                }
+            };
+            // SAFETY: recording, outside rendering
+            unsafe { self.device.cmd_reset_query_pool(commands, pool, 0, TIMESTAMPS) };
+        }
         // SAFETY: recording, outside rendering
         unsafe {
             self.device.cmd_reset_query_pool(commands, pool, 0, TIMESTAMPS);
@@ -2299,6 +2353,21 @@ impl Hardware {
             timing.last_end = last;
             marks.clear();
         }
+        if let Some((pool, classes)) = timing.draw_counts.get_mut(&commands) {
+            if !classes.is_empty() {
+                let mut counts = vec![0u64; classes.len()];
+                // SAFETY: the batch finished, its fence was waited for
+                unsafe {
+                    self.device
+                        .get_query_pool_results(*pool, 0, &mut counts, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)
+                        .map_err(vk_error("read fragment counts"))?;
+                }
+                for (&class, &count) in classes.iter().zip(&counts) {
+                    *timing.class_fragments.entry(class).or_insert(0) += count;
+                }
+                classes.clear();
+            }
+        }
         if let Some(&pool) = timing.statistics.as_ref().and_then(|statistics| statistics.get(&commands)) {
             let mut values = [[0u64; 4]];
             // SAFETY: the batch finished, its fence was waited for
@@ -2363,11 +2432,15 @@ impl Hardware {
             if timing.per_draw {
                 let mut classes: Vec<(u32, (f64, u32))> = timing.by_class.drain().collect();
                 classes.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+                let mut fragments = std::mem::take(&mut timing.class_fragments);
                 for (class, (ms, draws)) in classes.iter().take(14) {
+                    let count = fragments.remove(class).unwrap_or(0);
                     log::info!(
                         target: "zakuro_gpu::times",
-                        "  draws {ms:.1} ms in {draws} ({:.0} us each): lighting {} depth-in-shader {} units {:03b} proctex {} alpha test {} blend {} target {}x{}",
+                        "  draws {ms:.1} ms in {draws} ({:.0} us each), {:.2}M fragments ({:.1} ns each): lighting {} depth-in-shader {} units {:03b} proctex {} alpha test {} blend {} target {}x{}",
                         ms * 1000.0 / *draws as f64,
+                        count as f64 / 1e6,
+                        if count > 0 { ms * 1e6 / count as f64 } else { 0.0 },
                         class & 1,
                         (class >> 1) & 1,
                         (class >> 2) & 7,
@@ -3355,6 +3428,9 @@ impl Hardware {
         if let Some(&pipeline) = self.pipelines.get(&key) {
             self.last_pipeline = Some((key, pipeline));
             return Ok(pipeline);
+        }
+        if !translating && !self.compiler.asked.contains(&key) {
+            log_lit(&key);
         }
         if !translating && self.compiler.asked.insert(key) {
             if let Some(pipeline) = self.cached(key) {
@@ -4413,6 +4489,14 @@ impl Hardware {
         if self.timing.as_ref().is_some_and(|timing| timing.per_draw) {
             self.mark(Work::Draw, true);
         }
+        let draw_class = self.draw_class;
+        let counted = self.timing.as_mut().and_then(|timing| {
+            let (pool, classes) = timing.draw_counts.get_mut(&self.commands)?;
+            ((classes.len() as u32) < TIMESTAMPS).then(|| {
+                classes.push(draw_class);
+                (*pool, classes.len() as u32 - 1)
+            })
+        });
         let commands = self.commands;
         let face = vk::StencilFaceFlags::FRONT_AND_BACK;
         let (test, op) = r.stencil;
@@ -4476,6 +4560,9 @@ impl Hardware {
             self.last_draw_state = Some((r.pipeline, now));
             self.push.cmd_push_descriptor_set(commands, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, writes);
             self.draws += 1;
+            if let Some((pool, query)) = counted {
+                device.cmd_begin_query(commands, pool, query, vk::QueryControlFlags::empty());
+            }
             match vertex_infos {
                 Some(infos) => {
                     device.cmd_bind_index_buffer(commands, self.ring.buffer, infos[3][0].offset, vk::IndexType::UINT32);
@@ -4486,6 +4573,9 @@ impl Hardware {
                     device.cmd_bind_index_buffer(commands, self.ring.buffer, r.placed.1, vk::IndexType::UINT32);
                     device.cmd_draw_indexed(commands, r.count, 1, 0, 0, 0);
                 }
+            }
+            if let Some((pool, query)) = counted {
+                device.cmd_end_query(commands, pool, query);
             }
         }
     }
