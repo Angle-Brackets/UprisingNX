@@ -73,6 +73,225 @@ pub(crate) fn translate(program: &Program, entry_point: u32, semantics: &[u32; S
     Ok(translator.shader(semantics))
 }
 
+/// how a draw's vertex shader feeds its geometry shader: the attributes
+/// each vertex gives (the output registers the vertex output mask enables,
+/// packed), how many make one invocation's inputs and which input register
+/// each goes to, and the vertex slots each invocation gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GeometryLayout {
+    pub per_vertex: u32,
+    pub per_invocation: u32,
+    pub vertex_mask: u32,
+    pub input_map: u64,
+    pub slots: u32,
+}
+
+impl GeometryLayout {
+    /// the vertices one invocation takes, the attributes past its inputs
+    /// dropped, as geometry_stage does.
+    pub(crate) fn vertices(&self) -> u32 {
+        self.per_invocation.div_ceil(self.per_vertex)
+    }
+}
+
+/// the vertex slots a geometry program from an entry point needs at most,
+/// three for each emit it can reach, when its flow only goes forward (ifs
+/// and jumps ahead, so no emit runs twice); none otherwise, or when it
+/// emits nothing or more than 16 triangles.
+pub(crate) fn geometry_slots(program: &Program, entry: u32) -> Option<u32> {
+    let translator = Translator::new(program, entry).ok()?;
+    let mut emits = 0u32;
+    for run in translator.runs.values() {
+        emits += run.body.iter().filter(|&&at| translator.ops[at as usize].opcode == OpCode::Emit).count() as u32;
+        if let Exit::Flow(at) = run.exit {
+            let op = &translator.ops[at as usize];
+            let (destination, _) = op.instruction.flow_target();
+            let forward = match op.opcode {
+                OpCode::IfU | OpCode::IfC | OpCode::JmpC | OpCode::JmpU => destination > at,
+                _ => false,
+            };
+            if !forward {
+                return None;
+            }
+        }
+    }
+    (1..=16).contains(&emits).then_some(emits * 3)
+}
+
+/// a draw with a geometry shader as one vertex shader: each invocation's
+/// slots as vertices, the vertex program run for each of the invocation's
+/// vertices, its outputs into the geometry program's inputs, the geometry
+/// program run, and the vertex its slot names out of the triangles it
+/// emits, or a point for a triangle it never made, which draws nothing.
+/// semantics place the geometry program's outputs.
+pub(crate) fn translate_geometry(
+    vertex: &Program,
+    vertex_entry: u32,
+    geometry: &Program,
+    geometry_entry: u32,
+    layout: &GeometryLayout,
+    semantics: &[u32; SEMANTICS],
+) -> Result<String, String> {
+    let mut vertex_code = Translator::new(vertex, vertex_entry)?;
+    let mut geometry_code = Translator::new(geometry, geometry_entry)?;
+    for translator in [&vertex_code, &geometry_code] {
+        let length: usize = translator.runs.values().map(|run| run.length() as usize).sum();
+        if length > LONGEST {
+            return Err(format!("{length} reachable instructions, more than {LONGEST}"));
+        }
+    }
+    geometry_code.prefix = "g_";
+    geometry_code.geometry = true;
+    let (vertex_run, vertex_flows) = vertex_code.code();
+    let (geometry_run, geometry_flows) = geometry_code.code();
+
+    let mut out = String::with_capacity(vertex_run.len() + geometry_run.len() + 16384);
+    // the geometry program's uniforms after everything else in the block,
+    // stage_shading writing them there for these draws
+    let header = header();
+    let block_end = "    vec4 defaults[16];\n};";
+    if !header.contains(block_end) {
+        return Err("the shading block changed".to_owned());
+    }
+    out.push_str(&header.replace(block_end, "    vec4 defaults[16];\n    vec4 g_floats[96];\n    ivec4 g_integers[4];\n    uvec4 g_flags;\n};"));
+    out.push_str(GEOMETRY_HEADER);
+    if vertex_flows || geometry_flows {
+        out.push_str(BLOCKS);
+    }
+    let _ = writeln!(out, "const uint SLOTS = {}u;\n", layout.slots);
+
+    // an emitted vertex's values, placed by the semantics
+    let component = |which: usize, missing: &str| semantic(semantics[which], missing);
+    let vector = |range: std::ops::Range<usize>, missing: &str| range.map(|which| component(which, missing)).collect::<Vec<_>>().join(", ");
+    out.push_str("void fill_slot(uint slot) {\n");
+    let _ = writeln!(out, "    slot_position[slot] = vec4({});", vector(0..4, "0.0"));
+    let _ = writeln!(out, "    slot_color[slot] = vec4({});", vector(4..8, "1.0"));
+    let _ = writeln!(out, "    slot_texcoords01[slot] = vec4({});", vector(8..12, "0.0"));
+    let _ = writeln!(out, "    slot_texcoord2[slot] = vec2({});", vector(12..14, "0.0"));
+    let _ = writeln!(out, "    slot_quaternion[slot] = vec4({});", vector(14..18, "0.0"));
+    let _ = writeln!(out, "    slot_view[slot] = vec3({});", vector(18..21, "0.0"));
+    out.push_str("}\n\n");
+    out.push_str(EMIT);
+
+    out.push_str("void run_vertex() {\n");
+    out.push_str(&vertex_run);
+    out.push_str("}\n\nvoid run_geometry() {\n");
+    out.push_str(&geometry_run);
+    out.push_str("}\n\n");
+
+    out.push_str("void main() {\n");
+    out.push_str("    uint invocation = uint(gl_VertexIndex) / SLOTS;\n");
+    out.push_str("    uint slot = uint(gl_VertexIndex) % SLOTS;\n");
+    out.push_str("    want_triangle = slot / 3u;\n");
+    out.push_str("    want_corner = slot % 3u;\n");
+    out.push_str("    for (int i = 0; i < 16; i++) {\n        gs_in[i] = vec4(0.0);\n    }\n");
+    // the packed attributes, as pack_outputs packs them: the enabled
+    // registers in turn, all of them for no mask, zero past the last
+    let mask = layout.vertex_mask & 0xFFFF;
+    let enabled: Vec<u32> = (0..16).filter(|register| mask == 0 || mask & (1 << register) != 0).collect();
+    let vertices = layout.vertices();
+    for k in 0..vertices {
+        let _ = writeln!(out, "    vertex_index = invocation * {vertices}u + {k}u;");
+        out.push_str(RESET);
+        if vertex_flows {
+            out.push_str("    blocks = 0;\n");
+        }
+        out.push_str("    run_vertex();\n");
+        for id in (k * layout.per_vertex)..((k + 1) * layout.per_vertex).min(layout.per_invocation) {
+            let register = (layout.input_map >> (id * 4)) & 0xF;
+            match enabled.get((id % layout.per_vertex) as usize) {
+                Some(output) => {
+                    let _ = writeln!(out, "    gs_in[{register}] = outputs[{output}];");
+                }
+                None => {
+                    let _ = writeln!(out, "    gs_in[{register}] = vec4(0.0);");
+                }
+            }
+        }
+    }
+    out.push_str(RESET);
+    if geometry_flows {
+        out.push_str("    blocks = 0;\n");
+    }
+    // the emitter's slots start as zero registers make them
+    out.push_str("    fill_slot(0u);\n    fill_slot(1u);\n    fill_slot(2u);\n");
+    out.push_str("    emit_slot = 0u;\n    emit_completes = false;\n    triangles_made = 0u;\n    found = false;\n");
+    out.push_str("    run_geometry();\n");
+    out.push_str(GEOMETRY_EPILOGUE);
+    out.push_str(EPILOGUE);
+    out.push_str("    out_color = chosen_color;\n");
+    out.push_str("    out_texcoords01 = chosen_texcoords01;\n");
+    out.push_str("    out_texcoord2 = chosen_texcoord2;\n");
+    out.push_str("    out_depth = position.z / position.w * depth_map.x + depth_map.y;\n");
+    out.push_str("    out_quaternion = chosen_quaternion;\n");
+    out.push_str("    out_view = chosen_view;\n");
+    out.push_str("}\n");
+    Ok(out)
+}
+
+/// what a geometry draw adds to shade.vert's interface: the geometry
+/// program's uniforms after the vertex program's, its inputs, and the
+/// emitter, the three slots as their values and the vertex picked.
+const GEOMETRY_HEADER: &str = r#"vec4 g_uniform_at(int index) {
+    return index >= 0 && index < 96 ? g_floats[index] : vec4(0.0);
+}
+
+vec4 gs_in[16];
+uint emit_slot;
+bool emit_completes;
+uint triangles_made;
+uint want_triangle;
+uint want_corner;
+bool found;
+vec4 slot_position[3];
+vec4 slot_color[3];
+vec4 slot_texcoords01[3];
+vec2 slot_texcoord2[3];
+vec4 slot_quaternion[3];
+vec3 slot_view[3];
+vec4 chosen_position;
+vec4 chosen_color;
+vec4 chosen_texcoords01;
+vec2 chosen_texcoord2;
+vec4 chosen_quaternion;
+vec3 chosen_view;
+
+"#;
+
+/// an emit, as batch.rs's emit does it: the outputs into the slot, and a
+/// triangle out of the three slots when the slot completes one, the one
+/// this vertex is a corner of picked.
+const EMIT: &str = r#"void emit_vertex() {
+    fill_slot(emit_slot);
+    if (emit_completes) {
+        if (triangles_made == want_triangle) {
+            found = true;
+            chosen_position = slot_position[want_corner];
+            chosen_color = slot_color[want_corner];
+            chosen_texcoords01 = slot_texcoords01[want_corner];
+            chosen_texcoord2 = slot_texcoord2[want_corner];
+            chosen_quaternion = slot_quaternion[want_corner];
+            chosen_view = slot_view[want_corner];
+        }
+        triangles_made++;
+    }
+}
+
+"#;
+
+/// the vertex picked, or for a triangle never made the same point at each
+/// corner, which covers nothing.
+const GEOMETRY_EPILOGUE: &str = r#"    if (!found) {
+        chosen_position = vec4(0.0, 0.0, 0.0, 1.0);
+        chosen_color = vec4(0.0);
+        chosen_texcoords01 = vec4(0.0);
+        chosen_texcoord2 = vec2(0.0);
+        chosen_quaternion = vec4(0.0);
+        chosen_view = vec3(0.0);
+    }
+    vec4 position = chosen_position;
+"#;
+
 /// a hash of everything a translation from an entry point is made of: the
 /// inputs packed, and the code execution can reach with its operands worked
 /// out. programs differing only in words they never run, earlier programs
@@ -166,6 +385,11 @@ struct Translator<'a> {
     runs: BTreeMap<u32, Run>,
     /// the input registers the reachable code reads.
     read: u16,
+    /// what the uniforms' names start with, g_ for a geometry program's,
+    /// which a draw carries beside the vertex program's.
+    prefix: &'static str,
+    /// whether setemit and emit fill the emitter.
+    geometry: bool,
 }
 
 impl<'a> Translator<'a> {
@@ -184,7 +408,7 @@ impl<'a> Translator<'a> {
             })
             .collect();
         let runs = reachable(ops, &starts(ops, entry, flows), entry)?;
-        Ok(Translator { ops, packed: program.inputs, entry, runs, read: 0 })
+        Ok(Translator { ops, packed: program.inputs, entry, runs, read: 0, prefix: "", geometry: false })
     }
 
     /// whether anything reachable is a flow instruction, which needs the
@@ -194,6 +418,42 @@ impl<'a> Translator<'a> {
     }
 
     fn shader(mut self, semantics: &[u32; SEMANTICS]) -> String {
+        let (run, flows) = self.code();
+        let mut out = String::with_capacity(run.len() + 8192);
+        out.push_str(&header());
+        if flows {
+            out.push_str(BLOCKS);
+        }
+        out.push_str("void run() {\n");
+        out.push_str(&run);
+        out.push_str("}\n\n");
+
+        out.push_str("void main() {\n");
+        out.push_str("    vertex_index = uint(gl_VertexIndex);\n");
+        out.push_str(RESET);
+        if flows {
+            out.push_str("    blocks = 0;\n");
+        }
+        out.push_str("    run();\n");
+        let component = |which: usize, missing: &str| semantic(semantics[which], missing);
+        let vector = |range: std::ops::Range<usize>, missing: &str| {
+            range.map(|which| component(which, missing)).collect::<Vec<_>>().join(", ")
+        };
+        let _ = writeln!(out, "    vec4 position = vec4({});", vector(0..4, "0.0"));
+        out.push_str(EPILOGUE);
+        let _ = writeln!(out, "    out_color = vec4({});", vector(4..8, "1.0"));
+        let _ = writeln!(out, "    out_texcoords01 = vec4({});", vector(8..12, "0.0"));
+        let _ = writeln!(out, "    out_texcoord2 = vec2({});", vector(12..14, "0.0"));
+        out.push_str("    out_depth = position.z / position.w * depth_map.x + depth_map.y;\n");
+        let _ = writeln!(out, "    out_quaternion = vec4({});", vector(14..18, "0.0"));
+        let _ = writeln!(out, "    out_view = vec3({});", vector(18..21, "0.0"));
+        out.push_str("}\n");
+        out
+    }
+
+    /// the program's code, the inputs it reads worked out first, for a
+    /// function's body, and whether it needs the block stack.
+    fn code(&mut self) -> (String, bool) {
         let mut flows = self.flows();
         let mut run = String::new();
         if flows {
@@ -219,8 +479,27 @@ impl<'a> Translator<'a> {
         } else {
             self.straight(&mut run);
         }
+        // the inputs the code reads, each worked out once, from the arrays
+        // the way the draw's attributes say, or for a geometry program
+        // from the vertices' outputs
+        let mut code = String::with_capacity(run.len() + 512);
+        for register in (0..16).filter(|register| self.read & (1 << register) != 0) {
+            let _ = match self.geometry {
+                false => writeln!(code, "    vec4 v{register} = input_register({register}u);"),
+                true => writeln!(code, "    vec4 v{register} = gs_in[{register}];"),
+            };
+        }
+        code.push_str(&run);
+        (code, flows)
+    }
+}
 
-        let mut out = String::with_capacity(run.len() + 8192);
+/// shade.vert's interface and helpers, with the products' NaN guard unless
+/// ZAKURO_FAST_MUL=1 drops it, a test of what the guard costs the GPU (0 *
+/// inf is NaN on the host, 0 on the console).
+fn header() -> String {
+    let mut out = String::with_capacity(HEADER.len());
+    {
         // ZAKURO_FAST_MUL=1: products without the NaN guard (0 * inf is NaN on
         // the host, 0 on the console), a test of what the guard costs the GPU
         static FAST_MUL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -232,44 +511,20 @@ impl<'a> Translator<'a> {
         } else {
             out.push_str(HEADER);
         }
-        if flows {
-            out.push_str(BLOCKS);
-        }
-        out.push_str("void run() {\n");
-        // the inputs the code reads, each worked out once from the arrays
-        // the way the draw's attributes say
-        for register in (0..16).filter(|register| self.read & (1 << register) != 0) {
-            let _ = writeln!(out, "    vec4 v{register} = input_register({register}u);");
-        }
-        out.push_str(&run);
-        out.push_str("}\n\n");
-
-        out.push_str("void main() {\n");
-        out.push_str("    for (int i = 0; i < 16; i++) {\n");
-        out.push_str("        temps[i] = vec4(0.0, 0.0, 0.0, 1.0);\n");
-        out.push_str("        outputs[i] = vec4(0.0);\n");
-        out.push_str("    }\n");
-        out.push_str("    address = ivec3(0);\n");
-        out.push_str("    condition = bvec2(false);\n");
-        if flows {
-            out.push_str("    blocks = 0;\n");
-        }
-        out.push_str("    run();\n");
-        let component = |which: usize, missing: &str| semantic(semantics[which], missing);
-        let vector = |range: std::ops::Range<usize>, missing: &str| {
-            range.map(|which| component(which, missing)).collect::<Vec<_>>().join(", ")
-        };
-        let _ = writeln!(out, "    vec4 position = vec4({});", vector(0..4, "0.0"));
-        out.push_str(EPILOGUE);
-        let _ = writeln!(out, "    out_color = vec4({});", vector(4..8, "1.0"));
-        let _ = writeln!(out, "    out_texcoords01 = vec4({});", vector(8..12, "0.0"));
-        let _ = writeln!(out, "    out_texcoord2 = vec2({});", vector(12..14, "0.0"));
-        out.push_str("    out_depth = position.z / position.w * depth_map.x + depth_map.y;\n");
-        let _ = writeln!(out, "    out_quaternion = vec4({});", vector(14..18, "0.0"));
-        let _ = writeln!(out, "    out_view = vec3({});", vector(18..21, "0.0"));
-        out.push_str("}\n");
-        out
     }
+    out
+}
+
+/// a program's registers as each run starts them.
+const RESET: &str = "    for (int i = 0; i < 16; i++) {
+        temps[i] = vec4(0.0, 0.0, 0.0, 1.0);
+        outputs[i] = vec4(0.0);
+    }
+    address = ivec3(0);
+    condition = bvec2(false);
+";
+
+impl Translator<'_> {
 
     /// a program without flow, its runs one after another from the entry.
     fn straight(&mut self, out: &mut String) {
@@ -392,7 +647,7 @@ impl<'a> Translator<'a> {
                     if depth >= BLOCK_LIMIT {
                         return Err("calls nest past the block stack".to_owned());
                     }
-                    let taken = taken(&op);
+                    let taken = taken(&op, self.prefix);
                     let _ = writeln!(out, "{indent}if ({taken}) {{");
                     let inner = self.block(out, destination, destination + count, true, depth + 1, in_loop, inner_level, emitted, pending, flags)?;
                     let _ = writeln!(out, "{indent}}}");
@@ -408,7 +663,7 @@ impl<'a> Translator<'a> {
                     if after <= at {
                         return Err(format!("an if at {at} goes back"));
                     }
-                    let taken = taken(&op);
+                    let taken = taken(&op, self.prefix);
                     let _ = writeln!(out, "{indent}if ({taken}) {{");
                     let body = self.block(out, next, body_end, true, depth + 1, in_loop, inner_level, emitted, pending, flags)?;
                     let _ = writeln!(out, "{indent}}} else {{");
@@ -421,7 +676,7 @@ impl<'a> Translator<'a> {
                     if destination <= at {
                         return Err(format!("a jump at {at} goes back"));
                     }
-                    let taken = taken(&op);
+                    let taken = taken(&op, self.prefix);
                     if end == FINISHED || destination <= end {
                         // what it skips, run when it is not taken
                         let _ = writeln!(out, "{indent}if (!({taken})) {{");
@@ -452,7 +707,7 @@ impl<'a> Translator<'a> {
                     }
                     let integer = op.instruction.integer_index();
                     let _ = writeln!(out, "{indent}{{");
-                    let _ = writeln!(out, "{indent}    ivec4 integer{depth} = integers[{integer}];");
+                    let _ = writeln!(out, "{indent}    ivec4 integer{depth} = {}integers[{integer}];", self.prefix);
                     let _ = writeln!(out, "{indent}    address.z = integer{depth}.y;");
                     let _ = writeln!(out, "{indent}    uint repeat{depth} = uint(integer{depth}.x);");
                     let _ = writeln!(out, "{indent}    for (uint n{depth} = 0u; n{depth} <= repeat{depth}; n{depth}++) {{");
@@ -468,7 +723,7 @@ impl<'a> Translator<'a> {
                     if !in_loop {
                         return Err(format!("a break at {at} outside a loop"));
                     }
-                    let taken = taken(&op);
+                    let taken = taken(&op, self.prefix);
                     let _ = writeln!(out, "{indent}if ({taken}) {{");
                     let _ = writeln!(out, "{indent}    break;");
                     let _ = writeln!(out, "{indent}}}");
@@ -560,7 +815,7 @@ impl<'a> Translator<'a> {
         let op = &self.ops[at as usize];
         let (destination, count) = op.instruction.flow_target();
         let next = at + 1;
-        let taken = taken(op);
+        let taken = taken(op, self.prefix);
         let indent = "            ";
         match op.opcode {
             OpCode::Call | OpCode::CallC | OpCode::CallU => {
@@ -587,7 +842,7 @@ impl<'a> Translator<'a> {
                 let integer = op.instruction.integer_index();
                 let end = destination + 1;
                 let _ = writeln!(out, "{indent}{{");
-                let _ = writeln!(out, "{indent}    ivec4 integer = integers[{integer}];");
+                let _ = writeln!(out, "{indent}    ivec4 integer = {}integers[{integer}];", self.prefix);
                 let _ = writeln!(out, "{indent}    address.z = integer.y;");
                 let _ = writeln!(out, "{indent}    if (blocks < 16) {{");
                 let _ = writeln!(out, "{indent}        block_end[blocks] = {end}u;");
@@ -626,6 +881,21 @@ impl<'a> Translator<'a> {
     fn instruction(&mut self, out: &mut String, at: u32, indent: &str) {
         use OpCode::*;
         let op = self.ops[at as usize];
+        if self.geometry {
+            match op.opcode {
+                SetEmit => {
+                    let (slot, completes) = (op.instruction.emit_vertex().min(2), op.instruction.emit_primitive());
+                    let _ = writeln!(out, "{indent}emit_slot = {slot}u;");
+                    let _ = writeln!(out, "{indent}emit_completes = {completes};");
+                    return;
+                }
+                Emit => {
+                    let _ = writeln!(out, "{indent}emit_vertex();");
+                    return;
+                }
+                _ => {}
+            }
+        }
         let sources = match op.opcode {
             Mad | MadI => 3,
             Add | Dp3 | Dp4 | Dph | DphI | Dst | DstI | Mul | Sge | SgeI | Slt | SltI | Max | Min | Cmp => 2,
@@ -723,8 +993,8 @@ impl<'a> Translator<'a> {
         } else {
             let uniform = register - 0x20;
             match operand.index {
-                0 => format!("floats[{uniform}]"),
-                index => format!("uniform_at({uniform} + address.{})", ["x", "y", "z"][(index as usize - 1).min(2)]),
+                0 => format!("{}floats[{uniform}]", self.prefix),
+                index => format!("{}uniform_at({uniform} + address.{})", self.prefix, ["x", "y", "z"][(index as usize - 1).min(2)]),
             }
         };
         let swizzled = if operand.swizzle == [0, 1, 2, 3] {
@@ -902,9 +1172,9 @@ fn broken(mut open: Vec<Open>, next: u32) -> (u32, Vec<Open>) {
 
 /// whether a flow instruction is taken, as shade.vert's flow_condition
 /// works it out, its fields folded in.
-fn taken(op: &Op) -> String {
+fn taken(op: &Op, prefix: &str) -> String {
     let instruction = op.instruction;
-    let set = format!("((flags.x & {}u) != 0u)", 1u32 << instruction.bool_index());
+    let set = format!("(({prefix}flags.x & {}u) != 0u)", 1u32 << instruction.bool_index());
     match op.opcode {
         OpCode::Call | OpCode::Break => "true".to_owned(),
         OpCode::CallU | OpCode::IfU => set,
@@ -997,6 +1267,8 @@ layout(std430, set = 0, binding = 7) readonly buffer Inputs {
     uint vertex_bytes[];
 };
 
+// the vertex the arrays are read for
+uint vertex_index;
 vec4 temps[16];
 vec4 outputs[16];
 ivec3 address;
@@ -1064,7 +1336,7 @@ vec4 input_register(uint r) {
     }
     uint type = (field.z >> 8u) & 0xFFu;
     uint size = type == 3u ? 4u : (type == 2u ? 2u : 1u);
-    uint at = field.x + uint(gl_VertexIndex) * field.y + (field.z & 0xFFu);
+    uint at = field.x + vertex_index * field.y + (field.z & 0xFFu);
     value.x = component(at, type);
     if (count > 1u) {
         value.y = component(at + size, type);
@@ -1250,6 +1522,80 @@ mod tests {
         }
         let _ = std::fs::remove_file(path);
         glsl
+    }
+
+    /// a setemit for a slot, completing a triangle or not, and an emit.
+    fn emits(random: &mut Random, program: &mut Vec<u32>) {
+        let (slot, completes) = (random.below(3), random.below(2));
+        program.push((0x2B << 26) | (slot << 24) | (completes << 23));
+        program.push(0x2A << 26);
+    }
+
+    /// geometry programs of arithmetic and emits, with an if and its else
+    /// emitting their own, take slots for each emit and come out, with a
+    /// random vertex program before them, as shaders that compile.
+    #[test]
+    fn geometry_programs_compile_with_their_vertex_programs() {
+        let mut random = Random(17);
+        for case in 0..60 {
+            let mut vertex: Vec<u32> = (0..1 + random.below(30)).map(|_| arithmetic(&mut random)).collect();
+            vertex.push(0x22 << 26);
+            let mut geometry: Vec<u32> = (0..random.below(10)).map(|_| arithmetic(&mut random)).collect();
+            let mut count = 0;
+            let branches = case % 2 == 1;
+            let at = geometry.len() as u32;
+            if branches {
+                geometry.push(0);
+            }
+            let body_start = geometry.len();
+            for _ in 0..1 + random.below(4) {
+                geometry.push(arithmetic(&mut random));
+                emits(&mut random, &mut geometry);
+                count += 1;
+            }
+            if branches {
+                let destination = geometry.len() as u32;
+                for _ in 0..1 + random.below(3) {
+                    emits(&mut random, &mut geometry);
+                    count += 1;
+                }
+                let otherwise = geometry.len() as u32 - destination;
+                let condition = random.below(1 << 4) << 22;
+                geometry[at as usize] = (0x28 << 26) | condition | (destination << 10) | otherwise;
+                assert!(body_start as u32 == at + 1);
+            }
+            geometry.push(0x22 << 26);
+            let vertex_unit = unit(&vertex, 0, &mut random);
+            let geometry_unit = unit(&geometry, 0, &mut random);
+            let geometry_program = geometry_unit.prepared().unwrap();
+            let slots = geometry_slots(&geometry_program, 0).expect("forward flow only");
+            assert_eq!(slots, count * 3);
+            let per_vertex = 1 + random.below(7);
+            let layout = GeometryLayout {
+                per_vertex,
+                per_invocation: 1 + random.below(16),
+                vertex_mask: random.next() & 0xFFFF,
+                input_map: (random.next() as u64) << 32 | random.next() as u64,
+                slots,
+            };
+            let glsl = translate_geometry(&vertex_unit.prepared().unwrap(), 0, &geometry_program, 0, &layout, &semantics(&mut random)).unwrap();
+            if let Err(error) = compile(&glsl) {
+                panic!("{error}\n{glsl}");
+            }
+        }
+    }
+
+    /// a geometry program with a loop or a call may emit any number of
+    /// times, and has no slots.
+    #[test]
+    fn geometry_programs_that_go_back_have_no_slots() {
+        let mut random = Random(18);
+        let looped = [(0x29 << 26) | (2 << 10), (0x2B << 26) | (1 << 23), 0x2A << 26, 0x22 << 26];
+        let called = [(0x24 << 26) | (2 << 10) | 2, 0x22 << 26, (0x2B << 26) | (1 << 23), 0x2A << 26];
+        for program in [&looped[..], &called[..]] {
+            let unit = unit(program, 0, &mut random);
+            assert_eq!(geometry_slots(&unit.prepared().unwrap(), 0), None);
+        }
     }
 
     /// programs of nothing but arithmetic come out straight, with no

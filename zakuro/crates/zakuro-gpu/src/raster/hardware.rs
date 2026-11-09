@@ -90,6 +90,13 @@ const PROGRAM_BYTES: u64 = ((PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4) as u64;
 /// finds its attribute and what it reads without one.
 const SHADING_WORDS: usize = 96 * 4 + 4 * 4 + 4 + 24 + 4 + 4 + 16 * 4 + 16 * 4;
 const SHADING_SIZE: u64 = (SHADING_WORDS * 4) as u64;
+/// what a draw with a geometry shader adds after it: the geometry
+/// program's float, integer and bool uniforms.
+const GEOMETRY_WORDS: usize = 96 * 4 + 4 * 4 + 4;
+const GEOMETRY_SHADING_SIZE: u64 = ((SHADING_WORDS + GEOMETRY_WORDS) * 4) as u64;
+/// a draw with a geometry shader the GPU can't draw yet, which the CPU
+/// draws meanwhile.
+pub(super) const GEOMETRY_NOT_READY: &str = "the geometry draw's shader is not ready";
 /// a semantic no output register carries, which takes its default.
 pub(super) const MISSING: u32 = u32::MAX;
 /// a semantic in an output attribute past the enabled registers, zero.
@@ -232,6 +239,16 @@ pub(super) struct Shading<'a> {
     pub(super) viewport: (f32, f32, f32, f32),
     /// the face culling register.
     pub(super) cull: u32,
+    /// the geometry shader after the vertex shader, the draw's vertices
+    /// then its slots, as glsl::translate_geometry has them.
+    pub(super) geometry: Option<GeometryShading<'a>>,
+}
+
+/// a draw's geometry shader and how the vertex shader feeds it.
+#[derive(Clone, Copy)]
+pub(super) struct GeometryShading<'a> {
+    pub(super) unit: &'a ShaderUnit,
+    pub(super) layout: glsl::GeometryLayout,
 }
 
 /// a draw's input registers, as the vertex shader gets them.
@@ -1255,6 +1272,9 @@ enum Translation {
 enum Job {
     /// a program to translate, and where to keep it.
     Translate(ProgramKey, Arc<Program>, Option<Arc<std::path::Path>>),
+    /// a vertex program and the geometry program after it to translate
+    /// as one, and where to keep it.
+    TranslateGeometry(ProgramKey, Arc<Program>, Arc<Program>, u32, glsl::GeometryLayout, Option<Arc<std::path::Path>>),
     /// a pipeline to compile, with its vertex shader's module.
     Compile(PipelineKey, vk::ShaderModule),
 }
@@ -1357,7 +1377,7 @@ impl Compiler {
         let (queue, ready) = &*self.queue;
         let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
         match job {
-            Job::Translate(..) => waiting.translations.push_back(job),
+            Job::Translate(..) | Job::TranslateGeometry(..) => waiting.translations.push_back(job),
             Job::Compile(..) => waiting.compiles.push(job),
         }
         ready.notify_one();
@@ -1490,6 +1510,28 @@ fn work(
                     key.0,
                     key.1
                 ),
+            }
+            Made::Translated(key, made)
+        }
+        Job::TranslateGeometry(key, vertex, geometry, geometry_entry, layout, keep) => {
+            let source = std::panic::catch_unwind(|| glsl::translate_geometry(&vertex, key.1, &geometry, geometry_entry, &layout, &key.2))
+                .unwrap_or_else(|_| Err("the translation panicked".to_owned()));
+            let made = source.and_then(|source| Ok((glsl::compile(&source)?, source)));
+            match &made {
+                Ok((_, source)) => {
+                    log::info!(
+                        target: "zakuro_gpu::programs",
+                        "geometry program from {geometry_entry} after vertex program from {}: {} slots, {} bytes of GLSL, in {:.1} ms",
+                        key.1,
+                        layout.slots,
+                        source.len(),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                    if let (Ok((words, source)), Some(dir)) = (&made, &keep) {
+                        store_translation(dir, &key, source, words);
+                    }
+                }
+                Err(error) => log::info!(target: "zakuro_gpu::programs", "geometry program from {geometry_entry} stays on the CPU, {error}"),
             }
             Made::Translated(key, made)
         }
@@ -1706,6 +1748,10 @@ pub struct Hardware {
     /// the last draw's program and how far its translation got, which the
     /// next draw mostly shares, until the compiler brings anything in.
     last_translation: Option<(ProgramKey, Translation)>,
+    /// the same for the last geometry draw.
+    last_geometry: Option<(ProgramKey, Translation)>,
+    /// the draws with a geometry shader drawn here rather than on the CPU.
+    pub(super) geometry_draws: u64,
     /// the modules made, by their source, which programs differing only in
     /// words they never run share, and so their pipelines.
     modules: HashMap<String, vk::ShaderModule>,
@@ -2005,6 +2051,8 @@ impl Hardware {
                 translated: QuickMap::default(),
                 reached: QuickMap::default(),
                 last_translation: None,
+                last_geometry: None,
+                geometry_draws: 0,
                 modules: HashMap::new(),
                 program_of: HashMap::new(),
                 // to draw through the pipeline made for each draw from the
@@ -2143,8 +2191,8 @@ impl Hardware {
                         Some(&module) => module,
                         None => {
                             let info = vk::ShaderModuleCreateInfo::default().code(&words);
-                            // SAFETY: the words are SPIR-V naga made and validated in an earlier run
-                            match unsafe { hardware.device.create_shader_module(&info, None) } {
+                            // the words are SPIR-V naga made and validated in an earlier run
+                            match hardware.device.create_shader_module(&info, None) {
                                 Ok(module) => {
                                     hardware.modules.insert(source, module);
                                     module
@@ -3591,6 +3639,24 @@ impl Hardware {
     /// once per blend function and the like. a program still being
     /// translated does not have its interpreted pipeline asked for, it
     /// would not be used for long.
+    /// the pipeline for a key and no other, asked of the compiler the first
+    /// time, an error until it is made.
+    fn exact_pipeline(&mut self, key: PipelineKey) -> Result<vk::Pipeline, String> {
+        if let Some(&pipeline) = self.pipelines.get(&key) {
+            return Ok(pipeline);
+        }
+        if self.compiler.asked.insert(key) {
+            if let Some(pipeline) = self.cached(key) {
+                return Ok(pipeline);
+            }
+            self.hand(Job::Compile(key, self.vertex_module(key.vertex)));
+            if let Some(&pipeline) = self.pipelines.get(&key) {
+                return Ok(pipeline);
+            }
+        }
+        Err(GEOMETRY_NOT_READY.to_owned())
+    }
+
     fn pipeline_for(&mut self, key: PipelineKey, translating: bool) -> Result<vk::Pipeline, String> {
         let vertex = match key.vertex {
             VertexStage::Placed => VertexStage::Placed,
@@ -3911,6 +3977,12 @@ impl Hardware {
             return (VertexStage::Interpreted, false);
         }
         let unit = shading.unit;
+        if let Some(geometry) = &shading.geometry {
+            return match self.geometry_translation(unit, geometry, shading.semantics) {
+                Translation::Done(module) => (VertexStage::Translated(module), false),
+                _ => (VertexStage::Interpreted, true),
+            };
+        }
         let key = (unit.fingerprint(), unit.entry_point, shading.semantics);
         let translation = match self.last_translation {
             Some((last, translation)) if last == key => translation,
@@ -3943,6 +4015,62 @@ impl Hardware {
             Translation::Failed => (VertexStage::Interpreted, false),
             Translation::Done(module) => (VertexStage::Translated(module), false),
         }
+    }
+
+    /// whether a draw with this geometry shader can go to the GPU: its
+    /// translation is made (started the first time it is asked about).
+    pub(super) fn geometry_ready(&mut self, unit: &ShaderUnit, geometry: &GeometryShading, semantics: [u32; 24]) -> bool {
+        self.shades && self.translates && matches!(self.geometry_translation(unit, geometry, semantics), Translation::Done(_))
+    }
+
+    /// how far the translation of a vertex program and the geometry
+    /// program after it got, by a key from both programs' reachable code
+    /// and the layout between them, the compiler starting on it the first
+    /// time.
+    fn geometry_translation(&mut self, unit: &ShaderUnit, geometry: &GeometryShading, semantics: [u32; 24]) -> Translation {
+        let mix = |hash: u64, word: u64| (hash ^ word).wrapping_mul(0x0100_0000_01B3).rotate_left(17);
+        let layout = &geometry.layout;
+        let layout_hash = [layout.per_vertex as u64, layout.per_invocation as u64, layout.vertex_mask as u64, layout.input_map, layout.slots as u64]
+            .into_iter()
+            .fold(0x6765_6F6D_6574_7279, mix);
+        let raw = (mix(mix(mix(unit.fingerprint(), geometry.unit.fingerprint()), geometry.unit.entry_point as u64), layout_hash), unit.entry_point, semantics);
+        if let Some((last, translation)) = self.last_geometry {
+            if last == raw {
+                return translation;
+            }
+        }
+        let key = match self.reached.get(&raw) {
+            Some(&reached) => reached,
+            None => {
+                let reach = |unit: &ShaderUnit| unit.prepared().and_then(|program| glsl::reach_hash(&program, unit.entry_point));
+                let reached = match (reach(unit), reach(geometry.unit)) {
+                    (Some(vertex), Some(geometry_hash)) => {
+                        (mix(mix(mix(vertex, geometry_hash), geometry.unit.entry_point as u64), layout_hash), unit.entry_point, semantics)
+                    }
+                    _ => raw,
+                };
+                self.reached.insert(raw, reached);
+                reached
+            }
+        };
+        let translation = match self.translated.get(&key) {
+            Some(&translation) => translation,
+            None => {
+                match (unit.prepared(), geometry.unit.prepared()) {
+                    (Some(vertex), Some(program)) => {
+                        self.translated.insert(key, Translation::Pending);
+                        let keep = self.kept_pipelines.as_deref().map(|cache| Arc::from(programs_dir(cache)));
+                        self.hand(Job::TranslateGeometry(key, vertex, program, geometry.unit.entry_point, *layout, keep));
+                    }
+                    _ => {
+                        self.translated.insert(key, Translation::Failed);
+                    }
+                }
+                self.translated[&key]
+            }
+        };
+        self.last_geometry = Some((raw, translation));
+        translation
     }
 
     /// how far a program's translation got, the compiler starting on it the
@@ -4011,6 +4139,7 @@ impl Hardware {
     fn take(&mut self, made: Made) {
         // a translation may have come in or gone back to the interpreter
         self.last_translation = None;
+        self.last_geometry = None;
         match made {
             Made::Translated(key, Ok((words, source))) => {
                 let module = match self.modules.get(&source) {
@@ -4146,7 +4275,19 @@ impl Hardware {
         words.extend([x, y, width, height].map(f32::to_bits));
         words.extend_from_slice(attributes.as_flattened());
         words.extend(defaults.as_flattened().iter().map(|value| value.to_bits()));
-        let uniforms = self.stage_block(&mut block, SHADING_SIZE, self.storage_alignment.max(self.uniform_alignment));
+        let shading_size = match &shading.geometry {
+            Some(geometry) => {
+                let unit = geometry.unit;
+                words.extend(unit.float_uniforms.as_flattened().iter().map(|value| value.to_bits()));
+                for [count, start, step, _] in unit.int_uniforms {
+                    words.extend([count as u32, start as u32, step as i8 as u32, 0]);
+                }
+                words.extend([unit.bool_uniforms as u32, unit.entry_point, 0, 0]);
+                GEOMETRY_SHADING_SIZE
+            }
+            None => SHADING_SIZE,
+        };
+        let uniforms = self.stage_block(&mut block, shading_size, self.storage_alignment.max(self.uniform_alignment));
         self.shading = block;
         let uniforms = uniforms?;
 
@@ -4155,7 +4296,7 @@ impl Hardware {
         let index_bytes = (shading.indices.len() * 4) as u64;
         if let Some((batch, inputs, indices)) = self.twinned_inputs.filter(|_| self.pass == Pass::Twin) {
             if batch == self.batch && inputs.1 == input_bytes && indices.1 == index_bytes {
-                return Ok([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), inputs, indices]);
+                return Ok([(program, PROGRAM_BYTES), (uniforms, shading_size), inputs, indices]);
             }
         }
 
@@ -4189,7 +4330,7 @@ impl Hardware {
         if self.pass == Pass::Twinned {
             self.twinned_inputs = Some((self.batch, (inputs, input_bytes), (indices, index_bytes)));
         }
-        Ok([(program, PROGRAM_BYTES), (uniforms, SHADING_SIZE), (inputs, input_bytes), (indices, index_bytes)])
+        Ok([(program, PROGRAM_BYTES), (uniforms, shading_size), (inputs, input_bytes), (indices, index_bytes)])
     }
 
     pub(super) fn draw<M: GpuMemory>(&mut self, memory: &mut M, draw: &Draw) -> Result<(), String> {
@@ -4408,8 +4549,13 @@ impl Hardware {
                 (indices.len(), offsets, None, (VertexStage::Placed, false))
             }
             Geometry::Shaded(shading) => {
+                let stage = self.vertex_stage(shading);
+                // a geometry draw has nothing to stand in for its shader
+                if shading.geometry.is_some() && !matches!(stage.0, VertexStage::Translated(_)) {
+                    return Err(GEOMETRY_NOT_READY.to_owned());
+                }
                 let staged = self.stage_shading(memory, shading, depth_map)?;
-                (shading.indices.len(), (0, 0), Some(staged), self.vertex_stage(shading))
+                (shading.indices.len(), (0, 0), Some(staged), stage)
             }
         };
 
@@ -4515,7 +4661,11 @@ impl Hardware {
             vertex,
             fragment,
         };
-        let pipeline = self.pipeline_for(key, translating)?;
+        let exact = matches!(draw.geometry, Geometry::Shaded(shading) if shading.geometry.is_some());
+        let pipeline = match exact {
+            true => self.exact_pipeline(key)?,
+            false => self.pipeline_for(key, translating)?,
+        };
         if self.timing.as_ref().is_some_and(|timing| timing.per_draw) {
             let surface = &self.surfaces[color];
             self.draw_class = (fragment[26] & 1)
@@ -6581,6 +6731,11 @@ pub(crate) fn render_device(
     // SAFETY: the physical device came from this instance
     let supported = unsafe { instance.get_physical_device_features(physical) };
     let logic_ops = supported.logic_op == vk::TRUE;
+    log::info!(
+        "device features: geometry shaders {}, shader clip distance {}",
+        supported.geometry_shader == vk::TRUE,
+        supported.shader_clip_distance == vk::TRUE
+    );
     let dynamic = dynamic_state(instance, physical, logic_ops);
     if dynamic.blend {
         extensions.push(ash::ext::extended_dynamic_state3::NAME.as_ptr());

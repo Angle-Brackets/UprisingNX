@@ -771,6 +771,15 @@ fn shading_key(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::IN
     hash
 }
 
+/// ZAKURO_GPU_GEOMETRY=1: geometry-shader draws as slots on the host GPU,
+/// each slot running both programs; off, they shade on the CPU. Tests have
+/// it on.
+#[cfg(feature = "vulkan")]
+fn gpu_geometry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("ZAKURO_GPU_GEOMETRY").is_ok_and(|value| value == "1"))
+}
+
 fn cpu_shade_log() -> bool {
     static WHY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WHY.get_or_init(|| std::env::var_os("ZAKURO_CPU_SHADE_LOG").is_some())
@@ -884,8 +893,15 @@ impl Vertices<'_> {
 /// the component, the way to_vertex reads them.
 #[cfg(feature = "vulkan")]
 fn output_semantics(registers: &[u32]) -> [u32; 24] {
+    semantics_for(registers, registers[REG_VS_OUTPUT_MASK])
+}
+
+/// output_semantics for the stage whose output mask is given, the
+/// geometry shader's for a draw with one.
+#[cfg(feature = "vulkan")]
+fn semantics_for(registers: &[u32], mask: u32) -> [u32; 24] {
     let map = read_output_map(registers);
-    let mask = registers[REG_VS_OUTPUT_MASK] & 0xFFFF;
+    let mask = mask & 0xFFFF;
     // the output register behind each attribute, as pack_outputs packs them
     let mut enabled = [0; shader::OUTPUT_REGISTERS];
     let mut count = 0;
@@ -1408,6 +1424,15 @@ pub struct Resources {
     /// the last draw's triangles as the GPU takes them, the next one's
     /// buffer.
     triangles: Vec<u32>,
+    /// a geometry draw's inputs in draw order and its slots' indices, the
+    /// next one's buffers, and the slots each geometry program needs, by
+    /// its fingerprint and entry, none for one the CPU runs.
+    #[cfg(feature = "vulkan")]
+    geometry_inputs: Vec<[Vec4; shader::INPUT_REGISTERS]>,
+    #[cfg(feature = "vulkan")]
+    geometry_indices: Vec<u32>,
+    #[cfg(feature = "vulkan")]
+    geometry_slots: std::collections::HashMap<(u64, u32), Option<u32>>,
     placed: Vec<Screen>,
     slots: Vec<u32>,
     shaded_indices: Vec<u32>,
@@ -4077,6 +4102,64 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 }
             }
         }
+        // a geometry shader's draw as its slots, the vertex shader and the
+        // geometry shader run for each, when the geometry program only
+        // goes forward and its translation is made
+        if let Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } = vertices {
+            if gpu_geometry() && hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2 && registers[REG_GS_CONFIG] & 0xFF == 0 {
+                let program_key = (geometry_shader.fingerprint(), geometry_shader.entry_point);
+                let slots = *resources.geometry_slots.entry(program_key).or_insert_with(|| {
+                    geometry_shader.prepared().and_then(|program| crate::shader::glsl::geometry_slots(&program, geometry_shader.entry_point))
+                });
+                if let Some(slots) = slots {
+                    let layout = crate::shader::glsl::GeometryLayout {
+                        per_vertex: (registers[REG_VS_OUTPUT_TOTAL] & 0xF) + 1,
+                        per_invocation: (registers[REG_GS_BLOCK + SHADER_INPUT_CONFIG] & 0xF) + 1,
+                        vertex_mask: registers[REG_VS_OUTPUT_MASK] & 0xFFFF,
+                        input_map: registers[REG_GS_BLOCK + SHADER_INPUT_MAP_LOW] as u64
+                            | (registers[REG_GS_BLOCK + SHADER_INPUT_MAP_HIGH] as u64) << 32,
+                        slots,
+                    };
+                    let semantics = semantics_for(registers, registers[REG_GS_BLOCK + SHADER_OUTPUT_MASK]);
+                    let geometry = hardware::GeometryShading { unit: geometry_shader, layout };
+                    if hardware.geometry_ready(vertex_shader, &geometry, semantics) {
+                        // the vertices in draw order, each invocation taking
+                        // the next few, those left over dropped
+                        let mut gathered = std::mem::take(&mut resources.geometry_inputs);
+                        gathered.clear();
+                        match order {
+                            Some(order) => gathered.extend(order.iter().map(|&i| inputs[i])),
+                            None => gathered.extend_from_slice(inputs),
+                        }
+                        let invocations = gathered.len() as u32 / layout.vertices();
+                        let mut indices = std::mem::take(&mut resources.geometry_indices);
+                        indices.clear();
+                        indices.extend(0..invocations * slots);
+                        let shading = hardware::Shading {
+                            unit: vertex_shader,
+                            inputs: hardware::Inputs::Decoded(&gathered),
+                            indices: &indices,
+                            semantics,
+                            viewport,
+                            cull: cull_mode,
+                            geometry: Some(geometry),
+                        };
+                        let drawn = hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)));
+                        let triangles = indices.len() as u32 / 3;
+                        resources.geometry_inputs = gathered;
+                        resources.geometry_indices = indices;
+                        match drawn {
+                            Ok(()) => {
+                                hardware.geometry_draws += 1;
+                                return Some(triangles);
+                            }
+                            Err(error) if error == hardware::GEOMETRY_NOT_READY => {}
+                            Err(error) => log::error!("the GPU could not draw a geometry shader's draw, {error}, drawing it on the CPU"),
+                        }
+                    }
+                }
+            }
+        }
         if let Some((unit, inputs, order, raw)) = unshaded.filter(|_| hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2) {
             let mut assembled = std::mem::take(&mut resources.triangles);
             let indices = triangle_indices(topology, vertex_count, raw, order, &mut assembled);
@@ -4087,6 +4170,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 semantics: resources.semantics.get(registers),
                 viewport,
                 cull: cull_mode,
+                geometry: None,
             };
             let drawn = hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)));
             let triangles = (indices.len() / 3) as u32;
@@ -4118,6 +4202,9 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     std::sync::Arc::new(vertices)
                 }
             };
+            // a geometry shader's triangles are in the order it made them,
+            // the draw's own order numbers its inputs
+            let order = order.filter(|_| registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2);
             if let (Some(key), false) = (cache_key, reused) {
                 if resources.vcache.len() >= 40 {
                     resources.vcache_old = std::mem::take(&mut resources.vcache);
@@ -5914,6 +6001,115 @@ mod tests {
         assert!(drawn > 2000);
         assert!(differing * 100 < drawn, "{differing} of {drawn} pixels differ");
         assert!(deepest < 1 << 8, "depth differs by {deepest}");
+    }
+
+    /// a geometry shader making a quad around each point, its second
+    /// triangle only when a bool says, draws the same on the GPU, its
+    /// slots run through the vertex and geometry programs, as on the CPU.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_gpu_runs_geometry_shaders_like_the_cpu() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        const SIZE: u32 = 32;
+        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        let op = |opcode: u32, destination: u32, src1: u32, src2: u32| opcode << 26 | destination << 21 | src1 << 12 | src2 << 7;
+        let set_emit = |slot: u32, completes: u32| 0x2B << 26 | slot << 24 | completes << 23;
+        let emit = 0x2A << 26;
+        let end = 0x22 << 26;
+
+        let mut vertex = ShaderUnit::new();
+        vertex.descriptors[0] = 0xF | IDENTITY;
+        let program = [op(0x13, 0, 0x00, 0), op(0x13, 1, 0x01, 0), end];
+        vertex.program[..program.len()].copy_from_slice(&program);
+        vertex.prepare();
+
+        let mut geometry = ShaderUnit::new();
+        geometry.descriptors[0] = 0xF | IDENTITY;
+        let program = [
+            // o1 the color, o0 the point moved by c0, c1 and c2 in turn
+            op(0x13, 1, 0x01, 0),
+            op(0x00, 0, 0x20, 0x00),
+            set_emit(0, 0),
+            emit,
+            op(0x00, 0, 0x21, 0x00),
+            set_emit(1, 0),
+            emit,
+            op(0x00, 0, 0x22, 0x00),
+            set_emit(2, 1),
+            emit,
+            // the second triangle, with c3 in the first slot, when b0 is set
+            0x27 << 26 | 0 << 22 | 14 << 10,
+            op(0x00, 0, 0x23, 0x00),
+            set_emit(0, 1),
+            emit,
+            end,
+        ];
+        geometry.program[..program.len()].copy_from_slice(&program);
+        geometry.float_uniforms[..4].copy_from_slice(&[
+            [-0.2, -0.2, 0.0, 0.0],
+            [0.2, -0.2, 0.0, 0.0],
+            [-0.2, 0.2, 0.0, 0.0],
+            [0.2, 0.2, 0.0, 0.0],
+        ]);
+        geometry.prepare();
+
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(16.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(16.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_SHADER_OUTPUT_TOTAL] = 2;
+        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
+        registers[REG_VS_OUTPUT_MASK] = 0b11;
+        registers[REG_VS_OUTPUT_TOTAL] = 1;
+        registers[REG_GEOSTAGE_CONFIG] = 2;
+        registers[REG_GS_CONFIG] = 0;
+        registers[REG_GS_BLOCK + SHADER_INPUT_CONFIG] = 1;
+        registers[REG_GS_BLOCK + SHADER_INPUT_MAP_LOW] = 0x10;
+        registers[REG_GS_BLOCK + SHADER_OUTPUT_MASK] = 0b11;
+        registers[REG_PRIMITIVE_CONFIG] = 3 << 8;
+
+        let mut seed = 11u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let (mut differing, mut drawn) = (0, 0);
+        for case in 0..8 {
+            geometry.bool_uniforms = (case % 2) as u16;
+            registers[REG_FACE_CULLING] = case / 2 % 3;
+            let mut inputs = vec![[shader::ZERO; shader::INPUT_REGISTERS]; 6];
+            for input in &mut inputs {
+                input[0] = [random() * 1.6 - 0.8, random() * 1.6 - 0.8, -random() * 0.5, 1.0];
+                input[1] = [random(), random(), random(), 1.0];
+            }
+            let order: Vec<usize> = (0..5).map(|_| (random() * 6.0) as usize).collect();
+            let vertices = Vertices::Unshaded { vertex_shader: &vertex, geometry_shader: &geometry, inputs: &inputs, order: Some(&order) };
+            let mut software = ConsoleMemory::default();
+            let mut gpu = ConsoleMemory::default();
+            for memory in [&mut software, &mut gpu] {
+                memory.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+                memory.write(DEPTH, &vec![0xFFu8; (SIZE * SIZE * 4) as usize]);
+            }
+            rasterize(&registers, &mut software, &mut Resources::default(), vertices);
+            let before = resources.hardware.as_ref().unwrap().geometry_draws;
+            rasterize(&registers, &mut gpu, &mut resources, vertices);
+            assert_eq!(resources.hardware.as_ref().unwrap().geometry_draws, before + 1, "case {case} went to the CPU");
+            resources.hardware.as_mut().unwrap().flush(&mut gpu).unwrap();
+            for i in 0..SIZE * SIZE {
+                let (mut a, mut b) = ([0u8; 4], [0u8; 4]);
+                software.read(COLOR + i * 4, &mut a);
+                gpu.read(COLOR + i * 4, &mut b);
+                drawn += (a != [0; 4]) as u32;
+                if a.iter().zip(&b).any(|(a, b)| a.abs_diff(*b) > 3) {
+                    differing += 1;
+                }
+            }
+        }
+        eprintln!("{differing} of {drawn} drawn pixels differ");
+        assert!(drawn > 500, "{drawn} pixels drawn");
+        assert!(differing * 100 < drawn, "{differing} of {drawn} pixels differ");
     }
 
     /// guest memory with a stretch of it in one piece, from the linear
