@@ -1009,6 +1009,11 @@ fn key_bytes(key: &PipelineKey) -> Option<[u8; KEY_BYTES]> {
         VertexStage::Interpreted => 1,
         VertexStage::Translated(_) => return None,
     };
+    Some(key_bytes_as(key, vertex))
+}
+
+/// a key as it is kept, its vertex stage written as given.
+fn key_bytes_as(key: &PipelineKey, vertex: u8) -> [u8; KEY_BYTES] {
     let mut bytes = [0; KEY_BYTES];
     bytes[..4].copy_from_slice(&key.blend.unwrap_or(0).to_le_bytes());
     bytes[4] = key.blend.is_some() as u8;
@@ -1019,7 +1024,113 @@ fn key_bytes(key: &PipelineKey) -> Option<[u8; KEY_BYTES]> {
     for (at, constant) in bytes[12..].chunks_exact_mut(4).zip(key.fragment) {
         at.copy_from_slice(&constant.to_le_bytes());
     }
-    Some(bytes)
+    bytes
+}
+
+/// a translated program's key on disk: fingerprint, entry, semantics.
+const PROGRAM_KEY_BYTES: usize = 12 + 4 * SEMANTICS;
+
+fn program_key_bytes(key: &ProgramKey) -> [u8; PROGRAM_KEY_BYTES] {
+    let mut bytes = [0; PROGRAM_KEY_BYTES];
+    bytes[..8].copy_from_slice(&key.0.to_le_bytes());
+    bytes[8..12].copy_from_slice(&key.1.to_le_bytes());
+    for (at, semantic) in bytes[12..].chunks_exact_mut(4).zip(key.2) {
+        at.copy_from_slice(&semantic.to_le_bytes());
+    }
+    bytes
+}
+
+fn program_key_from_bytes(bytes: &[u8]) -> ProgramKey {
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let mut semantics = [0; SEMANTICS];
+    for (semantic, at) in semantics.iter_mut().zip((12..PROGRAM_KEY_BYTES).step_by(4)) {
+        *semantic = word(at);
+    }
+    (u64::from_le_bytes(bytes[..8].try_into().unwrap()), word(8), semantics)
+}
+
+/// where the pipelines with a translated vertex stage are listed, each a
+/// key (its vertex stage left out) and the program's key.
+fn translated_keys_path(cache: &std::path::Path) -> std::path::PathBuf {
+    cache.with_extension("keystr")
+}
+
+/// where the translated programs are kept, by the build of the translator,
+/// whose change makes them anew.
+fn programs_dir(cache: &std::path::Path) -> std::path::PathBuf {
+    static BUILD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let build = *BUILD.get_or_init(|| {
+        [&include_bytes!("../shader/glsl.rs")[..], &include_bytes!("../shader/isa.rs")[..], &include_bytes!("../shader/mod.rs")[..]]
+            .iter()
+            .flat_map(|bytes| bytes.iter())
+            .fold(0xCBF2_9CE4_8422_2325u64, |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01B3))
+            ^ SEMANTICS as u64
+    });
+    cache.with_extension("programs").join(format!("{build:016X}"))
+}
+
+/// keeps a translated program: its key, its source and its SPIR-V.
+fn store_translation(dir: &std::path::Path, key: &ProgramKey, source: &str, words: &[u32]) {
+    let semantics = program_key_bytes(key)[12..].iter().fold(0xCBF2_9CE4_8422_2325u64, |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01B3));
+    let path = dir.join(format!("{:016X}-{}-{semantics:016X}.spv", key.0, key.1));
+    if path.exists() {
+        return;
+    }
+    let mut bytes = Vec::with_capacity(PROGRAM_KEY_BYTES + 4 + source.len() + words.len() * 4);
+    bytes.extend_from_slice(&program_key_bytes(key));
+    bytes.extend_from_slice(&(source.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(source.as_bytes());
+    bytes.extend(words.iter().flat_map(|word| word.to_le_bytes()));
+    // written aside first, so a run cut short leaves no half of one
+    let partial = path.with_extension("part");
+    let written = std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(&partial, &bytes))
+        .and_then(|()| std::fs::rename(&partial, &path));
+    if let Err(error) = written {
+        log::warn!("could not keep translated program {:016X} in {}, {error}", key.0, dir.display());
+    }
+}
+
+/// the translated programs kept in a directory, each with its source and
+/// SPIR-V.
+fn read_translations(dir: &std::path::Path) -> Vec<(ProgramKey, String, Vec<u32>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "spv" {
+                return None;
+            }
+            let bytes = std::fs::read(&path).ok()?;
+            let length = u32::from_le_bytes(bytes.get(PROGRAM_KEY_BYTES..PROGRAM_KEY_BYTES + 4)?.try_into().ok()?) as usize;
+            let start = PROGRAM_KEY_BYTES + 4;
+            let source = std::str::from_utf8(bytes.get(start..start + length)?).ok()?.to_owned();
+            let rest = &bytes[start + length..];
+            if rest.is_empty() || rest.len() % 4 != 0 {
+                return None;
+            }
+            let words = rest.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect();
+            Some((program_key_from_bytes(&bytes), source, words))
+        })
+        .collect()
+}
+
+/// the pipelines with a translated vertex stage the title used before, each
+/// once, their vertex stage to be filled in from the program's key.
+fn read_translated_keys(cache: &std::path::Path) -> Vec<(PipelineKey, ProgramKey)> {
+    let bytes = std::fs::read(translated_keys_path(cache)).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    bytes
+        .chunks_exact(KEY_BYTES + PROGRAM_KEY_BYTES)
+        .filter_map(|record| {
+            // read as an interpreted one, the stage put right by the caller
+            let mut key_part = [0; KEY_BYTES];
+            key_part.copy_from_slice(&record[..KEY_BYTES]);
+            key_part[7] = 1;
+            Some((key_from_bytes(&key_part)?, program_key_from_bytes(&record[KEY_BYTES..])))
+        })
+        .filter(|record| seen.insert(*record))
+        .collect()
 }
 
 fn key_from_bytes(bytes: &[u8]) -> Option<PipelineKey> {
@@ -1142,8 +1253,8 @@ enum Translation {
 
 /// work for the compiler thread.
 enum Job {
-    /// a program to translate.
-    Translate(ProgramKey, Arc<Program>),
+    /// a program to translate, and where to keep it.
+    Translate(ProgramKey, Arc<Program>, Option<Arc<std::path::Path>>),
     /// a pipeline to compile, with its vertex shader's module.
     Compile(PipelineKey, vk::ShaderModule),
 }
@@ -1340,7 +1451,7 @@ fn work(
 ) -> Made {
     let started = std::time::Instant::now();
     match job {
-        Job::Translate(key, program) => {
+        Job::Translate(key, program, keep) => {
             // a panic is a bug in the translation, which the interpreter
             // can cover for
             let source = std::panic::catch_unwind(|| glsl::translate(&program, key.1, &key.2))
@@ -1362,6 +1473,9 @@ fn work(
                 );
             }
             let made = source.and_then(|source| Ok((glsl::compile(&source)?, source)));
+            if let (Ok((words, source)), Some(dir)) = (&made, &keep) {
+                store_translation(dir, &key, source, words);
+            }
             match &made {
                 Ok(_) => log::debug!(
                     target: "zakuro_gpu::programs",
@@ -1592,6 +1706,9 @@ pub struct Hardware {
     /// the modules made, by their source, which programs differing only in
     /// words they never run share, and so their pipelines.
     modules: HashMap<String, vk::ShaderModule>,
+    /// a translated module's program, which a pipeline using it is kept
+    /// by.
+    program_of: HashMap<vk::ShaderModule, ProgramKey>,
     /// whether draws wait for their translations and pipelines rather than
     /// draw the same through others meanwhile.
     waits: bool,
@@ -1885,6 +2002,7 @@ impl Hardware {
                 translated: QuickMap::default(),
                 last_translation: None,
                 modules: HashMap::new(),
+                program_of: HashMap::new(),
                 // to draw through the pipeline made for each draw from the
                 // first on, as the tests do
                 waits: cfg!(test) || std::env::var_os("ZAKURO_WAIT_FOR_SHADERS").is_some(),
@@ -2009,7 +2127,44 @@ impl Hardware {
             }
             // then every pipeline the title used before, so that one first
             // seen in an earlier run is ready before it is drawn again
-            let used = hardware.kept_pipelines.as_deref().map(read_keys).unwrap_or_default();
+            let mut used = hardware.kept_pipelines.as_deref().map(read_keys).unwrap_or_default();
+            // the programs translated before, ready from the first draw,
+            // and the pipelines made with them
+            if let (Some(cache), true) = (hardware.kept_pipelines.clone(), hardware.shades && hardware.translates && !hardware.waits) {
+                let started = std::time::Instant::now();
+                let programs = read_translations(&programs_dir(&cache));
+                let count = programs.len();
+                for (key, source, words) in programs {
+                    let module = match hardware.modules.get(&source) {
+                        Some(&module) => module,
+                        None => {
+                            let info = vk::ShaderModuleCreateInfo::default().code(&words);
+                            // SAFETY: the words are SPIR-V naga made and validated in an earlier run
+                            match unsafe { hardware.device.create_shader_module(&info, None) } {
+                                Ok(module) => {
+                                    hardware.modules.insert(source, module);
+                                    module
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                    };
+                    hardware.program_of.entry(module).or_insert(key);
+                    hardware.translated.insert(key, Translation::Done(module));
+                }
+                let mut translated = 0;
+                for (key, program) in read_translated_keys(&cache) {
+                    if let Some(&Translation::Done(module)) = hardware.translated.get(&program) {
+                        used.push(PipelineKey { vertex: VertexStage::Translated(module), ..key });
+                        translated += 1;
+                    }
+                }
+                log::info!(
+                    target: "zakuro_gpu::pipelines",
+                    "read back {count} translated programs and {translated} pipelines made with them in {:.0} ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             if !hardware.waits && !used.is_empty() {
                 log::info!(target: "zakuro_gpu::pipelines", "making the {} pipelines the title used before", used.len());
             }
@@ -3349,7 +3504,11 @@ impl Hardware {
     /// notes a pipeline the title used for the list kept beside the cache,
     /// writing the list out now and then, a few at a time.
     fn remember(&mut self, key: PipelineKey) {
-        if key_bytes(&key).is_none() || !self.known_keys.insert(key) {
+        let keepable = match key.vertex {
+            VertexStage::Translated(module) => self.program_of.contains_key(&module),
+            _ => true,
+        };
+        if !keepable || !self.known_keys.insert(key) {
             return;
         }
         self.new_keys.push(key);
@@ -3364,17 +3523,34 @@ impl Hardware {
         if self.new_keys.is_empty() {
             return;
         }
-        let bytes: Vec<u8> = self.new_keys.drain(..).filter_map(|key| key_bytes(&key)).flatten().collect();
-        let written = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(&path))
-            .and_then(|mut file| {
-                use std::io::Write;
-                file.write_all(&bytes)
-            });
-        if let Err(error) = written {
-            log::warn!("could not keep the pipelines used in {}, {error}", path.display());
+        let translated_path = self.kept_pipelines.as_deref().map(translated_keys_path).unwrap();
+        let (mut bytes, mut translated) = (Vec::new(), Vec::new());
+        for key in self.new_keys.drain(..) {
+            match key.vertex {
+                VertexStage::Translated(module) => {
+                    if let Some(program) = self.program_of.get(&module) {
+                        translated.extend_from_slice(&key_bytes_as(&key, 2));
+                        translated.extend_from_slice(&program_key_bytes(program));
+                    }
+                }
+                _ => bytes.extend(key_bytes(&key).into_iter().flatten()),
+            }
+        }
+        for (path, bytes) in [(path, bytes), (translated_path, translated)] {
+            if bytes.is_empty() {
+                continue;
+            }
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(&path))
+                .and_then(|mut file| {
+                    use std::io::Write;
+                    file.write_all(&bytes)
+                });
+            if let Err(error) = written {
+                log::warn!("could not keep the pipelines used in {}, {error}", path.display());
+            }
         }
     }
 
@@ -3458,10 +3634,12 @@ impl Hardware {
             fragment[31] = 0;
             for vertex in [key.vertex, VertexStage::Interpreted] {
                 if let Some(&pipeline) = self.pipelines.get(&PipelineKey { vertex, fragment, ..key }) {
+                    crate::stats::fell_back(crate::stats::FALL_UNSPECIALIZED);
                     return Ok(pipeline);
                 }
             }
         }
+        crate::stats::fell_back(crate::stats::FALL_GENERIC);
         self.pipeline(generic)
     }
 
@@ -3754,7 +3932,10 @@ impl Hardware {
             }
         }
         match translation {
-            Translation::Pending => (VertexStage::Interpreted, true),
+            Translation::Pending => {
+                crate::stats::fell_back(crate::stats::FALL_TRANSLATING);
+                (VertexStage::Interpreted, true)
+            }
             Translation::Failed => (VertexStage::Interpreted, false),
             Translation::Done(module) => (VertexStage::Translated(module), false),
         }
@@ -3769,7 +3950,8 @@ impl Hardware {
         match unit.prepared() {
             Some(program) => {
                 self.translated.insert(key, Translation::Pending);
-                self.hand(Job::Translate(key, program));
+                let keep = self.kept_pipelines.as_deref().map(|cache| Arc::from(programs_dir(cache)));
+                self.hand(Job::Translate(key, program, keep));
             }
             None => {
                 self.translated.insert(key, Translation::Failed);
@@ -3832,6 +4014,7 @@ impl Hardware {
                         }
                     }
                 };
+                self.program_of.entry(module).or_insert(key);
                 self.translated.insert(key, Translation::Done(module));
             }
             // the compiler said why
@@ -6542,6 +6725,26 @@ mod tests {
         let bytes: Vec<u8> = keys.iter().chain(&keys).filter_map(super::key_bytes).flatten().collect();
         std::fs::write(super::keys_path(&cache), bytes).unwrap();
         assert_eq!(super::read_keys(&cache), keys, "each once, as written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translated_programs_and_their_pipelines_are_kept_and_read_back() {
+        let dir = std::env::temp_dir().join(format!("zakuro programs {}", std::process::id()));
+        let cache = dir.join("title.bin");
+        let mut semantics = [0; super::SEMANTICS];
+        semantics[0] = 4;
+        semantics[23] = 0xFFFF_FFFF;
+        let program: super::ProgramKey = (0x0123_4567_89AB_CDEF, 0x42, semantics);
+        let programs = super::programs_dir(&cache);
+        super::store_translation(&programs, &program, "void main() {}", &[0x0723_0203, 7, 9]);
+        assert_eq!(super::read_translations(&programs), vec![(program, "void main() {}".to_owned(), vec![0x0723_0203, 7, 9])]);
+        let mut fragment = [0; super::FRAGMENT_CONSTANTS];
+        fragment[31] = 5;
+        let key = super::PipelineKey { blend: None, logic_op: None, mask: 0xF, depth: true, vertex: super::VertexStage::Interpreted, fragment };
+        let record: Vec<u8> = super::key_bytes_as(&key, 2).into_iter().chain(super::program_key_bytes(&program)).collect();
+        std::fs::write(super::translated_keys_path(&cache), [record.clone(), record].concat()).unwrap();
+        assert_eq!(super::read_translated_keys(&cache), vec![(key, program)], "each once, as written");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

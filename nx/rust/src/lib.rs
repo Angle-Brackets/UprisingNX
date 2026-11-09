@@ -114,7 +114,13 @@ pub struct UnxInput {
     pub touching: u32,
     pub touch_x: u16,
     pub touch_y: u16,
+    /// the frontend's own buttons, HOST_BOTTOM and so on
+    pub host: u32,
 }
+
+/// UnxInput::host: the right stick's click, which shows or hides the bottom
+/// screen
+const HOST_BOTTOM: u32 = 1 << 0;
 
 pub struct Unx {
     system: System,
@@ -147,23 +153,171 @@ pub struct Unx {
     hardware: f64,
     /// ms the GPU's thread waited for vertices a helper shaded
     shade_wait: f64,
-    /// frames since the game's overrides last said it was in play (a battle),
-    /// see IN_PLAY_QUIET; the layout follows it
+    /// frames since the game's overrides last said it was in play (a battle)
     out_of_play: u32,
-    /// frames since the bottom screen drew a large dialogue portrait
-    since_portrait: u32,
+    /// the bottom screen is shown: see Bottom
+    bottom: Bottom,
+    /// a benchmark under way, see Bench
+    bench: Option<Bench>,
     in_play: bool,
     aim: aim::Aim,
 }
 
-/// frames the overrides may stay quiet (8 s) before the game counts as out of play,
-/// long, so that a quiet moment in a battle never brings the bottom screen up
-/// (a menu, a cutscene), as in Zakuro's desktop frontend
-const IN_PLAY_QUIET: u32 = 480;
-/// frames a conversation's big portrait may go undrawn before the game counts
-/// as out of play: a battle's dialogue, before the player has control, while
-/// the overrides are quiet; it is seen again each frame the portrait is up
-const PORTRAIT_QUIET: u32 = 480;
+/// when the bottom screen is shown. Nothing guesses it from what the game
+/// draws or how long it has been quiet: a guess put the bottom screen up in
+/// the middle of battles (where the game's overrides go quiet, on foot, or in
+/// Chapter 14's flight), costing the frame its drawing and the player the view.
+/// It is shown
+/// - from boot until the game first says it is in play (the title, the save
+///   files and the menus before a first battle, which are played by touch),
+/// - when the player clicks the right stick, which shows or hides it anywhere
+///   (the menus after a battle, the arsenal, fusing weapons),
+/// - for the pause menu: Plus in play shows it, and it goes again at the next
+///   Plus or once the game says it is in play again after a quiet spell.
+#[derive(Default)]
+struct Bottom {
+    shown: bool,
+    /// shown by Plus, for the pause menu
+    paused: bool,
+    /// the game's overrides went quiet since the pause, as they do while it is
+    /// paused, so their next word is the battle going on
+    quiet_since_pause: bool,
+    /// the game has said it is in play once
+    played: bool,
+    /// last frame's 3DS buttons and host buttons, for presses
+    buttons: u32,
+    host: u32,
+}
+
+/// frames the overrides must be quiet in a pause before their next word ends it
+const PAUSE_QUIET: u32 = 20;
+
+impl Bottom {
+    fn new() -> Bottom {
+        Bottom { shown: true, ..Bottom::default() }
+    }
+
+    /// this frame's input and what the overrides said; whether the bottom
+    /// screen is shown now.
+    fn update(&mut self, buttons: u32, host: u32, said: u32, out_of_play: u32) -> bool {
+        let pressed = buttons & !self.buttons;
+        let host_pressed = host & !self.host;
+        self.buttons = buttons;
+        self.host = host;
+        if said != 0 && !self.played {
+            self.played = true;
+            self.shown = false;
+        }
+        if host_pressed & HOST_BOTTOM != 0 {
+            self.shown = !self.shown;
+            self.paused = false;
+        } else if pressed & PadState::START.bits() != 0 && self.played {
+            if !self.shown {
+                self.shown = true;
+                self.paused = true;
+                self.quiet_since_pause = false;
+            } else if self.paused {
+                self.shown = false;
+                self.paused = false;
+            }
+        }
+        if self.paused {
+            if out_of_play >= PAUSE_QUIET {
+                self.quiet_since_pause = true;
+            } else if said != 0 && self.quiet_since_pause {
+                self.shown = false;
+                self.paused = false;
+            }
+        }
+        self.shown
+    }
+}
+
+/// a benchmark, from cmd.txt `bench <seconds> <slot>[:fire] ...`: each save
+/// state in turn is loaded, left BENCH_SETTLE to settle, then measured for the
+/// seconds given, holding fire (the 3DS's L) for a slot named with `:fire`.
+/// One line a slot goes to sdmc:/switch/uprisingnx/bench.txt: new pictures a
+/// second and their gaps, and where a picture's time went. The same states the
+/// same way each time, so that a change is measured against the last.
+struct Bench {
+    seconds: f64,
+    slots: std::collections::VecDeque<String>,
+    slot: String,
+    fire: bool,
+    loaded: Instant,
+    gaps: Vec<f32>,
+    /// recompiled, GPU thread draw, of which shading, host GPU side, waiting
+    /// for the GPU thread, summed over the measured frames
+    spent: [f64; 5],
+    /// draws that fell back, see zakuro_gpu::stats::FALLBACKS
+    fallbacks: [u64; 4],
+    lines: Vec<String>,
+}
+
+const BENCH_SETTLE: f64 = 5.0;
+const BENCH_PATH: &str = "sdmc:/switch/uprisingnx/bench.txt";
+
+impl Bench {
+    fn measuring(&self) -> bool {
+        self.loaded.elapsed().as_secs_f64() >= BENCH_SETTLE
+    }
+
+    fn done(&self) -> bool {
+        self.loaded.elapsed().as_secs_f64() >= BENCH_SETTLE + self.seconds
+    }
+
+    fn line(&self) -> String {
+        let mut gaps = self.gaps.clone();
+        gaps.sort_by(f32::total_cmp);
+        let at = |q: f64| gaps.get(((gaps.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or(0.0);
+        let total: f32 = gaps.iter().sum();
+        let pictures = gaps.len().max(1) as f64;
+        let [recompiled, draw, shade, host, wait] = self.spent.map(|ms| ms / pictures);
+        format!(
+            "{:<14} {:5.1} pictures/s | gaps median {:5.1} 95th {:5.1} 99th {:5.1} worst {:6.1} ms, {:3} over 50 ms | per picture: recompiled {:4.1} draw {:4.1} shade {:4.1} host GPU {:4.1} wait {:4.1} ms",
+            format!("{}{}", self.slot, if self.fire { ":fire" } else { "" }),
+            if total > 0.0 { gaps.len() as f64 * 1000.0 / total as f64 } else { 0.0 },
+            at(0.5), at(0.95), at(0.99), at(1.0),
+            gaps.iter().filter(|g| **g > 50.0).count(),
+            recompiled, draw, shade, host, wait,
+        ) + &format!(
+            " | fallback draws per picture: {}",
+            zakuro_gpu::stats::FALLBACK_NAMES.iter().zip(self.fallbacks).map(|(name, n)| format!("{name} {:.1}", n as f64 / pictures)).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
+/// loads a save state from the SD card, see the cmd.txt commands.
+fn load_slot(system: &mut System, slot: &str) -> Result<String, String> {
+    let file = format!("sdmc:/switch/uprisingnx/{slot}.zst");
+    std::fs::read(&file).map_err(|e| e.to_string()).and_then(|bytes| system.load_state(&bytes).map(|_| "loaded".to_string()))
+}
+
+/// starts the next slot of a benchmark, or ends it, writing what it has.
+fn bench_next(unx: &mut Unx) {
+    let Some(bench) = unx.bench.as_mut() else { return };
+    let Some(next) = bench.slots.pop_front() else {
+        let mut text = bench.lines.join("\n");
+        text.push_str("\ndone\n");
+        let _ = std::fs::write(BENCH_PATH, text);
+        log::info!("unx: bench done");
+        unx.bench = None;
+        return;
+    };
+    let (slot, fire) = match next.strip_suffix(":fire") {
+        Some(slot) => (slot.to_owned(), true),
+        None => (next, false),
+    };
+    if let Err(error) = load_slot(&mut unx.system, &slot) {
+        bench.lines.push(format!("{slot}: failed to load, {error}"));
+    }
+    bench.slot = slot;
+    bench.fire = fire;
+    bench.loaded = Instant::now();
+    bench.gaps.clear();
+    bench.spent = [0.0; 5];
+    bench.fallbacks = [0; 4];
+}
 
 extern "C" {
     fn nx_audio_init();
@@ -304,7 +458,8 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         hardware: 0.0,
         shade_wait: 0.0,
         out_of_play: u32::MAX,
-        since_portrait: u32::MAX,
+        bottom: Bottom::new(),
+        bench: None,
         in_play: false,
         aim: aim::Aim::from_env(),
     }))
@@ -362,6 +517,9 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             touch: (input.touching != 0).then(|| touch_on_bottom(unx.in_play, input.touch_x, input.touch_y)).flatten(),
             tilt: [0.0, 0.0],
         };
+        if unx.bench.as_ref().is_some_and(|bench| bench.fire) {
+            state.buttons |= PadState::L;
+        }
         // left stick aiming, see aim.rs
         look = unx.aim.apply(&mut state);
         unx.system.set_input(state);
@@ -369,20 +527,19 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     // on foot the game's mouse-look override reads the camera's turn from here
     unx.aim.feed(&mut unx.system.memory.host_mailbox, look);
 
-    // In a battle the bottom screen is never drawn: its portraits and the
+    // In a battle the bottom screen is not drawn: its portraits and the
     // battle display (hearts, powers) are drawn onto the top screen instead,
-    // see zakuro_gpu::raster::mirror_portrait. In menus the game is played on
-    // the bottom screen, so it is shown over the top one. the game's
-    // overrides say which it is, in the host mailbox, as the desktop does.
+    // see zakuro_gpu::raster::mirror_portrait. When it is shown is the
+    // player's to say, see Bottom.
     unx.out_of_play = if said != 0 { 0 } else { unx.out_of_play.saturating_add(1) };
-    unx.since_portrait = if unx.system.gpu.flags().big_portrait.swap(false, std::sync::atomic::Ordering::Relaxed) { 0 } else { unx.since_portrait.saturating_add(1) };
-    let in_play = unx.out_of_play <= IN_PLAY_QUIET || unx.since_portrait <= PORTRAIT_QUIET;
+    let (buttons, host) = input.as_ref().map_or((0, 0), |input| (input.buttons, input.host));
+    let in_play = !unx.bottom.update(buttons, host, said, unx.out_of_play);
     unx.system.gpu.flags().in_play.store(in_play, std::sync::atomic::Ordering::Relaxed);
     if said != 0 && unx.frame % 120 == 0 {
         log::info!("unx: overrides say {said} (frame {})", unx.frame);
     }
     if in_play != unx.in_play {
-        log::info!("unx: {} at frame {} (said {said}, quiet for {})", if in_play { "in play" } else { "out of play" }, unx.frame, unx.out_of_play);
+        log::info!("unx: bottom screen {} at frame {} (said {said}, quiet for {}, paused {})", if in_play { "hidden" } else { "shown" }, unx.frame, unx.out_of_play, unx.bottom.paused);
         unx.in_play = in_play;
         unx.presenter.set_layout(if in_play { ScreenLayout::TopOnly } else { ScreenLayout::LargeTop });
     }
@@ -403,7 +560,27 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 "save" => unx.system.save_state().and_then(|bytes| {
                     std::fs::write(&file, &bytes).map(|_| format!("saved {} bytes", bytes.len())).map_err(|e| e.to_string())
                 }),
-                "load" => std::fs::read(&file).map_err(|e| e.to_string()).and_then(|bytes| unx.system.load_state(&bytes).map(|_| "loaded".to_string())),
+                "load" => load_slot(&mut unx.system, slot),
+                "bench" => {
+                    let mut words = text.split_whitespace().skip(1);
+                    let seconds = words.next().and_then(|w| w.parse::<f64>().ok()).unwrap_or(40.0);
+                    let slots: std::collections::VecDeque<String> = words.map(str::to_owned).collect();
+                    let count = slots.len();
+                    unx.bench = Some(Bench {
+                        seconds,
+                        slots,
+                        slot: String::new(),
+                        fire: false,
+                        loaded: Instant::now(),
+                        gaps: Vec::new(),
+                        spent: [0.0; 5],
+                        fallbacks: [0; 4],
+                        lines: vec![format!("bench: {seconds} s a slot after {BENCH_SETTLE} s to settle, env {:?}", std::fs::read_to_string("sdmc:/switch/uprisingnx/env.txt").unwrap_or_default().lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join(" "))],
+                    });
+                    let _ = std::fs::remove_file(BENCH_PATH);
+                    bench_next(unx);
+                    Ok(format!("started, {count} slots"))
+                }
                 other => Err(format!("unknown command {other:?}")),
             };
             let message = match result {
@@ -427,11 +604,12 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     // a slow frame says where it went, to find what the spikes are
     if took.as_secs_f64() * 1000.0 > 45.0 && unx.frame > 600 {
         report!(
-            "  slow frame {}: {:.0} ms | recompiled {:.1} draw {:.1} shade {:.1} tex {:.1} hw {:.1} wait {:.1} sync {:.1} writeback {:.1} | shader jit {:.0} ms for {} programs | in play {}",
+            "  slow frame {}: {:.0} ms | recompiled {:.1} draw {:.1} shade {:.1} tex {:.1} hw {:.1} wait {:.1} sync {:.1} writeback {:.1} | shader jit {:.0} ms for {} programs | in play {} | fallback draws: cpu shaded {}, translating {}, generic {}, unspecialized {}",
             unx.frame,
             took.as_secs_f64() * 1000.0,
             gpu.recompiled, gpu.drawing, gpu.shading, gpu.textures, gpu.hardware, gpu.waiting, gpu.sync, gpu.write_back,
             gpu.jit, gpu.jit_programs, unx.in_play,
+            gpu.fallbacks[0], gpu.fallbacks[1], gpu.fallbacks[2], gpu.fallbacks[3],
         );
     }
     for (sum, ms) in unx.spent.iter_mut().zip([
@@ -506,10 +684,31 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         if let Some(last) = unx.last_picture {
             let gap = (now - last).as_secs_f64() * 1000.0;
             unx.picture_gaps.push(gap as f32);
+            if let Some(bench) = unx.bench.as_mut().filter(|bench| bench.measuring()) {
+                bench.gaps.push(gap as f32);
+            }
             // about the last half second of pictures
             unx.gap_average = if unx.gap_average == 0.0 { gap } else { unx.gap_average * 0.94 + gap * 0.06 };
         }
         unx.last_picture = Some(now);
+    }
+
+    if let Some(bench) = unx.bench.as_mut() {
+        if bench.measuring() {
+            for (sum, ms) in bench.spent.iter_mut().zip([gpu.recompiled, gpu.drawing, gpu.shading, gpu.hardware, gpu.waiting]) {
+                *sum += ms;
+            }
+            for (sum, n) in bench.fallbacks.iter_mut().zip(gpu.fallbacks) {
+                *sum += n;
+            }
+        }
+        if bench.done() {
+            let line = bench.line();
+            log::info!("unx: bench {line}");
+            bench.lines.push(line);
+            let _ = std::fs::write(BENCH_PATH, bench.lines.join("\n") + "\n");
+            bench_next(unx);
+        }
     }
 
     // a line every 2 s: emulated frames per second, how long emulating took

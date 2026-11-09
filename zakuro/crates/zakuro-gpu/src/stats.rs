@@ -51,6 +51,21 @@ pub const BACK_FILL: usize = 2;
 pub const BACK_FLUSH: usize = 3;
 pub const BACK_SYNC: usize = 4;
 
+/// draws that took a slower way while a faster one was not ready, by kind,
+/// see FALLBACK_NAMES: shaded on the CPU, a program still being translated,
+/// the generic pipeline, the pipeline without the lighting's constants.
+pub static FALLBACKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+pub const FALLBACK_NAMES: [&str; 4] = ["cpu shaded", "translating", "generic", "unspecialized"];
+pub const FALL_CPU: usize = 0;
+pub const FALL_TRANSLATING: usize = 1;
+pub const FALL_GENERIC: usize = 2;
+pub const FALL_UNSPECIALIZED: usize = 3;
+
+/// counts a draw that fell back, see FALLBACKS.
+pub fn fell_back(kind: usize) {
+    FALLBACKS[kind].fetch_add(1, Ordering::Relaxed);
+}
+
 /// counts a write-back of surfaces for a reason, when there are any.
 pub fn write_back(why: usize, surfaces: usize) {
     if surfaces > 0 {
@@ -78,6 +93,7 @@ pub struct Spent {
     pub shade_wait: f64,
     pub jit: f64,
     pub jit_programs: u64,
+    pub fallbacks: [u64; 4],
 }
 
 /// what was spent since the last take, starting afresh.
@@ -101,6 +117,7 @@ pub fn take() -> Spent {
         shade_wait: ms(&SHADE_WAIT),
         jit: ms(&JIT_NS),
         jit_programs: JIT_PROGRAMS.swap(0, Ordering::Relaxed),
+        fallbacks: std::array::from_fn(|i| FALLBACKS[i].swap(0, Ordering::Relaxed)),
     }
 }
 

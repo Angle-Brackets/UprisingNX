@@ -784,6 +784,7 @@ fn process_vertices<'a>(
     order: Option<&'a [usize]>,
 ) -> (Vec<Vertex>, Option<&'a [usize]>) {
     let _timer = crate::stats::time(&crate::stats::SHADING);
+    crate::stats::fell_back(crate::stats::FALL_CPU);
     if log::log_enabled!(log::Level::Trace) {
         if let Some(input) = inputs.first() {
             let used_uniforms = vertex_shader.float_uniforms.iter().filter(|u| **u != shader::ZERO).count();

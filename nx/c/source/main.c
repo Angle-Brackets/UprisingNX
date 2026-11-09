@@ -15,7 +15,12 @@ typedef struct {
     float circle_x, circle_y, c_stick_x, c_stick_y;
     u32 touching;
     u16 touch_x, touch_y;
+    // the frontend's own buttons, not the 3DS's: UNX_HOST_BOTTOM is the right
+    // stick's click, which shows or hides the bottom screen
+    u32 host;
 } UnxInput;
+
+enum { UNX_HOST_BOTTOM = 1 << 0 };
 
 typedef struct {
     u32 abi;
@@ -61,6 +66,7 @@ static void read_input(PadState *pad, UnxInput *in) {
     memset(in, 0, sizeof *in);
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (held & map[i].nx) in->buttons |= map[i].ds;
+    if (held & HidNpadButton_StickR) in->host |= UNX_HOST_BOTTOM;
     HidAnalogStickState l = padGetStickPos(pad, 0), r = padGetStickPos(pad, 1);
     in->circle_x = axis(l.x); in->circle_y = axis(l.y);
     in->c_stick_x = axis(r.x); in->c_stick_y = axis(r.y);
