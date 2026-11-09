@@ -1,229 +1,244 @@
+// Audio output on a thread of its own, with time stretching.
+//
+// The game makes its sound in emulated time: one 3DS audio frame (160 samples at
+// 32728 Hz) per 4.9 emulated ms, and emulated time only goes as fast as frames are
+// emulated. At 38 fps that is ~63% of a second of sound per real second, so a plain
+// queue runs dry and the sound stutters. Here the game's frame only pushes samples
+// into a ring (nx_audio_play never blocks), and an audio thread keeps the DAC fed
+// at the real rate. It plays the ring through a WSOLA time stretcher whose tempo
+// follows how full the ring is, so slow frames slow the sound's tempo (as the game
+// itself is in slow motion) without lowering its pitch or leaving gaps.
+//
+// UNX_AUDIO_STRETCH=0 keeps the tempo near 1 (drift correction only); underruns
+// then fade to silence.
+
 #include <switch.h>
 #include <malloc.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdint.h>
+#include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-#define NUM_BUFFERS 8
-#define SAMPLES_PER_BUFFER 800 // 800 stereo samples @ 48 kHz = 16.666 ms (1 frame @ 60fps)
-#define BUFFER_MEM_SIZE 0x1000 // 4096 bytes (aligned to 0x1000)
-#define MAX_INPUT_SAMPLES 16384
+#define IN_RATE 32728.498
+#define OUT_RATE 48000.0
+#define NUM_BUFFERS 3
+#define SAMPLES_PER_BUFFER 512 // 10.7 ms at 48 kHz
+#define BUFFER_MEM_SIZE 0x1000
 
-typedef struct {
-    AudioOutBuffer audout_buf;
-    int16_t *data;
-    bool in_flight;
-} AudioBuffer;
+// the ring of the game's samples, single producer (the game's frame), single consumer
+#define RING_FRAMES 32768
+#define RING_MASK (RING_FRAMES - 1)
+static int16_t g_ring[RING_FRAMES][2];
+static volatile uint64_t g_write; // frames the game has written, ever
 
-static AudioBuffer g_buffers[NUM_BUFFERS];
-static int16_t g_input[MAX_INPUT_SAMPLES][2];
-static int g_input_count = 0;
-static double g_input_pos = 0.0;
-static const double BASE_STEP = 32728.498 / 48000.0; // ~0.6818437
-static double s_step = 32728.498 / 48000.0;
-static int16_t s_last_sample[2] = {0, 0};
-static bool g_initialized = false;
+// WSOLA: grains of N input frames, Hann windowed, laid down every HS frames (50%)
+#define N 640    // 19.6 ms
+#define HS (N / 2)
+#define SEARCH 160 // +-4.9 ms around where the tempo says the next grain starts
+
+static float g_window[N];
+static float g_tail[HS][2];   // the windowed second half of the last grain
+static double g_nominal;      // where the tempo says the next grain starts (input frames)
+static uint64_t g_prev;       // where the last grain started
+static double g_tempo = 1.0;
+
+// stretched frames waiting to be resampled to 48 kHz
+#define ST_MAX 4096
+static float g_st[ST_MAX][2];
+static int g_st_count;
+static double g_st_pos;
+
+static AudioOutBuffer g_audout[NUM_BUFFERS];
+static int16_t *g_data[NUM_BUFFERS];
+static Thread g_thread;
+static volatile bool g_running;
+static bool g_initialized;
+static bool g_stretch = true;
+static uint64_t g_underruns, g_grains;
+static float g_last[2];
+
+static inline float in_at(uint64_t i, int ch) { return (float)g_ring[i & RING_MASK][ch]; }
+
+// target ring fill (input frames) ahead of the next grain's end: ~90 ms
+#define TARGET (IN_RATE * 0.090)
+
+static void set_tempo(void) {
+    uint64_t w = __atomic_load_n(&g_write, __ATOMIC_ACQUIRE);
+    double fill = (double)w - (g_nominal + N + SEARCH);
+    double want = fill / TARGET;
+    double lo = g_stretch ? 0.35 : 0.97;
+    double hi = g_stretch ? 1.30 : 1.03;
+    if (want < lo) want = lo;
+    if (want > hi) want = hi;
+    // down fast when the ring drains (a late frame), back up slowly
+    g_tempo += (want - g_tempo) * (want < g_tempo ? 0.3 : 0.05);
+}
+
+// lays down one grain, HS stretched frames. false when the ring has too little.
+static bool wsola_step(void) {
+    set_tempo();
+    double next = g_nominal + HS * g_tempo;
+    uint64_t w = __atomic_load_n(&g_write, __ATOMIC_ACQUIRE);
+    int64_t base = (int64_t)next - SEARCH;
+    if (base < 0) base = 0;
+    if ((double)base + 2 * SEARCH + N > (double)w) return false;
+    // the stretch is falling too far behind what the game wrote: jump ahead
+    if ((double)w - next > RING_FRAMES - 4096) {
+        next = (double)w - TARGET - N - SEARCH;
+        base = (int64_t)next - SEARCH;
+        g_prev = (uint64_t)base;
+    }
+    // the start whose first half best continues the last grain's natural next frames
+    uint64_t natural = g_prev + HS;
+    int best = SEARCH;
+    if (g_grains > 0) {
+        float bestc = -1e30f;
+        for (int d = 0; d <= 2 * SEARCH; d += 2) {
+            uint64_t a = (uint64_t)base + d;
+            float c = 0, e = 1e-3f;
+            for (int i = 0; i < HS; i += 4) {
+                float x = in_at(a + i, 0) + in_at(a + i, 1);
+                float y = in_at(natural + i, 0) + in_at(natural + i, 1);
+                c += x * y;
+                e += x * x;
+            }
+            c /= sqrtf(e);
+            if (c > bestc) { bestc = c; best = d; }
+        }
+    }
+    uint64_t a = (uint64_t)base + best;
+    if (g_st_count + HS > ST_MAX) return true; // full, the resampler has plenty
+    for (int i = 0; i < HS; i++) {
+        for (int ch = 0; ch < 2; ch++) {
+            g_st[g_st_count + i][ch] = g_tail[i][ch] + in_at(a + i, ch) * g_window[i];
+            g_tail[i][ch] = in_at(a + HS + i, ch) * g_window[HS + i];
+        }
+    }
+    g_st_count += HS;
+    g_prev = a;
+    g_nominal = next;
+    g_grains++;
+    return true;
+}
+
+static void fill_buffer(int16_t *out) {
+    const double step = IN_RATE / OUT_RATE;
+    for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
+        while ((int)g_st_pos + 1 >= g_st_count) {
+            if (!wsola_step()) break;
+        }
+        int idx = (int)g_st_pos;
+        if (idx + 1 >= g_st_count) {
+            // nothing to play: fade what was last played to silence
+            g_underruns++;
+            for (; i < SAMPLES_PER_BUFFER; i++) {
+                g_last[0] *= 0.97f;
+                g_last[1] *= 0.97f;
+                out[i * 2] = (int16_t)g_last[0];
+                out[i * 2 + 1] = (int16_t)g_last[1];
+            }
+            break;
+        }
+        float f = (float)(g_st_pos - idx);
+        for (int ch = 0; ch < 2; ch++) {
+            float v = g_st[idx][ch] + f * (g_st[idx + 1][ch] - g_st[idx][ch]);
+            if (v > 32767.f) v = 32767.f;
+            if (v < -32768.f) v = -32768.f;
+            g_last[ch] = v;
+            out[i * 2 + ch] = (int16_t)v;
+        }
+        g_st_pos += step;
+    }
+    int used = (int)g_st_pos;
+    if (used > 0) {
+        if (used > g_st_count) used = g_st_count;
+        memmove(&g_st[0], &g_st[used], (size_t)(g_st_count - used) * sizeof(g_st[0]));
+        g_st_count -= used;
+        g_st_pos -= used;
+    }
+}
+
+static void submit(int b) {
+    fill_buffer(g_data[b]);
+    g_audout[b].next = NULL;
+    g_audout[b].buffer = g_data[b];
+    g_audout[b].buffer_size = BUFFER_MEM_SIZE;
+    g_audout[b].data_size = SAMPLES_PER_BUFFER * 2 * sizeof(int16_t);
+    g_audout[b].data_offset = 0;
+    audoutAppendAudioOutBuffer(&g_audout[b]);
+}
+
+static void audio_thread(void *arg) {
+    (void)arg;
+    for (int b = 0; b < NUM_BUFFERS; b++) submit(b);
+    uint64_t report = 0;
+    while (g_running) {
+        AudioOutBuffer *released = NULL;
+        u32 count = 0;
+        Result rc = audoutWaitPlayFinish(&released, &count, 100000000ULL);
+        if (R_FAILED(rc) || !released) continue;
+        for (int b = 0; b < NUM_BUFFERS; b++) {
+            if (&g_audout[b] == released) submit(b);
+        }
+        // others released at the same time
+        while (R_SUCCEEDED(audoutGetReleasedAudioOutBuffer(&released, &count)) && released && count) {
+            for (int b = 0; b < NUM_BUFFERS; b++) {
+                if (&g_audout[b] == released) submit(b);
+            }
+        }
+        if (++report % 940 == 0) { // ~10 s
+            printf("nx_audio: tempo %.2f, %llu underruns, ring %lld frames ahead\n", g_tempo,
+                   (unsigned long long)g_underruns,
+                   (long long)((double)__atomic_load_n(&g_write, __ATOMIC_ACQUIRE) - g_nominal));
+        }
+    }
+}
 
 void nx_audio_init(void) {
     if (g_initialized) return;
-
-    memset(g_buffers, 0, sizeof(g_buffers));
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        g_buffers[i].data = (int16_t *)memalign(0x1000, BUFFER_MEM_SIZE);
-        if (!g_buffers[i].data) {
-            printf("nx_audio: failed to allocate audio buffer %d\n", i);
-            return;
-        }
-        memset(g_buffers[i].data, 0, BUFFER_MEM_SIZE);
+    const char *e = getenv("UNX_AUDIO_STRETCH");
+    g_stretch = !(e && e[0] == '0');
+    for (int i = 0; i < N; i++) g_window[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)i / (float)N);
+    for (int b = 0; b < NUM_BUFFERS; b++) {
+        g_data[b] = (int16_t *)memalign(0x1000, BUFFER_MEM_SIZE);
+        if (!g_data[b]) { printf("nx_audio: no memory for buffer %d\n", b); return; }
+        memset(g_data[b], 0, BUFFER_MEM_SIZE);
     }
-
     Result rc = audoutInitialize();
-    if (R_FAILED(rc)) {
-        printf("nx_audio: audoutInitialize failed: 0x%x\n", rc);
-        return;
-    }
-
+    if (R_FAILED(rc)) { printf("nx_audio: audoutInitialize failed: 0x%x\n", rc); return; }
     rc = audoutStartAudioOut();
-    if (R_FAILED(rc)) {
-        printf("nx_audio: audoutStartAudioOut failed: 0x%x\n", rc);
-        audoutExit();
-        return;
-    }
-
-    g_input_count = 0;
-    g_input_pos = 0.0;
-    s_step = BASE_STEP;
-    s_last_sample[0] = 0;
-    s_last_sample[1] = 0;
+    if (R_FAILED(rc)) { printf("nx_audio: audoutStartAudioOut failed: 0x%x\n", rc); audoutExit(); return; }
+    g_running = true;
+    // above the game's priority, on core 0 next to the game's mostly waiting thread
+    rc = threadCreate(&g_thread, audio_thread, NULL, NULL, 0x8000, 0x2A, 0);
+    if (R_SUCCEEDED(rc)) rc = threadStart(&g_thread);
+    if (R_FAILED(rc)) { printf("nx_audio: no audio thread: 0x%x\n", rc); g_running = false; return; }
     g_initialized = true;
-    printf("nx_audio: initialized audout (48kHz stereo, %d buffers)\n", NUM_BUFFERS);
+    printf("nx_audio: audout 48kHz stereo on its own thread, %d x %d samples, time stretch %s\n", NUM_BUFFERS,
+           SAMPLES_PER_BUFFER, g_stretch ? "on" : "off");
 }
 
+// the game's samples (stereo, IN_RATE) since its last frame. never blocks.
 void nx_audio_play(const int16_t *samples, uint32_t count) {
     if (!g_initialized || !samples || count == 0) return;
-
-    // Reclaim finished buffers from hardware
-    AudioOutBuffer *released = NULL;
-    u32 released_count = 0;
-    while (R_SUCCEEDED(audoutGetReleasedAudioOutBuffer(&released, &released_count)) && released != NULL) {
-        for (int i = 0; i < NUM_BUFFERS; i++) {
-            if (&g_buffers[i].audout_buf == released) {
-                g_buffers[i].in_flight = false;
-                break;
-            }
-        }
-        released = NULL;
+    uint64_t w = g_write;
+    for (uint32_t i = 0; i < count; i++) {
+        g_ring[(w + i) & RING_MASK][0] = samples[i * 2];
+        g_ring[(w + i) & RING_MASK][1] = samples[i * 2 + 1];
     }
-
-    // Append incoming samples (stereo pairs)
-    if (g_input_count + (int)count <= MAX_INPUT_SAMPLES) {
-        memcpy(&g_input[g_input_count], samples, count * sizeof(int16_t) * 2);
-        g_input_count += (int)count;
-    } else {
-        // Drop oldest if overflowing
-        int drop = (g_input_count + (int)count) - MAX_INPUT_SAMPLES;
-        if (drop < g_input_count) {
-            memmove(&g_input[0], &g_input[drop], (g_input_count - drop) * sizeof(g_input[0]));
-            g_input_count -= drop;
-            g_input_pos = (g_input_pos > drop) ? (g_input_pos - drop) : 0.0;
-            memcpy(&g_input[g_input_count], samples, count * sizeof(int16_t) * 2);
-            g_input_count += (int)count;
-        }
-    }
-
-    // Count in-flight buffers
-    int in_flight = 0;
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        if (g_buffers[i].in_flight) in_flight++;
-    }
-
-    // Drift compensation: Target 3 in-flight hardware buffers (50 ms) + 400 input samples (~12 ms reserve)
-    // Keep pitch adjustments smoothly within ±2.0% (imperceptible, standard emulator rate matching)
-    int total_input_available = g_input_count - (int)g_input_pos;
-    double current_buffered = (double)(in_flight * SAMPLES_PER_BUFFER) * BASE_STEP + (double)total_input_available;
-    const double TARGET_BUFFERED = (3.0 * (double)SAMPLES_PER_BUFFER) * BASE_STEP + 400.0; // ~2036 samples
-    double error = current_buffered - TARGET_BUFFERED;
-
-    double target_scale = 1.0 + (error / 4000.0) * 0.02;
-    if (target_scale < 0.98) target_scale = 0.98;
-    if (target_scale > 1.02) target_scale = 1.02;
-
-    s_step = s_step * 0.95 + (BASE_STEP * target_scale) * 0.05;
-
-    const int needed = (int)((double)SAMPLES_PER_BUFFER * s_step) + 2;
-
-    // Fill available buffers
-    for (int b = 0; b < NUM_BUFFERS; b++) {
-        if (g_buffers[b].in_flight) continue;
-
-        // If hardware DAC already has 4 buffers queued (66 ms), hold off until next frame
-        if (in_flight >= 4) {
-            break;
-        }
-
-        int available = g_input_count - (int)g_input_pos;
-
-        // If we already have 1+ buffer playing in DAC and not enough samples to fill a complete buffer,
-        // wait for next frame rather than playing truncated/silence-padded audio
-        if (in_flight >= 1 && available < needed) {
-            break;
-        }
-
-        // If input is completely exhausted:
-        if (available <= 0) {
-            if (in_flight == 0) {
-                // Emergency DAC underrun prevention: smoothly fade out to silence
-                int16_t *out = g_buffers[b].data;
-                for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
-                    float fade = 1.0f - (float)i / 32.0f;
-                    if (fade < 0.0f) fade = 0.0f;
-                    out[i * 2 + 0] = (int16_t)(s_last_sample[0] * fade);
-                    out[i * 2 + 1] = (int16_t)(s_last_sample[1] * fade);
-                }
-                s_last_sample[0] = 0;
-                s_last_sample[1] = 0;
-                g_buffers[b].audout_buf.next = NULL;
-                g_buffers[b].audout_buf.buffer = g_buffers[b].data;
-                g_buffers[b].audout_buf.buffer_size = BUFFER_MEM_SIZE;
-                g_buffers[b].audout_buf.data_size = SAMPLES_PER_BUFFER * 2 * sizeof(int16_t);
-                g_buffers[b].audout_buf.data_offset = 0;
-                g_buffers[b].in_flight = true;
-                audoutAppendAudioOutBuffer(&g_buffers[b].audout_buf);
-                in_flight++;
-            }
-            break;
-        }
-
-        // Dynamic step for this buffer: if in_flight == 0 and available < needed,
-        // smoothly stretch available samples across SAMPLES_PER_BUFFER to avoid ANY dead silence
-        double step = s_step;
-        if (in_flight == 0 && available < needed && available >= 64) {
-            step = (double)(available - 1) / (double)SAMPLES_PER_BUFFER;
-        }
-
-        int16_t *out = g_buffers[b].data;
-        for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
-            int idx = (int)g_input_pos;
-            if (idx + 1 >= g_input_count) {
-                idx = g_input_count - 2;
-                if (idx < 0) idx = 0;
-            }
-            float frac = (float)(g_input_pos - idx);
-            if (frac < 0.0f) frac = 0.0f;
-            if (frac > 1.0f) frac = 1.0f;
-            int16_t l0 = g_input[idx][0];
-            int16_t l1 = g_input[idx + 1][0];
-            int16_t r0 = g_input[idx][1];
-            int16_t r1 = g_input[idx + 1][1];
-
-            int16_t sample_l = (int16_t)(l0 + frac * (l1 - l0));
-            int16_t sample_r = (int16_t)(r0 + frac * (r1 - r0));
-            out[i * 2 + 0] = sample_l;
-            out[i * 2 + 1] = sample_r;
-            s_last_sample[0] = sample_l;
-            s_last_sample[1] = sample_r;
-
-            g_input_pos += step;
-        }
-
-        // Enqueue to audout
-        g_buffers[b].audout_buf.next = NULL;
-        g_buffers[b].audout_buf.buffer = g_buffers[b].data;
-        g_buffers[b].audout_buf.buffer_size = BUFFER_MEM_SIZE;
-        g_buffers[b].audout_buf.data_size = SAMPLES_PER_BUFFER * 2 * sizeof(int16_t);
-        g_buffers[b].audout_buf.data_offset = 0;
-        g_buffers[b].in_flight = true;
-
-        audoutAppendAudioOutBuffer(&g_buffers[b].audout_buf);
-        in_flight++;
-    }
-
-    // Compact input buffer
-    int consumed = (int)g_input_pos;
-    if (consumed > 0 && consumed <= g_input_count) {
-        int remaining = g_input_count - consumed;
-        if (remaining > 0) {
-            memmove(&g_input[0], &g_input[consumed], remaining * sizeof(g_input[0]));
-        }
-        g_input_count = remaining;
-        g_input_pos -= consumed;
-    }
+    __atomic_store_n(&g_write, w + count, __ATOMIC_RELEASE);
 }
 
 void nx_audio_exit(void) {
     if (!g_initialized) return;
-
+    g_running = false;
+    threadWaitForExit(&g_thread);
+    threadClose(&g_thread);
     audoutStopAudioOut();
     audoutExit();
-
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        if (g_buffers[i].data) {
-            free(g_buffers[i].data);
-            g_buffers[i].data = NULL;
-        }
-    }
-
+    for (int b = 0; b < NUM_BUFFERS; b++) { free(g_data[b]); g_data[b] = NULL; }
     g_initialized = false;
     printf("nx_audio: exited\n");
 }
