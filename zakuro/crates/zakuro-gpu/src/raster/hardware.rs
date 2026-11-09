@@ -1700,6 +1700,9 @@ pub struct Hardware {
     scratch: Vec<u8>,
     /// the programs seen and how far their translation got.
     translated: QuickMap<ProgramKey, Translation>,
+    /// a program's key by its fingerprint to the one by the code it can
+    /// reach, which translated goes by.
+    reached: QuickMap<ProgramKey, ProgramKey>,
     /// the last draw's program and how far its translation got, which the
     /// next draw mostly shares, until the compiler brings anything in.
     last_translation: Option<(ProgramKey, Translation)>,
@@ -2000,6 +2003,7 @@ impl Hardware {
                 translates: std::env::var_os("ZAKURO_INTERPRET_SHADERS").is_none(),
                 scratch: Vec::new(),
                 translated: QuickMap::default(),
+                reached: QuickMap::default(),
                 last_translation: None,
                 modules: HashMap::new(),
                 program_of: HashMap::new(),
@@ -3944,6 +3948,19 @@ impl Hardware {
     /// how far a program's translation got, the compiler starting on it the
     /// first time the program is seen.
     fn translation(&mut self, unit: &ShaderUnit, key: ProgramKey) -> Translation {
+        // translations go by the code the program can reach, which programs
+        // left in memory around it don't change
+        let key = match self.reached.get(&key) {
+            Some(&reached) => reached,
+            None => {
+                let reached = unit
+                    .prepared()
+                    .and_then(|program| glsl::reach_hash(&program, key.1))
+                    .map_or(key, |hash| (hash, key.1, key.2));
+                self.reached.insert(key, reached);
+                reached
+            }
+        };
         if let Some(&translation) = self.translated.get(&key) {
             return translation;
         }

@@ -73,6 +73,35 @@ pub(crate) fn translate(program: &Program, entry_point: u32, semantics: &[u32; S
     Ok(translator.shader(semantics))
 }
 
+/// a hash of everything a translation from an entry point is made of: the
+/// inputs packed, and the code execution can reach with its operands worked
+/// out. programs differing only in words they never run, earlier programs
+/// left in memory, hash the same and share one translation. none when the
+/// program can't be translated from there.
+pub(crate) fn reach_hash(program: &Program, entry_point: u32) -> Option<u64> {
+    use std::fmt::Write;
+    let translator = Translator::new(program, entry_point).ok()?;
+    let mut text = format!("{} {}", translator.packed, entry_point);
+    for (start, run) in &translator.runs {
+        let _ = write!(text, "|{start}");
+        for &at in &run.body {
+            let _ = write!(text, " {at}:{:?}", translator.ops[at as usize]);
+        }
+        match run.exit {
+            Exit::Fall(at) => {
+                let _ = write!(text, " fall {at}");
+            }
+            Exit::End => text.push_str(" end"),
+            Exit::Flow(at) => {
+                let _ = write!(text, " flow {at}:{:?}", translator.ops[at as usize]);
+            }
+        }
+    }
+    // FNV-1a, the same every run, as kept translations are found by it
+    let hash = text.bytes().fold(0xCBF2_9CE4_8422_2325u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01B3));
+    Some(hash)
+}
+
 /// a vertex shader in GLSL to SPIR-V for vkCreateShaderModule, or why not.
 /// naga can panic on some inputs, so a panic is an error too, and the caller
 /// keeps the interpreter to fall back on.
@@ -1271,6 +1300,25 @@ mod tests {
 
     /// execution falling into the words after a program, which run to the
     /// end of the program memory, leaves the program to the interpreter.
+    /// words past the end that execution never reaches leave the key a
+    /// translation goes by alone, a word it does reach changes it.
+    #[test]
+    fn only_reachable_words_make_the_translation_key() {
+        let mut random = Random(15);
+        let mut program: Vec<u32> = (0..12).map(|_| arithmetic(&mut random)).collect();
+        program.push(0x22 << 26);
+        let key = |words: &[u32]| {
+            let unit = unit(words, 0, &mut Random(16));
+            reach_hash(&unit.prepared().unwrap(), 0).unwrap()
+        };
+        let mut left_over = program.clone();
+        left_over.extend([0x22 << 26, 0x21 << 26, 0x22 << 26]);
+        assert_eq!(key(&program), key(&left_over));
+        let mut changed = program.clone();
+        changed[3] = arithmetic(&mut random);
+        assert_ne!(key(&program), key(&changed));
+    }
+
     #[test]
     fn programs_running_into_the_rest_of_memory_stay_interpreted() {
         let mut random = Random(14);
