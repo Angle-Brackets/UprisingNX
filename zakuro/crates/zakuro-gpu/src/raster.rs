@@ -1385,6 +1385,12 @@ struct BoundTexture {
     linear: bool,
     /// bilinear rather than point sampling when minifying.
     min_linear: bool,
+    /// bilinear rather than point sampling between mipmap levels.
+    mip_linear: bool,
+    /// smallest mipmap level present (0 when only the full size is used).
+    max_level: u8,
+    /// signed 5.8 fixed-point LOD bias from GPUREG_TEXUNITi_LOD.
+    lod_bias: i16,
     wrap_s: Wrap,
     wrap_t: Wrap,
     width: u32,
@@ -2280,7 +2286,7 @@ impl TextureCache {
     /// the texture, when it was checked during this list and nothing drew
     /// over it since.
     fn checked(&self, key: TextureKey, size: u32) -> Option<Found> {
-        let decoded = self.entries.get(&key)?;
+        let decoded = self.entries.get(&key).filter(|d| d.bytes.len() == size as usize)?;
         let (list, writes) = decoded.checked;
         let addr = key.0 & !1;
         let overwritten = self.written[writes.min(self.written.len())..]
@@ -2293,6 +2299,9 @@ impl TextureCache {
         let _timer = crate::stats::time(&crate::stats::TEXTURES);
         let (addr, format, width, height) = key;
         let portrait = addr & 1 != 0;
+        let bpp = format.bits_per_pixel() as usize;
+        let base_size = (width as usize * height as usize * bpp).div_ceil(8);
+        let base_count = (width * height) as usize;
         let checked = (self.list, self.written.len());
         if let Some(decoded) = self.entries.get_mut(&key) {
             if decoded.bytes == data {
@@ -2300,7 +2309,7 @@ impl TextureCache {
                 return (decoded.texels.clone(), decoded.replacement.clone());
             }
             let hash = fingerprint(data);
-            if !portrait && decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
+            if !portrait && data.len() == base_size && decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
                 // a title changing a few sprites of an atlas rewrites a
                 // handful of its 8x8 tiles, those alone are decoded again,
                 // into a copy, as the old texels may still be uploading
@@ -2322,25 +2331,38 @@ impl TextureCache {
                 decoded.bytes.copy_from_slice(data);
                 decoded.texels = copy;
                 decoded.hash = hash;
-                decoded.replacement = picture_for(self.pack.as_deref(), data, &decoded.texels, key, &mut self.rows);
+                decoded.replacement = picture_for(self.pack.as_deref(), &data[..base_size], &decoded.texels[..base_count], key, &mut self.rows);
             }
-            if decoded.hash == hash {
+            if decoded.hash == hash && decoded.bytes.len() == data.len() {
                 decoded.checked = checked;
                 return (decoded.texels.clone(), decoded.replacement.clone());
             }
         }
-        let count = (width * height) as usize;
+        let hash = fingerprint(data);
+        let mut decoded_texels = crate::texture::decode_texture(&data[..base_size], format, width, height);
+        if portrait {
+            clean_portrait_texels(&mut decoded_texels, width, height);
+        } else if data.len() > base_size {
+            let mut offset = base_size;
+            let mut level = 1u32;
+            while offset < data.len() {
+                let (w, h) = (width >> level, height >> level);
+                let level_size = (w as usize * h as usize * bpp).div_ceil(8);
+                if w < 8 || h < 8 || offset + level_size > data.len() {
+                    break;
+                }
+                decoded_texels.extend_from_slice(&crate::texture::decode_texture(&data[offset..offset + level_size], format, w, h));
+                offset += level_size;
+                level += 1;
+            }
+        }
+        let count = decoded_texels.len();
         if self.texels + count > CACHED_TEXELS {
             self.entries.clear();
             self.texels = 0;
         }
-        let hash = fingerprint(data);
-        let mut decoded_texels = crate::texture::decode_texture(data, format, width, height);
-        if portrait {
-            clean_portrait_texels(&mut decoded_texels, width, height);
-        }
         let texels: Arc<[[u8; 4]]> = Arc::from(decoded_texels);
-        let replacement = picture_for(self.pack.as_deref(), data, &texels, key, &mut self.rows);
+        let replacement = picture_for(self.pack.as_deref(), &data[..base_size], &texels[..base_count], key, &mut self.rows);
         let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
         if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
@@ -2535,6 +2557,9 @@ fn empty_texture() -> BoundTexture {
         drawn: None,
         linear: false,
         min_linear: false,
+        mip_linear: false,
+        max_level: 0,
+        lod_bias: 0,
         wrap_s: Wrap::Repeat,
         wrap_t: Wrap::Repeat,
         width: 1,
@@ -2577,10 +2602,21 @@ fn bind_texture<M: GpuMemory>(
 
     let addr = memory.translate(address);
     log::trace!("texture unit {unit}: 0x{address:08X} -> 0x{addr:08X}, {width}x{height} {format:?}");
-    let bits = (width as u64) * (height as u64) * format.bits_per_pixel() as u64;
-    let size = bits.div_ceil(8) as usize;
-
     let portrait = unit == 0 && format == TextureFormat::Etc1 && registers[0x0CA] == 0x0002_0001 && registers[0x0D0] >> 16 == 0x0F03;
+    let lod = registers[base + 3];
+    let req_max_level = if portrait || drawn.is_some() { 0 } else { (lod >> 16) & 0xF };
+    let mut max_level = 0u32;
+    while max_level < req_max_level && (width >> (max_level + 1)) >= 8 && (height >> (max_level + 1)) >= 8 {
+        max_level += 1;
+    }
+    let bpp = format.bits_per_pixel() as u64;
+    let mut total_bits = 0u64;
+    for level in 0..=max_level {
+        total_bits += (width >> level) as u64 * (height >> level) as u64 * bpp;
+    }
+    let size = total_bits.div_ceil(8) as usize;
+    let lod_bias = (((lod & 0x1FFF) as i32) << 19 >> 19) as i16;
+
     let key = (addr | (portrait as u32), format, width, height);
     let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
         (Some(_), _) if !past => (Arc::default(), None),
@@ -2595,19 +2631,23 @@ fn bind_texture<M: GpuMemory>(
         },
     };
 
-    // filter mode in bit 1 (magnification) and 2 (minification), the wrap
-    // modes for T and S in bits 8-10 and 12-14.
+    // filter mode in bit 1 (magnification), 2 (minification), and 24 (mipmap),
+    // the wrap modes for T and S in bits 8-10 and 12-14.
     let config = registers[base + 2];
+    let mipmapped = max_level > 0;
     Some(BoundTexture {
         texels,
         drawn,
-        linear: config & 0x2 != 0 || filter_mode() == 3,
-        min_linear: match filter_mode() {
+        linear: config & 0x2 != 0 || mipmapped || filter_mode() == 3,
+        min_linear: mipmapped || match filter_mode() {
             3 => true,
             1 => config & 0x2 != 0,
-            2 => config & 0x6 != 0,
-            _ => config & 0x4 != 0,
+            0 => config & 0x4 != 0,
+            _ => config & 0x6 != 0,
         },
+        mip_linear: config & (1 << 24) != 0 || mipmapped || filter_mode() == 3,
+        max_level: max_level as u8,
+        lod_bias,
         wrap_t: Wrap::from_raw(config >> 8),
         wrap_s: Wrap::from_raw(config >> 12),
         width,
@@ -4962,7 +5002,10 @@ mod tests {
             drawn: None,
             texels: vec![[0xFF; 4]; 8 * 8].into(),
             linear: false,
-        min_linear: false,
+            min_linear: false,
+            mip_linear: false,
+            max_level: 0,
+            lod_bias: 0,
             wrap_s: wrap,
             wrap_t: wrap,
             width: 8,

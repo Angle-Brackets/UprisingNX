@@ -910,6 +910,7 @@ struct Texture {
     image: Image,
     /// holds the decoded texels the key points at, so the key stays theirs.
     _texels: Arc<[[u8; 4]]>,
+    smallest: u32,
     used: u64,
 }
 
@@ -2037,7 +2038,7 @@ pub struct Hardware {
     /// the same writing an image, made the first time it is needed.
     upright_image: Option<Compute>,
     samples: Option<Local>,
-    samplers: QuickMap<(u8, Wrap, Wrap, u32), vk::Sampler>,
+    samplers: QuickMap<(u8, Wrap, Wrap, u32, i16), vk::Sampler>,
     ring: Buffer,
     used: u64,
     readback: Option<Buffer>,
@@ -3569,13 +3570,15 @@ impl Hardware {
         let key = Arc::as_ptr(&bound.texels) as *const u8 as usize;
         if let Some(texture) = self.textures.get_mut(&key) {
             texture.used = self.batch;
-            return Ok((texture.image.view, 0));
+            return Ok((texture.image.view, texture.smallest));
         }
         self.mark(Work::Upload, false);
         self.end_rendering();
-        let image = self.image(
+        let levels = bound.max_level as u32 + 1;
+        let image = self.image_levels(
             bound.width,
             bound.height,
+            levels,
             COLOR_FORMAT,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::ImageAspectFlags::COLOR,
@@ -3586,19 +3589,33 @@ impl Hardware {
         for (out, texel) in staging.as_chunks_mut::<4>().0.iter_mut().zip(bound.texels.iter()) {
             *out = *texel;
         }
-        let regions = [vk::BufferImageCopy::default()
-            .buffer_offset(offset)
-            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
-            .image_extent(vk::Extent3D { width: bound.width, height: bound.height, depth: 1 })];
-        // SAFETY: recording, the region lies inside the ring and the image
+        let mut regions = Vec::with_capacity(levels as usize);
+        let mut level_offset = offset;
+        for level in 0..levels {
+            let (w, h) = (bound.width >> level, bound.height >> level);
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(level_offset)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(level)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D { width: w, height: h, depth: 1 }),
+            );
+            level_offset += (w as u64) * (h as u64) * 4;
+        }
+        // SAFETY: recording, the regions lie inside the ring and the image
         unsafe {
             self.unfenced = true;
             self.device.cmd_copy_buffer_to_image(self.commands, self.ring.buffer, image.image, vk::ImageLayout::GENERAL, &regions)
         };
         self.uploads = true;
         let view = image.view;
-        self.textures.insert(key, Texture { image, _texels: bound.texels.clone(), used: self.batch });
-        Ok((view, 0))
+        let smallest = bound.max_level as u32;
+        self.textures.insert(key, Texture { image, _texels: bound.texels.clone(), smallest, used: self.batch });
+        Ok((view, smallest))
     }
 
     /// the image of a texture pack's picture for a texture of size, and
@@ -3717,9 +3734,9 @@ impl Hardware {
     }
 
     /// a sampler for a unit, which goes between an image's sizes down to
-    /// smallest, as texture pack pictures have them.
-    fn sampler(&mut self, filters: u8, s: Wrap, t: Wrap, smallest: u32) -> Result<vk::Sampler, String> {
-        if let Some(&sampler) = self.samplers.get(&(filters, s, t, smallest)) {
+    /// smallest, as guest mipmaps and texture pack pictures have them.
+    fn sampler(&mut self, filters: u8, s: Wrap, t: Wrap, smallest: u32, lod_bias: i16) -> Result<vk::Sampler, String> {
+        if let Some(&sampler) = self.samplers.get(&(filters, s, t, smallest, lod_bias)) {
             return Ok(sampler);
         }
         // the border is the shader's to draw, past the edge it clamps
@@ -3728,12 +3745,10 @@ impl Hardware {
             Wrap::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
             _ => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         };
-        let (mag, min) = (filters & 1 != 0, filters & 2 != 0);
+        let (mag, min, mip) = (filters & 1 != 0, filters & 2 != 0, filters & 4 != 0);
         let filter = |linear: bool| if linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
-        let between = if smallest > 0 && min { vk::SamplerMipmapMode::LINEAR } else { vk::SamplerMipmapMode::NEAREST };
-        // a picture drawn a little smaller than its own size, as at 3 times
-        // the console's resolution, stays as sharp as it is
-        let mut bias = if smallest > 0 { -0.5 } else { 0.0 };
+        let between = if smallest > 0 && (min || mip) { vk::SamplerMipmapMode::LINEAR } else { vk::SamplerMipmapMode::NEAREST };
+        let mut bias = if smallest > 0 { lod_bias as f32 / 256.0 } else { 0.0 };
         // test switches: ZAKURO_MIP_BIAS=<float> overrides the bias,
         // ZAKURO_NO_MIPS=1 samples only the full picture
         if let Some(value) = std::env::var("ZAKURO_MIP_BIAS").ok().and_then(|v| v.parse::<f32>().ok()) {
@@ -3751,7 +3766,7 @@ impl Hardware {
             .max_lod(smallest_lod as f32);
         // SAFETY: plain object creation on our device
         let sampler = unsafe { self.device.create_sampler(&info, None) }.map_err(vk_error("create a sampler"))?;
-        self.samplers.insert((filters, s, t, smallest), sampler);
+        self.samplers.insert((filters, s, t, smallest, lod_bias), sampler);
         Ok(sampler)
     }
 
@@ -4756,17 +4771,25 @@ impl Hardware {
                     };
                     // ZAKURO_SELF_LINEAR=1: a draw reading the target it draws
                     // into (the sky's ripple) is filtered linearly
-                    let mut filters = bound.linear as u8 | (bound.min_linear as u8) << 1;
+                    let mut filters = bound.linear as u8 | (bound.min_linear as u8) << 1 | (bound.mip_linear as u8) << 2;
                     static SELF_LINEAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                     if *SELF_LINEAR.get_or_init(|| std::env::var_os("ZAKURO_SELF_LINEAR").is_some())
                         && bound.drawn.is_some_and(|d| d.addr & 0x00FF_FFFF == (draw.registers[0x11D] << 3) & 0x00FF_FFFF)
                     {
                         filters = 3;
                     }
-                    samplers[unit] = self.sampler(filters, bound.wrap_s, bound.wrap_t, smallest)?;
+                    let lod_bias = if smallest == 0 {
+                        0
+                    } else if bound.replacement.is_some() {
+                        -128
+                    } else {
+                        let scale_bias = ((self.scale as f32).log2() * 256.0).round() as i32;
+                        (bound.lod_bias as i32 + scale_bias).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+                    };
+                    samplers[unit] = self.sampler(filters, bound.wrap_s, bound.wrap_t, smallest, lod_bias)?;
                     enabled |= 1 << unit;
                 }
-                None => samplers[unit] = self.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0)?,
+                None => samplers[unit] = self.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0, 0)?,
             }
         }
         static DRAW_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
