@@ -1925,13 +1925,13 @@ fn build_pipeline(
         return compile_pipeline(device, cache, layout, modules, key, flags, dynamic, depth_format);
     };
     let fail = vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
-    if let Ok(pipeline) = compile_pipeline(device, cache, layout, modules, key, flags | fail, dynamic, depth_format) {
-        return Ok(pipeline);
-    }
     let only_kept = flags.contains(fail);
     let mut made = [vk::Pipeline::null(); 4];
     for (made, part) in made.iter_mut().zip(Part::of(key, modules, dynamic)) {
         *made = libraries.part(part, !only_kept, || {
+            if only_kept {
+                return Err("part not made yet".to_owned());
+            }
             let started = std::time::Instant::now();
             let library = make_pipeline(device, cache, layout, modules, key, flags, dynamic, depth_format, Some(part.flag()));
             let took = started.elapsed();
@@ -2440,7 +2440,9 @@ impl Hardware {
                 let count = programs.len();
                 for (key, source, words) in programs {
                     // a geometry draw's slots, made only when that path is on
-                    if !super::gpu_geometry() && source.contains("void run_geometry()") {
+                    if (!super::gpu_geometry() || source.contains("vec4 slot_position[3];"))
+                        && source.contains("void run_geometry()")
+                    {
                         continue;
                     }
                     let module = match hardware.modules.get(&source) {

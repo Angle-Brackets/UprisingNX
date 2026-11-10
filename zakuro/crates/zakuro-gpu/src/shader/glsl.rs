@@ -95,14 +95,12 @@ impl GeometryLayout {
 }
 
 /// the vertex slots a geometry program from an entry point needs at most,
-/// three for each emit it can reach, when its flow only goes forward (ifs
-/// and jumps ahead, so no emit runs twice); none otherwise, or when it
-/// emits nothing or more than 16 triangles.
+/// three for each completing emit a path through it can run, when its flow
+/// only goes forward (ifs and jumps ahead, so no emit runs twice); none
+/// otherwise, or when it emits nothing or more than 16 triangles.
 pub(crate) fn geometry_slots(program: &Program, entry: u32) -> Option<u32> {
     let translator = Translator::new(program, entry).ok()?;
-    let mut emits = 0u32;
     for run in translator.runs.values() {
-        emits += run.body.iter().filter(|&&at| translator.ops[at as usize].opcode == OpCode::Emit).count() as u32;
         if let Exit::Flow(at) = run.exit {
             let op = &translator.ops[at as usize];
             let (destination, _) = op.instruction.flow_target();
@@ -115,7 +113,73 @@ pub(crate) fn geometry_slots(program: &Program, entry: u32) -> Option<u32> {
             }
         }
     }
+    let mut memo = std::collections::HashMap::new();
+    let emits = most_emits(&translator, entry, Vec::new(), false, &mut memo);
     (1..=16).contains(&emits).then_some(emits * 3)
+}
+
+/// the most completing emits any path from `at` with `open` blocks and
+/// `completes` set by the last setemit can run, when flow only goes forward.
+fn most_emits(
+    translator: &Translator,
+    at: u32,
+    open: Vec<Open>,
+    mut completes: bool,
+    memo: &mut std::collections::HashMap<(u32, Vec<Open>, bool), u32>,
+) -> u32 {
+    let Some((at, open)) = settle(at, open).into_iter().next() else {
+        return 0;
+    };
+    if at as usize >= PROGRAM_SIZE {
+        return 0;
+    }
+    let key = (at, open.clone(), completes);
+    if let Some(&cached) = memo.get(&key) {
+        return cached;
+    }
+    let Some(run) = translator.runs.get(&at) else {
+        return 0;
+    };
+    let mut emits = 0u32;
+    for &address in &run.body {
+        let op = &translator.ops[address as usize];
+        match op.opcode {
+            OpCode::SetEmit => completes = op.instruction.emit_primitive(),
+            OpCode::Emit if completes => emits += 1,
+            _ => {}
+        }
+    }
+    let after = match run.exit {
+        Exit::Fall(next) => most_emits(translator, next, open, completes, memo),
+        Exit::End => 0,
+        Exit::Flow(flow) => {
+            let op = &translator.ops[flow as usize];
+            let (destination, _) = op.instruction.flow_target();
+            let mut ways = follow(op, flow, open);
+            if matches!(op.opcode, OpCode::JmpC | OpCode::JmpU) {
+                // a jump at the end of a then branch over the else branch after it
+                if ways[0].1.last().is_some_and(|top| !top.is_loop && top.end == top.back && top.end == flow + 1)
+                    && destination > flow + 1
+                {
+                    ways.truncate(1);
+                    while ways[0].1.last().is_some_and(|top| !top.is_loop && top.end == top.back && top.end == flow + 1) {
+                        ways[0].1.pop();
+                    }
+                } else if let Some((_, not_taken)) = ways.get_mut(1) {
+                    if not_taken.len() < BLOCK_LIMIT {
+                        not_taken.push(Open { end: destination, back: destination, start: flow + 1, is_loop: false });
+                    }
+                }
+            }
+            ways.into_iter()
+                .map(|(next, open)| most_emits(translator, next, open, completes, memo))
+                .max()
+                .unwrap_or(0)
+        }
+    };
+    let total = emits + after;
+    memo.insert(key, total);
+    total
 }
 
 /// a draw with a geometry shader as one vertex shader: each invocation's
@@ -163,13 +227,13 @@ pub(crate) fn translate_geometry(
     // an emitted vertex's values, placed by the semantics
     let component = |which: usize, missing: &str| semantic(semantics[which], missing);
     let vector = |range: std::ops::Range<usize>, missing: &str| range.map(|which| component(which, missing)).collect::<Vec<_>>().join(", ");
-    out.push_str("void fill_slot(uint slot) {\n");
-    let _ = writeln!(out, "    slot_position[slot] = vec4({});", vector(0..4, "0.0"));
-    let _ = writeln!(out, "    slot_color[slot] = vec4({});", vector(4..8, "1.0"));
-    let _ = writeln!(out, "    slot_texcoords01[slot] = vec4({});", vector(8..12, "0.0"));
-    let _ = writeln!(out, "    slot_texcoord2[slot] = vec2({});", vector(12..14, "0.0"));
-    let _ = writeln!(out, "    slot_quaternion[slot] = vec4({});", vector(14..18, "0.0"));
-    let _ = writeln!(out, "    slot_view[slot] = vec3({});", vector(18..21, "0.0"));
+    out.push_str("void fill_chosen() {\n");
+    let _ = writeln!(out, "    chosen_position = vec4({});", vector(0..4, "0.0"));
+    let _ = writeln!(out, "    chosen_color = vec4({});", vector(4..8, "1.0"));
+    let _ = writeln!(out, "    chosen_texcoords01 = vec4({});", vector(8..12, "0.0"));
+    let _ = writeln!(out, "    chosen_texcoord2 = vec2({});", vector(12..14, "0.0"));
+    let _ = writeln!(out, "    chosen_quaternion = vec4({});", vector(14..18, "0.0"));
+    let _ = writeln!(out, "    chosen_view = vec3({});", vector(18..21, "0.0"));
     out.push_str("}\n\n");
     out.push_str(EMIT);
 
@@ -213,8 +277,8 @@ pub(crate) fn translate_geometry(
     if geometry_flows {
         out.push_str("    blocks = 0;\n");
     }
-    // the emitter's slots start as zero registers make them
-    out.push_str("    fill_slot(0u);\n    fill_slot(1u);\n    fill_slot(2u);\n");
+    // the wanted corner's slot starts as zero registers make it
+    out.push_str("    fill_chosen();\n");
     out.push_str("    emit_slot = 0u;\n    emit_completes = false;\n    triangles_made = 0u;\n    found = false;\n");
     out.push_str("    run_geometry();\n");
     out.push_str(GEOMETRY_EPILOGUE);
@@ -231,7 +295,8 @@ pub(crate) fn translate_geometry(
 
 /// what a geometry draw adds to shade.vert's interface: the geometry
 /// program's uniforms after the vertex program's, its inputs, and the
-/// emitter, the three slots as their values and the vertex picked.
+/// emitter, keeping the wanted corner's slot until the wanted triangle
+/// is completed.
 const GEOMETRY_HEADER: &str = r#"vec4 g_uniform_at(int index) {
     return index >= 0 && index < 96 ? g_floats[index] : vec4(0.0);
 }
@@ -243,12 +308,6 @@ uint triangles_made;
 uint want_triangle;
 uint want_corner;
 bool found;
-vec4 slot_position[3];
-vec4 slot_color[3];
-vec4 slot_texcoords01[3];
-vec2 slot_texcoord2[3];
-vec4 slot_quaternion[3];
-vec3 slot_view[3];
 vec4 chosen_position;
 vec4 chosen_color;
 vec4 chosen_texcoords01;
@@ -258,20 +317,16 @@ vec3 chosen_view;
 
 "#;
 
-/// an emit, as batch.rs's emit does it: the outputs into the slot, and a
-/// triangle out of the three slots when the slot completes one, the one
-/// this vertex is a corner of picked.
+/// an emit, as batch.rs's emit does it: the outputs into the wanted
+/// corner's slot when emit_slot names it, and the triangle picked once
+/// emit_completes reaches want_triangle.
 const EMIT: &str = r#"void emit_vertex() {
-    fill_slot(emit_slot);
+    if (emit_slot == want_corner) {
+        fill_chosen();
+    }
     if (emit_completes) {
         if (triangles_made == want_triangle) {
             found = true;
-            chosen_position = slot_position[want_corner];
-            chosen_color = slot_color[want_corner];
-            chosen_texcoords01 = slot_texcoords01[want_corner];
-            chosen_texcoord2 = slot_texcoord2[want_corner];
-            chosen_quaternion = slot_quaternion[want_corner];
-            chosen_view = slot_view[want_corner];
         }
         triangles_made++;
     }
@@ -891,6 +946,9 @@ impl Translator<'_> {
                 }
                 Emit => {
                     let _ = writeln!(out, "{indent}emit_vertex();");
+                    let _ = writeln!(out, "{indent}if (found) {{");
+                    let _ = writeln!(out, "{indent}    return;");
+                    let _ = writeln!(out, "{indent}}}");
                     return;
                 }
                 _ => {}
@@ -1525,15 +1583,17 @@ mod tests {
     }
 
     /// a setemit for a slot, completing a triangle or not, and an emit.
-    fn emits(random: &mut Random, program: &mut Vec<u32>) {
+    fn emits(random: &mut Random, program: &mut Vec<u32>) -> u32 {
         let (slot, completes) = (random.below(3), random.below(2));
         program.push((0x2B << 26) | (slot << 24) | (completes << 23));
         program.push(0x2A << 26);
+        completes
     }
 
     /// geometry programs of arithmetic and emits, with an if and its else
-    /// emitting their own, take slots for each emit and come out, with a
-    /// random vertex program before them, as shaders that compile.
+    /// emitting their own, take slots for the most completing emits any path
+    /// runs and come out, with a random vertex program before them, as
+    /// shaders that compile.
     #[test]
     fn geometry_programs_compile_with_their_vertex_programs() {
         let mut random = Random(17);
@@ -1541,7 +1601,8 @@ mod tests {
             let mut vertex: Vec<u32> = (0..1 + random.below(30)).map(|_| arithmetic(&mut random)).collect();
             vertex.push(0x22 << 26);
             let mut geometry: Vec<u32> = (0..random.below(10)).map(|_| arithmetic(&mut random)).collect();
-            let mut count = 0;
+            let mut body_emits = 0;
+            let mut else_emits = 0;
             let branches = case % 2 == 1;
             let at = geometry.len() as u32;
             if branches {
@@ -1550,14 +1611,12 @@ mod tests {
             let body_start = geometry.len();
             for _ in 0..1 + random.below(4) {
                 geometry.push(arithmetic(&mut random));
-                emits(&mut random, &mut geometry);
-                count += 1;
+                body_emits += emits(&mut random, &mut geometry);
             }
             if branches {
                 let destination = geometry.len() as u32;
                 for _ in 0..1 + random.below(3) {
-                    emits(&mut random, &mut geometry);
-                    count += 1;
+                    else_emits += emits(&mut random, &mut geometry);
                 }
                 let otherwise = geometry.len() as u32 - destination;
                 let condition = random.below(1 << 4) << 22;
@@ -1568,8 +1627,10 @@ mod tests {
             let vertex_unit = unit(&vertex, 0, &mut random);
             let geometry_unit = unit(&geometry, 0, &mut random);
             let geometry_program = geometry_unit.prepared().unwrap();
-            let slots = geometry_slots(&geometry_program, 0).expect("forward flow only");
-            assert_eq!(slots, count * 3);
+            let count = body_emits.max(else_emits);
+            let slots = geometry_slots(&geometry_program, 0);
+            assert_eq!(slots, (count > 0).then_some(count * 3));
+            let Some(slots) = slots else { continue };
             let per_vertex = 1 + random.below(7);
             let layout = GeometryLayout {
                 per_vertex,

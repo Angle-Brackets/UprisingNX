@@ -771,13 +771,12 @@ fn shading_key(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::IN
     hash
 }
 
-/// ZAKURO_GPU_GEOMETRY=1: geometry-shader draws as slots on the host GPU,
-/// each slot running both programs; off, they shade on the CPU. Tests have
-/// it on.
+/// ZAKURO_GPU_GEOMETRY=0 turns off geometry-shader draws as slots on the
+/// host GPU, each slot running both programs; on by default.
 #[cfg(feature = "vulkan")]
 pub(crate) fn gpu_geometry() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    cfg!(test) || *ON.get_or_init(|| std::env::var("ZAKURO_GPU_GEOMETRY").is_ok_and(|value| value == "1"))
+    cfg!(test) || *ON.get_or_init(|| std::env::var("ZAKURO_GPU_GEOMETRY").map_or(true, |value| value != "0"))
 }
 
 fn cpu_shade_log() -> bool {
@@ -831,11 +830,10 @@ fn process_vertices<'a>(
         // names more than once
         let shaded = shade(registers, vertex_shader, inputs);
         let vs_time = started.map(|s| s.elapsed());
-        let outputs: Box<dyn Iterator<Item = [Vec4; 16]>> = match order {
-            Some(order) => Box::new(order.iter().map(|&i| shaded[i])),
-            None => Box::new(shaded.iter().copied()),
+        let vertices = match order {
+            Some(order) => geometry_stage(registers, geometry_shader, &map, order.iter().map(|&i| shaded[i])),
+            None => geometry_stage(registers, geometry_shader, &map, shaded.into_iter()),
         };
-        let vertices = geometry_stage(registers, geometry_shader, &map, outputs);
         slow("geometry", vertices.len(), vs_time);
         if started.is_some_and(|s| s.elapsed().as_micros() >= 1000) {
             if let Some(report) = shader::geometry_report(geometry_shader) {
@@ -1076,15 +1074,18 @@ fn geometry_stage(
 
     // every invocation's inputs, then all of them through the shader in
     // batches
-    let mut pending: Vec<Vec4> = Vec::with_capacity(16);
-    let mut invocations = Vec::new();
+    let count = vertex_outputs.size_hint().0;
+    let mut pending = [shader::ZERO; 32];
+    let mut pending_len = 0;
+    let mut invocations = Vec::with_capacity((count * per_vertex) / per_invocation);
     for outputs in vertex_outputs {
-        pending.extend_from_slice(&outputs[..per_vertex]);
-        if pending.len() < per_invocation {
+        pending[pending_len..pending_len + per_vertex].copy_from_slice(&outputs[..per_vertex]);
+        pending_len += per_vertex;
+        if pending_len < per_invocation {
             continue;
         }
         invocations.push(map_inputs(registers, REG_GS_BLOCK, &pending[..per_invocation]));
-        pending.clear();
+        pending_len = 0;
     }
     // many primitives go over threads, like many vertices do
     let emitted: Vec<Vec<_>> = if cfg!(target_os = "horizon") || invocations.len() < PARALLEL_VERTICES / 4 {
@@ -1094,7 +1095,7 @@ fn geometry_stage(
     };
 
     let plan = VertexPlan::new(map, output_mask);
-    let mut vertices = Vec::new();
+    let mut vertices = Vec::with_capacity(invocations.len() * 6);
     for (input, triangles) in invocations.iter().zip(&emitted) {
         if vertices.is_empty() && log::log_enabled!(log::Level::Trace) {
             let used_uniforms = unit.float_uniforms.iter().filter(|u| **u != shader::ZERO).count();
