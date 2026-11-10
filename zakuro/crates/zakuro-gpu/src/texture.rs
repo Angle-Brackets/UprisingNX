@@ -400,7 +400,7 @@ fn decode_etc1_block_all(block: &[u8], alpha: Option<&[u8]>, out: &mut [[u8; 4];
     let alpha_word = alpha.map(|a| u64::from_le_bytes(a[..8].try_into().unwrap()));
     for y in 0..4u32 {
         for x in 0..4u32 {
-            let (base, table) = if (if flip { y < 2 } else { x < 2 }) { (&base0, table0) } else { (&base1, table1) };
+            let (base, table) = if if flip { y < 2 } else { x < 2 } { (&base0, table0) } else { (&base1, table1) };
             let pixel_index = x * 4 + y;
             let msb = (low >> (pixel_index + 16)) & 1;
             let lsb = (low >> pixel_index) & 1;

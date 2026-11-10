@@ -1404,7 +1404,12 @@ impl Compiler {
         let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
         match job {
             Job::Translate(..) | Job::TranslateGeometry(..) => waiting.translations.push_back(job),
-            Job::Compile(..) => waiting.compiles.push(job),
+            Job::Compile(key, _) => {
+                let before = waiting.compiles.len();
+                waiting.compiles.retain(|queued| !matches!(queued, Job::Compile(k, _) if *k == key));
+                self.outstanding -= before - waiting.compiles.len();
+                waiting.compiles.push(job);
+            }
         }
         ready.notify_one();
         self.outstanding += 1;
@@ -2480,7 +2485,7 @@ impl Hardware {
                 log::info!(target: "zakuro_gpu::pipelines", "making the {} pipelines the title used before", used.len());
             }
             for key in used {
-                if hardware.waits || !hardware.known_keys.insert(key) || !hardware.compiler.asked.insert(key) {
+                if hardware.waits || !hardware.known_keys.insert(key) {
                     continue;
                 }
                 let module = hardware.vertex_module(key.vertex);
@@ -3902,6 +3907,9 @@ impl Hardware {
             self.pipelines.len() + 1,
             started.elapsed().as_secs_f64() * 1000.0
         );
+        if let Some((since, _)) = self.stand_ins.remove(&key) {
+            log::info!(target: "zakuro_gpu::pipelines", "generic stand-in ends: its pipeline came after {:.0} ms", since.elapsed().as_secs_f64() * 1000.0);
+        }
         self.pipelines.insert(key, pipeline);
         self.remember(key);
         Some(pipeline)
@@ -3920,9 +3928,16 @@ impl Hardware {
         if let Some(&pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline);
         }
-        if self.compiler.asked.insert(key) {
+        if self.libraries.is_some() {
             if let Some(pipeline) = self.cached(key) {
                 return Ok(pipeline);
+            }
+        }
+        if self.compiler.asked.insert(key) {
+            if self.libraries.is_none() {
+                if let Some(pipeline) = self.cached(key) {
+                    return Ok(pipeline);
+                }
             }
             self.hand(Job::Compile(key, self.vertex_module(key.vertex)));
             if let Some(&pipeline) = self.pipelines.get(&key) {
@@ -3950,16 +3965,26 @@ impl Hardware {
             self.last_pipeline = Some((key, pipeline));
             return Ok(pipeline);
         }
+        if !translating && self.libraries.is_some() {
+            if let Some(pipeline) = self.cached(key) {
+                self.last_pipeline = Some((key, pipeline));
+                return Ok(pipeline);
+            }
+        }
         if !translating && !self.compiler.asked.contains(&key) {
             log_lit(&key);
         }
         if !translating && self.compiler.asked.insert(key) {
-            if let Some(pipeline) = self.cached(key) {
-                return Ok(pipeline);
+            if self.libraries.is_none() {
+                if let Some(pipeline) = self.cached(key) {
+                    self.last_pipeline = Some((key, pipeline));
+                    return Ok(pipeline);
+                }
             }
             // made right here when waiting for it
             self.hand(Job::Compile(key, self.vertex_module(key.vertex)));
             if let Some(&pipeline) = self.pipelines.get(&key) {
+                self.last_pipeline = Some((key, pipeline));
                 return Ok(pipeline);
             }
         }
@@ -3968,6 +3993,11 @@ impl Hardware {
             let interpreted = PipelineKey { vertex: VertexStage::Interpreted, ..key };
             if self.waits || self.pipelines.contains_key(&interpreted) {
                 return self.pipeline(interpreted);
+            }
+            if self.libraries.is_some() {
+                if let Some(pipeline) = self.cached(interpreted) {
+                    return Ok(pipeline);
+                }
             }
         }
         // the one without the lighting's constants, the uniforms giving
@@ -3978,9 +4008,16 @@ impl Hardware {
             fragment[30] = 0;
             fragment[31] = 0;
             for vertex in [key.vertex, VertexStage::Interpreted] {
-                if let Some(&pipeline) = self.pipelines.get(&PipelineKey { vertex, fragment, ..key }) {
+                let unspecialized = PipelineKey { vertex, fragment, ..key };
+                if let Some(&pipeline) = self.pipelines.get(&unspecialized) {
                     crate::stats::fell_back(crate::stats::FALL_UNSPECIALIZED);
                     return Ok(pipeline);
+                }
+                if self.libraries.is_some() {
+                    if let Some(pipeline) = self.cached(unspecialized) {
+                        crate::stats::fell_back(crate::stats::FALL_UNSPECIALIZED);
+                        return Ok(pipeline);
+                    }
                 }
             }
         }
@@ -4156,7 +4193,7 @@ impl Hardware {
             surface.write_guarded = None;
             surface.cleared = None;
             surface.stale = None;
-            surface.checked = true;
+            surface.checked = cfg!(target_os = "horizon");
             surface.replaced();
         }
         Ok(())
@@ -4340,9 +4377,17 @@ impl Hardware {
     fn geometry_translation(&mut self, unit: &ShaderUnit, geometry: &GeometryShading, semantics: [u32; 24]) -> Translation {
         let mix = |hash: u64, word: u64| (hash ^ word).wrapping_mul(0x0100_0000_01B3).rotate_left(17);
         let layout = &geometry.layout;
-        let layout_hash = [layout.per_vertex as u64, layout.per_invocation as u64, layout.vertex_mask as u64, layout.input_map, layout.slots as u64]
-            .into_iter()
-            .fold(0x6765_6F6D_6574_7279, mix);
+        let fixed_word = layout.fixed.map_or(0, |(fixed, start)| ((fixed as u64) << 32) | start as u64);
+        let layout_hash = [
+            layout.per_vertex as u64,
+            layout.per_invocation as u64,
+            layout.vertex_mask as u64,
+            layout.input_map,
+            fixed_word,
+            layout.slots as u64,
+        ]
+        .into_iter()
+        .fold(0x6765_6F6D_6574_7279, mix);
         let raw = (mix(mix(mix(unit.fingerprint(), geometry.unit.fingerprint()), geometry.unit.entry_point as u64), layout_hash), unit.entry_point, semantics);
         if let Some((last, translation)) = self.last_geometry {
             if last == raw {
@@ -5352,7 +5397,7 @@ impl Hardware {
         let dirty = if len == 0x5dc00 && *SKIP.get_or_init(|| std::env::var_os("ZAKURO_SKIP_SCREEN_SYNC").is_some()) { Vec::new() } else { dirty };
         self.write_back(memory, dirty)?;
         for i in overlapping {
-            self.surfaces[i].checked = true;
+            self.surfaces[i].checked = cfg!(target_os = "horizon");
         }
         Ok(())
     }

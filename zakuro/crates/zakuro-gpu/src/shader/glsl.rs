@@ -83,6 +83,10 @@ pub(crate) struct GeometryLayout {
     pub per_invocation: u32,
     pub vertex_mask: u32,
     pub input_map: u64,
+    /// in fixed-primitive mode (`REG_GS_CONFIG & 0xFF == 2`), `Some((fixed, start))`
+    /// where `fixed` is the number of vertices per primitive and `start` is the
+    /// first geometry float uniform written with their packed outputs.
+    pub fixed: Option<(u32, u32)>,
     pub slots: u32,
 }
 
@@ -90,36 +94,48 @@ impl GeometryLayout {
     /// the vertices one invocation takes, the attributes past its inputs
     /// dropped, as geometry_stage does.
     pub(crate) fn vertices(&self) -> u32 {
-        self.per_invocation.div_ceil(self.per_vertex)
+        match self.fixed {
+            Some((fixed, _)) => fixed,
+            None => self.per_invocation.div_ceil(self.per_vertex),
+        }
     }
 }
 
 /// the vertex slots a geometry program from an entry point needs at most,
 /// three for each completing emit a path through it can run, when its flow
-/// only goes forward (ifs and jumps ahead, so no emit runs twice); none
-/// otherwise, or when it emits nothing or more than 16 triangles.
+/// only goes forward (ifs and jumps ahead, so no emit runs twice), or when
+/// it has a single backward jump loop whose body runs at most 16 times; none
+/// otherwise, or when it emits nothing or more than 32 triangles.
 pub(crate) fn geometry_slots(program: &Program, entry: u32) -> Option<u32> {
     let translator = Translator::new(program, entry).ok()?;
+    let mut back_jump = None;
     for run in translator.runs.values() {
         if let Exit::Flow(at) = run.exit {
             let op = &translator.ops[at as usize];
             let (destination, _) = op.instruction.flow_target();
-            let forward = match op.opcode {
-                OpCode::IfU | OpCode::IfC | OpCode::JmpC | OpCode::JmpU => destination > at,
-                _ => false,
-            };
-            if !forward {
-                return None;
+            match op.opcode {
+                OpCode::IfU | OpCode::IfC | OpCode::JmpC | OpCode::JmpU if destination > at => {}
+                OpCode::JmpC | OpCode::JmpU if destination <= at && back_jump.is_none() => {
+                    back_jump = Some((at, destination));
+                }
+                _ => return None,
             }
         }
     }
     let mut memo = std::collections::HashMap::new();
-    let emits = most_emits(&translator, entry, Vec::new(), false, &mut memo);
-    (1..=16).contains(&emits).then_some(emits * 3)
+    let one_pass = most_emits(&translator, entry, Vec::new(), false, &mut memo);
+    let emits = match back_jump {
+        Some((_, loop_head)) => {
+            let per_iter = most_emits(&translator, loop_head, Vec::new(), false, &mut memo);
+            one_pass + per_iter * 9
+        }
+        None => one_pass,
+    };
+    (1..=32).contains(&emits).then_some(emits * 3)
 }
 
 /// the most completing emits any path from `at` with `open` blocks and
-/// `completes` set by the last setemit can run, when flow only goes forward.
+/// `completes` set by the last setemit can run, without following backward jumps.
 fn most_emits(
     translator: &Translator,
     at: u32,
@@ -157,8 +173,9 @@ fn most_emits(
             let (destination, _) = op.instruction.flow_target();
             let mut ways = follow(op, flow, open);
             if matches!(op.opcode, OpCode::JmpC | OpCode::JmpU) {
-                // a jump at the end of a then branch over the else branch after it
-                if ways[0].1.last().is_some_and(|top| !top.is_loop && top.end == top.back && top.end == flow + 1)
+                if destination <= flow {
+                    ways.retain(|&(next, _)| next > flow);
+                } else if ways[0].1.last().is_some_and(|top| !top.is_loop && top.end == top.back && top.end == flow + 1)
                     && destination > flow + 1
                 {
                     ways.truncate(1);
@@ -206,6 +223,7 @@ pub(crate) fn translate_geometry(
     }
     geometry_code.prefix = "g_";
     geometry_code.geometry = true;
+    geometry_code.fixed = layout.fixed.map(|(fixed, start)| (start, start + fixed * layout.per_vertex));
     let (vertex_run, vertex_flows) = vertex_code.code();
     let (geometry_run, geometry_flows) = geometry_code.code();
 
@@ -218,7 +236,17 @@ pub(crate) fn translate_geometry(
         return Err("the shading block changed".to_owned());
     }
     out.push_str(&header.replace(block_end, "    vec4 defaults[16];\n    vec4 g_floats[96];\n    ivec4 g_integers[4];\n    uvec4 g_flags;\n};"));
-    out.push_str(GEOMETRY_HEADER);
+    if let Some((start, end)) = geometry_code.fixed {
+        let count = end - start;
+        let _ = writeln!(out, "vec4 gs_fixed[{count}];");
+        let _ = writeln!(
+            out,
+            "vec4 g_uniform_at(int index) {{\n    if (index >= {start} && index < {end}) {{\n        return gs_fixed[index - {start}];\n    }}\n    return index >= 0 && index < 96 ? g_floats[index] : vec4(0.0);\n}}\n"
+        );
+        out.push_str(&GEOMETRY_HEADER["vec4 g_uniform_at(int index) {\n    return index >= 0 && index < 96 ? g_floats[index] : vec4(0.0);\n}\n\n".len()..]);
+    } else {
+        out.push_str(GEOMETRY_HEADER);
+    }
     if vertex_flows || geometry_flows {
         out.push_str(BLOCKS);
     }
@@ -261,14 +289,28 @@ pub(crate) fn translate_geometry(
             out.push_str("    blocks = 0;\n");
         }
         out.push_str("    run_vertex();\n");
-        for id in (k * layout.per_vertex)..((k + 1) * layout.per_vertex).min(layout.per_invocation) {
-            let register = (layout.input_map >> (id * 4)) & 0xF;
-            match enabled.get((id % layout.per_vertex) as usize) {
-                Some(output) => {
-                    let _ = writeln!(out, "    gs_in[{register}] = outputs[{output}];");
+        if layout.fixed.is_some() {
+            for i in 0..layout.per_vertex {
+                let slot_idx = k * layout.per_vertex + i;
+                match enabled.get(i as usize) {
+                    Some(output) => {
+                        let _ = writeln!(out, "    gs_fixed[{slot_idx}] = outputs[{output}];");
+                    }
+                    None => {
+                        let _ = writeln!(out, "    gs_fixed[{slot_idx}] = vec4(0.0);");
+                    }
                 }
-                None => {
-                    let _ = writeln!(out, "    gs_in[{register}] = vec4(0.0);");
+            }
+        } else {
+            for id in (k * layout.per_vertex)..((k + 1) * layout.per_vertex).min(layout.per_invocation) {
+                let register = (layout.input_map >> (id * 4)) & 0xF;
+                match enabled.get((id % layout.per_vertex) as usize) {
+                    Some(output) => {
+                        let _ = writeln!(out, "    gs_in[{register}] = outputs[{output}];");
+                    }
+                    None => {
+                        let _ = writeln!(out, "    gs_in[{register}] = vec4(0.0);");
+                    }
                 }
             }
         }
@@ -445,6 +487,9 @@ struct Translator<'a> {
     prefix: &'static str,
     /// whether setemit and emit fill the emitter.
     geometry: bool,
+    /// in fixed-primitive geometry mode, the `[start, end)` uniform range
+    /// redirected to `gs_fixed[uniform - start]`.
+    fixed: Option<(u32, u32)>,
 }
 
 impl<'a> Translator<'a> {
@@ -463,7 +508,7 @@ impl<'a> Translator<'a> {
             })
             .collect();
         let runs = reachable(ops, &starts(ops, entry, flows), entry)?;
-        Ok(Translator { ops, packed: program.inputs, entry, runs, read: 0, prefix: "", geometry: false })
+        Ok(Translator { ops, packed: program.inputs, entry, runs, read: 0, prefix: "", geometry: false, fixed: None })
     }
 
     /// whether anything reachable is a flow instruction, which needs the
@@ -608,7 +653,24 @@ impl Translator<'_> {
         let mut flags = BTreeSet::new();
         let mut body = String::new();
         let mut pending = BTreeSet::new();
-        let cost = self.block(&mut body, self.entry, FINISHED, true, 0, false, 1, &mut emitted, &mut pending, &mut flags)?;
+        let mut back_jump = None;
+        if self.geometry {
+            let mut count = 0usize;
+            for run in self.runs.values() {
+                if let Exit::Flow(at) = run.exit {
+                    let op = &self.ops[at as usize];
+                    let (destination, _) = op.instruction.flow_target();
+                    if matches!(op.opcode, OpCode::JmpC | OpCode::JmpU) && destination <= at {
+                        back_jump = Some((at, destination));
+                        count += 1;
+                    }
+                }
+            }
+            if count > 1 {
+                back_jump = None;
+            }
+        }
+        let cost = self.block(&mut body, self.entry, FINISHED, true, 0, false, 1, &mut emitted, &mut pending, &mut flags, &mut back_jump, None)?;
         if !pending.is_empty() {
             return Err("a jump goes past the program's end".to_owned());
         }
@@ -640,6 +702,8 @@ impl Translator<'_> {
         emitted: &mut usize,
         pending: &mut BTreeSet<u32>,
         flags: &mut BTreeSet<u32>,
+        back_jump: &mut Option<(u32, u32)>,
+        back_exit: Option<u32>,
     ) -> Result<u64, String> {
         use OpCode::*;
         let outer: BTreeSet<u32> = pending.clone();
@@ -667,6 +731,39 @@ impl Translator<'_> {
             }
             if end != FINISHED && at > end {
                 return Err(format!("execution passes the end of a block at {end}"));
+            }
+            if guards.is_empty() {
+                if let Some((jump_at, loop_head)) = *back_jump {
+                    if at == loop_head && (end == FINISHED || jump_at < end) {
+                        *back_jump = None;
+                        let indent = indent_of(level, &guards);
+                        let inner_level = level + 1;
+                        let _ = writeln!(out, "{indent}for (uint back_iter = 0u; back_iter < 64u; back_iter++) {{");
+                        let inner = self.block(
+                            out,
+                            loop_head,
+                            jump_at,
+                            true,
+                            depth + 1,
+                            true,
+                            inner_level,
+                            emitted,
+                            pending,
+                            flags,
+                            back_jump,
+                            Some(jump_at + 1),
+                        )?;
+                        let back_op = self.ops[jump_at as usize];
+                        let taken = taken(&back_op, self.prefix);
+                        let _ = writeln!(out, "{indent}    if (!({taken})) {{");
+                        let _ = writeln!(out, "{indent}        break;");
+                        let _ = writeln!(out, "{indent}    }}");
+                        let _ = writeln!(out, "{indent}}}");
+                        cost += 16 * (inner + 1);
+                        at = jump_at + 1;
+                        continue;
+                    }
+                }
             }
             if at as usize >= PROGRAM_SIZE || at as usize >= self.ops.len() {
                 if end != FINISHED || !guards.is_empty() {
@@ -704,7 +801,7 @@ impl Translator<'_> {
                     }
                     let taken = taken(&op, self.prefix);
                     let _ = writeln!(out, "{indent}if ({taken}) {{");
-                    let inner = self.block(out, destination, destination + count, true, depth + 1, in_loop, inner_level, emitted, pending, flags)?;
+                    let inner = self.block(out, destination, destination + count, true, depth + 1, in_loop, inner_level, emitted, pending, flags, back_jump, back_exit)?;
                     let _ = writeln!(out, "{indent}}}");
                     cost += 1 + inner;
                     at = next;
@@ -720,9 +817,9 @@ impl Translator<'_> {
                     }
                     let taken = taken(&op, self.prefix);
                     let _ = writeln!(out, "{indent}if ({taken}) {{");
-                    let body = self.block(out, next, body_end, true, depth + 1, in_loop, inner_level, emitted, pending, flags)?;
+                    let body = self.block(out, next, body_end, true, depth + 1, in_loop, inner_level, emitted, pending, flags, back_jump, back_exit)?;
                     let _ = writeln!(out, "{indent}}} else {{");
-                    let otherwise = self.block(out, destination, after, true, depth + 1, in_loop, inner_level, emitted, pending, flags)?;
+                    let otherwise = self.block(out, destination, after, true, depth + 1, in_loop, inner_level, emitted, pending, flags, back_jump, back_exit)?;
                     let _ = writeln!(out, "{indent}}}");
                     cost += 1 + body.max(otherwise);
                     at = after;
@@ -732,10 +829,16 @@ impl Translator<'_> {
                         return Err(format!("a jump at {at} goes back"));
                     }
                     let taken = taken(&op, self.prefix);
-                    if end == FINISHED || destination <= end {
+                    if guards.is_empty() && back_exit == Some(destination) {
+                        let _ = writeln!(out, "{indent}if ({taken}) {{");
+                        let _ = writeln!(out, "{indent}    break;");
+                        let _ = writeln!(out, "{indent}}}");
+                        cost += 1;
+                        at = next;
+                    } else if end == FINISHED || destination <= end {
                         // what it skips, run when it is not taken
                         let _ = writeln!(out, "{indent}if (!({taken})) {{");
-                        let skipped = self.block(out, next, destination, false, depth, in_loop, inner_level, emitted, pending, flags)?;
+                        let skipped = self.block(out, next, destination, false, depth, in_loop, inner_level, emitted, pending, flags, back_jump, back_exit)?;
                         let _ = writeln!(out, "{indent}}}");
                         cost += 1 + skipped;
                         at = destination;
@@ -766,7 +869,7 @@ impl Translator<'_> {
                     let _ = writeln!(out, "{indent}    address.z = integer{depth}.y;");
                     let _ = writeln!(out, "{indent}    uint repeat{depth} = uint(integer{depth}.x);");
                     let _ = writeln!(out, "{indent}    for (uint n{depth} = 0u; n{depth} <= repeat{depth}; n{depth}++) {{");
-                    let body = self.block(out, next, destination + 1, true, depth + 1, true, inner_level + 1, emitted, pending, flags)?;
+                    let body = self.block(out, next, destination + 1, true, depth + 1, true, inner_level + 1, emitted, pending, flags, back_jump, None)?;
                     let _ = writeln!(out, "{indent}        address.z += integer{depth}.z;");
                     let _ = writeln!(out, "{indent}    }}");
                     let _ = writeln!(out, "{indent}}}");
@@ -1051,7 +1154,10 @@ impl Translator<'_> {
         } else {
             let uniform = register - 0x20;
             match operand.index {
-                0 => format!("{}floats[{uniform}]", self.prefix),
+                0 => match self.fixed {
+                    Some((start, end)) if uniform >= start && uniform < end => format!("gs_fixed[{}]", uniform - start),
+                    _ => format!("{}floats[{uniform}]", self.prefix),
+                },
                 index => format!("{}uniform_at({uniform} + address.{})", self.prefix, ["x", "y", "z"][(index as usize - 1).min(2)]),
             }
         };
@@ -1637,6 +1743,7 @@ mod tests {
                 per_invocation: 1 + random.below(16),
                 vertex_mask: random.next() & 0xFFFF,
                 input_map: (random.next() as u64) << 32 | random.next() as u64,
+                fixed: None,
                 slots,
             };
             let glsl = translate_geometry(&vertex_unit.prepared().unwrap(), 0, &geometry_program, 0, &layout, &semantics(&mut random)).unwrap();
@@ -1646,8 +1753,9 @@ mod tests {
         }
     }
 
-    /// a geometry program with a loop or a call may emit any number of
-    /// times, and has no slots.
+    /// a geometry program with a hardware loop or a call may emit any number of
+    /// times and has no slots, while a single backward jump loop gets 10
+    /// iterations of slots and compiles without a dispatch switch.
     #[test]
     fn geometry_programs_that_go_back_have_no_slots() {
         let mut random = Random(18);
@@ -1657,6 +1765,28 @@ mod tests {
             let unit = unit(program, 0, &mut random);
             assert_eq!(geometry_slots(&unit.prepared().unwrap(), 0), None);
         }
+        let back_loop = [
+            (0x2C << 26) | (1 << 22) | (4 << 10),
+            (0x2B << 26) | (1 << 23),
+            0x2A << 26,
+            0x2D << 26,
+            0x22 << 26,
+        ];
+        let back_unit = unit(&back_loop, 0, &mut random);
+        let back_prog = back_unit.prepared().unwrap();
+        assert_eq!(geometry_slots(&back_prog, 0), Some(30));
+        let vertex_unit = unit(&[0x22 << 26], 0, &mut random);
+        let layout = GeometryLayout {
+            per_vertex: 2,
+            per_invocation: 4,
+            vertex_mask: 0b11,
+            input_map: 0x3210,
+            fixed: Some((2, 8)),
+            slots: 30,
+        };
+        let glsl = translate_geometry(&vertex_unit.prepared().unwrap(), 0, &back_prog, 0, &layout, &semantics(&mut random)).unwrap();
+        assert!(!glsl.contains("switch (pc)"), "{glsl}");
+        compile(&glsl).unwrap();
     }
 
     /// programs of nothing but arithmetic come out straight, with no

@@ -735,11 +735,11 @@ pub fn run_vertices_mapped<T>(
     outputs
 }
 
-/// runs the vertex shader over inputs, writing mapped outputs directly into an existing slice without allocating.
 thread_local! {
     static JIT_SHADED: std::cell::RefCell<Vec<[Vec4; OUTPUT_REGISTERS]>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// runs the vertex shader over inputs, writing mapped outputs directly into an existing slice without allocating.
 pub fn run_vertices_into<T>(
     unit: &ShaderUnit,
     inputs: &[[Vec4; INPUT_REGISTERS]],
@@ -910,16 +910,17 @@ pub fn geometry_report(unit: &ShaderUnit) -> Option<String> {
     let mut out = String::new();
     #[cfg(feature = "jit")]
     let _ = write!(out, "jit {}; ", jit::report(unit, program));
-    let _ = write!(out, "program {:016X} entry {}, bools 0x{:X}, ints {:?}, flow:", program.fingerprint, unit.entry_point, unit.bool_uniforms, unit.int_uniforms);
+    let _ = write!(out, "program {:016X} entry {}, flow:", program.fingerprint, unit.entry_point);
     for (pc, op) in program.ops.iter().enumerate().skip(unit.entry_point as usize) {
-        let flow = matches!(
-            op.opcode,
-            OpCode::Break | OpCode::BreakC | OpCode::Call | OpCode::CallC | OpCode::CallU | OpCode::IfU | OpCode::IfC
-                | OpCode::Loop | OpCode::Emit | OpCode::SetEmit | OpCode::JmpC | OpCode::JmpU | OpCode::End | OpCode::Unknown(_)
-        );
-        if flow {
-            let (destination, count) = op.instruction.flow_target();
-            let _ = write!(out, " {pc}:{:?}({destination},{count},c{})", op.opcode, op.instruction.raw_condition());
+        let (destination, count) = op.instruction.flow_target();
+        match op.opcode {
+            OpCode::End | OpCode::SetEmit | OpCode::Emit => {
+                let _ = write!(out, " {pc}:{:?}", op.opcode);
+            }
+            OpCode::Loop | OpCode::Call | OpCode::CallU | OpCode::CallC | OpCode::JmpC | OpCode::JmpU | OpCode::IfC | OpCode::IfU | OpCode::Break | OpCode::BreakC => {
+                let _ = write!(out, " {pc}:{:?}({destination},{count})", op.opcode);
+            }
+            _ => {}
         }
         if op.opcode == OpCode::End {
             break;

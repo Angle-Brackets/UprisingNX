@@ -3639,7 +3639,11 @@ pub fn draw<M: GpuMemory>(
         };
         static NO_RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let no_raw = *NO_RAW.get_or_init(|| std::env::var_os("ZAKURO_NO_RAW_INPUTS").is_some());
-        if !no_raw && !is_bottom(registers) && raw_inputs(plan, memory, attribute_base, first, span, &mut scratch.raw) {
+        let allow_bottom = !is_bottom(registers)
+            || (!resources.portraits.in_play
+                && !(on_bottom(registers) && is_portrait(registers))
+                && !(on_bottom(registers) && vertex_count <= 16 && battle_detection()));
+        if !no_raw && allow_bottom && raw_inputs(plan, memory, attribute_base, first, span, &mut scratch.raw) {
             scratch.relative.clear();
             if indexed {
                 // straight from the index buffer, the draw needs its indices
@@ -4214,18 +4218,24 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
         // geometry shader run for each, when the geometry program only
         // goes forward and its translation is made
         if let Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } = vertices {
-            if gpu_geometry() && hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2 && registers[REG_GS_CONFIG] & 0xFF == 0 {
+            let gs_config = registers[REG_GS_CONFIG];
+            let gs_mode = gs_config & 0xFF;
+            if gpu_geometry() && hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2 && (gs_mode == 0 || gs_mode == 2) {
                 let program_key = (geometry_shader.fingerprint(), geometry_shader.entry_point);
                 let slots = *resources.geometry_slots.entry(program_key).or_insert_with(|| {
                     geometry_shader.prepared().and_then(|program| crate::shader::glsl::geometry_slots(&program, geometry_shader.entry_point))
                 });
-                if let Some(slots) = slots {
+                let per_vertex = (registers[REG_VS_OUTPUT_TOTAL] & 0xF) + 1;
+                let fixed = (gs_mode == 2).then(|| (((gs_config >> 8) & 0xF) + 1, (gs_config >> 16) & 0xFF));
+                let fits = fixed.is_none_or(|(count, start)| (start + count * per_vertex) as usize <= shader::FLOAT_UNIFORMS);
+                if let (Some(slots), true) = (slots, fits) {
                     let layout = crate::shader::glsl::GeometryLayout {
-                        per_vertex: (registers[REG_VS_OUTPUT_TOTAL] & 0xF) + 1,
+                        per_vertex,
                         per_invocation: (registers[REG_GS_BLOCK + SHADER_INPUT_CONFIG] & 0xF) + 1,
                         vertex_mask: registers[REG_VS_OUTPUT_MASK] & 0xFFFF,
                         input_map: registers[REG_GS_BLOCK + SHADER_INPUT_MAP_LOW] as u64
                             | (registers[REG_GS_BLOCK + SHADER_INPUT_MAP_HIGH] as u64) << 32,
+                        fixed,
                         slots,
                     };
                     let semantics = semantics_for(registers, registers[REG_GS_BLOCK + SHADER_OUTPUT_MASK]);
@@ -5368,6 +5378,7 @@ mod tests {
         let order: Vec<usize> = (0..6).collect();
         for (k, &pick) in picks.iter().enumerate() {
             unit.float_uniforms[0] = colors[pick];
+            unit.sync_wide_uniforms();
             for (input, &(x, y)) in inputs.iter_mut().zip(&corners(k)) {
                 input[0] = [x, y, -0.5, 1.0];
             }
@@ -6228,6 +6239,75 @@ mod tests {
         eprintln!("{differing} of {drawn} drawn pixels differ");
         assert!(drawn > 500, "{drawn} pixels drawn");
         assert!(differing * 100 < drawn, "{differing} of {drawn} pixels differ");
+
+        // fixed-primitive mode (REG_GS_CONFIG mode 2) with a backward-jump loop
+        let mut fixed_gs = ShaderUnit::new();
+        fixed_gs.descriptors[0] = 0xF | IDENTITY;
+        let fixed_program = [
+            // 0: r0 = c4 (loop counter = 0), 1: r1 = c7 (third corner offset)
+            op(0x13, 0x10, 0x24, 0),
+            op(0x13, 0x11, 0x27, 0),
+            // 2: cmp.x = (c6.x <= r0.x) (mode 3 = LessEqual)
+            (0x2E << 26) | (3 << 24) | (0x26 << 12) | (0x10 << 7),
+            // 3: jmpc cmp.x -> 15 (end)
+            (0x2C << 26) | (1 << 25) | (2 << 22) | (15 << 10),
+            // 4..12: emit triangle from fixed vertices at c8..c11 offset by r0 / r1
+            op(0x13, 1, 0x29, 0),
+            op(0x00, 0, 0x28, 0x10),
+            set_emit(0, 0),
+            emit,
+            op(0x00, 0, 0x2A, 0x10),
+            set_emit(1, 0),
+            emit,
+            op(0x00, 0, 0x28, 0x11),
+            set_emit(2, 1),
+            emit,
+            // 13: r0 = c5 + r0
+            op(0x00, 0x10, 0x25, 0x10),
+            // 14: jmpu !b0 -> 2
+            (0x2D << 26) | (2 << 10) | 1,
+            // 15: end
+            end,
+        ];
+        fixed_gs.program[..fixed_program.len()].copy_from_slice(&fixed_program);
+        fixed_gs.float_uniforms[4] = [0.0, 0.0, 0.0, 0.0];
+        fixed_gs.float_uniforms[5] = [0.25, 0.0, 0.0, 0.0];
+        fixed_gs.float_uniforms[6] = [0.4, 0.0, 0.0, 0.0];
+        fixed_gs.float_uniforms[7] = [0.0, 0.6, 0.0, 0.0];
+        fixed_gs.sync_wide_uniforms();
+        fixed_gs.prepare();
+        registers[REG_GS_CONFIG] = 2 | (1 << 8) | (8 << 16);
+        registers[REG_FACE_CULLING] = 0;
+        let inputs = [
+            [[-0.4, -0.3, -0.2, 1.0], [0.9, 0.2, 0.3, 1.0], shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO],
+            [[0.3, -0.3, -0.2, 1.0], [0.2, 0.8, 0.4, 1.0], shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO],
+            [[-0.2, 0.4, -0.2, 1.0], [0.3, 0.4, 0.9, 1.0], shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO],
+            [[0.4, 0.4, -0.2, 1.0], [0.8, 0.8, 0.2, 1.0], shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO, shader::ZERO],
+        ];
+        let vertices = Vertices::Unshaded { vertex_shader: &vertex, geometry_shader: &fixed_gs, inputs: &inputs, order: None };
+        let mut software = ConsoleMemory::default();
+        let mut gpu = ConsoleMemory::default();
+        for memory in [&mut software, &mut gpu] {
+            memory.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+            memory.write(DEPTH, &vec![0xFFu8; (SIZE * SIZE * 4) as usize]);
+        }
+        rasterize(&registers, &mut software, &mut Resources::default(), vertices);
+        let before = resources.hardware.as_ref().unwrap().geometry_draws;
+        rasterize(&registers, &mut gpu, &mut resources, vertices);
+        assert_eq!(resources.hardware.as_ref().unwrap().geometry_draws, before + 1, "fixed-primitive loop went to the CPU");
+        resources.hardware.as_mut().unwrap().flush(&mut gpu).unwrap();
+        let (mut fixed_diff, mut fixed_drawn) = (0, 0);
+        for i in 0..SIZE * SIZE {
+            let (mut a, mut b) = ([0u8; 4], [0u8; 4]);
+            software.read(COLOR + i * 4, &mut a);
+            gpu.read(COLOR + i * 4, &mut b);
+            fixed_drawn += (a != [0; 4]) as u32;
+            if a.iter().zip(&b).any(|(a, b)| a.abs_diff(*b) > 3) {
+                fixed_diff += 1;
+            }
+        }
+        assert!(fixed_drawn > 20, "{fixed_drawn} fixed-primitive pixels drawn");
+        assert!(fixed_diff * 50 < fixed_drawn, "{fixed_diff} of {fixed_drawn} fixed-primitive pixels differ");
     }
 
     /// guest memory with a stretch of it in one piece, from the linear
