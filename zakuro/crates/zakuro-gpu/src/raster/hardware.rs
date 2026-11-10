@@ -1019,10 +1019,6 @@ pub(crate) struct Dynamic {
     pub(crate) libraries: bool,
 }
 
-/// every generic pipeline a draw can need when the blend state is dynamic,
-/// with the vertex stages that draws have.
-/// pipelines noted before the list on disk grows by them.
-const KEYS_WRITTEN_TOGETHER: usize = 16;
 /// a key on disk: the blend register and whether it blends, the logic op
 /// as one more than its number or none, depth, the vertex stage, the write
 /// mask, then the fragment constants, all little endian.
@@ -1312,6 +1308,8 @@ struct Queue {
     translations: VecDeque<Job>,
     generic: VecDeque<Job>,
     compiles: Vec<Job>,
+    new_keys: Vec<u8>,
+    new_translated_keys: Vec<u8>,
     stopped: bool,
     /// pipelines compiled since the cache was last kept on disk, and when
     /// that was, which a thread with nothing else to do sees to.
@@ -1352,6 +1350,8 @@ impl Compiler {
             translations: VecDeque::new(),
             generic: VecDeque::new(),
             compiles: Vec::new(),
+            new_keys: Vec::new(),
+            new_translated_keys: Vec::new(),
             stopped: false,
             compiled: 0,
             saved: std::time::Instant::now(),
@@ -1416,25 +1416,63 @@ impl Compiler {
         None
     }
 
+    /// queues pipeline key bytes for the threads to append to disk when idle.
+    fn remember(&self, bytes: &[u8], translated: &[u8]) -> bool {
+        if self.threads.is_empty() {
+            return false;
+        }
+        let (queue, ready) = &*self.queue;
+        let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
+        waiting.new_keys.extend_from_slice(bytes);
+        waiting.new_translated_keys.extend_from_slice(translated);
+        ready.notify_one();
+        true
+    }
+
     /// waits for the jobs the threads are on and drops the rest, giving
     /// back the pipelines they made that no one took.
-    fn finish(&mut self) -> Vec<vk::Pipeline> {
+    fn finish(&mut self, kept: Option<&std::path::Path>) -> Vec<vk::Pipeline> {
         let (queue, ready) = &*self.queue;
         let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
         waiting.stopped = true;
         waiting.translations.clear();
         waiting.generic.clear();
         waiting.compiles.clear();
+        let bytes = std::mem::take(&mut waiting.new_keys);
+        let translated = std::mem::take(&mut waiting.new_translated_keys);
         ready.notify_all();
         drop(waiting);
         for thread in self.threads.drain(..) {
             let _ = thread.join();
+        }
+        if let Some(path) = kept {
+            flush_keys(path, &bytes, &translated);
         }
         let made = self.made.try_iter().filter_map(|made| match made {
             Made::Compiled(_, Ok(pipeline)) => Some(pipeline),
             _ => None,
         });
         made.collect()
+    }
+}
+
+/// appends newly noted pipeline keys to the lists beside the cache on disk.
+fn flush_keys(cache: &std::path::Path, bytes: &[u8], translated: &[u8]) {
+    for (path, slice) in [(keys_path(cache), bytes), (translated_keys_path(cache), translated)] {
+        if slice.is_empty() {
+            continue;
+        }
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(&path))
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(slice)
+            });
+        if let Err(error) = written {
+            log::warn!("could not keep the pipelines used in {}, {error}", path.display());
+        }
     }
 }
 
@@ -1465,6 +1503,16 @@ fn compile(
                 waiting.translations.pop_front().or_else(|| waiting.generic.pop_front()).or_else(|| waiting.compiles.pop())
             {
                 break job;
+            }
+            if !waiting.new_keys.is_empty() || !waiting.new_translated_keys.is_empty() {
+                let bytes = std::mem::take(&mut waiting.new_keys);
+                let translated = std::mem::take(&mut waiting.new_translated_keys);
+                drop(waiting);
+                if let Some(path) = kept {
+                    flush_keys(path, &bytes, &translated);
+                }
+                waiting = lock();
+                continue;
             }
             if waiting.compiled == 0 {
                 waiting = ready.wait(waiting).unwrap_or_else(PoisonError::into_inner);
@@ -2139,10 +2187,8 @@ pub struct Hardware {
     /// the file they are kept in, none for nowhere.
     kept_pipelines: Option<Arc<std::path::Path>>,
     /// the keys of the pipelines the title used, kept beside them so the
-    /// next run makes them all while it starts rather than as it plays,
-    /// and those not written there yet.
+    /// next run makes them all while it starts rather than as it plays.
     known_keys: std::collections::HashSet<PipelineKey>,
-    new_keys: Vec<PipelineKey>,
 }
 
 impl Hardware {
@@ -2408,7 +2454,6 @@ impl Hardware {
                 libraries,
                 kept_pipelines,
                 known_keys: std::collections::HashSet::new(),
-                new_keys: Vec::new(),
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
@@ -2470,7 +2515,16 @@ impl Hardware {
                 }
                 let mut translated = 0;
                 for (key, program) in read_translated_keys(&cache) {
-                    if let Some(&Translation::Done(module)) = hardware.translated.get(&program) {
+                    let matched = hardware.translated.get(&program).copied().or_else(|| {
+                        (program.2[21] == MISSING).then(|| {
+                            hardware
+                                .translated
+                                .iter()
+                                .find(|((fp, ep, sems), _)| *fp == program.0 && *ep == program.1 && sems[..21] == program.2[..21])
+                                .map(|(_, &translation)| translation)
+                        })?
+                    });
+                    if let Some(Translation::Done(module)) = matched {
                         used.push(PipelineKey { vertex: VertexStage::Translated(module), ..key });
                         translated += 1;
                     }
@@ -3833,7 +3887,7 @@ impl Hardware {
     }
 
     /// notes a pipeline the title used for the list kept beside the cache,
-    /// writing the list out now and then, a few at a time.
+    /// handing its bytes to the compiler threads to write out when idle.
     fn remember(&mut self, key: PipelineKey) {
         let keepable = match key.vertex {
             VertexStage::Translated(module) => self.program_of.contains_key(&module),
@@ -3842,45 +3896,23 @@ impl Hardware {
         if !keepable || !self.known_keys.insert(key) {
             return;
         }
-        self.new_keys.push(key);
-        if self.new_keys.len() >= KEYS_WRITTEN_TOGETHER {
-            self.write_keys();
-        }
-    }
-
-    /// adds the pipelines noted since last time to the list on disk.
-    fn write_keys(&mut self) {
-        let Some(path) = self.kept_pipelines.as_deref().map(keys_path) else { return };
-        if self.new_keys.is_empty() {
-            return;
-        }
-        let translated_path = self.kept_pipelines.as_deref().map(translated_keys_path).unwrap();
-        let (mut bytes, mut translated) = (Vec::new(), Vec::new());
-        for key in self.new_keys.drain(..) {
-            match key.vertex {
-                VertexStage::Translated(module) => {
-                    if let Some(program) = self.program_of.get(&module) {
-                        translated.extend_from_slice(&key_bytes_as(&key, 2));
-                        translated.extend_from_slice(&program_key_bytes(program));
+        let Some(kept) = self.kept_pipelines.as_deref() else { return };
+        match key.vertex {
+            VertexStage::Translated(module) => {
+                let Some(program) = self.program_of.get(&module) else { return };
+                let mut record = [0u8; KEY_BYTES + PROGRAM_KEY_BYTES];
+                record[..KEY_BYTES].copy_from_slice(&key_bytes_as(&key, 2));
+                record[KEY_BYTES..].copy_from_slice(&program_key_bytes(program));
+                if !self.compiler.remember(&[], &record) {
+                    flush_keys(kept, &[], &record);
+                }
+            }
+            _ => {
+                if let Some(bytes) = key_bytes(&key) {
+                    if !self.compiler.remember(&bytes, &[]) {
+                        flush_keys(kept, &bytes, &[]);
                     }
                 }
-                _ => bytes.extend(key_bytes(&key).into_iter().flatten()),
-            }
-        }
-        for (path, bytes) in [(path, bytes), (translated_path, translated)] {
-            if bytes.is_empty() {
-                continue;
-            }
-            let written = path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(&path))
-                .and_then(|mut file| {
-                    use std::io::Write;
-                    file.write_all(&bytes)
-                });
-            if let Err(error) = written {
-                log::warn!("could not keep the pipelines used in {}, {error}", path.display());
             }
         }
     }
@@ -6902,14 +6934,13 @@ pub(crate) fn format_index(format: ColorFormat) -> i32 {
 impl Drop for Hardware {
     fn drop(&mut self) {
         // the compiler first, it uses the cache, the layout and the modules
-        let unclaimed = self.compiler.finish();
+        let unclaimed = self.compiler.finish(self.kept_pipelines.as_deref());
         // SAFETY: waits for the GPU before anything it uses goes
         unsafe {
             let _ = self.device.device_wait_idle();
             if let Some(path) = &self.kept_pipelines {
                 save_pipeline_cache(&self.device, self.pipeline_cache, path);
             }
-            self.write_keys();
             self.device.destroy_pipeline_cache(self.pipeline_cache, None);
             for texture in self.textures.values() {
                 self.destroy_image(&texture.image);
