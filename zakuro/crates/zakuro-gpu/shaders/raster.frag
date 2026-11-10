@@ -6,7 +6,7 @@
 
 layout(location = 0) in vec4 in_color;
 layout(location = 1) in vec4 in_texcoords01;
-layout(location = 2) in vec2 in_texcoord2;
+layout(location = 2) in vec3 in_texcoord2;
 layout(location = 3) noperspective in float in_depth;
 layout(location = 4) in vec4 in_quaternion;
 layout(location = 5) in vec3 in_view;
@@ -695,18 +695,22 @@ void main() {
     // set 1 instead of its own
     uint texture_config = DYNAMIC != 0u ? (misc.w & 0x2307u) | (TEXTURE_CONFIG & 0x400u) : TEXTURE_CONFIG;
     vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
+    vec2 uv0 = in_texcoords01.xy;
+    if (((units[0].x >> 28) & 7u) == 3u && in_texcoord2.z != 0.0) {
+        uv0 /= in_texcoord2.z;
+    }
     if ((texture_config & 1u) != 0u) {
-        textures[0] = sample_unit(0u, in_texcoords01.xy);
+        textures[0] = sample_unit(0u, uv0);
     }
     if ((texture_config & 2u) != 0u) {
         textures[1] = sample_unit(1u, in_texcoords01.zw);
     }
     if ((texture_config & 4u) != 0u) {
-        textures[2] = sample_unit(2u, (texture_config & (1u << 13)) != 0u ? in_texcoords01.zw : in_texcoord2);
+        textures[2] = sample_unit(2u, (texture_config & (1u << 13)) != 0u ? in_texcoords01.zw : in_texcoord2.xy);
     }
     if ((texture_config & (1u << 10)) != 0u) {
         uint set = min((texture_config >> 8) & 3u, 2u);
-        textures[3] = procedural(set == 0u ? in_texcoords01.xy : (set == 1u ? in_texcoords01.zw : in_texcoord2));
+        textures[3] = procedural(set == 0u ? uv0 : (set == 1u ? in_texcoords01.zw : in_texcoord2.xy));
     }
 
     // without fragment lighting the primary fragment color is the vertex

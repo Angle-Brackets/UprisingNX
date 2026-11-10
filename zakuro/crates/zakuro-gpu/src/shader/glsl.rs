@@ -231,7 +231,7 @@ pub(crate) fn translate_geometry(
     let _ = writeln!(out, "    chosen_position = vec4({});", vector(0..4, "0.0"));
     let _ = writeln!(out, "    chosen_color = vec4({});", vector(4..8, "1.0"));
     let _ = writeln!(out, "    chosen_texcoords01 = vec4({});", vector(8..12, "0.0"));
-    let _ = writeln!(out, "    chosen_texcoord2 = vec2({});", vector(12..14, "0.0"));
+    let _ = writeln!(out, "    chosen_texcoord2 = vec3({}, {});", vector(12..14, "0.0"), component(21, "1.0"));
     let _ = writeln!(out, "    chosen_quaternion = vec4({});", vector(14..18, "0.0"));
     let _ = writeln!(out, "    chosen_view = vec3({});", vector(18..21, "0.0"));
     out.push_str("}\n\n");
@@ -311,7 +311,7 @@ bool found;
 vec4 chosen_position;
 vec4 chosen_color;
 vec4 chosen_texcoords01;
-vec2 chosen_texcoord2;
+vec3 chosen_texcoord2;
 vec4 chosen_quaternion;
 vec3 chosen_view;
 
@@ -340,7 +340,7 @@ const GEOMETRY_EPILOGUE: &str = r#"    if (!found) {
         chosen_position = vec4(0.0, 0.0, 0.0, 1.0);
         chosen_color = vec4(0.0);
         chosen_texcoords01 = vec4(0.0);
-        chosen_texcoord2 = vec2(0.0);
+        chosen_texcoord2 = vec3(0.0, 0.0, 1.0);
         chosen_quaternion = vec4(0.0);
         chosen_view = vec3(0.0);
     }
@@ -498,7 +498,7 @@ impl<'a> Translator<'a> {
         out.push_str(EPILOGUE);
         let _ = writeln!(out, "    out_color = vec4({});", vector(4..8, "1.0"));
         let _ = writeln!(out, "    out_texcoords01 = vec4({});", vector(8..12, "0.0"));
-        let _ = writeln!(out, "    out_texcoord2 = vec2({});", vector(12..14, "0.0"));
+        let _ = writeln!(out, "    out_texcoord2 = vec3({}, {});", vector(12..14, "0.0"), component(21, "1.0"));
         out.push_str("    out_depth = position.z / position.w * depth_map.x + depth_map.y;\n");
         let _ = writeln!(out, "    out_quaternion = vec4({});", vector(14..18, "0.0"));
         let _ = writeln!(out, "    out_view = vec3({});", vector(18..21, "0.0"));
@@ -1304,7 +1304,7 @@ const HEADER: &str = r#"#version 450
 
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_texcoords01;
-layout(location = 2) out vec2 out_texcoord2;
+layout(location = 2) out vec3 out_texcoord2;
 layout(location = 3) noperspective out float out_depth;
 layout(location = 4) out vec4 out_quaternion;
 layout(location = 5) out vec3 out_view;

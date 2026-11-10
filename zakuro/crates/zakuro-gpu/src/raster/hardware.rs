@@ -1874,11 +1874,11 @@ impl Libraries {
             if let Some(&library) = parts.0.get(&part) {
                 return Ok(library);
             }
+            if !wait {
+                return Err("part not made yet".to_owned());
+            }
             if !parts.1.contains(&part) {
                 break;
-            }
-            if !wait {
-                return Err("another thread is making it".to_owned());
             }
             parts = self.made.wait(parts).unwrap_or_else(PoisonError::into_inner);
         }
@@ -4217,7 +4217,7 @@ impl Hardware {
                 v.texcoords[0][0], if flip & 1 != 0 { 1.0 - v.texcoords[0][1] } else { v.texcoords[0][1] },
                 v.texcoords[1][0], if flip & 2 != 0 { 1.0 - v.texcoords[1][1] } else { v.texcoords[1][1] },
                 v.texcoords[2][0], if flip & 4 != 0 { 1.0 - v.texcoords[2][1] } else { v.texcoords[2][1] },
-                depth, 0.0,
+                depth, v.texcoord0_w,
                 v.quaternion[0], v.quaternion[1], v.quaternion[2], v.quaternion[3],
                 v.view[0], v.view[1], v.view[2], 0.0,
             ]
