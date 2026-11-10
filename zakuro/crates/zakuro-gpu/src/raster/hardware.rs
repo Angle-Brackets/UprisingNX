@@ -15,7 +15,7 @@
 //! buffer meanwhile, so the CPU rarely waits for the GPU.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
 use std::thread;
@@ -617,6 +617,18 @@ pub(crate) fn pipeline_cache(title: u64) -> Option<std::path::PathBuf> {
         return None;
     }
     if cfg!(target_os = "horizon") {
+        // ZAKURO_COLD_PIPELINES: a cache of its own, emptied at start, so
+        // every scene is new to the driver (measuring) and the kept one
+        // stays as it was
+        if std::env::var_os("ZAKURO_COLD_PIPELINES").is_some() {
+            static EMPTIED: std::sync::Once = std::sync::Once::new();
+            let dir = "sdmc:/switch/uprisingnx/data/cache/cold";
+            EMPTIED.call_once(|| {
+                let _ = std::fs::remove_dir_all(dir);
+                log::info!(target: "zakuro_gpu::pipelines", "pipelines from cold: {dir} emptied");
+            });
+            return Some(std::path::PathBuf::from(format!("{dir}/{title:016X}.bin")));
+        }
         return Some(std::path::PathBuf::from(format!("sdmc:/switch/uprisingnx/data/cache/pipelines/{title:016X}.bin")));
     }
     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(std::path::PathBuf::from);
@@ -1002,6 +1014,8 @@ pub(crate) struct Dynamic {
     pub(crate) blend: bool,
     /// the logic op on or off, and which.
     pub(crate) logic_op: bool,
+    /// pipelines linked from libraries made apart, see Libraries.
+    pub(crate) libraries: bool,
 }
 
 /// every generic pipeline a draw can need when the blend state is dynamic,
@@ -1331,6 +1345,7 @@ impl Compiler {
         fragments: [vk::ShaderModule; 2],
         dynamic: Dynamic,
         depth_format: vk::Format,
+        libraries: Option<Arc<Libraries>>,
     ) -> Compiler {
         let waiting = Queue {
             translations: VecDeque::new(),
@@ -1348,11 +1363,19 @@ impl Compiler {
             thread::available_parallelism().map_or(1, |cores| cores.get().saturating_sub(2).clamp(1, 3))
         };
         let threads = (0..count)
-            .map_while(|_| {
+            .map_while(|index| {
                 let (jobs, sent, device, kept) = (queue.clone(), sent.clone(), device.clone(), kept.clone());
+                let libraries = libraries.clone();
                 thread::Builder::new()
                     .name("shader compiler".into())
-                    .spawn(move || compile(&jobs, &sent, &device, cache, kept.as_deref(), layout, fragments, dynamic, depth_format))
+                    .spawn(move || {
+                        // the frontend puts it where cores are idle: at the
+                        // priority of the threads drawing, it waited seconds
+                        // for them, pipelines a tenth of a second's work
+                        crate::thread_role("compiler", index);
+                        let libraries = libraries.as_deref();
+                        compile(&jobs, &sent, &device, cache, kept.as_deref(), layout, fragments, dynamic, depth_format, libraries)
+                    })
                     .ok()
             })
             .collect();
@@ -1422,6 +1445,7 @@ fn compile(
     fragments: [vk::ShaderModule; 2],
     dynamic: Dynamic,
     depth_format: vk::Format,
+    libraries: Option<&Libraries>,
 ) {
     let (queue, ready) = jobs;
     let lock = || queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1452,7 +1476,7 @@ fn compile(
         };
         drop(waiting);
         let compiles = matches!(job, Job::Compile(..));
-        let made = work(job, device, cache, layout, fragments, dynamic, depth_format);
+        let made = work(job, device, cache, layout, fragments, dynamic, depth_format, libraries);
         lock().compiled += compiles as usize;
         if sent.send(made).is_err() {
             return;
@@ -1470,6 +1494,7 @@ fn work(
     fragments: [vk::ShaderModule; 2],
     dynamic: Dynamic,
     depth_format: vk::Format,
+    libraries: Option<&Libraries>,
 ) -> Made {
     let started = std::time::Instant::now();
     match job {
@@ -1539,14 +1564,51 @@ fn work(
         }
         Job::Compile(key, module) => {
             let modules = [module, fragment_module(fragments, &key)];
-            let made = compile_pipeline(device, cache, layout, modules, &key, vk::PipelineCreateFlags::empty(), dynamic, depth_format);
-            log::debug!(
-                target: "zakuro_gpu::pipelines",
-                "compiled a pipeline while drawing went on, in {:.1} ms",
-                started.elapsed().as_secs_f64() * 1000.0
-            );
+            let flags = vk::PipelineCreateFlags::empty();
+            let made = build_pipeline(device, cache, layout, modules, &key, flags, dynamic, depth_format, libraries);
+            let took = started.elapsed();
+            if took.as_millis() > 250 {
+                log::info!(
+                    target: "zakuro_gpu::pipelines",
+                    "slow compile: {} ms, {} vertex stage, lit {}, blend {}, logic op {}",
+                    took.as_millis(),
+                    match key.vertex {
+                        VertexStage::Translated(_) => "translated",
+                        VertexStage::Placed => "placed",
+                        _ => "other",
+                    },
+                    key.fragment[30] != 0,
+                    key.blend.is_some(),
+                    key.logic_op.is_some(),
+                );
+            }
+            note_compile(took, matches!(key.vertex, VertexStage::Translated(_)));
             Made::Compiled(key, made)
         }
+    }
+}
+
+/// how long pipelines take to compile, logged every 25 of them: the count,
+/// the mean and the slowest, and how many took over 100 ms (a miss in the
+/// driver's cache rather than a hit), with translated vertex stages apart.
+fn note_compile(took: std::time::Duration, translated: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    let at = if translated { 4 } else { 0 };
+    let micros = took.as_micros() as u64;
+    let count = STATS[at].fetch_add(1, Relaxed) + 1;
+    STATS[at + 1].fetch_add(micros, Relaxed);
+    STATS[at + 2].fetch_max(micros, Relaxed);
+    STATS[at + 3].fetch_add((micros > 100_000) as u64, Relaxed);
+    if count % 25 == 0 {
+        let [count, total, most, slow] = [0, 1, 2, 3].map(|i| STATS[at + i].swap(0, Relaxed));
+        log::info!(
+            target: "zakuro_gpu::pipelines",
+            "compile times, {count} {} pipelines: mean {:.1} ms, slowest {:.1} ms, {slow} over 100 ms",
+            if translated { "translated" } else { "interpreted" },
+            total as f64 / count as f64 / 1000.0,
+            most as f64 / 1000.0,
+        );
     }
 }
 
@@ -1582,18 +1644,35 @@ fn compile_pipeline(
     device: &ash::Device,
     cache: vk::PipelineCache,
     layout: vk::PipelineLayout,
+    modules: [vk::ShaderModule; 2],
+    key: &PipelineKey,
+    flags: vk::PipelineCreateFlags,
+    dynamic: Dynamic,
+    depth_format: vk::Format,
+) -> Result<vk::Pipeline, String> {
+    make_pipeline(device, cache, layout, modules, key, flags, dynamic, depth_format, None)
+}
+
+/// a pipeline for a key as compile_pipeline makes it, or one part of it
+/// alone, a pipeline library, when part says which.
+#[allow(clippy::too_many_arguments)]
+fn make_pipeline(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
     [vertex, fragment]: [vk::ShaderModule; 2],
     key: &PipelineKey,
     flags: vk::PipelineCreateFlags,
     dynamic: Dynamic,
     depth_format: vk::Format,
+    part: Option<vk::GraphicsPipelineLibraryFlagsEXT>,
 ) -> Result<vk::Pipeline, String> {
     let entries: Vec<vk::SpecializationMapEntry> = (0..FRAGMENT_CONSTANTS as u32)
         .map(|id| vk::SpecializationMapEntry::default().constant_id(id).offset(id * 4).size(4))
         .collect();
     let constants: Vec<u8> = key.fragment.iter().flat_map(|value| value.to_le_bytes()).collect();
     let specialization = vk::SpecializationInfo::default().map_entries(&entries).data(&constants);
-    let stages = [
+    let all_stages = [
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
             .module(vertex)
@@ -1604,6 +1683,13 @@ fn compile_pipeline(
             .name(c"main")
             .specialization_info(&specialization),
     ];
+    // a library has the stage of its part, if any
+    let stages = match part {
+        None => &all_stages[..],
+        Some(part) if part == vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS => &all_stages[..1],
+        Some(part) if part == vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER => &all_stages[1..],
+        Some(_) => &[],
+    };
     let bindings = [vk::VertexInputBindingDescription::default()
         .binding(0)
         .stride(VERTEX_SIZE as u32)
@@ -1688,9 +1774,10 @@ fn compile_pipeline(
         .color_attachment_formats(&color_formats)
         .depth_attachment_format(depth_format)
         .stencil_attachment_format(depth_format);
-    let info = vk::GraphicsPipelineCreateInfo::default()
-        .flags(flags)
-        .stages(&stages)
+    let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(part.unwrap_or_default());
+    let mut info = vk::GraphicsPipelineCreateInfo::default()
+        .flags(if part.is_some() { flags | vk::PipelineCreateFlags::LIBRARY_KHR } else { flags })
+        .stages(stages)
         .vertex_input_state(&vertex_input)
         .input_assembly_state(&assembly)
         .viewport_state(&viewport)
@@ -1701,11 +1788,165 @@ fn compile_pipeline(
         .dynamic_state(&dynamic)
         .layout(layout)
         .push_next(&mut rendering);
+    if part.is_some() {
+        info = info.push_next(&mut library);
+    }
     // SAFETY: every state the create info points at lives until it
     // returns
     unsafe { device.create_graphics_pipelines(cache, &[info], None) }
         .map(|pipelines| pipelines[0])
         .map_err(|(_, error)| format!("could not create a pipeline, {error}"))
+}
+
+/// a pipeline made of four libraries, VK_EXT_graphics_pipeline_library,
+/// each kept: the vertex input, the vertex stage, the fragment stage and
+/// the blending. the driver compiles a vertex and a fragment shader
+/// together for a pipeline made whole, seconds for these on the console's
+/// CPU and again for each pairing of the two; made apart, each is compiled
+/// once, and a pairing is a link of them, a fraction of a millisecond.
+#[derive(Default)]
+pub(crate) struct Libraries {
+    /// the parts made, and those a thread is making.
+    parts: Mutex<(HashMap<Part, vk::Pipeline>, HashSet<Part>)>,
+    made: Condvar,
+}
+
+/// a part of a pipeline, by what decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Part {
+    /// whether the vertices come placed, from a vertex buffer.
+    Input(bool),
+    /// the vertex shader, and whether its vertices come placed, which
+    /// clamps depth.
+    Vertex(vk::ShaderModule, bool),
+    /// the fragment shader, its constants, and whether there is depth.
+    Fragment(vk::ShaderModule, [u32; FRAGMENT_CONSTANTS], bool),
+    /// blending, the logic op, the write mask, and whether there is depth.
+    Output(Option<u32>, Option<LogicOp>, u32, bool),
+}
+
+impl Part {
+    fn flag(&self) -> vk::GraphicsPipelineLibraryFlagsEXT {
+        match self {
+            Part::Input(_) => vk::GraphicsPipelineLibraryFlagsEXT::VERTEX_INPUT_INTERFACE,
+            Part::Vertex(..) => vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS,
+            Part::Fragment(..) => vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER,
+            Part::Output(..) => vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_OUTPUT_INTERFACE,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Part::Input(_) => "vertex input",
+            Part::Vertex(..) => "vertex stage",
+            Part::Fragment(..) => "fragment stage",
+            Part::Output(..) => "blending",
+        }
+    }
+
+    /// the four parts of the pipeline for a key.
+    fn of(key: &PipelineKey, [vertex, fragment]: [vk::ShaderModule; 2], dynamic: Dynamic) -> [Part; 4] {
+        let placed = key.vertex == VertexStage::Placed;
+        // state the draws set as they go is left out, sharing the part
+        let (blend, mask) = if dynamic.blend { (None, 0xF) } else { (key.blend, key.mask) };
+        let logic_op = if dynamic.logic_op { None } else { key.logic_op };
+        [
+            Part::Input(placed),
+            Part::Vertex(vertex, placed),
+            Part::Fragment(fragment, key.fragment, key.depth),
+            Part::Output(blend, logic_op, mask, key.depth),
+        ]
+    }
+}
+
+impl Libraries {
+    /// a part, made unless a thread made it before. one making it now is
+    /// waited for when wait, else it is an error.
+    fn part(
+        &self,
+        part: Part,
+        wait: bool,
+        make: impl FnOnce() -> Result<vk::Pipeline, String>,
+    ) -> Result<vk::Pipeline, String> {
+        let lock = || self.parts.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut parts = lock();
+        loop {
+            if let Some(&library) = parts.0.get(&part) {
+                return Ok(library);
+            }
+            if !parts.1.contains(&part) {
+                break;
+            }
+            if !wait {
+                return Err("another thread is making it".to_owned());
+            }
+            parts = self.made.wait(parts).unwrap_or_else(PoisonError::into_inner);
+        }
+        parts.1.insert(part);
+        drop(parts);
+        let made = make();
+        let mut parts = lock();
+        parts.1.remove(&part);
+        if let Ok(library) = made {
+            parts.0.insert(part, library);
+        }
+        self.made.notify_all();
+        made
+    }
+
+    /// destroys every part, once no pipeline linked from them is left.
+    ///
+    /// SAFETY: the caller destroyed those.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        let mut parts = self.parts.lock().unwrap_or_else(PoisonError::into_inner);
+        for (_, library) in parts.0.drain() {
+            device.destroy_pipeline(library, None);
+        }
+    }
+}
+
+/// a pipeline for a key: the whole one the cache on disk kept from before
+/// when it has it, else linked from the libraries, making those it lacks,
+/// or with no libraries compiled whole. with FAIL_ON_PIPELINE_COMPILE_REQUIRED
+/// in flags, nothing that needs compiling is made, which is an error.
+#[allow(clippy::too_many_arguments)]
+fn build_pipeline(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
+    modules: [vk::ShaderModule; 2],
+    key: &PipelineKey,
+    flags: vk::PipelineCreateFlags,
+    dynamic: Dynamic,
+    depth_format: vk::Format,
+    libraries: Option<&Libraries>,
+) -> Result<vk::Pipeline, String> {
+    let Some(libraries) = libraries else {
+        return compile_pipeline(device, cache, layout, modules, key, flags, dynamic, depth_format);
+    };
+    let fail = vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
+    if let Ok(pipeline) = compile_pipeline(device, cache, layout, modules, key, flags | fail, dynamic, depth_format) {
+        return Ok(pipeline);
+    }
+    let only_kept = flags.contains(fail);
+    let mut made = [vk::Pipeline::null(); 4];
+    for (made, part) in made.iter_mut().zip(Part::of(key, modules, dynamic)) {
+        *made = libraries.part(part, !only_kept, || {
+            let started = std::time::Instant::now();
+            let library = make_pipeline(device, cache, layout, modules, key, flags, dynamic, depth_format, Some(part.flag()));
+            let took = started.elapsed();
+            if library.is_ok() && took.as_millis() > 250 {
+                log::info!(target: "zakuro_gpu::pipelines", "slow library: {} ms for the {}", took.as_millis(), part.name());
+            }
+            library
+        })?;
+    }
+    let mut linked = vk::PipelineLibraryCreateInfoKHR::default().libraries(&made);
+    let info = vk::GraphicsPipelineCreateInfo::default().flags(flags & !fail).layout(layout).push_next(&mut linked);
+    // SAFETY: the libraries live until every pipeline is destroyed
+    unsafe { device.create_graphics_pipelines(cache, &[info], None) }
+        .map(|pipelines| pipelines[0])
+        .map_err(|(_, error)| format!("could not link a pipeline, {error}"))
 }
 
 pub struct Hardware {
@@ -1754,6 +1995,9 @@ pub struct Hardware {
     last_geometry: Option<(ProgramKey, Translation)>,
     /// the draws with a geometry shader drawn here rather than on the CPU.
     pub(super) geometry_draws: u64,
+    /// the pipelines draws stood in for with the generic one, since when,
+    /// and whether that went on long enough to be told (diagnostics).
+    stand_ins: std::collections::HashMap<PipelineKey, (std::time::Instant, bool)>,
     /// the modules made, by their source, which programs differing only in
     /// words they never run share, and so their pipelines.
     modules: HashMap<String, vk::ShaderModule>,
@@ -1884,6 +2128,8 @@ pub struct Hardware {
     /// the pipelines compiled before, kept on disk between runs, so a
     /// combination of fragment stages seen once does not stall again.
     pipeline_cache: vk::PipelineCache,
+    /// the parts pipelines are linked from, when the device does that.
+    libraries: Option<Arc<Libraries>>,
     /// the file they are kept in, none for nowhere.
     kept_pipelines: Option<Arc<std::path::Path>>,
     /// the keys of the pipelines the title used, kept beside them so the
@@ -2011,7 +2257,9 @@ impl Hardware {
                 .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
                 .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
                 .map_err(vk_error("create a pipeline cache"))?;
-            let compiler = Compiler::start(device.clone(), pipeline_cache, kept_pipelines.clone(), layout, [fragment_shader, depth_fragment_shader], dynamic, depth_format);
+            let libraries = dynamic.libraries.then(|| Arc::new(Libraries::default()));
+            let fragments = [fragment_shader, depth_fragment_shader];
+            let compiler = Compiler::start(device.clone(), pipeline_cache, kept_pipelines.clone(), layout, fragments, dynamic, depth_format, libraries.clone());
             let blend_state = dynamic.blend.then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device));
             let logic_op_state = dynamic.logic_op.then(|| ash::ext::extended_dynamic_state2::Device::new(&instance, &device));
             let mut hardware = Hardware {
@@ -2055,6 +2303,7 @@ impl Hardware {
                 last_translation: None,
                 last_geometry: None,
                 geometry_draws: 0,
+                stand_ins: Default::default(),
                 modules: HashMap::new(),
                 program_of: HashMap::new(),
                 // to draw through the pipeline made for each draw from the
@@ -2150,6 +2399,7 @@ impl Hardware {
                 vertex_scratch: Vec::new(),
                 flip_v: 0,
                 pipeline_cache,
+                libraries,
                 kept_pipelines,
                 known_keys: std::collections::HashSet::new(),
                 new_keys: Vec::new(),
@@ -3541,7 +3791,7 @@ impl Hardware {
         }
         let modules = [self.vertex_module(key.vertex), fragment_module(self.fragment_modules(), &key)];
         let started = std::time::Instant::now();
-        let pipeline = compile_pipeline(
+        let pipeline = build_pipeline(
             &self.device,
             self.pipeline_cache,
             self.layout,
@@ -3550,6 +3800,7 @@ impl Hardware {
             vk::PipelineCreateFlags::empty(),
             self.dynamic,
             self.depth_format,
+            self.libraries.as_deref(),
         )?;
         // one that takes long holds the frame up, which the player feels
         let took = started.elapsed().as_secs_f64() * 1000.0;
@@ -3618,7 +3869,8 @@ impl Hardware {
         let modules = [self.vertex_module(key.vertex), fragment_module(self.fragment_modules(), &key)];
         let started = std::time::Instant::now();
         let flags = vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
-        let pipeline = compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, flags, self.dynamic, self.depth_format);
+        let libraries = self.libraries.as_deref();
+        let pipeline = build_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, flags, self.dynamic, self.depth_format, libraries);
         let Ok(pipeline) = pipeline else {
             // a driver should turn it down at once, one that takes long holds the frame up
             let took = started.elapsed().as_secs_f64() * 1000.0;
@@ -3716,7 +3968,42 @@ impl Hardware {
             }
         }
         crate::stats::fell_back(crate::stats::FALL_GENERIC);
+        self.note_stand_in(key, translating);
         self.pipeline(generic)
+    }
+
+    /// a draw drawn through the generic pipeline in place of key: told the
+    /// first time, and again if it is still so two seconds on.
+    fn note_stand_in(&mut self, key: PipelineKey, translating: bool) {
+        let asked = self.compiler.asked.contains(&key);
+        let vertex = match key.vertex {
+            VertexStage::Placed => "placed",
+            VertexStage::Interpreted => "interpreted",
+            VertexStage::Translated(_) => "translated",
+        };
+        let outstanding = self.compiler.outstanding;
+        let now = std::time::Instant::now();
+        match self.stand_ins.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((now, false));
+                log::info!(
+                    target: "zakuro_gpu::pipelines",
+                    "generic stand-in begins: {vertex} vertex stage, asked {asked}, translating {translating}, {outstanding} jobs outstanding, lit {}",
+                    key.fragment[30] != 0
+                );
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (since, told) = entry.get_mut();
+                if !*told && since.elapsed().as_secs() >= 2 {
+                    *told = true;
+                    log::info!(
+                        target: "zakuro_gpu::pipelines",
+                        "generic stand-in still on after {:.1} s: {vertex} vertex stage, asked {asked}, translating {translating}, {outstanding} jobs outstanding",
+                        since.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        }
     }
 
     /// raster.frag leaving depth to the rasterizer, and working it out.
@@ -4127,7 +4414,7 @@ impl Hardware {
                 None => return,
             },
         };
-        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_modules(), self.dynamic, self.depth_format);
+        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_modules(), self.dynamic, self.depth_format, self.libraries.as_deref());
         self.take(made);
     }
 
@@ -4175,6 +4462,9 @@ impl Hardware {
             }
             Made::Compiled(key, Ok(pipeline)) => match self.pipelines.entry(key) {
                 Entry::Vacant(entry) => {
+                    if let Some((since, _)) = self.stand_ins.remove(&key) {
+                        log::info!(target: "zakuro_gpu::pipelines", "generic stand-in ends: its pipeline came after {:.0} ms", since.elapsed().as_secs_f64() * 1000.0);
+                    }
                     entry.insert(pipeline);
                     self.remember(key);
                 }
@@ -6591,6 +6881,9 @@ impl Drop for Hardware {
             for &pipeline in self.pipelines.values().chain(&unclaimed) {
                 self.device.destroy_pipeline(pipeline, None);
             }
+            if let Some(libraries) = &self.libraries {
+                libraries.destroy(&self.device);
+            }
             for &sampler in self.samplers.values() {
                 self.device.destroy_sampler(sampler, None);
             }
@@ -6775,7 +7068,13 @@ pub(crate) fn render_device(
         supported.geometry_shader == vk::TRUE,
         supported.shader_clip_distance == vk::TRUE
     );
-    let dynamic = dynamic_state(instance, physical, logic_ops);
+    let mut dynamic = dynamic_state(instance, physical, logic_ops);
+    dynamic.libraries = links_libraries(instance, physical);
+    if dynamic.libraries {
+        extensions.push(ash::khr::pipeline_library::NAME.as_ptr());
+        extensions.push(ash::ext::graphics_pipeline_library::NAME.as_ptr());
+    }
+    let mut library_state = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default().graphics_pipeline_library(true);
     if dynamic.blend {
         extensions.push(ash::ext::extended_dynamic_state3::NAME.as_ptr());
     }
@@ -6810,6 +7109,9 @@ pub(crate) fn render_device(
     }
     if dynamic.logic_op {
         info = info.push_next(&mut logic_op_state);
+    }
+    if dynamic.libraries {
+        info = info.push_next(&mut library_state);
     }
     // SAFETY: the caller checked the device has all of this
     let device = unsafe { instance.create_device(physical, &info, None) }.map_err(vk_error("create a device"))?;
@@ -6852,7 +7154,37 @@ fn dynamic_state(instance: &ash::Instance, physical: vk::PhysicalDevice, logic_o
         && supported2.extended_dynamic_state2_logic_op == vk::TRUE
         && supported3.extended_dynamic_state3_logic_op_enable == vk::TRUE;
     log::info!("blend state set as draws go: {blend}, logic op too: {logic_op}, so pipelines warm up at start: {blend}");
-    Dynamic { blend, logic_op }
+    Dynamic { blend, logic_op, libraries: false }
+}
+
+/// whether the device makes pipelines out of libraries, with them linked
+/// quickly, none with ZAKURO_NO_PIPELINE_LIBRARIES set, to compare.
+fn links_libraries(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bool {
+    if std::env::var_os("ZAKURO_NO_PIPELINE_LIBRARIES").is_some() {
+        return false;
+    }
+    // SAFETY: the physical device came from this instance
+    let available = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+    let has = |name: &std::ffi::CStr| available.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
+    if !has(ash::ext::graphics_pipeline_library::NAME) || !has(ash::khr::pipeline_library::NAME) {
+        log::info!("pipelines made whole: the device has no pipeline libraries");
+        return false;
+    }
+    let mut supported = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default();
+    let mut properties = vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
+    // SAFETY: as above, with structures that live as long
+    unsafe {
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported);
+        instance.get_physical_device_features2(physical, &mut features);
+        let mut all = vk::PhysicalDeviceProperties2::default().push_next(&mut properties);
+        instance.get_physical_device_properties2(physical, &mut all);
+    }
+    let links = supported.graphics_pipeline_library == vk::TRUE;
+    log::info!(
+        "pipelines linked from libraries: {links}, linked fast: {}",
+        properties.graphics_pipeline_library_fast_linking == vk::TRUE
+    );
+    links
 }
 
 /// the Vulkan entry points: the system's loader, or on Horizon the driver

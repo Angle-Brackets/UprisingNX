@@ -78,6 +78,21 @@ static int place_core(const char *list, int index, int fallback) {
 }
 
 void unx_thread_role(const char *role, int index) {
+    // the pipeline compilers: a step below every other thread's priority, so
+    // they never take a core from the game or the GPU, free to run on any
+    // core and on core 0 first, which the game's thread leaves idle most of
+    // each frame. at the drawing threads' priority on cores 1 and 2 they
+    // waited seconds for a turn (Horizon does not share a core between
+    // threads of one priority), the scene drawing through the generic
+    // shader all along. UNX_COMPILER_PRIO (hex) overrides the priority.
+    if (!strcmp(role, "compiler")) {
+        const char *p = getenv("UNX_COMPILER_PRIO");
+        int priority = (p && p[0]) ? (int)strtol(p, NULL, 16) : 0x2D;
+        svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
+        svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 0x7);
+        printf("place: compiler %d at priority 0x%X, core 0 first, any core\n", index, priority);
+        return;
+    }
     const char *on = getenv("UNX_PLACE");
     if (!on || on[0] != '1') return;
     int core;
