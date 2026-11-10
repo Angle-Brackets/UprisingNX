@@ -2298,6 +2298,7 @@ impl TextureCache {
     fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Found {
         let _timer = crate::stats::time(&crate::stats::TEXTURES);
         let (addr, format, width, height) = key;
+        let height = height & 0xFFFF;
         let portrait = addr & 1 != 0;
         let bpp = format.bits_per_pixel() as usize;
         let base_size = (width as usize * height as usize * bpp).div_ceil(8);
@@ -2435,6 +2436,7 @@ fn picture_for(
     rows: &mut Vec<u8>,
 ) -> Option<Arc<crate::pack::Material>> {
     let (_, format, width, height) = key;
+    let height = height & 0xFFFF;
     if crate::pack::recording() {
         crate::pack::record(data, texels, format, width, height);
     }
@@ -2617,7 +2619,7 @@ fn bind_texture<M: GpuMemory>(
     let size = total_bits.div_ceil(8) as usize;
     let lod_bias = (((lod & 0x1FFF) as i32) << 19 >> 19) as i16;
 
-    let key = (addr | (portrait as u32), format, width, height);
+    let key = (addr | (portrait as u32), format, width, height | (max_level << 16));
     let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
         (Some(_), _) if !past => (Arc::default(), None),
         (_, Some(found)) => found,
@@ -4262,7 +4264,10 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                             cull: cull_mode,
                             geometry: Some(geometry),
                         };
-                        let drawn = hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)));
+                        let drawn = {
+                            let _hardware_timer = crate::stats::time(&crate::stats::HARDWARE);
+                            hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)))
+                        };
                         let triangles = indices.len() as u32 / 3;
                         resources.geometry_inputs = gathered;
                         resources.geometry_indices = indices;
@@ -4290,7 +4295,10 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 cull: cull_mode,
                 geometry: None,
             };
-            let drawn = hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)));
+            let drawn = {
+                let _hardware_timer = crate::stats::time(&crate::stats::HARDWARE);
+                hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)))
+            };
             let triangles = (indices.len() / 3) as u32;
             resources.triangles = assembled;
             match drawn {
@@ -5087,6 +5095,26 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &again));
         let changed = cache.decoded(key, &[0x22; 256]).0;
         assert_ne!(first[0], changed[0]);
+
+        let mut registers = vec![0u32; 0x300];
+        let mut memory = ConsoleMemory::default();
+        let base = TEXTURE_UNIT_BASES[0];
+        registers[REG_TEXTURE_CONFIG] = 1;
+        registers[base + 1] = (16 << 16) | 16;
+        registers[base + 4] = 0x1800_1000 >> 3;
+        registers[base + 13] = 4; // Etc1 (16x16 = 128B base + 32B mip1 = 160B)
+        registers[base + 3] = 1 << 16;
+        let mipped = bind_texture(&registers, &mut memory, &mut cache, 0, None, false).unwrap().texels;
+        registers[base + 3] = 0;
+        let plain = bind_texture(&registers, &mut memory, &mut cache, 0, None, false).unwrap().texels;
+        assert_eq!(mipped.len(), 256 + 64);
+        assert_eq!(plain.len(), 256);
+        registers[base + 3] = 1 << 16;
+        let mipped_again = bind_texture(&registers, &mut memory, &mut cache, 0, None, false).unwrap().texels;
+        registers[base + 3] = 0;
+        let plain_again = bind_texture(&registers, &mut memory, &mut cache, 0, None, false).unwrap().texels;
+        assert!(Arc::ptr_eq(&mipped, &mipped_again));
+        assert!(Arc::ptr_eq(&plain, &plain_again));
     }
 
     /// a pixel centered on an edge goes to the triangle on its right, or

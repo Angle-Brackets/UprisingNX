@@ -821,7 +821,7 @@ pub fn run(unit: &ShaderUnit, state: &mut ShaderState) {
 /// one run for each primitive with its vertices put in the float uniforms
 /// from start on, every primitive's triangles one after another. none where
 /// the program isn't compiled or gave a run back.
-#[allow(unreachable_code)]
+#[allow(unreachable_code, unused_variables)]
 pub fn run_geometry_fixed(unit: &ShaderUnit, start: usize, primitives: &[&[Vec4]]) -> Option<Vec<batch::Triangle>> {
     #[cfg(feature = "jit")]
     {
