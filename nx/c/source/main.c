@@ -96,9 +96,10 @@ static void load_env(void) {
     // self-sampling draws (the water/ripple moire) issued in 8 runs so each
     // run sees the image the earlier ones drew; ZAKURO_SELF_CHUNKS=1 turns it off
     setenv("ZAKURO_SELF_CHUNKS", "8", 0);
-    // aiming with the left stick, see nx/rust/src/aim.rs: 0 off, 1 on (default),
-    // 2 flying aims only while the modifier (UNX_AIM_MODIFIER, default ZL) is held
-    setenv("UNX_LEFT_STICK_AIM", "1", 0);
+    // aiming with the right stick (UNX_RIGHT_STICK_AIM=1 default) and optional
+    // left stick mode (UNX_LEFT_STICK_AIM=0 default), see nx/rust/src/aim.rs
+    setenv("UNX_RIGHT_STICK_AIM", "1", 0);
+    setenv("UNX_LEFT_STICK_AIM", "0", 0);
     FILE *f = fopen("sdmc:/switch/uprisingnx/env.txt", "r");
     if (!f) return;
     char line[256];
