@@ -1899,33 +1899,19 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
         true => MARGIN - low[1] * SCALE,
         false => 400.0 - MARGIN - high[1] * SCALE,
     };
-    #[cfg(target_os = "horizon")]
-    {
-        let mut vertices = faded_top(registers[REG_PRIMITIVE_CONFIG] >> 8 & 3, &vertices);
-        for vertex in &mut vertices {
-            let w = vertex.clip[3];
-            let below_x = (vertex.clip[0] / w * 0.5 + 0.5) * 240.0;
-            let below_y = (vertex.clip[1] / w * 0.5 + 0.5) * 320.0;
-            let above_x = x + below_x * SCALE;
-            let above_y = y + below_y * SCALE;
-            vertex.clip[0] = (above_x / 120.0 - 1.0) * w;
-            vertex.clip[1] = (above_y / 200.0 - 1.0) * w;
-        }
-        let mut registers = onto_top(registers, top, 1.0, 0.0, 0.0);
-        registers[REG_VIEWPORT_HEIGHT] = float24(200.0);
-        registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
-        resources.portraits.sides[!right as usize].incoming.push(PortraitDraw { registers, vertices });
-        return;
+    let mut registers = onto_top(registers, top, SCALE, x, y);
+    registers[TEXTURE_UNIT_BASES[0] + 2] |= 0x6;
+    if registers[0x0CA] == 0x0002_0001 && registers[0x0D2] == 0x0009_0001 {
+        // clean_portrait_texels decodes the Etc1 portrait's alpha into A and
+        // unpremultiplies its dark border, so stage 2 modulates by tex0.a.
+        registers[0x0D0] = (registers[0x0D0] & 0xFFFF) | 0x0F03_0000;
+        registers[0x0D2] = (registers[0x0D2] & 0xFFFF) | 0x0001_0000;
     }
-    #[cfg(not(target_os = "horizon"))]
-    {
-        let mut registers = onto_top(registers, top, SCALE, x, y);
-        // the title's pictures stop at the bottom screen's top edge, some cut
-        // there, Medusa's snakes; on the top screen that edge fades out
-        let vertices = faded_top(registers[REG_PRIMITIVE_CONFIG] >> 8 & 3, &vertices);
-        registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
-        resources.portraits.sides[!right as usize].incoming.push(PortraitDraw { registers, vertices });
-    }
+    // the title's pictures stop at the bottom screen's top edge, some cut
+    // there, Medusa's snakes; on the top screen that edge fades out
+    let vertices = faded_top(registers[REG_PRIMITIVE_CONFIG] >> 8 & 3, &vertices);
+    registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
+    resources.portraits.sides[!right as usize].incoming.push(PortraitDraw { registers, vertices });
 }
 
 /// how many of the bottom screen's rows below its top edge a portrait fades
@@ -1939,14 +1925,6 @@ const PORTRAIT_FADE: f32 = 24.0;
 // ponytail: fades by the vertices' alpha, so only a draw that blends by it
 // fades, as Kid Icarus Uprising's portraits do.
 fn faded_top(topology: u32, vertices: &[Vertex]) -> Vec<Vertex> {
-    if cfg!(target_os = "horizon") {
-        let mut faded = vertices.to_vec();
-        for vertex in &mut faded {
-            let row = (vertex.clip[0] / vertex.clip[3] * 0.5 + 0.5) * 240.0;
-            vertex.color[3] *= ((240.0 - row) / PORTRAIT_FADE).clamp(0.0, 1.0);
-        }
-        return faded;
-    }
     // where an edge crosses the band's lower edge, in clip space, so the
     // cut is where it is however far the vertex is
     let edge = (240.0 - PORTRAIT_FADE) / 120.0 - 1.0;
@@ -2304,7 +2282,7 @@ impl TextureCache {
     fn checked(&self, key: TextureKey, size: u32) -> Option<Found> {
         let decoded = self.entries.get(&key)?;
         let (list, writes) = decoded.checked;
-        let addr = key.0;
+        let addr = key.0 & !1;
         let overwritten = self.written[writes.min(self.written.len())..]
             .iter()
             .any(|&(start, length)| start < addr.saturating_add(size) && addr < start.saturating_add(length));
@@ -2313,7 +2291,8 @@ impl TextureCache {
 
     fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Found {
         let _timer = crate::stats::time(&crate::stats::TEXTURES);
-        let (_, format, width, height) = key;
+        let (addr, format, width, height) = key;
+        let portrait = addr & 1 != 0;
         let checked = (self.list, self.written.len());
         if let Some(decoded) = self.entries.get_mut(&key) {
             if decoded.bytes == data {
@@ -2321,7 +2300,7 @@ impl TextureCache {
                 return (decoded.texels.clone(), decoded.replacement.clone());
             }
             let hash = fingerprint(data);
-            if decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
+            if !portrait && decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
                 // a title changing a few sprites of an atlas rewrites a
                 // handful of its 8x8 tiles, those alone are decoded again,
                 // into a copy, as the old texels may still be uploading
@@ -2356,7 +2335,11 @@ impl TextureCache {
             self.texels = 0;
         }
         let hash = fingerprint(data);
-        let texels: Arc<[[u8; 4]]> = Arc::from(crate::texture::decode_texture(data, format, width, height));
+        let mut decoded_texels = crate::texture::decode_texture(data, format, width, height);
+        if portrait {
+            clean_portrait_texels(&mut decoded_texels, width, height);
+        }
+        let texels: Arc<[[u8; 4]]> = Arc::from(decoded_texels);
         let replacement = picture_for(self.pack.as_deref(), data, &texels, key, &mut self.rows);
         let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
         if let Some(old) = self.entries.insert(key, decoded) {
@@ -2364,6 +2347,60 @@ impl TextureCache {
         }
         self.texels += count;
         (texels, replacement)
+    }
+}
+
+/// Kid Icarus Uprising's Etc1 portraits encode transparency by shifting the
+/// character's color up by a 1/4 pedestal and taking alpha from 2 * (R + G),
+/// with the outer edge anti-aliased against black. Unpremultiplying boundary
+/// texels and writing true alpha into A keeps the dark border from showing
+/// when scaled and filtered over the bright top screen.
+fn clean_portrait_texels(texels: &mut [[u8; 4]], width: u32, height: u32) {
+    let (w, h) = (width as usize, height as usize);
+    let raw = texels.to_vec();
+    for y in 0..h {
+        let y0 = y.saturating_sub(1);
+        let y1 = (y + 1).min(h - 1);
+        let by0 = y.saturating_sub(2);
+        let by1 = (y + 2).min(h - 1);
+        for x in 0..w {
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(w - 1);
+            let bx0 = x.saturating_sub(2);
+            let bx1 = (x + 2).min(w - 1);
+            let [r, g, b, _] = raw[y * w + x];
+            let s = r as u32 + g as u32;
+            let mut s_min = u32::MAX;
+            for ny in y0..=y1 {
+                for nx in x0..=x1 {
+                    let [nr, ng, _, _] = raw[ny * w + nx];
+                    s_min = s_min.min(nr as u32 + ng as u32);
+                }
+            }
+            if s_min <= 32 {
+                let mut s_max = 0u32;
+                let mut best = [r, g, b];
+                for ny in by0..=by1 {
+                    for nx in bx0..=bx1 {
+                        let [nr, ng, nb, _] = raw[ny * w + nx];
+                        let ns = nr as u32 + ng as u32;
+                        if ns > s_max {
+                            s_max = ns;
+                            best = [nr, ng, nb];
+                        }
+                    }
+                }
+                texels[y * w + x] = if s <= 32 || s_max <= 96 {
+                    [best[0], best[1], best[2], 0]
+                } else {
+                    let alpha = ((s - 16) as f32 / (s_max - 16) as f32).clamp(0.05, 1.0);
+                    let unpremult = |c: u8| (c as f32 / alpha).round().clamp(0.0, 255.0) as u8;
+                    [unpremult(r), unpremult(g), unpremult(b), (alpha * 255.0).round() as u8]
+                };
+            } else {
+                texels[y * w + x] = [r, g, b, (s * 2).min(255) as u8];
+            }
+        }
     }
 }
 
@@ -2543,7 +2580,8 @@ fn bind_texture<M: GpuMemory>(
     let bits = (width as u64) * (height as u64) * format.bits_per_pixel() as u64;
     let size = bits.div_ceil(8) as usize;
 
-    let key = (addr, format, width, height);
+    let portrait = unit == 0 && format == TextureFormat::Etc1 && registers[0x0CA] == 0x0002_0001 && registers[0x0D0] >> 16 == 0x0F03;
+    let key = (addr | (portrait as u32), format, width, height);
     let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
         (Some(_), _) if !past => (Arc::default(), None),
         (_, Some(found)) => found,
