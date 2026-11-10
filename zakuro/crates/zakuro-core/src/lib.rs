@@ -525,6 +525,8 @@ impl System {
         };
         let exit = match recompiled {
             Some(exit) => {
+                let resumes = self.cpu.regs[15];
+                self.note_stuck(resumes);
                 // its writes do not go through the log a watch keeps
                 self.idle_interrupted(false);
                 if let Some(hints) = &mut self.hints {
@@ -541,6 +543,7 @@ impl System {
                     return StepOutcome::Ran;
                 }
                 self.interpreted_instructions += 1;
+                self.note_stuck(pc);
                 let thumb = self.cpu.cpsr.thumb;
                 if let Some(pcs) = &mut self.interpreted_pcs {
                     *pcs.entry(pc | thumb as u32).or_insert(0) += 1;
@@ -1950,5 +1953,57 @@ mod tests {
         arbitrate(&mut system, signaller, 0);
         assert_eq!(system.kernel.thread(ended).status, ThreadStatus::Dead);
         assert_eq!(system.kernel.thread(parked).status, ThreadStatus::Ready);
+    }
+}
+
+impl System {
+    /// ZAKURO_STUCK_PC=<hex>: once the interpreter has been at that address
+    /// 20000 times, the registers, the words r1 and r0 point at and the
+    /// stack, once, to name what fed a loop that never ends (diagnostics).
+    fn note_stuck(&mut self, pc: u32) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static WATCHED: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let watched = WATCHED.get_or_init(|| {
+            std::env::var("ZAKURO_STUCK_PC")
+                .map(|v| v.split(',').filter_map(|pc| u32::from_str_radix(pc.trim().trim_start_matches("0x"), 16).ok()).collect())
+                .unwrap_or_default()
+        });
+        if watched.is_empty() || !watched.contains(&pc) || { let hit = HITS.fetch_add(1, Relaxed); hit < 2_000 || hit % 5_000 != 2_000 } {
+            return;
+        }
+        use zakuro_cpu::Bus as _;
+        let regs = self.cpu.regs;
+        let vfp = self.cpu.vfp.regs;
+        log::warn!("stuck at {pc:08X}: r {:08X?}", regs);
+        log::warn!(
+            "stuck at {pc:08X}: s0-s15 {:?}",
+            vfp[..16].iter().map(|bits| format!("{:08X}={}", bits, f32::from_bits(*bits))).collect::<Vec<_>>()
+        );
+        log::warn!("stuck at {pc:08X}: fpscr {:08X}", self.cpu.vfp.fpscr);
+        for (name, base) in [("r1", regs[1]), ("r0", regs[0])] {
+            let words: Vec<String> = (0..16u32)
+                .map(|i| {
+                    let bits = self.memory.read32(base.wrapping_add(i * 4));
+                    format!("{bits:08X}={}", f32::from_bits(bits))
+                })
+                .collect();
+            log::warn!("stuck at {pc:08X}: [{name}={base:08X}] {}", words.join(" "));
+        }
+        // a list walked through the word at +4 (the 0xA4C5E8 loop): where it turns back on itself
+        let mut node = regs[1];
+        let mut chain = Vec::new();
+        for _ in 0..24 {
+            let flag = self.memory.read32(node.wrapping_add(0x10)) & 0xFF;
+            chain.push(format!("{node:08X}(f{flag:02X})"));
+            node = self.memory.read32(node.wrapping_add(4));
+        }
+        log::warn!("stuck at {pc:08X}: list from r1 by +4: {}", chain.join(" -> "));
+        for (index, base) in [regs[1], self.memory.read32(regs[1].wrapping_add(4))].into_iter().enumerate() {
+            let words: Vec<String> = (0..12u32).map(|i| format!("{:08X}", self.memory.read32(base.wrapping_sub(0x10).wrapping_add(i * 4)))).collect();
+            log::warn!("stuck at {pc:08X}: node {index} {base:08X} from -0x10: {}", words.join(" "));
+        }
+        let stack: Vec<String> = (0..48u32).map(|i| format!("{:08X}", self.memory.read32(regs[13].wrapping_add(i * 4)))).collect();
+        log::warn!("stuck at {pc:08X}: stack at {:08X}: {}", regs[13], stack.join(" "));
     }
 }

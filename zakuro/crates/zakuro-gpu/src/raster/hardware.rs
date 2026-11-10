@@ -6441,9 +6441,42 @@ impl Hardware {
         if s.shadow.len() == bytes.len() {
             let mut now = vec![0u8; rows.len()];
             memory.read(addr + rows.start as u32, &mut now);
-            for ((out, &held), &was) in bytes[rows.clone()].iter_mut().zip(&now).zip(&s.shadow[rows.clone()]) {
+            let was = &s.shadow[rows.clone()];
+            // the title reused the memory, for its heap say (Chapter 15): what
+            // it wrote is newer than anything drawn there, all of it, also
+            // where it wrote what the bytes held before, a zero over a black
+            // pixel, which compares as untouched and would get the drawing's
+            // byte, a broken pointer or float in the title's data
+            let words = now.len() / 4;
+            let changed = now.chunks_exact(4).zip(was.chunks_exact(4)).filter(|(held, was)| held != was).count();
+            if words > 0 && changed * 8 > words {
+                static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                    log::warn!(
+                        target: "zakuro_gpu::diag",
+                        "not writing back {addr:08x} {}x{} {:?}: memory changed under {changed} of its {words} drawn words, the title has it for something else",
+                        s.width, s.height, s.kind
+                    );
+                }
+                let surface = &mut self.surfaces[index];
+                surface.untwin();
+                surface.shadow.clear();
+                surface.pixel = None;
+                surface.dirty = None;
+                surface.guarded = None;
+                surface.write_guarded = None;
+                surface.cleared = None;
+                surface.stale = None;
+                surface.checked = false;
+                surface.replaced();
+                return;
+            }
+            // what the CPU wrote it wrote in runs, a changed byte has the
+            // bytes around it be the CPU's as well
+            const RUN: usize = 16;
+            for ((out, held), was) in bytes[rows.clone()].chunks_mut(RUN).zip(now.chunks(RUN)).zip(was.chunks(RUN)) {
                 if held != was {
-                    *out = held;
+                    out.copy_from_slice(held);
                 }
             }
         }
