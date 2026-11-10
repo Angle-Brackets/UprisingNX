@@ -13,12 +13,17 @@
 typedef struct {
     u32 buttons;
     float circle_x, circle_y, c_stick_x, c_stick_y;
+    float gyro_x, gyro_y, gyro_z;
     u32 touching;
     u16 touch_x, touch_y;
     // the frontend's own buttons, not the 3DS's: UNX_HOST_BOTTOM is the right
     // stick's click, which shows or hides the bottom screen
     u32 host;
 } UnxInput;
+
+static HidSixAxisSensorHandle sixaxis_handheld;
+static HidSixAxisSensorHandle sixaxis_fullkey;
+static HidSixAxisSensorHandle sixaxis_joydual[2];
 
 enum { UNX_HOST_BOTTOM = 1 << 0 };
 
@@ -70,6 +75,21 @@ static void read_input(PadState *pad, UnxInput *in) {
     HidAnalogStickState l = padGetStickPos(pad, 0), r = padGetStickPos(pad, 1);
     in->circle_x = axis(l.x); in->circle_y = axis(l.y);
     in->c_stick_x = axis(r.x); in->c_stick_y = axis(r.y);
+    u32 style = padGetStyleSet(pad);
+    HidSixAxisSensorHandle gyro_handle = {0};
+    bool has_gyro = true;
+    if (style & HidNpadStyleTag_NpadHandheld) gyro_handle = sixaxis_handheld;
+    else if (style & HidNpadStyleTag_NpadFullKey) gyro_handle = sixaxis_fullkey;
+    else if (style & HidNpadStyleTag_NpadJoyDual) gyro_handle = sixaxis_joydual[1];
+    else has_gyro = false;
+    if (has_gyro) {
+        HidSixAxisSensorState sixaxis = {0};
+        if (hidGetSixAxisSensorStates(gyro_handle, &sixaxis, 1) > 0) {
+            in->gyro_x = sixaxis.angular_velocity.x;
+            in->gyro_y = sixaxis.angular_velocity.y;
+            in->gyro_z = sixaxis.angular_velocity.z;
+        }
+    }
     // the touchscreen's first finger, in pixels of the 1280x720 screen; the
     // Rust side maps it onto the 3DS bottom screen for the layout on show
     HidTouchScreenState touch = {0};
@@ -96,9 +116,11 @@ static void load_env(void) {
     // self-sampling draws (the water/ripple moire) issued in 8 runs so each
     // run sees the image the earlier ones drew; ZAKURO_SELF_CHUNKS=1 turns it off
     setenv("ZAKURO_SELF_CHUNKS", "8", 0);
-    // aiming with the right stick (UNX_RIGHT_STICK_AIM=1 default) and optional
-    // left stick mode (UNX_LEFT_STICK_AIM=0 default), see nx/rust/src/aim.rs
+    // aiming with the right stick (UNX_RIGHT_STICK_AIM=1 default), gyro
+    // (UNX_GYRO_AIM=1 default), and optional left stick mode (UNX_LEFT_STICK_AIM=0),
+    // see nx/rust/src/aim.rs
     setenv("UNX_RIGHT_STICK_AIM", "1", 0);
+    setenv("UNX_GYRO_AIM", "1", 0);
     setenv("UNX_LEFT_STICK_AIM", "0", 0);
     FILE *f = fopen("sdmc:/switch/uprisingnx/env.txt", "r");
     if (!f) return;
@@ -130,6 +152,13 @@ static void *game(void *p) {
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 0x7);
     PadState pad;
     padInitializeDefault(&pad);
+    hidGetSixAxisSensorHandles(&sixaxis_handheld, 1, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
+    hidGetSixAxisSensorHandles(&sixaxis_fullkey, 1, HidNpadIdType_No1, HidNpadStyleTag_NpadFullKey);
+    hidGetSixAxisSensorHandles(sixaxis_joydual, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual);
+    hidStartSixAxisSensor(sixaxis_handheld);
+    hidStartSixAxisSensor(sixaxis_fullkey);
+    hidStartSixAxisSensor(sixaxis_joydual[0]);
+    hidStartSixAxisSensor(sixaxis_joydual[1]);
     hidInitializeTouchScreen();
     appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
 

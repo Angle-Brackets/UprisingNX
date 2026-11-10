@@ -13,6 +13,9 @@
 //! Environment switches:
 //! - `UNX_RIGHT_STICK_AIM` (default `1`): right stick aims the reticle via
 //!   `MOUSE_AIM` while flying and turns the camera via `MOUSE_LOOK` on foot.
+//! - `UNX_GYRO_AIM` (default `1`): Switch SixAxis gyroscope angular velocity
+//!   contributes fine aiming deltas in both air and land battles.
+//! - `UNX_GYRO_SPEED` (default `1.0`): additional multiplier on gyro sensitivity.
 //! - `UNX_LEFT_STICK_AIM` (default `0`):
 //!   `0` off, the left stick only steers/walks Pit;
 //!   `1` flying: the left stick also places a synthetic stylus touch, and on
@@ -21,8 +24,25 @@
 //! - `UNX_AIM_MODIFIER`: `ZL` (default), `ZR`, `L`, `R`, `X`, `Y` or `A`.
 //! - `UNX_AIM_INVERT_Y=1`: flips vertical aim/camera direction.
 //! - `UNX_AIM_SPEED`: scales aiming and camera turn speed (default `1.0`).
+//!
+//! Native in-game Options -> Controls menu integration (`0x00EF9638` in guest BSS):
+//! - Air Battle Reticle Speed slider (`+0x160`, `[-1.0, +1.0]`) scales air right-stick
+//!   and gyro speed from `0.5x` to `2.0x` via the game's `f_006014EC` curve.
+//! - Air Battle Stop Sensitivity slider (`+0x154`, `[-1.0, +1.0]`) scales air gyro
+//!   sensitivity from `0.0x` (off at `<= -0.95`) through `1.0x` (default `0.0`) to `2.0x`.
+//! - Land Battle Left/Right & Up/Down Speed sliders (`+0x158`, `+0x15C`, `[-1.0, +1.0]`)
+//!   scale on-foot horizontal and vertical right-stick and gyro speed from `0.5x` to `2.0x`.
+//! - Land Battle Stop Sensitivity slider (`+0x150`, `[-1.0, +1.0]`) scales on-foot gyro
+//!   sensitivity from `0.0x` (off at `<= -0.95`) through `1.0x` (default `0.0`) to `2.0x`.
+//! - Air Battle & Land Battle Up/Down Invert toggles (`+0x173` bits 1 and 0) invert
+//!   vertical aiming in air and on foot respectively.
 
+use zakuro_core::memory::Memory;
 use zakuro_core::services::hid::{InputState, PadState};
+
+/// Guest BSS address of the active profile's Controls configuration block
+/// (`0x00EE33C0 + 0x16278`, see `f_007DAA9C` in `code564.c` and `code063.c`).
+pub const GUEST_CONTROLS_VADDR: u32 = 0x00EF9638;
 
 /// Host mailbox mark for on-foot camera look (`"MLK1"`), followed by `across`
 /// and `down` as `f32` bottom-screen pixels (`zakuro::input::MOUSE_LOOK`).
@@ -39,6 +59,9 @@ const DEAD_ZONE: f32 = 0.10;
 const LINEAR_GAIN: f32 = 0.35;
 /// Left-stick radial dead zone to prevent minor stick drift from walking Pit.
 const LEFT_DEAD_ZONE: f32 = 0.12;
+/// Gyro radial deadband in turns/sec (`0.0025` turns/s = `0.9 deg/s`) to suppress
+/// resting MEMS sensor bias without introducing a step on micro-adjustments.
+const GYRO_DEAD_ZONE: f32 = 0.0025;
 /// Flying reticle speed in bottom-screen pixels per 60 Hz frame at full stick
 /// deflection (`6.0 * 1.25 = 7.5` top-screen px/frame = `450` px/s across 400x240).
 const AIR_PIXELS_PER_FRAME: f32 = 6.0;
@@ -46,6 +69,10 @@ const AIR_PIXELS_PER_FRAME: f32 = 6.0;
 /// stick deflection (`10.0 * 0.00408 rad = 140 deg/s` yaw).
 const LAND_X_PIXELS_PER_FRAME: f32 = 10.0;
 const LAND_Y_PIXELS_PER_FRAME: f32 = 7.0;
+/// Gyro sensitivity in bottom-screen pixels per frame per `1.0` turn/sec (`360 deg/s`).
+const AIR_GYRO_PIXELS_PER_TURN_RATE: f32 = 50.0;
+const LAND_GYRO_X_PIXELS_PER_TURN_RATE: f32 = 64.0;
+const LAND_GYRO_Y_PIXELS_PER_TURN_RATE: f32 = 52.0;
 /// Frames the game may leave the mailbox movement unread before it is dropped.
 const STALE_FRAMES: u8 = 4;
 /// Frames without a word from the game's overrides before it is out of play.
@@ -55,8 +82,93 @@ const QUIET_FRAMES: u8 = 10;
 const REACH_X: f32 = 150.0;
 const REACH_Y: f32 = 112.0;
 
+/// Live snapshot of the in-game Options -> Controls menu sliders and invert toggles.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GuestControls {
+    pub initialized: bool,
+    pub land_stop: f32,
+    pub air_stop: f32,
+    pub land_x_speed: f32,
+    pub land_y_speed: f32,
+    pub air_speed: f32,
+    pub flags_173: u8,
+}
+
+impl Default for GuestControls {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            land_stop: 0.0,
+            air_stop: 0.0,
+            land_x_speed: 0.0,
+            land_y_speed: 0.0,
+            air_speed: 0.0,
+            flags_173: 0x02,
+        }
+    }
+}
+
+impl GuestControls {
+    /// Reads the live Controls settings block from guest memory at `0x00EF9638`.
+    pub fn read(memory: &mut Memory) -> Self {
+        let word_170 = memory.peek32(GUEST_CONTROLS_VADDR + 0x170);
+        if (word_170 & 0xFFFF) == 0 {
+            return Self::default();
+        }
+        let clean = |bits: u32| {
+            let f = f32::from_bits(bits);
+            if f.is_finite() && (-1.0..=1.0).contains(&f) { f } else { 0.0 }
+        };
+        Self {
+            initialized: true,
+            land_stop: clean(memory.peek32(GUEST_CONTROLS_VADDR + 0x150)),
+            air_stop: clean(memory.peek32(GUEST_CONTROLS_VADDR + 0x154)),
+            land_x_speed: clean(memory.peek32(GUEST_CONTROLS_VADDR + 0x158)),
+            land_y_speed: clean(memory.peek32(GUEST_CONTROLS_VADDR + 0x15C)),
+            air_speed: clean(memory.peek32(GUEST_CONTROLS_VADDR + 0x160)),
+            flags_173: (word_170 >> 24) as u8,
+        }
+    }
+
+    /// Exact slider curve from `f_006014EC` (`code449.c:24419`): maps `[-1.0, +1.0]`
+    /// to `[0.5, 2.0]` with `0.0 -> 1.0`.
+    pub fn slider_scale(s: f32) -> f32 {
+        if !s.is_finite() {
+            return 1.0;
+        }
+        let s = s.clamp(-1.0, 1.0);
+        if s >= 0.0 { 1.0 + s } else { 1.0 + 0.5 * s }
+    }
+
+    /// Maps the Stop Sensitivity slider (`[-1.0, +1.0]`) to Gyro Sensitivity
+    /// (`0.0x` at minimum `<= -0.95` to disable gyro, `1.0x` at `0.0`, `2.0x` at `+1.0`).
+    pub fn gyro_scale(s: f32) -> f32 {
+        if !s.is_finite() {
+            return 1.0;
+        }
+        let s = s.clamp(-1.0, 1.0);
+        if s <= -0.95 {
+            0.0
+        } else if s >= 0.0 {
+            1.0 + s
+        } else {
+            (1.0 + s).max(0.0)
+        }
+    }
+
+    pub fn air_invert_y(self) -> bool {
+        self.initialized && (self.flags_173 & 0x02) == 0
+    }
+
+    pub fn land_invert_y(self) -> bool {
+        self.initialized && (self.flags_173 & 0x01) != 0
+    }
+}
+
 pub struct Aim {
     right_stick: bool,
+    gyro: bool,
+    gyro_speed: f32,
     mode: u32,
     modifier: PadState,
     invert_y: bool,
@@ -69,6 +181,8 @@ pub struct Aim {
     touching: bool,
     /// Whether the modifier was held last frame, for logging.
     aiming: bool,
+    /// Last seen in-game Controls settings, for change logging and scaling.
+    controls: GuestControls,
 }
 
 fn modifier(name: &str) -> PadState {
@@ -88,6 +202,8 @@ impl Aim {
         let var = |name: &str| std::env::var(name).ok();
         let aim = Aim {
             right_stick: var("UNX_RIGHT_STICK_AIM").map_or(true, |v| v.trim() != "0"),
+            gyro: var("UNX_GYRO_AIM").map_or(true, |v| v.trim() != "0"),
+            gyro_speed: var("UNX_GYRO_SPEED").and_then(|v| v.trim().parse().ok()).unwrap_or(1.0),
             mode: var("UNX_LEFT_STICK_AIM").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
             modifier: modifier(var("UNX_AIM_MODIFIER").as_deref().unwrap_or("ZL")),
             invert_y: var("UNX_AIM_INVERT_Y").is_some_and(|v| v.trim() == "1"),
@@ -97,12 +213,35 @@ impl Aim {
             untaken: 0,
             touching: false,
             aiming: false,
+            controls: GuestControls::default(),
         };
         log::info!(
-            "unx: aim right_stick {} left_stick_mode {} (modifier {:?}, invert y {}, speed {})",
-            aim.right_stick, aim.mode, aim.modifier, aim.invert_y, aim.speed
+            "unx: aim right_stick {} gyro {} (gyro_speed {}) left_stick_mode {} (modifier {:?}, invert y {}, speed {})",
+            aim.right_stick, aim.gyro, aim.gyro_speed, aim.mode, aim.modifier, aim.invert_y, aim.speed
         );
         aim
+    }
+
+    /// Updates the cached in-game Controls menu settings (`0x00EF9638`), logging when changed.
+    pub fn set_controls(&mut self, controls: GuestControls) {
+        if controls.initialized && controls != self.controls {
+            log::info!(
+                "unx: guest controls updated: air_speed {:+.2} (x{:.2}), air_gyro_slider {:+.2} (x{:.2}), land_x {:+.2} (x{:.2}), land_y {:+.2} (x{:.2}), land_gyro_slider {:+.2} (x{:.2}), air_inv_y {}, land_inv_y {}",
+                controls.air_speed,
+                GuestControls::slider_scale(controls.air_speed),
+                controls.air_stop,
+                GuestControls::gyro_scale(controls.air_stop),
+                controls.land_x_speed,
+                GuestControls::slider_scale(controls.land_x_speed),
+                controls.land_y_speed,
+                GuestControls::slider_scale(controls.land_y_speed),
+                controls.land_stop,
+                GuestControls::gyro_scale(controls.land_stop),
+                controls.air_invert_y(),
+                controls.land_invert_y(),
+            );
+            self.controls = controls;
+        }
     }
 
     /// Updates what the game's overrides reported this frame (`0` for nothing).
@@ -144,10 +283,30 @@ impl Aim {
         (x * gain, y * gain)
     }
 
-    /// Processes stick inputs for the current frame and returns the `(across, down)`
-    /// delta in bottom-screen pixels to feed into the host mailbox (`MOUSE_AIM`
-    /// while flying, `MOUSE_LOOK` on foot).
-    pub fn apply(&mut self, input: &mut InputState) -> (f32, f32) {
+    /// Radial deadband on SixAxis angular velocity (`[gyro_x, gyro_y, gyro_z]` in
+    /// turns/sec) so resting sensor bias does not drift the reticle or camera.
+    /// Horizontal yaw combines `-gyro_y` (controller yaw) with `-0.35 * gyro_z`
+    /// (controller roll) so handheld/tabletop/pro-controller turns feel natural at
+    /// any holding angle; vertical pitch uses `gyro_x`.
+    fn gyro_rate(gyro: [f32; 3]) -> (f32, f32) {
+        let [gx, gy, gz] = gyro;
+        if !gx.is_finite() || !gy.is_finite() || !gz.is_finite() {
+            return (0.0, 0.0);
+        }
+        let yaw_right = -gy - 0.35 * gz;
+        let pitch_up = gx;
+        let mag = (yaw_right * yaw_right + pitch_up * pitch_up).sqrt();
+        if mag < GYRO_DEAD_ZONE {
+            return (0.0, 0.0);
+        }
+        let scale = (mag - GYRO_DEAD_ZONE) / mag;
+        (yaw_right * scale, pitch_up * scale)
+    }
+
+    /// Processes stick and gyro inputs for the current frame and returns the
+    /// `(across, down)` delta in bottom-screen pixels to feed into the host
+    /// mailbox (`MOUSE_AIM` while flying, `MOUSE_LOOK` on foot).
+    pub fn apply(&mut self, input: &mut InputState, gyro: [f32; 3]) -> (f32, f32) {
         self.touching = input.touch.is_some();
         (input.circle_x, input.circle_y) = Aim::left_stick(input.circle_x, input.circle_y);
 
@@ -159,6 +318,24 @@ impl Aim {
         let mut across = 0.0;
         let mut down = 0.0;
 
+        let menu_invert_y = if self.game == GAME_FLYING {
+            self.controls.air_invert_y()
+        } else {
+            self.controls.land_invert_y()
+        };
+        let invert_y = self.invert_y != menu_invert_y;
+
+        let (menu_scale_x, menu_scale_y, menu_gyro_scale) = if self.game == GAME_FLYING {
+            let s = GuestControls::slider_scale(self.controls.air_speed);
+            (s, s, GuestControls::gyro_scale(self.controls.air_stop))
+        } else {
+            (
+                GuestControls::slider_scale(self.controls.land_x_speed),
+                GuestControls::slider_scale(self.controls.land_y_speed),
+                GuestControls::gyro_scale(self.controls.land_stop),
+            )
+        };
+
         if self.right_stick {
             let (rx, ry) = (input.c_stick_x, input.c_stick_y);
             // Consume c_stick so 3DS ir:USER C-stick emulation does not fight
@@ -169,14 +346,27 @@ impl Aim {
             // In GAME_FLYING, top-screen y=0 is at the top (so stick up -> down < 0).
             // In GAME_ON_FOOT, kiu_mouse_look adds `down * PITCH_PER_PIXEL` where
             // positive pitch looks up (so stick up -> down > 0).
-            let dy = if (self.game == GAME_FLYING) != self.invert_y { -sy } else { sy };
+            let dy = if (self.game == GAME_FLYING) != invert_y { -sy } else { sy };
             let (px_x, px_y) = if self.game == GAME_FLYING {
                 (AIR_PIXELS_PER_FRAME, AIR_PIXELS_PER_FRAME)
             } else {
                 (LAND_X_PIXELS_PER_FRAME, LAND_Y_PIXELS_PER_FRAME)
             };
-            across += sx * px_x * self.speed;
-            down += dy * px_y * self.speed;
+            across += sx * px_x * menu_scale_x * self.speed;
+            down += dy * px_y * menu_scale_y * self.speed;
+        }
+
+        if self.gyro && menu_gyro_scale > 0.0 {
+            let (gx, gy) = Aim::gyro_rate(gyro);
+            let dy = if (self.game == GAME_FLYING) != invert_y { -gy } else { gy };
+            let (g_px_x, g_px_y) = if self.game == GAME_FLYING {
+                (AIR_GYRO_PIXELS_PER_TURN_RATE, AIR_GYRO_PIXELS_PER_TURN_RATE)
+            } else {
+                (LAND_GYRO_X_PIXELS_PER_TURN_RATE, LAND_GYRO_Y_PIXELS_PER_TURN_RATE)
+            };
+            let g_mult = self.gyro_speed * menu_gyro_scale * self.speed;
+            across += gx * g_px_x * menu_scale_x * g_mult;
+            down += dy * g_px_y * menu_scale_y * g_mult;
         }
 
         if self.mode == 0 {
@@ -216,10 +406,10 @@ impl Aim {
         input.circle_x = 0.0;
         input.circle_y = 0.0;
         let (sx, sy) = Aim::stick(x, y);
-        let dy = if self.invert_y { -sy } else { sy };
+        let dy = if invert_y { -sy } else { sy };
         (
-            across + sx * LAND_X_PIXELS_PER_FRAME * self.speed,
-            down + dy * LAND_Y_PIXELS_PER_FRAME * self.speed,
+            across + sx * LAND_X_PIXELS_PER_FRAME * menu_scale_x * self.speed,
+            down + dy * LAND_Y_PIXELS_PER_FRAME * menu_scale_y * self.speed,
         )
     }
 
@@ -230,8 +420,8 @@ impl Aim {
     /// - `MOUSE_LOOK` (`"MLK1"`) while on foot.
     pub fn feed(&mut self, mailbox: &mut [u32], (across, down): (f32, f32)) {
         let mark = match self.game {
-            GAME_ON_FOOT if self.right_stick || self.mode != 0 => MOUSE_LOOK,
-            GAME_FLYING if self.right_stick && !self.touching => MOUSE_AIM,
+            GAME_ON_FOOT if self.right_stick || self.gyro || self.mode != 0 => MOUSE_LOOK,
+            GAME_FLYING if (self.right_stick || self.gyro) && !self.touching => MOUSE_AIM,
             _ => {
                 mailbox[..3].fill(0);
                 return;
@@ -253,6 +443,8 @@ mod tests {
     fn test_aim() -> Aim {
         Aim {
             right_stick: true,
+            gyro: true,
+            gyro_speed: 1.0,
             mode: 0,
             modifier: PadState::ZL,
             invert_y: false,
@@ -262,6 +454,7 @@ mod tests {
             untaken: 0,
             touching: false,
             aiming: false,
+            controls: GuestControls::default(),
         }
     }
 
@@ -276,7 +469,7 @@ mod tests {
             c_stick_y: 1.0,
             ..InputState::default()
         };
-        let (across, down) = aim.apply(&mut input);
+        let (across, down) = aim.apply(&mut input, [0.0; 3]);
         assert_eq!(input.touch, None, "left stick must not inject a fake stylus touch");
         assert!(input.circle_x > 0.8 && input.circle_y < -0.4, "left stick still steers Pit");
         assert_eq!((input.c_stick_x, input.c_stick_y), (0.0, 0.0), "c_stick is consumed");
@@ -297,7 +490,7 @@ mod tests {
             circle_x: -1.0,
             ..InputState::default()
         };
-        let delta = aim.apply(&mut input);
+        let delta = aim.apply(&mut input, [0.0; 3]);
         assert_eq!(delta, (0.0, 0.0));
         let mut mailbox = [0u32; 4];
         aim.feed(&mut mailbox, delta);
@@ -313,7 +506,7 @@ mod tests {
             c_stick_y: 0.0,
             ..InputState::default()
         };
-        let (across, down) = aim.apply(&mut input);
+        let (across, down) = aim.apply(&mut input, [0.0; 3]);
         assert_eq!((across, down), (-LAND_X_PIXELS_PER_FRAME, 0.0));
         assert_eq!(input.c_stick_x, 0.0);
         let mut mailbox = [0u32; 4];
@@ -325,8 +518,26 @@ mod tests {
             c_stick_y: 1.0,
             ..InputState::default()
         };
-        let (across_up, down_up) = aim.apply(&mut input_up);
+        let (across_up, down_up) = aim.apply(&mut input_up, [0.0; 3]);
         assert_eq!(across_up, 0.0);
         assert_eq!(down_up, LAND_Y_PIXELS_PER_FRAME, "pushing right stick up on foot must pitch camera up (down > 0)");
+    }
+
+    #[test]
+    fn gyro_and_guest_controls_sliders_scale_and_invert_aim() {
+        let mut aim = test_aim();
+        aim.said(GAME_FLYING);
+        aim.set_controls(GuestControls {
+            initialized: true,
+            air_speed: 1.0,   // 2.0x reticle speed
+            air_stop: 0.5,    // 1.5x gyro sensitivity
+            flags_173: 0x00,  // Air Up/Down inverted (bit 1 == 0)
+            ..GuestControls::default()
+        });
+        let mut input = InputState::default();
+        // Pitch nose up (+0.1 turns/s) and yaw right (gy = -0.1 turns/s)
+        let (across, down) = aim.apply(&mut input, [0.1, -0.1, 0.0]);
+        assert!(across > 10.0, "gyro yaw right moves reticle right, scaled by air_speed * air_stop");
+        assert!(down > 10.0, "inverted air_invert_y makes gyro pitch up move reticle down (down > 0)");
     }
 }

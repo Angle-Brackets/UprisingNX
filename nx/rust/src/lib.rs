@@ -111,6 +111,9 @@ pub struct UnxInput {
     pub circle_y: f32,
     pub c_stick_x: f32,
     pub c_stick_y: f32,
+    pub gyro_x: f32,
+    pub gyro_y: f32,
+    pub gyro_z: f32,
     pub touching: u32,
     pub touch_x: u16,
     pub touch_y: u16,
@@ -161,6 +164,7 @@ pub struct Unx {
     bench: Option<Bench>,
     in_play: bool,
     aim: aim::Aim,
+    gyro_test: ([f32; 3], u32),
 }
 
 /// when the bottom screen is shown. Nothing guesses it from what the game
@@ -431,6 +435,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         bench: None,
         in_play: false,
         aim: aim::Aim::from_env(),
+        gyro_test: ([0.0; 3], 0),
     }))
 }
 
@@ -475,6 +480,8 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     // what the game's overrides say it is doing this frame (see below)
     let said = std::mem::take(&mut unx.system.memory.host_mailbox[3]);
     unx.aim.said(said);
+    let controls = aim::GuestControls::read(&mut unx.system.memory);
+    unx.aim.set_controls(controls);
     let mut look = (0.0, 0.0);
     if let Some(input) = input.as_ref() {
         let mut state = InputState {
@@ -489,8 +496,14 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         if unx.bench.as_ref().is_some_and(|bench| bench.fire) {
             state.buttons |= PadState::L;
         }
-        // left stick aiming, see aim.rs
-        look = unx.aim.apply(&mut state);
+        let mut gyro = [input.gyro_x, input.gyro_y, input.gyro_z];
+        if unx.gyro_test.1 > 0 {
+            unx.gyro_test.1 -= 1;
+            for (g, t) in gyro.iter_mut().zip(unx.gyro_test.0) {
+                *g += t;
+            }
+        }
+        look = unx.aim.apply(&mut state, gyro);
         unx.system.set_input(state);
     }
     // on foot the game's mouse-look override reads the camera's turn from here
@@ -530,6 +543,13 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                     std::fs::write(&file, &bytes).map(|_| format!("saved {} bytes", bytes.len())).map_err(|e| e.to_string())
                 }),
                 "load" => load_slot(&mut unx.system, slot),
+                "gyro" => {
+                    let gx: f32 = slot.parse().unwrap_or(0.0);
+                    let gy: f32 = words.next().and_then(|w| w.parse().ok()).unwrap_or(0.0);
+                    let frames: u32 = words.next().and_then(|w| w.parse().ok()).unwrap_or(30);
+                    unx.gyro_test = ([gx, gy, 0.0], frames);
+                    Ok(format!("gyro ({gx}, {gy}) for {frames} frames"))
+                }
                 "bench" => {
                     let mut words = text.split_whitespace().skip(1);
                     let seconds = words.next().and_then(|w| w.parse::<f64>().ok()).unwrap_or(40.0);
