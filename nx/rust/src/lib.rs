@@ -171,38 +171,25 @@ pub struct Unx {
 /// - from boot until the game first says it is in play (the title, the save
 ///   files and the menus before a first battle, which are played by touch),
 /// - when the player clicks the right stick, which shows or hides it anywhere
-///   (the menus after a battle, the arsenal, fusing weapons),
-/// - for the pause menu: Plus in play shows it, and it goes again at the next
-///   Plus or once the game says it is in play again after a quiet spell.
+///   (the pause menu, the menus after a battle, the arsenal, fusing weapons).
 #[derive(Default)]
 struct Bottom {
     shown: bool,
-    /// shown by Plus, for the pause menu
-    paused: bool,
-    /// the game's overrides went quiet since the pause, as they do while it is
-    /// paused, so their next word is the battle going on
-    quiet_since_pause: bool,
     /// the game has said it is in play once
     played: bool,
-    /// last frame's 3DS buttons and host buttons, for presses
-    buttons: u32,
+    /// last frame's host buttons, for presses
     host: u32,
 }
-
-/// frames the overrides must be quiet in a pause before their next word ends it
-const PAUSE_QUIET: u32 = 20;
 
 impl Bottom {
     fn new() -> Bottom {
         Bottom { shown: true, ..Bottom::default() }
     }
 
-    /// this frame's input and what the overrides said; whether the bottom
+    /// this frame's host input and what the overrides said; whether the bottom
     /// screen is shown now.
-    fn update(&mut self, buttons: u32, host: u32, said: u32, out_of_play: u32) -> bool {
-        let pressed = buttons & !self.buttons;
+    fn update(&mut self, host: u32, said: u32) -> bool {
         let host_pressed = host & !self.host;
-        self.buttons = buttons;
         self.host = host;
         if said != 0 && !self.played {
             self.played = true;
@@ -210,24 +197,6 @@ impl Bottom {
         }
         if host_pressed & HOST_BOTTOM != 0 {
             self.shown = !self.shown;
-            self.paused = false;
-        } else if pressed & PadState::START.bits() != 0 && self.played {
-            if !self.shown {
-                self.shown = true;
-                self.paused = true;
-                self.quiet_since_pause = false;
-            } else if self.paused {
-                self.shown = false;
-                self.paused = false;
-            }
-        }
-        if self.paused {
-            if out_of_play >= PAUSE_QUIET {
-                self.quiet_since_pause = true;
-            } else if said != 0 && self.quiet_since_pause {
-                self.shown = false;
-                self.paused = false;
-            }
         }
         self.shown
     }
@@ -532,14 +501,14 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     // see zakuro_gpu::raster::mirror_portrait. When it is shown is the
     // player's to say, see Bottom.
     unx.out_of_play = if said != 0 { 0 } else { unx.out_of_play.saturating_add(1) };
-    let (buttons, host) = input.as_ref().map_or((0, 0), |input| (input.buttons, input.host));
-    let in_play = !unx.bottom.update(buttons, host, said, unx.out_of_play);
+    let host = input.as_ref().map_or(0, |input| input.host);
+    let in_play = !unx.bottom.update(host, said);
     unx.system.gpu.flags().in_play.store(in_play, std::sync::atomic::Ordering::Relaxed);
     if said != 0 && unx.frame % 120 == 0 {
         log::info!("unx: overrides say {said} (frame {})", unx.frame);
     }
     if in_play != unx.in_play {
-        log::info!("unx: bottom screen {} at frame {} (said {said}, quiet for {}, paused {})", if in_play { "hidden" } else { "shown" }, unx.frame, unx.out_of_play, unx.bottom.paused);
+        log::info!("unx: bottom screen {} at frame {} (said {said}, quiet for {})", if in_play { "hidden" } else { "shown" }, unx.frame, unx.out_of_play);
         unx.in_play = in_play;
         unx.presenter.set_layout(if in_play { ScreenLayout::TopOnly } else { ScreenLayout::LargeTop });
     }
