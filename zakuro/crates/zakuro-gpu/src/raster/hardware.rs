@@ -602,8 +602,10 @@ fn surface_image(kind: Kind, depth_format: vk::Format) -> (vk::Format, vk::Image
 }
 
 /// how big a game's pipelines get before they are thrown away and compiled
-/// again, a session of Ocarina of Time 3D makes 1.3 MB of them.
-const MOST_PIPELINE_BYTES: u64 = 64 << 20;
+/// again, a session of Ocarina of Time 3D makes 1.3 MB of them, Kid Icarus
+/// on NVK about 80 KB a pipeline, 78 MB after a dozen chapters: thrown away,
+/// the next run compiles every one again, a cold start for minutes.
+const MOST_PIPELINE_BYTES: u64 = 512 << 20;
 
 /// where the pipelines compiled for a game are kept, the system's place for
 /// caches. each game keeps its own, all of them in one file only grew, the
@@ -2187,6 +2189,10 @@ impl Hardware {
                 let programs = read_translations(&programs_dir(&cache));
                 let count = programs.len();
                 for (key, source, words) in programs {
+                    // a geometry draw's slots, made only when that path is on
+                    if !super::gpu_geometry() && source.contains("void run_geometry()") {
+                        continue;
+                    }
                     let module = match hardware.modules.get(&source) {
                         Some(&module) => module,
                         None => {

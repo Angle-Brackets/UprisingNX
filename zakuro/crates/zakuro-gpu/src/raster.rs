@@ -775,7 +775,7 @@ fn shading_key(registers: &[u32], unit: &ShaderUnit, inputs: &[[Vec4; shader::IN
 /// each slot running both programs; off, they shade on the CPU. Tests have
 /// it on.
 #[cfg(feature = "vulkan")]
-fn gpu_geometry() -> bool {
+pub(crate) fn gpu_geometry() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cfg!(test) || *ON.get_or_init(|| std::env::var("ZAKURO_GPU_GEOMETRY").is_ok_and(|value| value == "1"))
 }
