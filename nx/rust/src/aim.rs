@@ -204,7 +204,7 @@ const MSBT_CONTROLS_PATCHES: &[(usize, usize, &str)] = &[
     (
         0x11B3A,
         77,
-        "This adjusts SixAxis Gyro Aiming sensitivity.\nSlide all the way left for Off.",
+        "This adjusts Gyro Aiming sensitivity.\nSlide all the way left for Off.",
     ),
     (0x11BD6, 51, "Adjust Air Battle Stick, Gyro & Invert Y controls."),
     (0x11C3E, 28, "Adjust Land Stick & Gyro."),
