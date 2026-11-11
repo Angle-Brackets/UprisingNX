@@ -384,7 +384,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     let fixed_resolution = std::env::var("ZAKURO_RESOLUTION")
         .ok()
         .and_then(|v| v.parse::<u32>().ok());
-    let resolution = fixed_resolution.unwrap_or(if docked { 2 } else { 1 });
+    let resolution = fixed_resolution.unwrap_or(2);
 
     let started = Instant::now();
     let mut presenter = match VulkanPresenter::new_vi(nwindow, window) {
@@ -484,7 +484,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         dock_override: None,
         fixed_resolution,
         title_quiet: u32::MAX,
-        title_boosted: false,
+        title_boosted: true,
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
     }))
@@ -607,14 +607,14 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     } else {
         unx.title_quiet.saturating_add(1)
     };
-    let title_boost = unx.title_quiet <= 3 && !in_battle;
+    let title_boost = !in_battle;
     if title_boost != unx.title_boosted {
         unx.title_boosted = title_boost;
         if unx.fixed_resolution.is_none() && !unx.docked {
             let target = if title_boost { 2 } else { 1 };
             let scale = unx.system.set_resolution(target);
             log::info!(
-                "unx: title screen resolution {} -> {}x (frame {})",
+                "unx: non-battle resolution {} -> {}x (frame {})",
                 if title_boost { "boost" } else { "restore" },
                 scale,
                 unx.frame,

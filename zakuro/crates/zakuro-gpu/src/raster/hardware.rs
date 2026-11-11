@@ -2627,7 +2627,10 @@ impl Hardware {
         }
         let _ = keep;
         let dirty: Vec<usize> = (0..self.surfaces.len())
-            .filter(|&i| self.surfaces[i].dirty.is_some())
+            .filter(|&i| {
+                self.surfaces[i].dirty.is_some()
+                    && matches!(self.surfaces[i].kind, Kind::Color(_))
+            })
             .collect();
         if let Err(error) = self.write_back(memory, dirty) {
             log::error!("the GPU could not write back surfaces before changing scale, {error}");

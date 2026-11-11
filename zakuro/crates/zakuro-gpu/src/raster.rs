@@ -1797,7 +1797,7 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         portraits.title_bottom_drawing = true;
         portraits.title_seen = true;
         portraits.title_frames = portraits.title_frames.saturating_add(1);
-        if portraits.title_frames <= 4 || portraits.title.len() < 2 {
+        if portraits.title_frames <= 16 || portraits.title.len() < 2 {
             portraits.title.clear();
         }
     } else if !is_bottom(registers) {
@@ -2293,20 +2293,14 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     const TITLE_SIZZLE_START_FRAMES: u32 = 335;
     const TITLE_SIZZLE_TRANSITION_FRAMES: f32 = 42.0;
     if resources.portraits.title_sky_active && !resources.portraits.title.is_empty() {
-        let should_warmup = (resources.portraits.title_warmups == 0
-            && resources.portraits.title.len() >= 2)
-            || (resources.portraits.title_warmups == 1
-                && resources.portraits.title_frames >= 4);
-        if should_warmup {
-            // Warm up the TEV stage 5 fade-in pipeline, upscale the logo into
-            // the persistent static cache on frame 1 (while the screen is still
-            // black before Pit appears), and upload the 2x textures to Vulkan
-            // on frame 4 after resolution boost so zero stall occurs when Pit
-            // zooms away at frame 248.
-            resources.portraits.title_warmups += 1;
-            let title = resources.portraits.title.clone();
-            for draw in &title {
-                draw_title_faded(memory, resources, draw, 0.0, 0.0, true);
+        if resources.portraits.title_frames >= 16
+            && (resources.portraits.title_warmups as usize) < resources.portraits.title.len()
+        {
+            if prewarm_title_draws_async(memory, &resources.portraits.title) {
+                let idx = resources.portraits.title_warmups as usize;
+                resources.portraits.title_warmups += 1;
+                let draw = resources.portraits.title[idx].clone();
+                draw_title_faded(memory, resources, &draw, 0.0, 0.0, true);
             }
         } else if resources.portraits.title_frames >= TITLE_LOGO_DELAY_FRAMES {
             let elapsed = (resources.portraits.title_frames - TITLE_LOGO_DELAY_FRAMES + 1) as f32;
@@ -2672,10 +2666,7 @@ impl TextureCache {
             clean_portrait_texels(&mut decoded_texels, width, height);
             Arc::from(decoded_texels)
         } else if title_sprite {
-            static TITLE_CACHE: std::sync::OnceLock<
-                std::sync::Mutex<HashMap<(u32, u32, u64), Arc<[[u8; 4]]>>>,
-            > = std::sync::OnceLock::new();
-            let cache = TITLE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+            let cache = title_cache();
             let cache_key = (width, height, hash);
             if let Some(cached) = cache
                 .lock()
@@ -2727,6 +2718,81 @@ impl TextureCache {
         self.texels += count;
         (texels, replacement)
     }
+}
+
+fn title_cache() -> &'static std::sync::Mutex<HashMap<(u32, u32, u64), Arc<[[u8; 4]]>>> {
+    static TITLE_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(u32, u32, u64), Arc<[[u8; 4]]>>>,
+    > = std::sync::OnceLock::new();
+    TITLE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// kicks off background bicubic upscaling of the title screen's RGBA8 sprites
+/// on a worker thread as soon as the title draws are captured, returning `true`
+/// once all of them are present in `title_cache()` so the GPU thread never
+/// stalls on CPU upscaling.
+fn prewarm_title_draws_async<M: GpuMemory>(memory: &mut M, draws: &[PortraitDraw]) -> bool {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u32, u32, u64)>>> =
+        std::sync::OnceLock::new();
+    let in_flight = IN_FLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let base = TEXTURE_UNIT_BASES[0];
+    let mut all_ready = true;
+    let mut to_spawn: Vec<(u32, u32, u64, Vec<u8>)> = Vec::new();
+    for draw in draws {
+        if draw.registers[REG_TEXTURE_CONFIG] & 1 == 0 {
+            continue;
+        }
+        let format = crate::texture::TextureFormat::from_raw(draw.registers[base + 13]);
+        if format != TextureFormat::Rgba8 {
+            continue;
+        }
+        let dimensions = draw.registers[base + 1];
+        let height = dimensions & 0x7FF;
+        let width = (dimensions >> 16) & 0x7FF;
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let address = loc_register(&draw.registers, base + 4);
+        if address == 0 {
+            continue;
+        }
+        let addr = memory.translate(address);
+        let size = (width as usize) * (height as usize) * 4;
+        let bytes = match memory.slice(addr, size) {
+            Some(slice) => slice.to_vec(),
+            None => {
+                let mut buf = vec![0u8; size];
+                memory.read(addr, &mut buf);
+                buf
+            }
+        };
+        let hash = fingerprint(&bytes);
+        let key = (width, height, hash);
+        let ready = title_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&key);
+        if !ready {
+            all_ready = false;
+            let mut guard = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            if guard.insert(key) {
+                to_spawn.push((width, height, hash, bytes));
+            }
+        }
+    }
+    if !to_spawn.is_empty() {
+        std::thread::spawn(move || {
+            for (width, height, hash, bytes) in to_spawn {
+                let decoded = crate::texture::decode_texture(&bytes, TextureFormat::Rgba8, width, height);
+                let upscaled: Arc<[[u8; 4]]> = Arc::from(upscale_title_texels(&decoded, width, height));
+                title_cache()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert((width, height, hash), upscaled);
+            }
+        });
+    }
+    all_ready
 }
 
 /// upscales a 3DS title-screen RGBA8 sprite (the Kid Icarus: Uprising logo and
@@ -4116,7 +4182,7 @@ pub fn draw<M: GpuMemory>(
     }
     note_title_draw(registers, &mut resources.portraits);
     let on_title = is_on_title(&resources.portraits);
-    let title_ready = resources.portraits.title_frames > 4 && resources.portraits.title.len() >= 2;
+    let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
     let bottom = is_bottom(registers);
     if bottom {
         resources.portraits.bottom_seen = true;
@@ -4393,7 +4459,7 @@ pub fn draw_immediate<M: GpuMemory>(
 ) -> u32 {
     note_title_draw(registers, &mut resources.portraits);
     let on_title = is_on_title(&resources.portraits);
-    let title_ready = resources.portraits.title_frames > 4 && resources.portraits.title.len() >= 2;
+    let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
     let bottom = is_bottom(registers);
     if bottom {
         resources.portraits.bottom_seen = true;
