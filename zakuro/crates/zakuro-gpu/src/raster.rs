@@ -2746,16 +2746,22 @@ fn upscale_title_texels(base: &[[u8; 4]], width: u32, height: u32) -> Vec<[u8; 4
             up_pm[oy * out_w + ox] = sum;
         }
     }
-    let sharpen_and_unpremult = |buf: &[[f32; 4]], bw: usize, bh: usize, strength: f32| -> Vec<[u8; 4]> {
+    let sharpen_and_unpremult = |buf: &[[f32; 4]], bw: usize, bh: usize, strength: f32, wide_strength: f32| -> Vec<[u8; 4]> {
         let mut out = vec![[0u8; 4]; bw * bh];
         for y in 0..bh {
             let ym = y.saturating_sub(1);
             let yp = (y + 1).min(bh - 1);
+            let ym2 = y.saturating_sub(2);
+            let yp2 = (y + 2).min(bh - 1);
             for x in 0..bw {
                 let xm = x.saturating_sub(1);
                 let xp = (x + 1).min(bw - 1);
+                let xm2 = x.saturating_sub(2);
+                let xp2 = (x + 2).min(bw - 1);
                 let center = buf[y * bw + x];
                 let mut blur = [0.0f32; 4];
+                let mut lo = center;
+                let mut hi = center;
                 let neighbors = [
                     (xm, ym, 1.0), (x, ym, 2.0), (xp, ym, 1.0),
                     (xm, y,  2.0), (x, y,  4.0), (xp, y,  2.0),
@@ -2765,11 +2771,31 @@ fn upscale_title_texels(base: &[[u8; 4]], width: u32, height: u32) -> Vec<[u8; 4
                     let p = buf[ny * bw + nx];
                     for c in 0..4 {
                         blur[c] += p[c] * (w_k / 16.0);
+                        lo[c] = lo[c].min(p[c]);
+                        hi[c] = hi[c].max(p[c]);
+                    }
+                }
+                let mut wide_blur = [0.0f32; 4];
+                if wide_strength > 0.0 {
+                    let wide_neighbors = [
+                        (xm2, ym2, 1.0), (x, ym2, 2.0), (xp2, ym2, 1.0),
+                        (xm2, y,   2.0), (x, y,   4.0), (xp2, y,   2.0),
+                        (xm2, yp2, 1.0), (x, yp2, 2.0), (xp2, yp2, 1.0),
+                    ];
+                    for &(nx, ny, w_k) in &wide_neighbors {
+                        let p = buf[ny * bw + nx];
+                        for c in 0..4 {
+                            wide_blur[c] += p[c] * (w_k / 16.0);
+                            lo[c] = lo[c].min(p[c]);
+                            hi[c] = hi[c].max(p[c]);
+                        }
                     }
                 }
                 let mut s = [0.0f32; 4];
                 for c in 0..4 {
-                    s[c] = (center[c] + strength * (center[c] - blur[c])).clamp(0.0, 255.0);
+                    let delta = strength * (center[c] - blur[c]) + wide_strength * (center[c] - wide_blur[c]);
+                    let headroom = (hi[c] - lo[c]) * 0.08;
+                    s[c] = (center[c] + delta).clamp((lo[c] - headroom).max(0.0), (hi[c] + headroom).min(255.0));
                 }
                 let a = s[3].round() as u8;
                 if a <= 2 {
@@ -2785,7 +2811,7 @@ fn upscale_title_texels(base: &[[u8; 4]], width: u32, height: u32) -> Vec<[u8; 4
         }
         out
     };
-    let mut total_texels = sharpen_and_unpremult(&up_pm, out_w, out_h, 0.65);
+    let mut total_texels = sharpen_and_unpremult(&up_pm, out_w, out_h, 1.35, 0.65);
     let mut cur_pm = up_pm;
     let (mut cur_w, mut cur_h) = (out_w, out_h);
     for level in 1..=3 {
@@ -2803,8 +2829,8 @@ fn upscale_title_texels(base: &[[u8; 4]], width: u32, height: u32) -> Vec<[u8; 4
                 next_pm[y * nw + x] = std::array::from_fn(|c| 0.25 * (p00[c] + p10[c] + p01[c] + p11[c]));
             }
         }
-        let mip_strength = if level == 1 { 0.45 } else { 0.30 };
-        total_texels.extend_from_slice(&sharpen_and_unpremult(&next_pm, nw, nh, mip_strength));
+        let mip_strength = if level == 1 { 0.65 } else { 0.35 };
+        total_texels.extend_from_slice(&sharpen_and_unpremult(&next_pm, nw, nh, mip_strength, 0.0));
         cur_pm = next_pm;
         cur_w = nw;
         cur_h = nh;
@@ -3085,7 +3111,7 @@ fn bind_texture<M: GpuMemory>(
     // the wrap modes for T and S in bits 8-10 and 12-14.
     let config = registers[base + 2];
     let (out_width, out_height, out_max_level, out_lod_bias) = if title_sprite {
-        (width * 2, height * 2, 3u8, -96i16)
+        (width * 2, height * 2, 3u8, -192i16)
     } else {
         (width, height, max_level as u8, lod_bias)
     };
