@@ -2147,14 +2147,25 @@ fn mirror_title(registers: &[u32], resources: &mut Resources, vertices: Vertices
     resources.portraits.title.push(PortraitDraw { registers, vertices });
 }
 
-/// draws a redirected title-screen element onto the top screen with fade-in alpha.
+/// draws a redirected title-screen element onto the top screen with fade-in alpha
+/// and optional sizzle-reel corner transition (`corner_t` in `0.0..=1.0`).
 fn draw_title_faded<M: GpuMemory>(
     memory: &mut M,
     resources: &mut Resources,
     draw: &PortraitDraw,
     alpha: f32,
+    corner_t: f32,
     warmup_only: bool,
 ) {
+    let is_copyright = draw
+        .vertices
+        .first()
+        .is_some_and(|v| v.clip[0] < -0.7 * v.clip[3]);
+    let s = corner_t * corner_t * (3.0 - 2.0 * corner_t);
+    let effective_alpha = if is_copyright { alpha * (1.0 - s) } else { alpha };
+    if !warmup_only && effective_alpha <= 0.004 {
+        return;
+    }
     let mut registers = draw.registers.clone();
     if let Some([address, format, dimensions]) = resources.portraits.top {
         registers[REG_COLOR_BUFFER_ADDRESS] = address;
@@ -2166,13 +2177,13 @@ fn draw_title_faded<M: GpuMemory>(
             registers[REG_COLOR_BUFFER_ADDRESS] = (source & !0x7_FFFF) >> 3;
         }
     }
-    if alpha < 1.0 || warmup_only {
+    if effective_alpha < 1.0 || warmup_only {
         registers[REG_COLOR_OPERATION] = (registers[REG_COLOR_OPERATION] & !0xFF) | 0x00E4_0100;
         registers[REG_BLEND_FUNC] = 0x0176_0000;
         registers[0x0F8] = 0x00EF_000F;
         registers[0x0F9] = 0x0000_0000;
         registers[0x0FA] = 0x0001_0000;
-        registers[0x0FB] = ((alpha * 255.0).round() as u32) << 24;
+        registers[0x0FB] = ((effective_alpha * 255.0).round() as u32) << 24;
         registers[0x0FC] = 0x0000_0000;
     }
     resources.portraits.adding = true;
@@ -2182,6 +2193,21 @@ fn draw_title_faded<M: GpuMemory>(
             vertex.clip = [0.0, 0.0, 0.0, 1.0];
         }
         rasterize(&registers, memory, resources, Vertices::Shaded(&hidden));
+    } else if !is_copyright && s > 0.0 {
+        let scale = 1.0 + (0.42 - 1.0) * s;
+        let cx = 125.85 + (201.35 - 125.85) * s;
+        let cy = 192.75 + (66.20 - 192.75) * s;
+        let mut transformed = draw.vertices.clone();
+        for vertex in &mut transformed {
+            let w = vertex.clip[3];
+            let c0 = (vertex.clip[0] / w * 0.5 + 0.5) * 240.0;
+            let c1 = (vertex.clip[1] / w * 0.5 + 0.5) * 400.0;
+            let above0 = cx + (c0 - 125.85) * scale;
+            let above1 = cy + (c1 - 192.75) * scale;
+            vertex.clip[0] = (above0 / 120.0 - 1.0) * w;
+            vertex.clip[1] = (above1 / 200.0 - 1.0) * w;
+        }
+        rasterize(&registers, memory, resources, Vertices::Shaded(&transformed));
     } else {
         rasterize(&registers, memory, resources, Vertices::Shaded(&draw.vertices));
     }
@@ -2213,9 +2239,13 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     let mut drew_title = false;
     // Pit flies in across the top screen for the first ~248 title-screen guest
     // frames (~8.3s) and disappears in a starburst flash at the top-right as
-    // the Triumphal trumpets sound.
+    // the Triumphal trumpets sound. Around frame ~335 (~11.2s), as the title
+    // screen transitions into the sizzle reel, the logo smoothly scales and
+    // glides into the top-right corner over 42 guest frames (~1.4s).
     const TITLE_LOGO_DELAY_FRAMES: u32 = 248;
     const TITLE_LOGO_FADE_FRAMES: f32 = 36.0;
+    const TITLE_SIZZLE_START_FRAMES: u32 = 335;
+    const TITLE_SIZZLE_TRANSITION_FRAMES: f32 = 42.0;
     if resources.portraits.title_sky_active && !resources.portraits.title.is_empty() {
         if resources.portraits.title_frames == 2 {
             // Warm up the TEV stage 5 fade-in pipeline with a degenerate triangle
@@ -2223,15 +2253,22 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
             // before the logo fade-in begins.
             let title = resources.portraits.title.clone();
             for draw in &title {
-                draw_title_faded(memory, resources, draw, 0.0, true);
+                draw_title_faded(memory, resources, draw, 0.0, 0.0, true);
             }
         } else if resources.portraits.title_frames >= TITLE_LOGO_DELAY_FRAMES {
             let elapsed = (resources.portraits.title_frames - TITLE_LOGO_DELAY_FRAMES + 1) as f32;
             resources.portraits.title_alpha = (elapsed / TITLE_LOGO_FADE_FRAMES).clamp(0.0, 1.0);
             let alpha = resources.portraits.title_alpha;
+            let corner_t = if resources.portraits.title_frames >= TITLE_SIZZLE_START_FRAMES {
+                ((resources.portraits.title_frames - TITLE_SIZZLE_START_FRAMES) as f32
+                    / TITLE_SIZZLE_TRANSITION_FRAMES)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             let title = resources.portraits.title.clone();
             for draw in &title {
-                draw_title_faded(memory, resources, draw, alpha, false);
+                draw_title_faded(memory, resources, draw, alpha, corner_t, false);
                 drew_title = true;
             }
         }
