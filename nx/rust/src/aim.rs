@@ -57,6 +57,17 @@ const MOUSE_AIM_RECENTER: u32 = u32::from_le_bytes(*b"MAMR");
 /// Host mailbox fourth word written by the game's overrides each tick.
 pub const GAME_ON_FOOT: u32 = 1;
 pub const GAME_FLYING: u32 = 2;
+pub const GAME_VEHICLE: u32 = 3;
+
+/// Bottom-screen touch coordinates (`320x240`) of the Vehicle Special Action HUD
+/// button (Exo Tank Dash/Boost, Cherubot Jump/Hover, Aether Ring Shield).
+const VEHICLE_SPECIAL_TOUCH: (u16, u16) = (28, 212);
+/// Bottom-screen touch coordinates (`320x240`) of the Vehicle Dismount HUD button.
+const VEHICLE_DISMOUNT_TOUCH: (u16, u16) = (86, 218);
+/// Number of 60 Hz frames to hold a synthetic vehicle HUD tap before releasing
+/// so the 3DS UI widget's `is_clicked()` (`vtable + 0x8`) callback fires immediately
+/// without waiting for the physical `A` or `B` button to be released.
+const VEHICLE_TAP_FRAMES: u8 = 3;
 
 /// Right-stick radial dead zone and linear+quadratic precision curve weight.
 const DEAD_ZONE: f32 = 0.10;
@@ -193,6 +204,12 @@ pub struct Aim {
     recenter_held: bool,
     /// Set when a gyro/reticle recenter has been requested for the next guest tick.
     recenter_pending: bool,
+    /// Rising-edge tracker for `A` in `GAME_VEHICLE` (tap-and-release Special Action).
+    vehicle_a_held: bool,
+    /// Rising-edge tracker for `B` in `GAME_VEHICLE` (tap-and-release Dismount).
+    vehicle_b_held: bool,
+    /// Active synthetic touchscreen tap pulse `((x, y), frames_remaining)` for vehicle HUD buttons.
+    vehicle_tap: Option<((u16, u16), u8)>,
 }
 
 /// Relative byte offsets and maximum UTF-16 character counts inside the Options/Menu
@@ -261,6 +278,9 @@ impl Aim {
             msbt_offset: None,
             recenter_held: false,
             recenter_pending: false,
+            vehicle_a_held: false,
+            vehicle_b_held: false,
+            vehicle_tap: None,
         };
         log::info!(
             "unx: aim right_stick {} gyro {} (gyro_speed {}) left_stick_mode {} (modifier {:?}, invert y {}, speed {})",
@@ -416,6 +436,9 @@ impl Aim {
         if self.game == 0 {
             self.aiming = false;
             self.recenter_held = false;
+            self.vehicle_a_held = false;
+            self.vehicle_b_held = false;
+            self.vehicle_tap = None;
             return (0.0, 0.0);
         }
 
@@ -433,6 +456,35 @@ impl Aim {
         if self.mode == 0 && input.buttons.intersects(PadState::ZL | PadState::ZR) {
             input.buttons.remove(PadState::ZL | PadState::ZR);
             input.buttons.insert(PadState::L);
+        }
+
+        // When mounted in a vehicle (Exo Tank, Cherubot, Aether Ring), the 3DS
+        // original uses bottom-screen touchscreen HUD buttons (`f_00A2CBB4` ->
+        // `vtable + 0x8` `is_clicked()` in `f_006D76E0`), which fire on touch
+        // release. Map pressing `A` to a tap-and-release pulse on the Special
+        // Action widget `(28, 212)` (Dash, Jump/Hover, Shield) and pressing `B`
+        // to a tap-and-release pulse on the Dismount widget `(86, 218)`.
+        if self.game == GAME_VEHICLE {
+            let a_now = input.buttons.contains(PadState::A);
+            let b_now = input.buttons.contains(PadState::B);
+            input.buttons.remove(PadState::A | PadState::B);
+            if b_now && !self.vehicle_b_held {
+                self.vehicle_tap = Some((VEHICLE_DISMOUNT_TOUCH, VEHICLE_TAP_FRAMES));
+            } else if a_now && !self.vehicle_a_held {
+                self.vehicle_tap = Some((VEHICLE_SPECIAL_TOUCH, VEHICLE_TAP_FRAMES));
+            }
+            self.vehicle_a_held = a_now;
+            self.vehicle_b_held = b_now;
+            if let Some((pos, rem)) = self.vehicle_tap {
+                if input.touch.is_none() {
+                    input.touch = Some(pos);
+                }
+                self.vehicle_tap = if rem > 1 { Some((pos, rem - 1)) } else { None };
+            }
+        } else {
+            self.vehicle_a_held = false;
+            self.vehicle_b_held = false;
+            self.vehicle_tap = None;
         }
 
         let mut across = 0.0;
@@ -542,7 +594,7 @@ impl Aim {
     ///   when a recenter is requested.
     pub fn feed(&mut self, mailbox: &mut [u32], (across, down): (f32, f32)) {
         let (mark, recenter_mark) = match self.game {
-            GAME_ON_FOOT if self.right_stick || self.gyro || self.mode != 0 => {
+            GAME_ON_FOOT | GAME_VEHICLE if self.right_stick || self.gyro || self.mode != 0 => {
                 (MOUSE_LOOK, MOUSE_LOOK_RECENTER)
             }
             GAME_FLYING if (self.right_stick || self.gyro) && !self.touching => {
@@ -593,6 +645,9 @@ mod tests {
             msbt_offset: None,
             recenter_held: false,
             recenter_pending: false,
+            vehicle_a_held: false,
+            vehicle_b_held: false,
+            vehicle_tap: None,
         }
     }
 
@@ -694,5 +749,46 @@ mod tests {
         let mut mailbox = [0u32; 4];
         aim.feed(&mut mailbox, delta);
         assert_eq!(mailbox[0], MOUSE_AIM_RECENTER);
+    }
+
+    #[test]
+    fn vehicle_a_and_b_buttons_tap_and_release_special_and_dismount_widgets() {
+        let mut aim = test_aim();
+        aim.said(GAME_VEHICLE);
+
+        // Holding A across 4 frames taps (28, 212) for VEHICLE_TAP_FRAMES frames and then releases
+        for frame in 0..=VEHICLE_TAP_FRAMES {
+            let mut input = InputState {
+                buttons: PadState::A,
+                c_stick_x: 1.0,
+                ..InputState::default()
+            };
+            let (across, down) = aim.apply(&mut input, [0.0; 3], 0);
+            assert!(!input.buttons.contains(PadState::A), "A button is consumed in vehicle");
+            if frame < VEHICLE_TAP_FRAMES {
+                assert_eq!(input.touch, Some(VEHICLE_SPECIAL_TOUCH));
+            } else {
+                assert_eq!(input.touch, None, "touch automatically releases even while A remains held");
+            }
+            assert_eq!((across, down), (LAND_X_PIXELS_PER_FRAME, 0.0));
+            let mut mailbox = [0u32; 4];
+            aim.feed(&mut mailbox, (across, down));
+            assert_eq!(mailbox[..3], [MOUSE_LOOK, LAND_X_PIXELS_PER_FRAME.to_bits(), 0]);
+        }
+
+        // Pressing B taps and releases the Dismount widget (86, 218)
+        for frame in 0..=VEHICLE_TAP_FRAMES {
+            let mut input = InputState {
+                buttons: PadState::B,
+                ..InputState::default()
+            };
+            aim.apply(&mut input, [0.0; 3], 0);
+            assert!(!input.buttons.contains(PadState::B), "B button is consumed in vehicle");
+            if frame < VEHICLE_TAP_FRAMES {
+                assert_eq!(input.touch, Some(VEHICLE_DISMOUNT_TOUCH));
+            } else {
+                assert_eq!(input.touch, None, "dismount touch automatically releases while B remains held");
+            }
+        }
     }
 }

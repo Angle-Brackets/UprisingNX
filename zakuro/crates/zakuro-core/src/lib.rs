@@ -1128,6 +1128,35 @@ impl System {
         memory::config::set_slider_3d(self.memory.phys.shared_page_mut(), value);
     }
 
+    /// changes the internal resolution scale the host's GPU draws at from now
+    /// on, preserving VRAM render targets and the active LCD screen buffers in
+    /// guest memory, and returns the scale it took.
+    pub fn set_resolution(&mut self, scale: u32) -> u32 {
+        self.gpu.wait_idle();
+        let mut keep = vec![(0x1F00_0000, 0x0060_0000)];
+        for (index, screen) in [(0, zakuro_common::Screen::Top), (1, zakuro_common::Screen::Bottom)] {
+            let config = self.gpu.framebuffers[index];
+            let bpp = config.color_format().bytes_per_pixel() as u32;
+            let stride = if config.stride == 0 { screen.height() * bpp } else { config.stride };
+            let len = screen.width() * stride;
+            for address in [config.address_left(), config.address_right()] {
+                if address != 0 && len > 0 {
+                    let base = services::gsp::physical_to_virtual(self, address);
+                    keep.push((base, len));
+                }
+            }
+        }
+        let previous = self.gpu.scale();
+        let linear_base = self.kernel.linear_base;
+        let now = self.gpu.set_scale(&mut GuestMemory { memory: &mut self.memory, linear_base }, scale, &keep);
+        self.config.resolution = now;
+        if now != previous {
+            self.showing = [None, None, None];
+            self.pacing = Pacing::default();
+        }
+        now
+    }
+
     /// where a screen's picture is on the host's GPU, for a presenter sharing
     /// its device to draw straight from, none when the GPU does not show the
     /// screens itself or did not draw what the screen shows, read_screen_scaled

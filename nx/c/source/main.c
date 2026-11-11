@@ -28,6 +28,7 @@ static HidSixAxisSensorHandle sixaxis_joydual[2];
 enum {
     UNX_HOST_BOTTOM = 1 << 0,
     UNX_HOST_RECENTER = 1 << 1,
+    UNX_HOST_DOCKED = 1 << 2,
 };
 
 typedef struct {
@@ -76,6 +77,7 @@ static void read_input(PadState *pad, UnxInput *in) {
         if (held & map[i].nx) in->buttons |= map[i].ds;
     if (held & HidNpadButton_StickR) in->host |= UNX_HOST_BOTTOM;
     if (held & (HidNpadButton_R | HidNpadButton_StickL)) in->host |= UNX_HOST_RECENTER;
+    if (appletGetOperationMode() == AppletOperationMode_Console) in->host |= UNX_HOST_DOCKED;
     HidAnalogStickState l = padGetStickPos(pad, 0), r = padGetStickPos(pad, 1);
     in->circle_x = axis(l.x); in->circle_y = axis(l.y);
     in->c_stick_x = axis(r.x); in->c_stick_y = axis(r.y);
@@ -152,10 +154,10 @@ static void *game(void *p) {
     if (!args->interpret) recomp = &linked;
 #endif
 
-    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padConfigureInput(8, HidNpadStyleSet_NpadStandard);
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 0x7);
     PadState pad;
-    padInitializeDefault(&pad);
+    padInitializeAny(&pad);
     hidGetSixAxisSensorHandles(&sixaxis_handheld, 1, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
     hidGetSixAxisSensorHandles(&sixaxis_fullkey, 1, HidNpadIdType_No1, HidNpadStyleTag_NpadFullKey);
     hidGetSixAxisSensorHandles(sixaxis_joydual, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual);
@@ -167,13 +169,6 @@ static void *game(void *p) {
     appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
 
     load_env();
-    // started in the dock, the docked clocks hold 2x (every bench state at
-    // 30), so it draws at 2x there and 1x handheld, unless env.txt sets
-    // ZAKURO_RESOLUTION; taken once, at start
-    if (appletGetOperationMode() == AppletOperationMode_Console && !getenv("ZAKURO_RESOLUTION")) {
-        setenv("ZAKURO_RESOLUTION", "2", 0);
-        printf("env: ZAKURO_RESOLUTION=2 (docked)\n");
-    }
     // UNX_CLOCKS=docked (or a hex PerformanceConfiguration such as 0x92220008) asks apm for
     // the docked clocks (CPU 1020 MHz, GPU 768 MHz, stock docked values) while running
     // handheld; the session stays open for the run, since the setting may go with it

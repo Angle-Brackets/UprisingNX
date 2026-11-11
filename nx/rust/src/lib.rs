@@ -124,6 +124,8 @@ pub struct UnxInput {
 /// UnxInput::host: the right stick's click, which shows or hides the bottom
 /// screen
 const HOST_BOTTOM: u32 = 1 << 0;
+/// UnxInput::host: the console is in the dock (AppletOperationMode_Console)
+const HOST_DOCKED: u32 = 1 << 2;
 
 pub struct Unx {
     system: System,
@@ -163,6 +165,14 @@ pub struct Unx {
     /// a benchmark under way, see Bench
     bench: Option<Bench>,
     in_play: bool,
+    /// whether the presenter and resolution are currently in docked mode
+    docked: bool,
+    /// the hardware's last reported docked state from appletGetOperationMode
+    hw_docked: bool,
+    /// a docked state forced by cmd.txt `dock 0|1`, cleared when hardware state changes
+    dock_override: Option<bool>,
+    /// a fixed resolution scale from ZAKURO_RESOLUTION in env.txt or cmd.txt `scale <n>`
+    fixed_resolution: Option<u32>,
     aim: aim::Aim,
     gyro_test: ([f32; 3], u32),
 }
@@ -187,7 +197,7 @@ struct Bottom {
 
 impl Bottom {
     fn new() -> Bottom {
-        Bottom { shown: true, ..Bottom::default() }
+        Bottom { shown: false, ..Bottom::default() }
     }
 
     /// this frame's host input and what the overrides said; whether the bottom
@@ -297,6 +307,25 @@ extern "C" {
     fn nx_audio_play(samples: *const i16, count: u32);
     fn nx_audio_exit();
     fn unx_thread_role(role: *const c_char, index: i32);
+    fn appletGetOperationMode() -> u32;
+}
+
+impl Unx {
+    fn apply_docked(&mut self, docked: bool) {
+        self.docked = docked;
+        let (width, height) = if docked { (1920, 1080) } else { (1280, 720) };
+        self.presenter.resize(width, height);
+        let target_scale = self.fixed_resolution.unwrap_or(if docked { 2 } else { 1 });
+        let scale = self.system.set_resolution(target_scale);
+        log::info!(
+            "unx: {} -> presenter {}x{}, internal resolution {}x (frame {})",
+            if docked { "docked" } else { "handheld" },
+            width,
+            height,
+            scale,
+            self.frame,
+        );
+    }
 }
 
 fn place_thread(role: &str, index: usize) {
@@ -345,17 +374,32 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         return std::ptr::null_mut();
     };
 
+    let docked = appletGetOperationMode() == 1;
+    let window = if docked { (1920, 1080) } else { (1280, 720) };
+    let fixed_resolution = std::env::var("ZAKURO_RESOLUTION")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let resolution = fixed_resolution.unwrap_or(if docked { 2 } else { 1 });
+
     let started = Instant::now();
-    let mut presenter = match VulkanPresenter::new_vi(nwindow, (1280, 720)) {
+    let mut presenter = match VulkanPresenter::new_vi(nwindow, window) {
         Ok(presenter) => presenter,
         Err(error) => {
             log::error!("unx: Vulkan presenter failed, {error}");
             return std::ptr::null_mut();
         }
     };
-    log::info!("unx: presenter {} up in {:?}", presenter.name(), started.elapsed());
-    // out of play until the game's overrides say otherwise, see unx_frame
-    presenter.set_layout(ScreenLayout::LargeTop);
+    log::info!(
+        "unx: presenter {} up in {:?} ({} {}x{}, internal {}x)",
+        presenter.name(),
+        started.elapsed(),
+        if docked { "docked" } else { "handheld" },
+        window.0,
+        window.1,
+        resolution,
+    );
+    // start in fullscreen (top screen only) by default
+    presenter.set_layout(ScreenLayout::TopOnly);
     presenter.set_scaling(ScreenFilter::Smooth, false);
     nx_audio_init();
 
@@ -363,10 +407,6 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         log::info!("unx: recompiled code linked in, ABI {}, {} entries, {} modules", r.abi, r.entry_count, r.module_count);
         zakuro_core::recompiled::Linked::new(0x0004000000030100, r.abi, r.entries, r.entry_count, r.modules, r.module_count)
     });
-    let resolution = std::env::var("ZAKURO_RESOLUTION")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
     let config = Config {
         data_dir: Some(PathBuf::from(&data_dir)),
         hardware_renderer: true,
@@ -433,7 +473,11 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         out_of_play: u32::MAX,
         bottom: Bottom::new(),
         bench: None,
-        in_play: false,
+        in_play: true,
+        docked,
+        hw_docked: docked,
+        dock_override: None,
+        fixed_resolution,
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
     }))
@@ -506,7 +550,11 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 *g += t;
             }
         }
+        let on_title = unx.system.gpu.flags().on_title.swap(false, std::sync::atomic::Ordering::Relaxed);
         look = unx.aim.apply(&mut state, gyro, input.host);
+        if on_title && !state.buttons.is_empty() {
+            state.buttons |= PadState::A;
+        }
         unx.system.set_input(state);
     }
     // on foot the game's mouse-look override reads the camera's turn from here
@@ -533,6 +581,20 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         unx.presenter.set_layout(if in_play { ScreenLayout::TopOnly } else { ScreenLayout::LargeTop });
     }
 
+    let hw_docked = if input.is_null() {
+        appletGetOperationMode() == 1
+    } else {
+        host & HOST_DOCKED != 0
+    };
+    if hw_docked != unx.hw_docked {
+        unx.hw_docked = hw_docked;
+        unx.dock_override = None;
+    }
+    let docked = unx.dock_override.unwrap_or(hw_docked);
+    if docked != unx.docked {
+        unx.apply_docked(docked);
+    }
+
     // development: sdmc:/switch/uprisingnx/cmd.txt holding "save" or "load" (optionally
     // followed by a slot name) saves or restores the whole console, so that a test
     // can start from the same moment every time. the file is removed when read, and
@@ -550,6 +612,44 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                     std::fs::write(&file, &bytes).map(|_| format!("saved {} bytes", bytes.len())).map_err(|e| e.to_string())
                 }),
                 "load" => load_slot(&mut unx.system, slot),
+                "scale" => match slot {
+                    "auto" => {
+                        unx.fixed_resolution = None;
+                        let target = if unx.docked { 2 } else { 1 };
+                        let scale = unx.system.set_resolution(target);
+                        Ok(format!("auto resolution -> {scale}x"))
+                    }
+                    _ => match slot.parse::<u32>() {
+                        Ok(target) => {
+                            unx.fixed_resolution = Some(target);
+                            let scale = unx.system.set_resolution(target);
+                            Ok(format!("resolution -> {scale}x"))
+                        }
+                        Err(error) => Err(format!("bad scale {slot:?}, {error}")),
+                    },
+                },
+                "dock" => match slot {
+                    "1" | "docked" | "console" => {
+                        unx.dock_override = Some(true);
+                        unx.apply_docked(true);
+                        Ok(format!("docked 1920x1080 at {}x", unx.system.gpu.scale()))
+                    }
+                    "0" | "handheld" => {
+                        unx.dock_override = Some(false);
+                        unx.apply_docked(false);
+                        Ok(format!("handheld 1280x720 at {}x", unx.system.gpu.scale()))
+                    }
+                    "auto" => {
+                        unx.dock_override = None;
+                        unx.apply_docked(unx.hw_docked);
+                        Ok(format!(
+                            "auto ({}) at {}x",
+                            if unx.docked { "docked 1920x1080" } else { "handheld 1280x720" },
+                            unx.system.gpu.scale(),
+                        ))
+                    }
+                    _ => Err(format!("bad dock mode {slot:?}, expected 0, 1, handheld, docked, or auto")),
+                },
                 "gyro" => {
                     let gx: f32 = slot.parse().unwrap_or(0.0);
                     let gy: f32 = words.next().and_then(|w| w.parse().ok()).unwrap_or(0.0);

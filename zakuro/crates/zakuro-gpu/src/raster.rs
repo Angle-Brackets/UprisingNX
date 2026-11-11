@@ -1484,6 +1484,27 @@ pub(crate) struct Portraits {
     /// the battle display's draws the bottom screen made this frame that lie
     /// in an island, see ISLANDS.
     hud: Vec<PortraitDraw>,
+    /// the title screen's logo and copyright draws redirected from the bottom
+    /// screen onto the top screen.
+    title: Vec<PortraitDraw>,
+    /// whether the bottom screen is currently rendering the title screen pass
+    /// (started by the 128x256 Etc1 sky backdrop).
+    title_bottom_drawing: bool,
+    /// whether the top screen drew the title screen's 512x512 La4 cloud layer
+    /// since the last top-screen transfer.
+    title_sky_seen: bool,
+    /// whether the title screen's cloud layer is currently active on the top
+    /// screen.
+    title_sky_active: bool,
+    /// consecutive top-screen transfers without a 512x512 La4 cloud draw.
+    title_sky_missed: u8,
+    /// number of title-screen guest frames elapsed since the opening fly-in started.
+    title_frames: u32,
+    /// fade-in opacity (0.0..=1.0) for the title logo on the top screen,
+    /// fading in when the Triumphal trumpets sound after Pit's fly-in.
+    title_alpha: f32,
+    /// whether the title screen was seen since the frontend last asked.
+    pub(crate) title_seen: bool,
     /// whether the game is in play, a battle, where its bottom screen's
     /// portraits are dialogue; in menus the same kind of picture is not.
     pub(crate) in_play: bool,
@@ -1652,6 +1673,7 @@ struct Faded {
 
 /// one draw of a portrait, its registers pointed at the top screen and its
 /// vertices already shaded, so it can be drawn again after the game stops.
+#[derive(Clone)]
 struct PortraitDraw {
     registers: Vec<u32>,
     vertices: Vec<Vertex>,
@@ -1683,9 +1705,12 @@ fn is_bottom(registers: &[u32]) -> bool {
 /// needed, the portraits and the small pieces of the battle display. whole
 /// bottom-screen pictures and meshes that no one sees are skipped, which
 /// saves decoding, vertex setup and shading for them.
-fn skip_bottom_in_play(registers: &[u32], in_battle: bool, vertex_count: u32) -> bool {
+fn skip_bottom_in_play(registers: &[u32], in_battle: bool, on_title: bool, vertex_count: u32) -> bool {
     if !on_bottom(registers) {
         return true;
+    }
+    if on_title {
+        return is_title_bottom_sky(registers);
     }
     let portrait = is_portrait(registers);
     if !in_battle {
@@ -1696,6 +1721,53 @@ fn skip_bottom_in_play(registers: &[u32], in_battle: bool, vertex_count: u32) ->
         return true;
     }
     !portrait && vertex_count > 16
+}
+
+/// Kid Icarus Uprising's real-time title screen sky layer on the top screen
+/// (512x512 La4 cloud mask), which starts drawing at the Triumphal trumpets
+/// right as Pit disappears from his opening fly-in.
+fn is_title_sky(registers: &[u32]) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    registers[REG_TEXTURE_CONFIG] & 1 != 0
+        && registers[base + 1] == (512 << 16 | 512)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::La4
+}
+
+/// the bottom screen's 128x256 Etc1 sky backdrop on the title screen, which
+/// is skipped when compositing the title logo onto the top screen.
+fn is_title_bottom_sky(registers: &[u32]) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    on_bottom(registers)
+        && (registers[base + 1] == (128 << 16 | 256) || registers[base + 1] == (256 << 16 | 128))
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
+}
+
+/// tracks when the title screen's top-screen sky or bottom-screen logo pass is
+/// being drawn.
+fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
+    if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
+        && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0
+    {
+        portraits.title_bottom_drawing = false;
+        if is_title_sky(registers) {
+            portraits.title_sky_seen = true;
+            portraits.title_sky_active = true;
+            portraits.title_sky_missed = 0;
+            portraits.title_seen = true;
+            portraits.top = Some([
+                registers[REG_COLOR_BUFFER_ADDRESS],
+                registers[REG_COLOR_BUFFER_FORMAT],
+                registers[REG_FRAMEBUFFER_DIMENSIONS],
+            ]);
+        }
+    } else if on_bottom(registers) && is_title_bottom_sky(registers) {
+        portraits.title_bottom_drawing = true;
+        portraits.title.clear();
+        portraits.title_seen = true;
+        portraits.title_frames = portraits.title_frames.saturating_add(1);
+    } else if !is_bottom(registers) {
+        portraits.title_bottom_drawing = false;
+    }
 }
 
 /// a dialogue portrait as Kid Icarus Uprising draws it, an Etc1 256x256
@@ -2033,6 +2105,89 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
     resources.portraits.hud.push(PortraitDraw { registers, vertices });
 }
 
+/// redirects the bottom screen's Kid Icarus: Uprising logo and copyright
+/// notice onto the top screen during the title screen, dropping the
+/// bottom-screen sky backdrop and the "Touch!" call-to-action.
+fn mirror_title(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
+    if is_title_bottom_sky(registers) {
+        return;
+    }
+    let top = resources.portraits.top.unwrap_or([
+        0x1808_0000 >> 3,
+        registers[REG_COLOR_BUFFER_FORMAT],
+        256 | (511 << 12),
+    ]);
+    let Some(vertices) = shaded_in_order(registers, vertices) else { return };
+    let Some((low, high)) = bottom_box(&vertices) else { return };
+    // in screen terms, left, top, right and bottom, y down (320x240 bottom screen)
+    let [left, upper, right, lower] = [320.0 - high[1], 240.0 - high[0], 320.0 - low[1], 240.0 - low[0]];
+    // drop full-screen backdrops
+    if (right - left) >= 316.0 && (lower - upper) >= 236.0 {
+        return;
+    }
+    // copyright notice at bottom-left (y >= 200, left < 10): keep at bottom-left of 400x240 top screen;
+    // logo elements (y < 140): center horizontally (+40 px) and shift down slightly (-32 px in buffer x);
+    // drop the "Touch!" prompt and its wing ornaments (y >= 140, left >= 40)
+    let is_copyright = upper >= 200.0 && left < 10.0 && right <= 115.0;
+    let is_logo = upper < 140.0;
+    if !is_logo && !is_copyright {
+        return;
+    }
+    let (dx, dy) = if is_copyright { (0.0, 80.0) } else { (-32.0, 40.0) };
+    let mut vertices = vertices;
+    for vertex in &mut vertices {
+        let w = vertex.clip[3];
+        let below = [(vertex.clip[0] / w * 0.5 + 0.5) * 240.0, (vertex.clip[1] / w * 0.5 + 0.5) * 320.0];
+        let above = [below[0] + dx, below[1] + dy];
+        vertex.clip[0] = (above[0] / 120.0 - 1.0) * w;
+        vertex.clip[1] = (above[1] / 200.0 - 1.0) * w;
+    }
+    let mut registers = onto_top(registers, top, 1.0, 0.0, 0.0);
+    registers[REG_VIEWPORT_HEIGHT] = float24(200.0);
+    resources.portraits.title.push(PortraitDraw { registers, vertices });
+}
+
+/// draws a redirected title-screen element onto the top screen with fade-in alpha.
+fn draw_title_faded<M: GpuMemory>(
+    memory: &mut M,
+    resources: &mut Resources,
+    draw: &PortraitDraw,
+    alpha: f32,
+    warmup_only: bool,
+) {
+    let mut registers = draw.registers.clone();
+    if let Some([address, format, dimensions]) = resources.portraits.top {
+        registers[REG_COLOR_BUFFER_ADDRESS] = address;
+        registers[REG_COLOR_BUFFER_FORMAT] = format;
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = dimensions;
+    }
+    if let Some(source) = resources.portraits.top_source {
+        if (0x1800_0000..0x1860_0000).contains(&source) {
+            registers[REG_COLOR_BUFFER_ADDRESS] = (source & !0x7_FFFF) >> 3;
+        }
+    }
+    if alpha < 1.0 || warmup_only {
+        registers[REG_COLOR_OPERATION] = (registers[REG_COLOR_OPERATION] & !0xFF) | 0x00E4_0100;
+        registers[REG_BLEND_FUNC] = 0x0176_0000;
+        registers[0x0F8] = 0x00EF_000F;
+        registers[0x0F9] = 0x0000_0000;
+        registers[0x0FA] = 0x0001_0000;
+        registers[0x0FB] = ((alpha * 255.0).round() as u32) << 24;
+        registers[0x0FC] = 0x0000_0000;
+    }
+    resources.portraits.adding = true;
+    if warmup_only {
+        let mut hidden = draw.vertices.clone();
+        for vertex in &mut hidden {
+            vertex.clip = [0.0, 0.0, 0.0, 1.0];
+        }
+        rasterize(&registers, memory, resources, Vertices::Shaded(&hidden));
+    } else {
+        rasterize(&registers, memory, resources, Vertices::Shaded(&draw.vertices));
+    }
+    resources.portraits.adding = false;
+}
+
 /// how much of a portrait shows over what is behind it once it has faded in,
 /// slightly less than all so the scene can be seen through it.
 const PORTRAIT_ALPHA: f32 = 0.85;
@@ -2045,11 +2200,47 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     // how much of a portrait fades in or out each frame, 8 frames in all
     let step = 1.0 / 8.0;
     resources.portraits.hud_islands = 0;
+    if std::mem::take(&mut resources.portraits.title_sky_seen) {
+        resources.portraits.title_sky_missed = 0;
+    } else if resources.portraits.title_sky_active {
+        resources.portraits.title_sky_missed = resources.portraits.title_sky_missed.saturating_add(1);
+        if resources.portraits.title_sky_missed > 2 {
+            resources.portraits.title_sky_active = false;
+            resources.portraits.title_alpha = 0.0;
+            resources.portraits.title_frames = 0;
+        }
+    }
+    let mut drew_title = false;
+    // Pit flies in across the top screen for the first ~248 title-screen guest
+    // frames (~8.3s) and disappears in a starburst flash at the top-right as
+    // the Triumphal trumpets sound.
+    const TITLE_LOGO_DELAY_FRAMES: u32 = 248;
+    const TITLE_LOGO_FADE_FRAMES: f32 = 36.0;
+    if resources.portraits.title_sky_active && !resources.portraits.title.is_empty() {
+        if resources.portraits.title_frames == 2 {
+            // Warm up the TEV stage 5 fade-in pipeline with a degenerate triangle
+            // at the start of the title screen so the shader is already compiled
+            // before the logo fade-in begins.
+            let title = resources.portraits.title.clone();
+            for draw in &title {
+                draw_title_faded(memory, resources, draw, 0.0, true);
+            }
+        } else if resources.portraits.title_frames >= TITLE_LOGO_DELAY_FRAMES {
+            let elapsed = (resources.portraits.title_frames - TITLE_LOGO_DELAY_FRAMES + 1) as f32;
+            resources.portraits.title_alpha = (elapsed / TITLE_LOGO_FADE_FRAMES).clamp(0.0, 1.0);
+            let alpha = resources.portraits.title_alpha;
+            let title = resources.portraits.title.clone();
+            for draw in &title {
+                draw_title_faded(memory, resources, draw, alpha, false);
+                drew_title = true;
+            }
+        }
+    }
     if resources.portraits.in_play && !resources.portraits.in_battle {
         resources.portraits.sides = Default::default();
         resources.portraits.hud.clear();
         resources.portraits.text_lines.clear();
-        return false;
+        return drew_title;
     }
     let mut sides = std::mem::take(&mut resources.portraits.sides);
     let mut drew = false;
@@ -3593,9 +3784,13 @@ pub fn draw<M: GpuMemory>(
             }
         }
     }
+    note_title_draw(registers, &mut resources.portraits);
+    let on_title = resources.portraits.title_bottom_drawing
+        || resources.portraits.title_sky_active
+        || resources.portraits.title_sky_seen;
     if is_bottom(registers)
         && resources.portraits.in_play
-        && skip_bottom_in_play(registers, resources.portraits.in_battle, vertex_count)
+        && skip_bottom_in_play(registers, resources.portraits.in_battle, on_title, vertex_count)
     {
         return vertex_count;
     }
@@ -3857,9 +4052,13 @@ pub fn draw_immediate<M: GpuMemory>(
     resources: &mut Resources,
     vertices: &[[Vec4; 16]],
 ) -> u32 {
+    note_title_draw(registers, &mut resources.portraits);
+    let on_title = resources.portraits.title_bottom_drawing
+        || resources.portraits.title_sky_active
+        || resources.portraits.title_sky_seen;
     if is_bottom(registers)
         && resources.portraits.in_play
-        && skip_bottom_in_play(registers, resources.portraits.in_battle, vertices.len() as u32)
+        && skip_bottom_in_play(registers, resources.portraits.in_battle, on_title, vertices.len() as u32)
     {
         return vertices.len() as u32;
     }
@@ -4006,6 +4205,15 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
     if portraits_on() && !resources.portraits.adding {
         if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0 {
             note_top_buffer(registers, resources);
+            if is_title_sky(registers) {
+                resources.portraits.title_sky_seen = true;
+                resources.portraits.title_seen = true;
+                resources.portraits.top = Some([
+                    registers[REG_COLOR_BUFFER_ADDRESS],
+                    registers[REG_COLOR_BUFFER_FORMAT],
+                    registers[REG_FRAMEBUFFER_DIMENSIONS],
+                ]);
+            }
             if resources.portraits.in_play && resources.portraits.in_battle && is_subtitle(registers) {
                 // the CPU decodes its arrays, so its lines can be centered
                 #[cfg(feature = "vulkan")]
@@ -4041,11 +4249,14 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             note_text(registers, resources, vertices);
         } else if on_bottom(registers) || is_bottom(registers) {
             let portrait = on_bottom(registers) && is_portrait(registers);
+            let on_title = resources.portraits.title_bottom_drawing
+                || resources.portraits.title_sky_active
+                || resources.portraits.title_sky_seen;
             // the CPU decodes its arrays then, and its vertices say where it is.
             // out of play only a portrait's are looked at, to see whether it is
             // a big one, a conversation
             #[cfg(feature = "vulkan")]
-            if ((resources.portraits.in_play && resources.portraits.in_battle) || portrait)
+            if ((resources.portraits.in_play && (resources.portraits.in_battle || on_title)) || portrait)
                 && matches!(vertices, Vertices::Raw { .. })
             {
                 return None;
@@ -4069,6 +4280,8 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                         mirror_portrait(registers, resources, vertices);
                     } else if resources.portraits.in_battle {
                         mirror_hud(registers, resources, vertices);
+                    } else if on_title {
+                        mirror_title(registers, resources, vertices);
                     }
                 }
                 return Some(0);

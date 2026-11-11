@@ -461,8 +461,9 @@ impl VulkanPresenter {
         .map_err(vk_fail("querying surface capabilities"))?;
 
         // a current extent of u32::MAX means the surface takes its size from
-        // the swapchain rather than the other way round.
-        let extent = if capabilities.current_extent.width == u32::MAX {
+        // the swapchain rather than the other way round; on Switch, NWindow
+        // also takes the swapchain's extent through nwindowSetDimensions.
+        let extent = if capabilities.current_extent.width == u32::MAX || cfg!(target_os = "horizon") {
             vk::Extent2D {
                 width: self.window.0.clamp(
                     capabilities.min_image_extent.width,
@@ -540,6 +541,7 @@ impl VulkanPresenter {
         self.destroy_swapchain_resources();
         if old != vk::SwapchainKHR::null() {
             unsafe { self.swapchain_device.destroy_swapchain(old, None) };
+            log::info!("rebuilt swapchain at {}x{}", extent.width, extent.height);
         }
 
         self.swapchain = swapchain;
@@ -604,7 +606,10 @@ impl VulkanPresenter {
     fn upload(&mut self, index: usize, image: &ScreenImage<'_>) -> Result<(), PresentError> {
         if self.screens[index].width != image.width || self.screens[index].height != image.height
         {
+            let queue_lock = self.shared.as_ref().map(|shared| shared.queue_lock.clone());
+            let _queue = queue_lock.as_ref().map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
             unsafe { self.device.device_wait_idle() }.map_err(vk_fail("waiting for idle"))?;
+            drop(_queue);
             let old = std::mem::replace(
                 &mut self.screens[index],
                 Screen::new(
@@ -867,14 +872,16 @@ impl Presenter for VulkanPresenter {
             // surface has no size, nothing is built, and stale stays set
             // until the window is restored to a size again, so the guard
             // below for an empty extent must not come first.
-            self.defer(overlay);
+            let queue_lock = self.shared.as_ref().map(|shared| shared.queue_lock.clone());
+            let _queue = queue_lock.as_ref().map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
             unsafe { self.device.device_wait_idle() }.map_err(vk_fail("waiting for idle"))?;
+            drop(_queue);
             self.build_swapchain()?;
             if self.extent.width == 0 || self.extent.height == 0 {
                 // still minimized, keep waiting for a size.
+                self.defer(overlay);
                 return Ok(());
             }
-            return Err(PresentError::OutOfDate);
         }
         if self.extent.width == 0 || self.extent.height == 0 {
             self.defer(overlay);
@@ -994,8 +1001,11 @@ impl Presenter for VulkanPresenter {
     }
 
     fn resize(&mut self, width: u32, height: u32) {
-        self.window = (width.max(1), height.max(1));
-        self.stale = true;
+        let window = (width.max(1), height.max(1));
+        if self.window != window {
+            self.window = window;
+            self.stale = true;
+        }
     }
 
     fn set_layout(&mut self, arrangement: ScreenLayout) {

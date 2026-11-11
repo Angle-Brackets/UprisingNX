@@ -2566,15 +2566,72 @@ impl Hardware {
         self.scale
     }
 
-    /// draws at a multiple of the console's resolution, before anything is
-    /// drawn, when the GPU can scale surfaces, and says the one it took.
+    /// draws at a multiple of the console's resolution from now on, when
+    /// the GPU can scale surfaces, and says the one it took.
     pub fn set_scale(&mut self, scale: u32) -> u32 {
-        if self.surfaces.is_empty() && self.blits {
-            // up to 8, and no more than keeps the largest buffers, 1024
-            // pixels across, within what the GPU makes
-            self.scale = scale.clamp(1, 8).min((self.max_image_size / 1024).max(1));
+        if !self.blits {
+            return self.scale;
         }
+        // up to 8, and no more than keeps the largest buffers, 1024
+        // pixels across, within what the GPU makes
+        let next = scale.clamp(1, 8).min((self.max_image_size / 1024).max(1));
+        if next == self.scale {
+            return self.scale;
+        }
+        if !self.surfaces.is_empty() || !self.copies.is_empty() || !self.twin_copies.is_empty() {
+            let _ = self.submit();
+            let _ = self.wait();
+            let _queue = self.queue_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: queue_lock is held, so neither thread is submitting to the queue
+            unsafe {
+                let _ = self.device.device_wait_idle();
+            }
+            drop(_queue);
+            self.twin_draws.clear();
+            self.twinned_inputs = None;
+            self.rendering = None;
+            self.last_draw_state = None;
+            let copies = std::mem::take(&mut self.copies);
+            let twin_copies = std::mem::take(&mut self.twin_copies);
+            for (_, copy) in copies.into_iter().chain(twin_copies) {
+                self.destroy_image(&copy.image);
+            }
+            for surface in std::mem::take(&mut self.surfaces) {
+                self.destroy_image(&surface.image);
+                let uprights = [surface.upright, surface.twin_upright].into_iter().flatten().map(|upright| upright.image);
+                for image in [surface.native, surface.twin].into_iter().flatten().chain(uprights) {
+                    self.destroy_image(&image);
+                }
+                for capture in [surface.capture, surface.screen].into_iter().flatten() {
+                    // SAFETY: the GPU is idle and the surface is being dropped
+                    unsafe {
+                        self.device.destroy_buffer(capture.buffer.buffer, None);
+                        self.device.free_memory(capture.buffer.memory, None);
+                    }
+                }
+            }
+        }
+        self.scale = next;
         self.scale
+    }
+
+    /// writes dirty surfaces overlapping `keep` back to guest memory and
+    /// switches to `scale` from the next draw on.
+    pub(crate) fn set_scale_with_memory<M: GpuMemory>(&mut self, memory: &mut M, scale: u32, keep: &[(u32, u32)]) -> u32 {
+        if !self.blits {
+            return self.scale;
+        }
+        let next = scale.clamp(1, 8).min((self.max_image_size / 1024).max(1));
+        if next == self.scale {
+            return self.scale;
+        }
+        let dirty: Vec<usize> = (0..self.surfaces.len())
+            .filter(|&i| keep.iter().any(|&(addr, len)| self.surfaces[i].dirty_overlaps(addr, len)))
+            .collect();
+        if let Err(error) = self.write_back(memory, dirty) {
+            log::error!("the GPU could not write back surfaces before changing scale, {error}");
+        }
+        self.set_scale(next)
     }
 
     /// a host visible buffer, mapped for as long as it lives. one the host

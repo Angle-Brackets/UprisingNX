@@ -159,6 +159,7 @@ pub struct Flags {
     pub in_play: std::sync::atomic::AtomicBool,
     pub in_battle: std::sync::atomic::AtomicBool,
     pub big_portrait: std::sync::atomic::AtomicBool,
+    pub on_title: std::sync::atomic::AtomicBool,
 }
 
 pub struct Gpu {
@@ -392,6 +393,7 @@ impl Gpu {
     ) {
         self.take_flags();
         self.flush_draws(memory);
+        self.give_flags();
         if self.skip_frame {
             let screens = [
                 self.framebuffers[0].address_a_left,
@@ -407,14 +409,18 @@ impl Gpu {
         let input_height = input_dimensions >> 16;
         // the portraits the bottom screen drew last frame go into the top
         // screen before it goes out, unless they went under its subtitles
-        let top = [self.framebuffers[0].address_a_left, self.framebuffers[0].address_b_left].contains(&output_paddr);
+        let out_size = (output_dimensions & 0xFFFF, output_dimensions >> 16);
+        let linear_screen_out = (flags & (1 << 1)) == 0 && (flags & (1 << 5)) == 0;
+        let top = [self.framebuffers[0].address_a_left, self.framebuffers[0].address_b_left].contains(&output_paddr)
+            || (linear_screen_out && out_size == (240, 400));
         if raster::portraits_on() && top {
             self.resources.portraits.top_source = Some(input_paddr);
             if !std::mem::take(&mut self.resources.portraits.flushed) {
                 raster::flush_portraits(memory, &mut self.resources);
             }
         }
-        let bottom = [self.framebuffers[1].address_a_left, self.framebuffers[1].address_b_left].contains(&output_paddr);
+        let bottom = [self.framebuffers[1].address_a_left, self.framebuffers[1].address_b_left].contains(&output_paddr)
+            || (linear_screen_out && out_size == (240, 320));
         if self.resources.portraits.in_play && bottom {
             return;
         }
@@ -767,6 +773,9 @@ impl Gpu {
         if std::mem::take(&mut self.resources.portraits.big_portrait) {
             self.flags.big_portrait.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        if std::mem::take(&mut self.resources.portraits.title_seen) {
+            self.flags.on_title.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// whether the bottom screen drew a large dialogue portrait since this
@@ -833,6 +842,25 @@ impl Gpu {
         if let Some(hardware) = self.resources.hardware.as_ref() {
             return hardware.scale();
         }
+        1
+    }
+
+    /// draws at a multiple of the console's resolution from now on, when
+    /// the host's GPU can scale surfaces, writing dirty surfaces overlapping
+    /// `keep` back to guest memory first, and says the scale it took.
+    pub fn set_scale<M: GpuMemory>(&mut self, memory: &mut M, scale: u32, keep: &[(u32, u32)]) -> u32 {
+        self.flush_draws(memory);
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            let previous = hardware.scale();
+            let now = hardware.set_scale_with_memory(memory, scale, keep);
+            if now != previous && self.interpolation.is_some() {
+                self.interpolation = Some(Default::default());
+            }
+            return now;
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = (scale, keep);
         1
     }
 
