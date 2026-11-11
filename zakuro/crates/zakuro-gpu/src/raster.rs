@@ -1495,16 +1495,19 @@ pub(crate) struct Portraits {
     /// whether the bottom screen is currently rendering the title screen pass
     /// (started by the 128x256 Etc1 sky backdrop).
     title_bottom_drawing: bool,
-    /// whether the top screen drew the title screen's 512x512 La4 cloud layer
-    /// since the last top-screen transfer.
+    /// whether the current bottom-screen pass has already counted a title frame.
+    title_bottom_counted: bool,
+    /// whether the title screen's bottom-screen logo pass was seen since the
+    /// last top-screen transfer.
     title_sky_seen: bool,
-    /// whether the title screen's cloud layer is currently active on the top
-    /// screen.
+    /// whether the title screen is currently active.
     title_sky_active: bool,
-    /// consecutive top-screen transfers without a 512x512 La4 cloud draw.
+    /// consecutive top-screen transfers without a title-screen logo draw.
     title_sky_missed: u8,
     /// number of title-screen guest frames elapsed since the opening fly-in started.
     title_frames: u32,
+    /// warmup passes completed for the current title screen visit (0..=2).
+    title_warmups: u8,
     /// fade-in opacity (0.0..=1.0) for the title logo on the top screen,
     /// fading in when the Triumphal trumpets sound after Pit's fly-in.
     title_alpha: f32,
@@ -1746,8 +1749,7 @@ fn is_on_title(portraits: &Portraits) -> bool {
 }
 
 /// Kid Icarus Uprising's real-time title screen sky layer on the top screen
-/// (512x512 La4 cloud mask), which starts drawing at the Triumphal trumpets
-/// right as Pit disappears from his opening fly-in.
+/// (512x512 La4 cloud mask).
 fn is_title_sky(registers: &[u32]) -> bool {
     let base = TEXTURE_UNIT_BASES[0];
     registers[REG_TEXTURE_CONFIG] & 1 != 0
@@ -1769,6 +1771,7 @@ fn is_title_bottom_sky(registers: &[u32]) -> bool {
 fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
     if portraits.in_battle {
         portraits.title_bottom_drawing = false;
+        portraits.title_bottom_counted = false;
         portraits.title_sky_active = false;
         portraits.title_sky_seen = false;
         portraits.title_seen = false;
@@ -1778,6 +1781,7 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0
     {
         portraits.title_bottom_drawing = false;
+        portraits.title_bottom_counted = false;
         if is_title_sky(registers) {
             portraits.title_sky_seen = true;
             portraits.title_sky_active = true;
@@ -1793,11 +1797,12 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         portraits.title_bottom_drawing = true;
         portraits.title_seen = true;
         portraits.title_frames = portraits.title_frames.saturating_add(1);
-        if portraits.title_frames <= 16 || portraits.title.len() < 2 {
+        if portraits.title_frames <= 4 || portraits.title.len() < 2 {
             portraits.title.clear();
         }
     } else if !is_bottom(registers) {
         portraits.title_bottom_drawing = false;
+        portraits.title_bottom_counted = false;
     }
 }
 
@@ -2258,19 +2263,24 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
         resources.portraits.title_sky_seen = false;
         resources.portraits.title_sky_active = false;
         resources.portraits.title_bottom_drawing = false;
+        resources.portraits.title_bottom_counted = false;
         resources.portraits.title_alpha = 0.0;
         resources.portraits.title_frames = 0;
+        resources.portraits.title_warmups = 0;
         resources.portraits.title.clear();
     } else if std::mem::take(&mut resources.portraits.title_sky_seen) {
         resources.portraits.title_sky_missed = 0;
     } else if resources.portraits.title_sky_active {
         resources.portraits.title_sky_missed = resources.portraits.title_sky_missed.saturating_add(1);
-        if resources.portraits.title_sky_missed > 2 {
+        if resources.portraits.title_sky_missed > 1 {
             resources.portraits.title_sky_active = false;
             resources.portraits.title_alpha = 0.0;
             resources.portraits.title_frames = 0;
+            resources.portraits.title_warmups = 0;
             resources.portraits.title.clear();
         }
+    } else {
+        resources.portraits.title.clear();
     }
     let mut drew_title = false;
     // Pit flies in across the top screen for the first ~248 title-screen guest
@@ -2283,11 +2293,17 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     const TITLE_SIZZLE_START_FRAMES: u32 = 335;
     const TITLE_SIZZLE_TRANSITION_FRAMES: f32 = 42.0;
     if resources.portraits.title_sky_active && !resources.portraits.title.is_empty() {
-        if resources.portraits.title_frames == 16 {
-            // Warm up the TEV stage 5 fade-in pipeline and upload the logo and
-            // copyright textures to Vulkan with alpha = 0.0 early in the title
-            // screen so no texture upload or pipeline stall occurs when Pit
+        let should_warmup = (resources.portraits.title_warmups == 0
+            && resources.portraits.title.len() >= 2)
+            || (resources.portraits.title_warmups == 1
+                && resources.portraits.title_frames >= 4);
+        if should_warmup {
+            // Warm up the TEV stage 5 fade-in pipeline, upscale the logo into
+            // the persistent static cache on frame 1 (while the screen is still
+            // black before Pit appears), and upload the 2x textures to Vulkan
+            // on frame 4 after resolution boost so zero stall occurs when Pit
             // zooms away at frame 248.
+            resources.portraits.title_warmups += 1;
             let title = resources.portraits.title.clone();
             for draw in &title {
                 draw_title_faded(memory, resources, draw, 0.0, 0.0, true);
@@ -2652,30 +2668,58 @@ impl TextureCache {
         } else {
             picture_for(self.pack.as_deref(), &data[..base_size], &decoded_texels[..base_count], key, &mut self.rows)
         };
-        if portrait {
+        let texels: Arc<[[u8; 4]]> = if portrait {
             clean_portrait_texels(&mut decoded_texels, width, height);
+            Arc::from(decoded_texels)
         } else if title_sprite {
-            decoded_texels = upscale_title_texels(&decoded_texels, width, height);
-        } else if data.len() > base_size {
-            let mut offset = base_size;
-            let mut level = 1u32;
-            while offset < data.len() {
-                let (w, h) = (width >> level, height >> level);
-                let level_size = (w as usize * h as usize * bpp).div_ceil(8);
-                if w < 8 || h < 8 || offset + level_size > data.len() {
-                    break;
-                }
-                decoded_texels.extend_from_slice(&crate::texture::decode_texture(&data[offset..offset + level_size], format, w, h));
-                offset += level_size;
-                level += 1;
+            static TITLE_CACHE: std::sync::OnceLock<
+                std::sync::Mutex<HashMap<(u32, u32, u64), Arc<[[u8; 4]]>>>,
+            > = std::sync::OnceLock::new();
+            let cache = TITLE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+            let cache_key = (width, height, hash);
+            if let Some(cached) = cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&cache_key)
+                .cloned()
+            {
+                cached
+            } else {
+                let upscaled: Arc<[[u8; 4]]> =
+                    Arc::from(upscale_title_texels(&decoded_texels, width, height));
+                cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(cache_key, upscaled.clone());
+                upscaled
             }
-        }
-        let count = decoded_texels.len();
+        } else {
+            if data.len() > base_size {
+                let mut offset = base_size;
+                let mut level = 1u32;
+                while offset < data.len() {
+                    let (w, h) = (width >> level, height >> level);
+                    let level_size = (w as usize * h as usize * bpp).div_ceil(8);
+                    if w < 8 || h < 8 || offset + level_size > data.len() {
+                        break;
+                    }
+                    decoded_texels.extend_from_slice(&crate::texture::decode_texture(
+                        &data[offset..offset + level_size],
+                        format,
+                        w,
+                        h,
+                    ));
+                    offset += level_size;
+                    level += 1;
+                }
+            }
+            Arc::from(decoded_texels)
+        };
+        let count = texels.len();
         if self.texels + count > CACHED_TEXELS {
             self.entries.clear();
             self.texels = 0;
         }
-        let texels: Arc<[[u8; 4]]> = Arc::from(decoded_texels);
         let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
         if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
@@ -2722,6 +2766,15 @@ fn upscale_title_texels(base: &[[u8; 4]], width: u32, height: u32) -> Vec<[u8; 4
         for ox in 0..out_w {
             let sx = (ox as f32 + 0.5) * 0.5 - 0.5;
             let ix = sx.floor() as i32;
+            // Fast-path: if the 2x2 clamping neighborhood is completely transparent,
+            // the clamped result is guaranteed to be [0.0; 4].
+            if sample_pm(ix, iy)[3] == 0.0
+                && sample_pm(ix + 1, iy)[3] == 0.0
+                && sample_pm(ix, iy + 1)[3] == 0.0
+                && sample_pm(ix + 1, iy + 1)[3] == 0.0
+            {
+                continue;
+            }
             let wx = catmull_rom(sx - ix as f32);
             let mut sum = [0.0f32; 4];
             let mut lo = [f32::MAX; 4];
@@ -2754,11 +2807,14 @@ fn upscale_title_texels(base: &[[u8; 4]], width: u32, height: u32) -> Vec<[u8; 4
             let ym2 = y.saturating_sub(2);
             let yp2 = (y + 2).min(bh - 1);
             for x in 0..bw {
+                let center = buf[y * bw + x];
+                if center[3] == 0.0 {
+                    continue;
+                }
                 let xm = x.saturating_sub(1);
                 let xp = (x + 1).min(bw - 1);
                 let xm2 = x.saturating_sub(2);
                 let xp2 = (x + 2).min(bw - 1);
-                let center = buf[y * bw + x];
                 let mut blur = [0.0f32; 4];
                 let mut lo = center;
                 let mut hi = center;
@@ -4060,7 +4116,7 @@ pub fn draw<M: GpuMemory>(
     }
     note_title_draw(registers, &mut resources.portraits);
     let on_title = is_on_title(&resources.portraits);
-    let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
+    let title_ready = resources.portraits.title_frames > 4 && resources.portraits.title.len() >= 2;
     let bottom = is_bottom(registers);
     if bottom {
         resources.portraits.bottom_seen = true;
@@ -4337,7 +4393,7 @@ pub fn draw_immediate<M: GpuMemory>(
 ) -> u32 {
     note_title_draw(registers, &mut resources.portraits);
     let on_title = is_on_title(&resources.portraits);
-    let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
+    let title_ready = resources.portraits.title_frames > 4 && resources.portraits.title.len() >= 2;
     let bottom = is_bottom(registers);
     if bottom {
         resources.portraits.bottom_seen = true;

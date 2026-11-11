@@ -2615,8 +2615,8 @@ impl Hardware {
         self.scale
     }
 
-    /// writes dirty surfaces overlapping `keep` back to guest memory and
-    /// switches to `scale` from the next draw on.
+    /// writes dirty surfaces back to guest memory and switches to `scale`
+    /// from the next draw on.
     pub(crate) fn set_scale_with_memory<M: GpuMemory>(&mut self, memory: &mut M, scale: u32, keep: &[(u32, u32)]) -> u32 {
         if !self.blits {
             return self.scale;
@@ -2625,8 +2625,9 @@ impl Hardware {
         if next == self.scale {
             return self.scale;
         }
+        let _ = keep;
         let dirty: Vec<usize> = (0..self.surfaces.len())
-            .filter(|&i| keep.iter().any(|&(addr, len)| self.surfaces[i].dirty_overlaps(addr, len)))
+            .filter(|&i| self.surfaces[i].dirty.is_some())
             .collect();
         if let Err(error) = self.write_back(memory, dirty) {
             log::error!("the GPU could not write back surfaces before changing scale, {error}");

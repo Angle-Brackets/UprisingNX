@@ -607,7 +607,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     } else {
         unx.title_quiet.saturating_add(1)
     };
-    let title_boost = unx.title_quiet <= 15 && !in_battle;
+    let title_boost = unx.title_quiet <= 3 && !in_battle;
     if title_boost != unx.title_boosted {
         unx.title_boosted = title_boost;
         if unx.fixed_resolution.is_none() && !unx.docked {
