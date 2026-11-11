@@ -422,6 +422,11 @@ impl Gpu {
             || (linear_screen_out && out_size == (240, 400));
         if raster::portraits_on() && top {
             self.resources.portraits.top_source = Some(input_paddr);
+            if (0x1800_0000..0x1860_0000).contains(&input_paddr) {
+                if let Some(top_buf) = self.resources.portraits.top.as_mut() {
+                    top_buf[0] = (input_paddr & !0x7_FFFF) >> 3;
+                }
+            }
             if !std::mem::take(&mut self.resources.portraits.flushed) {
                 raster::flush_portraits(memory, &mut self.resources);
             }

@@ -1478,12 +1478,17 @@ pub(crate) struct Portraits {
     pub(crate) top_source: Option<u32>,
     /// the top screen's color buffer registers, address, format and size,
     /// from the last draw into the buffer that transfer read.
-    top: Option<[u32; 3]>,
+    pub(crate) top: Option<[u32; 3]>,
     /// the right corner's portrait and the left one's.
     sides: [Side; 2],
     /// the battle display's draws the bottom screen made this frame that lie
     /// in an island, see ISLANDS.
     hud: Vec<PortraitDraw>,
+    /// the last battle display draws flushed, reused if a subtitle flush
+    /// follows an end-of-frame transfer flush before the bottom screen runs.
+    last_hud: Vec<PortraitDraw>,
+    /// whether the bottom screen has drawn since the last portrait flush.
+    bottom_seen: bool,
     /// the title screen's logo and copyright draws redirected from the bottom
     /// screen onto the top screen.
     title: Vec<PortraitDraw>,
@@ -1715,18 +1720,29 @@ fn skip_bottom_in_play(
     if !on_bottom(registers) {
         return true;
     }
+    let portrait = is_portrait(registers);
+    if portrait {
+        return false;
+    }
     if on_title {
         return is_title_bottom_sky(registers) || title_ready;
     }
-    let portrait = is_portrait(registers);
     if !in_battle {
-        return !portrait;
+        return true;
     }
     let base = TEXTURE_UNIT_BASES[0];
     if TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4 {
         return true;
     }
-    !portrait && vertex_count > 16
+    vertex_count > 16
+}
+
+/// whether the GPU is currently drawing the title screen (not a battle).
+fn is_on_title(portraits: &Portraits) -> bool {
+    !portraits.in_battle
+        && (portraits.title_bottom_drawing
+            || portraits.title_sky_active
+            || portraits.title_sky_seen)
 }
 
 /// Kid Icarus Uprising's real-time title screen sky layer on the top screen
@@ -1751,6 +1767,13 @@ fn is_title_bottom_sky(registers: &[u32]) -> bool {
 /// tracks when the title screen's top-screen sky or bottom-screen logo pass is
 /// being drawn.
 fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
+    if portraits.in_battle {
+        portraits.title_bottom_drawing = false;
+        portraits.title_sky_active = false;
+        portraits.title_sky_seen = false;
+        portraits.title_seen = false;
+        return;
+    }
     if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
         && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0
     {
@@ -1766,7 +1789,7 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                 registers[REG_FRAMEBUFFER_DIMENSIONS],
             ]);
         }
-    } else if on_bottom(registers) && is_title_bottom_sky(registers) {
+    } else if portraits.title_sky_active && on_bottom(registers) && is_title_bottom_sky(registers) {
         portraits.title_bottom_drawing = true;
         portraits.title_seen = true;
         portraits.title_frames = portraits.title_frames.saturating_add(1);
@@ -1835,15 +1858,18 @@ fn draw_subtitle_shadow<M: GpuMemory>(registers: &[u32], memory: &mut M, resourc
 /// the texture combiner's six stages, each five registers from there.
 const TEV_STAGES: [usize; 6] = [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8];
 
-/// remembers the top screen's color buffer, the one the last transfer to
-/// the top screen read from, as a draw into it shows it.
+/// remembers the top screen's color buffer, either a 240x400 top-screen draw
+/// into VRAM or the buffer the last transfer to the top screen read from.
 fn note_top_buffer(registers: &[u32], resources: &mut Resources) {
-    let Some(source) = resources.portraits.top_source else { return };
     let dimensions = registers[REG_FRAMEBUFFER_DIMENSIONS];
     let (width, height) = (dimensions & 0x7FF, ((dimensions >> 12) & 0x3FF) + 1);
     let format = ColorFormat::from_color_buffer((registers[REG_COLOR_BUFFER_FORMAT] >> 16) & 7);
     let start = loc_register(registers, REG_COLOR_BUFFER_ADDRESS);
-    if (start..start + width * height * format.bytes_per_pixel() as u32).contains(&source) {
+    let in_vram_top = (0x1800_0000..0x1860_0000).contains(&start) && width >= 240 && height >= 400;
+    let matches_source = resources.portraits.top_source.is_some_and(|source| {
+        (start..start + width * height * format.bytes_per_pixel() as u32).contains(&source)
+    });
+    if in_vram_top || matches_source {
         resources.portraits.top = Some([
             registers[REG_COLOR_BUFFER_ADDRESS],
             registers[REG_COLOR_BUFFER_FORMAT],
@@ -2186,11 +2212,6 @@ fn draw_title_faded<M: GpuMemory>(
         registers[REG_COLOR_BUFFER_FORMAT] = format;
         registers[REG_FRAMEBUFFER_DIMENSIONS] = dimensions;
     }
-    if let Some(source) = resources.portraits.top_source {
-        if (0x1800_0000..0x1860_0000).contains(&source) {
-            registers[REG_COLOR_BUFFER_ADDRESS] = (source & !0x7_FFFF) >> 3;
-        }
-    }
     registers[REG_COLOR_OPERATION] = (registers[REG_COLOR_OPERATION] & !0xFF) | 0x00E4_0100;
     registers[REG_BLEND_FUNC] = 0x0176_0000;
     registers[0x0F8] = 0x00EF_000F;
@@ -2231,8 +2252,16 @@ const PORTRAIT_ALPHA: f32 = 0.85;
 pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bool {
     // how much of a portrait fades in or out each frame, 8 frames in all
     let step = 1.0 / 8.0;
+    let bottom_seen = std::mem::take(&mut resources.portraits.bottom_seen);
     resources.portraits.hud_islands = 0;
-    if std::mem::take(&mut resources.portraits.title_sky_seen) {
+    if resources.portraits.in_battle {
+        resources.portraits.title_sky_seen = false;
+        resources.portraits.title_sky_active = false;
+        resources.portraits.title_bottom_drawing = false;
+        resources.portraits.title_alpha = 0.0;
+        resources.portraits.title_frames = 0;
+        resources.portraits.title.clear();
+    } else if std::mem::take(&mut resources.portraits.title_sky_seen) {
         resources.portraits.title_sky_missed = 0;
     } else if resources.portraits.title_sky_active {
         resources.portraits.title_sky_missed = resources.portraits.title_sky_missed.saturating_add(1);
@@ -2245,7 +2274,7 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     }
     let mut drew_title = false;
     // Pit flies in across the top screen for the first ~248 title-screen guest
-    // frames (~8.3s) and disappears in a starburst flash at the top-right as
+    // frames (~8.3s) and disappears in a starburst at the top-right as
     // the Triumphal trumpets sound. Around frame ~335 (~11.2s), as the title
     // screen transitions into the sizzle reel, the logo smoothly scales and
     // glides into the top-left corner over 42 guest frames (~1.4s).
@@ -2284,6 +2313,7 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     if resources.portraits.in_play && !resources.portraits.in_battle {
         resources.portraits.sides = Default::default();
         resources.portraits.hud.clear();
+        resources.portraits.last_hud.clear();
         resources.portraits.text_lines.clear();
         return drew_title;
     }
@@ -2291,27 +2321,29 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     let mut drew = false;
     for side in &mut sides {
         let incoming = std::mem::take(&mut side.incoming);
-        match (incoming.is_empty(), &mut side.shown) {
-            // the same picture, where the game has it now
-            (false, Some(shown)) if shown.draws.first().map(PortraitDraw::picture) == incoming.first().map(PortraitDraw::picture) => {
-                shown.draws = incoming;
-                shown.alpha = (shown.alpha + step).min(PORTRAIT_ALPHA);
+        if bottom_seen || !incoming.is_empty() {
+            match (incoming.is_empty(), &mut side.shown) {
+                // the same picture, where the game has it now
+                (false, Some(shown)) if shown.draws.first().map(PortraitDraw::picture) == incoming.first().map(PortraitDraw::picture) => {
+                    shown.draws = incoming;
+                    shown.alpha = (shown.alpha + step).min(PORTRAIT_ALPHA);
+                }
+                // a new one, over the one before
+                (false, _) => {
+                    side.leaving = side.shown.take().or(side.leaving.take());
+                    side.shown = Some(Faded { draws: incoming, alpha: step });
+                }
+                // the game stopped drawing it
+                (true, Some(shown)) => shown.alpha -= step,
+                (true, None) => {}
             }
-            // a new one, over the one before
-            (false, _) => {
-                side.leaving = side.shown.take().or(side.leaving.take());
-                side.shown = Some(Faded { draws: incoming, alpha: step });
+            if let Some(leaving) = &mut side.leaving {
+                leaving.alpha -= step;
             }
-            // the game stopped drawing it
-            (true, Some(shown)) => shown.alpha -= step,
-            (true, None) => {}
-        }
-        if let Some(leaving) = &mut side.leaving {
-            leaving.alpha -= step;
-        }
-        for faded in [&mut side.leaving, &mut side.shown] {
-            if faded.as_ref().is_some_and(|faded| faded.alpha <= 0.0) {
-                *faded = None;
+            for faded in [&mut side.leaving, &mut side.shown] {
+                if faded.as_ref().is_some_and(|faded| faded.alpha <= 0.0) {
+                    *faded = None;
+                }
             }
         }
         for faded in [&side.leaving, &side.shown].into_iter().flatten() {
@@ -2324,21 +2356,42 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     resources.portraits.sides = sides;
     // the battle display as the bottom screen had it, no fading, it is
     // there whenever the game draws it
-    let hud = std::mem::take(&mut resources.portraits.hud);
-    for draw in hud {
+    let hud = if bottom_seen || !resources.portraits.hud.is_empty() {
+        let taken = std::mem::take(&mut resources.portraits.hud);
+        resources.portraits.last_hud = taken.clone();
+        taken
+    } else {
+        resources.portraits.last_hud.clone()
+    };
+    let top_target = resources.portraits.top;
+    resources.portraits.adding = true;
+    for mut draw in hud {
+        if let Some([address, format, dimensions]) = top_target {
+            draw.registers[REG_COLOR_BUFFER_ADDRESS] = address;
+            draw.registers[REG_COLOR_BUFFER_FORMAT] = format;
+            draw.registers[REG_FRAMEBUFFER_DIMENSIONS] = dimensions;
+        }
         rasterize(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
         drew = true;
     }
+    resources.portraits.adding = false;
     drew
 }
 
 /// draws a portrait with only alpha of it showing over what is there.
 fn draw_faded<M: GpuMemory>(memory: &mut M, resources: &mut Resources, draw: &PortraitDraw, alpha: f32) {
+    let mut registers = draw.registers.clone();
+    if let Some([address, format, dimensions]) = resources.portraits.top {
+        registers[REG_COLOR_BUFFER_ADDRESS] = address;
+        registers[REG_COLOR_BUFFER_FORMAT] = format;
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = dimensions;
+    }
     if alpha >= 1.0 {
-        rasterize(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
+        resources.portraits.adding = true;
+        rasterize(&registers, memory, resources, Vertices::Shaded(&draw.vertices));
+        resources.portraits.adding = false;
         return;
     }
-    let mut registers = draw.registers.clone();
     let mut vertices = draw.vertices.clone();
     if registers[REG_COLOR_OPERATION] & 0x100 == 0 {
         // blends it with the constant alpha, color source * alpha plus the
@@ -2352,7 +2405,9 @@ fn draw_faded<M: GpuMemory>(memory: &mut M, resources: &mut Resources, draw: &Po
             vertex.color[3] *= alpha;
         }
     }
+    resources.portraits.adding = true;
     rasterize(&registers, memory, resources, Vertices::Shaded(&vertices));
+    resources.portraits.adding = false;
 }
 
 const REG_BLEND_COLOR: usize = 0x103;
@@ -2538,7 +2593,7 @@ impl TextureCache {
     fn checked(&self, key: TextureKey, size: u32) -> Option<Found> {
         let decoded = self.entries.get(&key).filter(|d| d.bytes.len() == size as usize)?;
         let (list, writes) = decoded.checked;
-        let addr = key.0 & !1;
+        let addr = key.0 & !3;
         let overwritten = self.written[writes.min(self.written.len())..]
             .iter()
             .any(|&(start, length)| start < addr.saturating_add(size) && addr < start.saturating_add(length));
@@ -2550,6 +2605,7 @@ impl TextureCache {
         let (addr, format, width, height) = key;
         let height = height & 0xFFFF;
         let portrait = addr & 1 != 0;
+        let title_sprite = addr & 2 != 0;
         let bpp = format.bits_per_pixel() as usize;
         let base_size = (width as usize * height as usize * bpp).div_ceil(8);
         let base_count = (width * height) as usize;
@@ -2560,7 +2616,7 @@ impl TextureCache {
                 return (decoded.texels.clone(), decoded.replacement.clone());
             }
             let hash = fingerprint(data);
-            if !portrait && data.len() == base_size && decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
+            if !portrait && !title_sprite && data.len() == base_size && decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
                 // a title changing a few sprites of an atlas rewrites a
                 // handful of its 8x8 tiles, those alone are decoded again,
                 // into a copy, as the old texels may still be uploading
@@ -2591,8 +2647,15 @@ impl TextureCache {
         }
         let hash = fingerprint(data);
         let mut decoded_texels = crate::texture::decode_texture(&data[..base_size], format, width, height);
+        let replacement = if title_sprite {
+            None
+        } else {
+            picture_for(self.pack.as_deref(), &data[..base_size], &decoded_texels[..base_count], key, &mut self.rows)
+        };
         if portrait {
             clean_portrait_texels(&mut decoded_texels, width, height);
+        } else if title_sprite {
+            decoded_texels = upscale_title_texels(&decoded_texels, width, height);
         } else if data.len() > base_size {
             let mut offset = base_size;
             let mut level = 1u32;
@@ -2613,7 +2676,6 @@ impl TextureCache {
             self.texels = 0;
         }
         let texels: Arc<[[u8; 4]]> = Arc::from(decoded_texels);
-        let replacement = picture_for(self.pack.as_deref(), &data[..base_size], &texels[..base_count], key, &mut self.rows);
         let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
         if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
@@ -2621,6 +2683,133 @@ impl TextureCache {
         self.texels += count;
         (texels, replacement)
     }
+}
+
+/// upscales a 3DS title-screen RGBA8 sprite (the Kid Icarus: Uprising logo and
+/// copyright notice) 2x in memory using clamped Catmull-Rom bicubic
+/// interpolation in premultiplied-alpha space followed by an unsharp mask, and
+/// builds a 3-level sharpened mipmap pyramid so both the full-size centered
+/// logo and the 42%-scaled sizzle-reel corner logo sample cleanly without
+/// blur or dark alpha fringes.
+fn upscale_title_texels(base: &[[u8; 4]], width: u32, height: u32) -> Vec<[u8; 4]> {
+    let (w, h) = (width as usize, height as usize);
+    let mut pm = vec![[0.0f32; 4]; w * h];
+    for (dst, &[r, g, b, a]) in pm.iter_mut().zip(base.iter()) {
+        let af = a as f32 / 255.0;
+        *dst = [r as f32 * af, g as f32 * af, b as f32 * af, a as f32];
+    }
+    let sample_pm = |x: i32, y: i32| -> [f32; 4] {
+        let cx = x.clamp(0, w as i32 - 1) as usize;
+        let cy = y.clamp(0, h as i32 - 1) as usize;
+        pm[cy * w + cx]
+    };
+    let catmull_rom = |t: f32| -> [f32; 4] {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        [
+            -0.5 * t + t2 - 0.5 * t3,
+            1.0 - 2.5 * t2 + 1.5 * t3,
+            0.5 * t + 2.0 * t2 - 1.5 * t3,
+            -0.5 * t2 + 0.5 * t3,
+        ]
+    };
+    let (out_w, out_h) = (w * 2, h * 2);
+    let mut up_pm = vec![[0.0f32; 4]; out_w * out_h];
+    for oy in 0..out_h {
+        let sy = (oy as f32 + 0.5) * 0.5 - 0.5;
+        let iy = sy.floor() as i32;
+        let wy = catmull_rom(sy - iy as f32);
+        for ox in 0..out_w {
+            let sx = (ox as f32 + 0.5) * 0.5 - 0.5;
+            let ix = sx.floor() as i32;
+            let wx = catmull_rom(sx - ix as f32);
+            let mut sum = [0.0f32; 4];
+            let mut lo = [f32::MAX; 4];
+            let mut hi = [f32::MIN; 4];
+            for dy in -1..=2 {
+                let row_w = wy[(dy + 1) as usize];
+                for dx in -1..=2 {
+                    let p = sample_pm(ix + dx, iy + dy);
+                    let weight = row_w * wx[(dx + 1) as usize];
+                    for c in 0..4 {
+                        sum[c] += p[c] * weight;
+                        if (0..=1).contains(&dx) && (0..=1).contains(&dy) {
+                            lo[c] = lo[c].min(p[c]);
+                            hi[c] = hi[c].max(p[c]);
+                        }
+                    }
+                }
+            }
+            for c in 0..4 {
+                sum[c] = sum[c].clamp(lo[c], hi[c]);
+            }
+            up_pm[oy * out_w + ox] = sum;
+        }
+    }
+    let sharpen_and_unpremult = |buf: &[[f32; 4]], bw: usize, bh: usize, strength: f32| -> Vec<[u8; 4]> {
+        let mut out = vec![[0u8; 4]; bw * bh];
+        for y in 0..bh {
+            let ym = y.saturating_sub(1);
+            let yp = (y + 1).min(bh - 1);
+            for x in 0..bw {
+                let xm = x.saturating_sub(1);
+                let xp = (x + 1).min(bw - 1);
+                let center = buf[y * bw + x];
+                let mut blur = [0.0f32; 4];
+                let neighbors = [
+                    (xm, ym, 1.0), (x, ym, 2.0), (xp, ym, 1.0),
+                    (xm, y,  2.0), (x, y,  4.0), (xp, y,  2.0),
+                    (xm, yp, 1.0), (x, yp, 2.0), (xp, yp, 1.0),
+                ];
+                for &(nx, ny, w_k) in &neighbors {
+                    let p = buf[ny * bw + nx];
+                    for c in 0..4 {
+                        blur[c] += p[c] * (w_k / 16.0);
+                    }
+                }
+                let mut s = [0.0f32; 4];
+                for c in 0..4 {
+                    s[c] = (center[c] + strength * (center[c] - blur[c])).clamp(0.0, 255.0);
+                }
+                let a = s[3].round() as u8;
+                if a <= 2 {
+                    out[y * bw + x] = [0, 0, 0, 0];
+                } else {
+                    let af = s[3] / 255.0;
+                    let r = (s[0] / af).round().clamp(0.0, 255.0) as u8;
+                    let g = (s[1] / af).round().clamp(0.0, 255.0) as u8;
+                    let b = (s[2] / af).round().clamp(0.0, 255.0) as u8;
+                    out[y * bw + x] = [r, g, b, a];
+                }
+            }
+        }
+        out
+    };
+    let mut total_texels = sharpen_and_unpremult(&up_pm, out_w, out_h, 0.65);
+    let mut cur_pm = up_pm;
+    let (mut cur_w, mut cur_h) = (out_w, out_h);
+    for level in 1..=3 {
+        let (nw, nh) = (cur_w >> 1, cur_h >> 1);
+        if nw < 8 || nh < 8 {
+            break;
+        }
+        let mut next_pm = vec![[0.0f32; 4]; nw * nh];
+        for y in 0..nh {
+            for x in 0..nw {
+                let p00 = cur_pm[(y * 2) * cur_w + (x * 2)];
+                let p10 = cur_pm[(y * 2) * cur_w + (x * 2 + 1)];
+                let p01 = cur_pm[(y * 2 + 1) * cur_w + (x * 2)];
+                let p11 = cur_pm[(y * 2 + 1) * cur_w + (x * 2 + 1)];
+                next_pm[y * nw + x] = std::array::from_fn(|c| 0.25 * (p00[c] + p10[c] + p01[c] + p11[c]));
+            }
+        }
+        let mip_strength = if level == 1 { 0.45 } else { 0.30 };
+        total_texels.extend_from_slice(&sharpen_and_unpremult(&next_pm, nw, nh, mip_strength));
+        cur_pm = next_pm;
+        cur_w = nw;
+        cur_h = nh;
+    }
+    total_texels
 }
 
 /// Kid Icarus Uprising's Etc1 portraits encode transparency by shifting the
@@ -2855,8 +3044,12 @@ fn bind_texture<M: GpuMemory>(
     let addr = memory.translate(address);
     log::trace!("texture unit {unit}: 0x{address:08X} -> 0x{addr:08X}, {width}x{height} {format:?}");
     let portrait = unit == 0 && format == TextureFormat::Etc1 && registers[0x0CA] == 0x0002_0001 && registers[0x0D0] >> 16 == 0x0F03;
+    let title_sprite = unit == 0
+        && format == TextureFormat::Rgba8
+        && registers[0x0F8] == 0x00EF_000F
+        && registers[0x0FA] == 0x0001_0000;
     let lod = registers[base + 3];
-    let req_max_level = if portrait || drawn.is_some() { 0 } else { (lod >> 16) & 0xF };
+    let req_max_level = if portrait || title_sprite || drawn.is_some() { 0 } else { (lod >> 16) & 0xF };
     let mut max_level = 0u32;
     while max_level < req_max_level && (width >> (max_level + 1)) >= 8 && (height >> (max_level + 1)) >= 8 {
         max_level += 1;
@@ -2869,7 +3062,12 @@ fn bind_texture<M: GpuMemory>(
     let size = total_bits.div_ceil(8) as usize;
     let lod_bias = (((lod & 0x1FFF) as i32) << 19 >> 19) as i16;
 
-    let key = (addr | (portrait as u32), format, width, height | (max_level << 16));
+    let key = (
+        addr | (portrait as u32) | ((title_sprite as u32) << 1),
+        format,
+        width,
+        height | (max_level << 16),
+    );
     let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
         (Some(_), _) if !past => (Arc::default(), None),
         (_, Some(found)) => found,
@@ -2886,7 +3084,12 @@ fn bind_texture<M: GpuMemory>(
     // filter mode in bit 1 (magnification), 2 (minification), and 24 (mipmap),
     // the wrap modes for T and S in bits 8-10 and 12-14.
     let config = registers[base + 2];
-    let mipmapped = max_level > 0;
+    let (out_width, out_height, out_max_level, out_lod_bias) = if title_sprite {
+        (width * 2, height * 2, 3u8, -96i16)
+    } else {
+        (width, height, max_level as u8, lod_bias)
+    };
+    let mipmapped = out_max_level > 0;
     Some(BoundTexture {
         texels,
         drawn,
@@ -2898,12 +3101,12 @@ fn bind_texture<M: GpuMemory>(
             _ => config & 0x6 != 0,
         },
         mip_linear: config & (1 << 24) != 0 || mipmapped || filter_mode() == 3,
-        max_level: max_level as u8,
-        lod_bias,
-        wrap_t: Wrap::from_raw(config >> 8),
-        wrap_s: Wrap::from_raw(config >> 12),
-        width,
-        height,
+        max_level: out_max_level,
+        lod_bias: out_lod_bias,
+        wrap_t: if title_sprite { Wrap::ClampToEdge } else { Wrap::from_raw(config >> 8) },
+        wrap_s: if title_sprite { Wrap::ClampToEdge } else { Wrap::from_raw(config >> 12) },
+        width: out_width,
+        height: out_height,
         // the border color register comes first in each unit's block, RGBA8
         border: registers[base].to_le_bytes().map(|c| c as f32 / 255.0),
         // a buffer drawn into is the GPU's, not a pack's picture
@@ -3830,11 +4033,13 @@ pub fn draw<M: GpuMemory>(
         }
     }
     note_title_draw(registers, &mut resources.portraits);
-    let on_title = resources.portraits.title_bottom_drawing
-        || resources.portraits.title_sky_active
-        || resources.portraits.title_sky_seen;
+    let on_title = is_on_title(&resources.portraits);
     let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
-    if is_bottom(registers)
+    let bottom = is_bottom(registers);
+    if bottom {
+        resources.portraits.bottom_seen = true;
+    }
+    if bottom
         && resources.portraits.in_play
         && skip_bottom_in_play(
             registers,
@@ -4105,11 +4310,13 @@ pub fn draw_immediate<M: GpuMemory>(
     vertices: &[[Vec4; 16]],
 ) -> u32 {
     note_title_draw(registers, &mut resources.portraits);
-    let on_title = resources.portraits.title_bottom_drawing
-        || resources.portraits.title_sky_active
-        || resources.portraits.title_sky_seen;
+    let on_title = is_on_title(&resources.portraits);
     let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
-    if is_bottom(registers)
+    let bottom = is_bottom(registers);
+    if bottom {
+        resources.portraits.bottom_seen = true;
+    }
+    if bottom
         && resources.portraits.in_play
         && skip_bottom_in_play(
             registers,
@@ -4264,7 +4471,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
     if portraits_on() && !resources.portraits.adding {
         if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0 {
             note_top_buffer(registers, resources);
-            if is_title_sky(registers) {
+            if !resources.portraits.in_battle && is_title_sky(registers) {
                 resources.portraits.title_sky_seen = true;
                 resources.portraits.title_seen = true;
                 resources.portraits.top = Some([
@@ -4308,9 +4515,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             note_text(registers, resources, vertices);
         } else if on_bottom(registers) || is_bottom(registers) {
             let portrait = on_bottom(registers) && is_portrait(registers);
-            let on_title = resources.portraits.title_bottom_drawing
-                || resources.portraits.title_sky_active
-                || resources.portraits.title_sky_seen;
+            let on_title = is_on_title(&resources.portraits);
             // the CPU decodes its arrays then, and its vertices say where it is.
             // out of play only a portrait's are looked at, to see whether it is
             // a big one, a conversation

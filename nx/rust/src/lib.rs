@@ -173,6 +173,10 @@ pub struct Unx {
     dock_override: Option<bool>,
     /// a fixed resolution scale from ZAKURO_RESOLUTION in env.txt or cmd.txt `scale <n>`
     fixed_resolution: Option<u32>,
+    /// frames since the GPU last reported drawing the title screen
+    title_quiet: u32,
+    /// whether internal resolution is currently boosted to 2x for the title screen
+    title_boosted: bool,
     aim: aim::Aim,
     gyro_test: ([f32; 3], u32),
 }
@@ -315,7 +319,8 @@ impl Unx {
         self.docked = docked;
         let (width, height) = if docked { (1920, 1080) } else { (1280, 720) };
         self.presenter.resize(width, height);
-        let target_scale = self.fixed_resolution.unwrap_or(if docked { 2 } else { 1 });
+        let auto_scale = if docked || self.title_boosted { 2 } else { 1 };
+        let target_scale = self.fixed_resolution.unwrap_or(auto_scale);
         let scale = self.system.set_resolution(target_scale);
         log::info!(
             "unx: {} -> presenter {}x{}, internal resolution {}x (frame {})",
@@ -478,6 +483,8 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         hw_docked: docked,
         dock_override: None,
         fixed_resolution,
+        title_quiet: u32::MAX,
+        title_boosted: false,
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
     }))
@@ -529,6 +536,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     if !unx.in_play {
         unx.aim.patch_controls_ui(&mut unx.system.memory.phys.fcram, unx.frame);
     }
+    let on_title = unx.system.gpu.flags().on_title.swap(false, std::sync::atomic::Ordering::Relaxed);
     let mut look = (0.0, 0.0);
     if let Some(input) = input.as_ref() {
         let mut state = InputState {
@@ -550,7 +558,6 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 *g += t;
             }
         }
-        let on_title = unx.system.gpu.flags().on_title.swap(false, std::sync::atomic::Ordering::Relaxed);
         look = unx.aim.apply(&mut state, gyro, input.host);
         if on_title && !state.buttons.is_empty() {
             state.buttons |= PadState::A;
@@ -593,6 +600,26 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let docked = unx.dock_override.unwrap_or(hw_docked);
     if docked != unx.docked {
         unx.apply_docked(docked);
+    }
+
+    unx.title_quiet = if on_title && !in_battle {
+        0
+    } else {
+        unx.title_quiet.saturating_add(1)
+    };
+    let title_boost = unx.title_quiet <= 15 && !in_battle;
+    if title_boost != unx.title_boosted {
+        unx.title_boosted = title_boost;
+        if unx.fixed_resolution.is_none() && !unx.docked {
+            let target = if title_boost { 2 } else { 1 };
+            let scale = unx.system.set_resolution(target);
+            log::info!(
+                "unx: title screen resolution {} -> {}x (frame {})",
+                if title_boost { "boost" } else { "restore" },
+                scale,
+                unx.frame,
+            );
+        }
     }
 
     // development: sdmc:/switch/uprisingnx/cmd.txt holding "save" or "load" (optionally
