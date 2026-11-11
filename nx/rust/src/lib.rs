@@ -506,7 +506,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 *g += t;
             }
         }
-        look = unx.aim.apply(&mut state, gyro);
+        look = unx.aim.apply(&mut state, gyro, input.host);
         unx.system.set_input(state);
     }
     // on foot the game's mouse-look override reads the camera's turn from here

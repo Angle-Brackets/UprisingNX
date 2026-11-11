@@ -47,9 +47,13 @@ pub const GUEST_CONTROLS_VADDR: u32 = 0x00EF9638;
 /// Host mailbox mark for on-foot camera look (`"MLK1"`), followed by `across`
 /// and `down` as `f32` bottom-screen pixels (`zakuro::input::MOUSE_LOOK`).
 const MOUSE_LOOK: u32 = u32::from_le_bytes(*b"MLK1");
+/// Host mailbox mark to level on-foot camera pitch (`"MLKR"`).
+const MOUSE_LOOK_RECENTER: u32 = u32::from_le_bytes(*b"MLKR");
 /// Host mailbox mark for flying reticle aim (`"MAM1"`), followed by `across`
 /// and `down` as `f32` bottom-screen pixels (`zakuro::input::MOUSE_AIM`).
 const MOUSE_AIM: u32 = u32::from_le_bytes(*b"MAM1");
+/// Host mailbox mark to snap flying reticle back to rail center (`"MAMR"`).
+const MOUSE_AIM_RECENTER: u32 = u32::from_le_bytes(*b"MAMR");
 /// Host mailbox fourth word written by the game's overrides each tick.
 pub const GAME_ON_FOOT: u32 = 1;
 pub const GAME_FLYING: u32 = 2;
@@ -185,6 +189,10 @@ pub struct Aim {
     controls: GuestControls,
     /// Cached FCRAM byte offset of the Options/Menu `MsgStdBn` (`_r/b_03`, size `0x26DD0`).
     msbt_offset: Option<usize>,
+    /// Rising-edge tracker for the gyro/reticle recenter button (`R` or `StickL`).
+    recenter_held: bool,
+    /// Set when a gyro/reticle recenter has been requested for the next guest tick.
+    recenter_pending: bool,
 }
 
 /// Relative byte offsets and maximum UTF-16 character counts inside the Options/Menu
@@ -197,14 +205,14 @@ const MSBT_CONTROLS_PATCHES: &[(usize, usize, &str)] = &[
     (0x1170E, 29, "Reticle: Right Stick & Gyro"),
     (0x11904, 13, "\u{2190}Gyro Off"),
     (0x11920, 12, "Gyro Fast\u{2192}"),
-    (0x119B6, 26, "R-Stick & Gyro Aim active."),
+    (0x119B6, 26, "R-Stick & Gyro (R:Center)"),
     (0x11A3A, 36, "Adjusts vertical Stick & Gyro speed."),
     (0x11A84, 38, "Adjusts horizontal Stick & Gyro speed."),
     (0x11AD2, 51, "Adjusts Right-Stick and Gyro Aiming reticle speed."),
     (
         0x11B3A,
         77,
-        "This adjusts Gyro Aiming sensitivity.\nSlide all the way left for Off.",
+        "This adjusts Gyro Aiming sensitivity.\nSlide left for Off. Press R to center.",
     ),
     (0x11BD6, 51, "Adjust Air Battle Stick, Gyro & Invert Y controls."),
     (0x11C3E, 28, "Adjust Land Stick & Gyro."),
@@ -251,6 +259,8 @@ impl Aim {
             aiming: false,
             controls: GuestControls::default(),
             msbt_offset: None,
+            recenter_held: false,
+            recenter_pending: false,
         };
         log::info!(
             "unx: aim right_stick {} gyro {} (gyro_speed {}) left_stick_mode {} (modifier {:?}, invert y {}, speed {})",
@@ -373,15 +383,15 @@ impl Aim {
 
     /// Radial deadband on SixAxis angular velocity (`[gyro_x, gyro_y, gyro_z]` in
     /// turns/sec) so resting sensor bias does not drift the reticle or camera.
-    /// Horizontal yaw combines `-gyro_y` (controller yaw) with `-0.35 * gyro_z`
-    /// (controller roll) so handheld/tabletop/pro-controller turns feel natural at
-    /// any holding angle; vertical pitch uses `gyro_x`.
+    /// Horizontal yaw combines `-gyro_y` (controller yaw) with `-0.5 * gyro_z`
+    /// (controller roll) so split Joy-Con pointer aiming as well as handheld /
+    /// Pro Controller turns feel natural at any holding angle; vertical pitch uses `gyro_x`.
     fn gyro_rate(gyro: [f32; 3]) -> (f32, f32) {
         let [gx, gy, gz] = gyro;
         if !gx.is_finite() || !gy.is_finite() || !gz.is_finite() {
             return (0.0, 0.0);
         }
-        let yaw_right = -gy - 0.35 * gz;
+        let yaw_right = -gy - 0.5 * gz;
         let pitch_up = gx;
         let mag = (yaw_right * yaw_right + pitch_up * pitch_up).sqrt();
         if mag < GYRO_DEAD_ZONE {
@@ -394,13 +404,30 @@ impl Aim {
     /// Processes stick and gyro inputs for the current frame and returns the
     /// `(across, down)` delta in bottom-screen pixels to feed into the host
     /// mailbox (`MOUSE_AIM` while flying, `MOUSE_LOOK` on foot).
-    pub fn apply(&mut self, input: &mut InputState, gyro: [f32; 3]) -> (f32, f32) {
+    pub fn apply(&mut self, input: &mut InputState, gyro: [f32; 3], host: u32) -> (f32, f32) {
         self.touching = input.touch.is_some();
         (input.circle_x, input.circle_y) = Aim::left_stick(input.circle_x, input.circle_y);
 
         if self.game == 0 {
             self.aiming = false;
+            self.recenter_held = false;
             return (0.0, 0.0);
+        }
+
+        // In battle:
+        // - R (Right Bumper) or Left Stick Click (`UNX_HOST_RECENTER`, bit 1) recenters
+        //   the Air Battle reticle to the rail center or levels the Land Battle camera pitch.
+        // - ZL (Nunchuk Z trigger) and ZR (Wii Remote B trigger) act as Fire (`PadState::L`).
+        let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
+        input.buttons.remove(PadState::R);
+        if recenter_now && !self.recenter_held {
+            self.recenter_pending = true;
+        }
+        self.recenter_held = recenter_now;
+
+        if self.mode == 0 && input.buttons.intersects(PadState::ZL | PadState::ZR) {
+            input.buttons.remove(PadState::ZL | PadState::ZR);
+            input.buttons.insert(PadState::L);
         }
 
         let mut across = 0.0;
@@ -504,23 +531,38 @@ impl Aim {
     /// Fills the host mailbox's first three words (`[mark, across, down]`):
     /// - `MOUSE_AIM` (`"MAM1"`) while flying without touchscreen touch (keeping
     ///   `MOUSE_AIM` set even at zero stick velocity so `0x006D269C` locks the
-    ///   reticle against left-stick movement drift).
-    /// - `MOUSE_LOOK` (`"MLK1"`) while on foot.
+    ///   reticle against left-stick movement drift), or `MOUSE_AIM_RECENTER` (`"MAMR"`)
+    ///   when a recenter is requested.
+    /// - `MOUSE_LOOK` (`"MLK1"`) while on foot, or `MOUSE_LOOK_RECENTER` (`"MLKR"`)
+    ///   when a recenter is requested.
     pub fn feed(&mut self, mailbox: &mut [u32], (across, down): (f32, f32)) {
-        let mark = match self.game {
-            GAME_ON_FOOT if self.right_stick || self.gyro || self.mode != 0 => MOUSE_LOOK,
-            GAME_FLYING if (self.right_stick || self.gyro) && !self.touching => MOUSE_AIM,
+        let (mark, recenter_mark) = match self.game {
+            GAME_ON_FOOT if self.right_stick || self.gyro || self.mode != 0 => {
+                (MOUSE_LOOK, MOUSE_LOOK_RECENTER)
+            }
+            GAME_FLYING if (self.right_stick || self.gyro) && !self.touching => {
+                (MOUSE_AIM, MOUSE_AIM_RECENTER)
+            }
             _ => {
+                self.recenter_pending = false;
                 mailbox[..3].fill(0);
                 return;
             }
         };
-        let waiting = mailbox[0] == mark && (mailbox[1] != 0 || mailbox[2] != 0);
+        let waiting_recenter = mailbox[0] == recenter_mark;
+        let waiting = waiting_recenter || (mailbox[0] == mark && (mailbox[1] != 0 || mailbox[2] != 0));
         self.untaken = if waiting { self.untaken.saturating_add(1) } else { 0 };
         let keep = waiting && self.untaken <= STALE_FRAMES;
+        if self.recenter_pending {
+            self.recenter_pending = false;
+            self.untaken = 0;
+            mailbox[..3].copy_from_slice(&[recenter_mark, 0, 0]);
+            return;
+        }
+        let active_mark = if waiting_recenter && keep { recenter_mark } else { mark };
         let carried = |word: u32| if keep { f32::from_bits(word) } else { 0.0 };
         let (across, down) = (carried(mailbox[1]) + across, carried(mailbox[2]) + down);
-        mailbox[..3].copy_from_slice(&[mark, across.to_bits(), down.to_bits()]);
+        mailbox[..3].copy_from_slice(&[active_mark, across.to_bits(), down.to_bits()]);
     }
 }
 
@@ -544,6 +586,8 @@ mod tests {
             aiming: false,
             controls: GuestControls::default(),
             msbt_offset: None,
+            recenter_held: false,
+            recenter_pending: false,
         }
     }
 
@@ -558,7 +602,7 @@ mod tests {
             c_stick_y: 1.0,
             ..InputState::default()
         };
-        let (across, down) = aim.apply(&mut input, [0.0; 3]);
+        let (across, down) = aim.apply(&mut input, [0.0; 3], 0);
         assert_eq!(input.touch, None, "left stick must not inject a fake stylus touch");
         assert!(input.circle_x > 0.8 && input.circle_y < -0.4, "left stick still steers Pit");
         assert_eq!((input.c_stick_x, input.c_stick_y), (0.0, 0.0), "c_stick is consumed");
@@ -579,7 +623,7 @@ mod tests {
             circle_x: -1.0,
             ..InputState::default()
         };
-        let delta = aim.apply(&mut input, [0.0; 3]);
+        let delta = aim.apply(&mut input, [0.0; 3], 0);
         assert_eq!(delta, (0.0, 0.0));
         let mut mailbox = [0u32; 4];
         aim.feed(&mut mailbox, delta);
@@ -595,7 +639,7 @@ mod tests {
             c_stick_y: 0.0,
             ..InputState::default()
         };
-        let (across, down) = aim.apply(&mut input, [0.0; 3]);
+        let (across, down) = aim.apply(&mut input, [0.0; 3], 0);
         assert_eq!((across, down), (-LAND_X_PIXELS_PER_FRAME, 0.0));
         assert_eq!(input.c_stick_x, 0.0);
         let mut mailbox = [0u32; 4];
@@ -607,7 +651,7 @@ mod tests {
             c_stick_y: 1.0,
             ..InputState::default()
         };
-        let (across_up, down_up) = aim.apply(&mut input_up, [0.0; 3]);
+        let (across_up, down_up) = aim.apply(&mut input_up, [0.0; 3], 0);
         assert_eq!(across_up, 0.0);
         assert_eq!(down_up, LAND_Y_PIXELS_PER_FRAME, "pushing right stick up on foot must pitch camera up (down > 0)");
     }
@@ -625,8 +669,25 @@ mod tests {
         });
         let mut input = InputState::default();
         // Pitch nose up (+0.1 turns/s) and yaw right (gy = -0.1 turns/s)
-        let (across, down) = aim.apply(&mut input, [0.1, -0.1, 0.0]);
+        let (across, down) = aim.apply(&mut input, [0.1, -0.1, 0.0], 0);
         assert!(across > 10.0, "gyro yaw right moves reticle right, scaled by air_speed * air_stop");
         assert!(down > 10.0, "inverted air_invert_y makes gyro pitch up move reticle down (down > 0)");
+    }
+
+    #[test]
+    fn split_joycon_triggers_fire_and_r_recenters_reticle() {
+        let mut aim = test_aim();
+        aim.said(GAME_FLYING);
+        let mut input = InputState {
+            buttons: PadState::ZR | PadState::R,
+            ..InputState::default()
+        };
+        let delta = aim.apply(&mut input, [0.0; 3], 0);
+        assert!(input.buttons.contains(PadState::L), "ZR trigger maps to 3DS L (Fire)");
+        assert!(!input.buttons.contains(PadState::ZR));
+        assert!(!input.buttons.contains(PadState::R), "R is consumed as Recenter in battle");
+        let mut mailbox = [0u32; 4];
+        aim.feed(&mut mailbox, delta);
+        assert_eq!(mailbox[0], MOUSE_AIM_RECENTER);
     }
 }

@@ -25,7 +25,10 @@ static HidSixAxisSensorHandle sixaxis_handheld;
 static HidSixAxisSensorHandle sixaxis_fullkey;
 static HidSixAxisSensorHandle sixaxis_joydual[2];
 
-enum { UNX_HOST_BOTTOM = 1 << 0 };
+enum {
+    UNX_HOST_BOTTOM = 1 << 0,
+    UNX_HOST_RECENTER = 1 << 1,
+};
 
 typedef struct {
     u32 abi;
@@ -72,6 +75,7 @@ static void read_input(PadState *pad, UnxInput *in) {
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (held & map[i].nx) in->buttons |= map[i].ds;
     if (held & HidNpadButton_StickR) in->host |= UNX_HOST_BOTTOM;
+    if (held & (HidNpadButton_R | HidNpadButton_StickL)) in->host |= UNX_HOST_RECENTER;
     HidAnalogStickState l = padGetStickPos(pad, 0), r = padGetStickPos(pad, 1);
     in->circle_x = axis(l.x); in->circle_y = axis(l.y);
     in->c_stick_x = axis(r.x); in->c_stick_y = axis(r.y);
