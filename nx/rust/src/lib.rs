@@ -482,6 +482,9 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     unx.aim.said(said);
     let controls = aim::GuestControls::read(&mut unx.system.memory);
     unx.aim.set_controls(controls);
+    if !unx.in_play {
+        unx.aim.patch_controls_ui(&mut unx.system.memory.phys.fcram, unx.frame);
+    }
     let mut look = (0.0, 0.0);
     if let Some(input) = input.as_ref() {
         let mut state = InputState {

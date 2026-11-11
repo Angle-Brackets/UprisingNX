@@ -183,6 +183,42 @@ pub struct Aim {
     aiming: bool,
     /// Last seen in-game Controls settings, for change logging and scaling.
     controls: GuestControls,
+    /// Cached FCRAM byte offset of the Options/Menu `MsgStdBn` (`_r/b_03`, size `0x26DD0`).
+    msbt_offset: Option<usize>,
+}
+
+/// Relative byte offsets and maximum UTF-16 character counts inside the Options/Menu
+/// `MsgStdBn` (`_r/b_03`, total size `0x0002_6DD0`) for Controls UI strings.
+const MSBT_MENU_SIZE: u32 = 0x0002_6DD0;
+const MSBT_CONTROLS_PATCHES: &[(usize, usize, &str)] = &[
+    (0x10E7C, 14, "Stick / Gyro"),
+    (0x10F0E, 35, "Adjust Right-Stick & Gyro Aiming."),
+    (0x116E0, 22, "Stick &\nGyro\n(Default)"),
+    (0x1170E, 29, "Reticle: Right Stick & Gyro"),
+    (0x11904, 13, "\u{2190}Gyro Off"),
+    (0x11920, 12, "Gyro Fast\u{2192}"),
+    (0x119B6, 26, "R-Stick & Gyro Aim active."),
+    (0x11A3A, 36, "Adjusts vertical Stick & Gyro speed."),
+    (0x11A84, 38, "Adjusts horizontal Stick & Gyro speed."),
+    (0x11AD2, 51, "Adjusts Right-Stick and Gyro Aiming reticle speed."),
+    (
+        0x11B3A,
+        77,
+        "This adjusts SixAxis Gyro Aiming sensitivity.\nSlide all the way left for Off.",
+    ),
+    (0x11BD6, 51, "Adjust Air Battle Stick, Gyro & Invert Y controls."),
+    (0x11C3E, 28, "Adjust Land Stick & Gyro."),
+];
+
+fn is_menu_msbt(fcram: &[u8], base: usize) -> bool {
+    base + (MSBT_MENU_SIZE as usize) <= fcram.len()
+        && &fcram[base..base + 8] == b"MsgStdBn"
+        && u32::from_le_bytes([
+            fcram[base + 0x12],
+            fcram[base + 0x13],
+            fcram[base + 0x14],
+            fcram[base + 0x15],
+        ]) == MSBT_MENU_SIZE
 }
 
 fn modifier(name: &str) -> PadState {
@@ -214,12 +250,64 @@ impl Aim {
             touching: false,
             aiming: false,
             controls: GuestControls::default(),
+            msbt_offset: None,
         };
         log::info!(
             "unx: aim right_stick {} gyro {} (gyro_speed {}) left_stick_mode {} (modifier {:?}, invert y {}, speed {})",
             aim.right_stick, aim.gyro, aim.gyro_speed, aim.mode, aim.modifier, aim.invert_y, aim.speed
         );
         aim
+    }
+
+    /// Patches the Options -> Controls UTF-16LE string table (`_r/b_03` `MsgStdBn`)
+    /// in guest FCRAM so the in-game UI natively displays Right-Stick & SixAxis Gyro
+    /// Aiming labels and descriptions.
+    pub fn patch_controls_ui(&mut self, fcram: &mut [u8], frame: u64) {
+        if !self.right_stick && !self.gyro {
+            return;
+        }
+        let valid_cached = self.msbt_offset.filter(|&off| is_menu_msbt(fcram, off));
+        let base = match valid_cached {
+            Some(off) => off,
+            None => {
+                self.msbt_offset = None;
+                if !frame.is_multiple_of(4) {
+                    return;
+                }
+                let search_end = fcram.len().min(0x0400_0000).saturating_sub(MSBT_MENU_SIZE as usize);
+                let mut found = None;
+                let mut off = 0;
+                while off <= search_end {
+                    if fcram[off] == b'M' && is_menu_msbt(fcram, off) {
+                        found = Some(off);
+                        break;
+                    }
+                    off += 0x80;
+                }
+                let Some(off) = found else { return };
+                self.msbt_offset = Some(off);
+                off
+            }
+        };
+
+        // Check sentinel at `base + 0x11904`: unpatched is `\u{2190}S` (`[0x90, 0x21, b'S', 0x00]`).
+        let sentinel = base + 0x11904;
+        if &fcram[sentinel..sentinel + 4] != &[0x90, 0x21, b'S', 0x00] {
+            return;
+        }
+
+        for &(rel_off, max_chars, text) in MSBT_CONTROLS_PATCHES {
+            let dst_start = base + rel_off;
+            let slot_bytes = (max_chars + 1) * 2;
+            let dst = &mut fcram[dst_start..dst_start + slot_bytes];
+            dst.fill(0);
+            for (i, unit) in text.encode_utf16().take(max_chars).enumerate() {
+                let bytes = unit.to_le_bytes();
+                dst[i * 2] = bytes[0];
+                dst[i * 2 + 1] = bytes[1];
+            }
+        }
+        log::info!("unx: patched Controls menu UI strings for Stick & Gyro Aiming at fcram+{base:#x}");
     }
 
     /// Updates the cached in-game Controls menu settings (`0x00EF9638`), logging when changed.
@@ -455,6 +543,7 @@ mod tests {
             touching: false,
             aiming: false,
             controls: GuestControls::default(),
+            msbt_offset: None,
         }
     }
 
