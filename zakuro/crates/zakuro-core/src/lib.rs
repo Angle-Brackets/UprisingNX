@@ -229,6 +229,8 @@ pub struct System {
     /// diagnostics: what the recompiled code leaves to it).
     pub interpreted_pcs: Option<std::collections::HashMap<u32, u64>>,
     pub recompiled_instructions: u64,
+    /// recompiled instructions executed so far in the current video frame.
+    frame_recompiled: u64,
     /// when each command list still on the GPU's thread was handed to it,
     /// in cycles, and at which frame, oldest first (see PACING).
     p3d_submits: std::collections::VecDeque<(u64, u64)>,
@@ -321,6 +323,7 @@ impl System {
             interpreted_instructions: 0,
             interpreted_pcs: None,
             recompiled_instructions: 0,
+            frame_recompiled: 0,
             p3d_submits: Default::default(),
         }
     }
@@ -370,6 +373,7 @@ impl System {
         // here, once, instead of again when the next frame's first step
         // finds the boundary passed
         let deadline = self.next_frame_boundary;
+        self.frame_recompiled = 0;
         while self.cpu.cycles < deadline {
             match self.step(Some(deadline)) {
                 StepOutcome::Ran => {}
@@ -642,15 +646,34 @@ impl System {
             limit = limit.min(deadline);
         }
         let budget = limit.saturating_sub(self.cpu.cycles).max(1);
+        // Once the frame's main UI/gameplay threads have executed 750,000
+        // instructions and blocked on VBlank, any remaining runnable thread
+        // burning the rest of the 4.48M-cycle refresh is a background
+        // archive-decompression / asset loader loop (e.g. Fiend's Cauldron
+        // Bet menu). Charge memory-bound ARM11 CPI (8 cycles/instruction)
+        // past 750,000 instructions in a single refresh so a 16.67 ms video
+        // frame never executes 4.48M recompiled instructions (~55 ms).
+        const FAST_FRAME_INSTRUCTIONS: u64 = 750_000;
+        const BACKGROUND_CPI: u64 = 8;
+        let (step_budget, cpi_extra) = if self.frame_recompiled < FAST_FRAME_INSTRUCTIONS {
+            let fast_left = FAST_FRAME_INSTRUCTIONS - self.frame_recompiled;
+            (budget.min(fast_left).max(1), 0)
+        } else {
+            ((budget / BACKGROUND_CPI).max(1), BACKGROUND_CPI - 1)
+        };
         // a read of the CPU from where the GPU drew has that come down
         // first, with nothing else holding the GPU until the run is over
         let gpu = &mut self.gpu as *mut gpu_thread::GpuCell as *mut ();
         let linear_base = self.kernel.linear_base;
         // SAFETY: as in step, until the run is over
         unsafe { self.memory.set_gpu_sync(memory::GpuSync { gpu, linear_base, sync: sync_for_cpu, sync_write: sync_for_cpu_write, wait: wait_for_gpu }) };
-        let (ran, stop) = library.run(&mut self.cpu, &mut self.memory, budget);
+        let (ran, stop) = library.run(&mut self.cpu, &mut self.memory, step_budget);
         self.memory.clear_gpu_sync();
         self.recompiled_instructions += ran;
+        self.frame_recompiled += ran;
+        if cpi_extra > 0 && ran > 0 {
+            self.cpu.cycles = (self.cpu.cycles + ran * cpi_extra).min(limit);
+        }
         if event.is_some_and(|tick| self.cpu.cycles >= tick) {
             self.kernel.reschedule_pending = true;
         }

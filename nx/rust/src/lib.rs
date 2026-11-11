@@ -516,10 +516,14 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     // battle display (hearts, powers) are drawn onto the top screen instead,
     // see zakuro_gpu::raster::mirror_portrait. When it is shown is the
     // player's to say, see Bottom.
-    unx.out_of_play = if said != 0 { 0 } else { unx.out_of_play.saturating_add(1) };
+    let big_portrait = unx.system.gpu.flags().big_portrait.swap(false, std::sync::atomic::Ordering::Relaxed);
+    unx.out_of_play = if said != 0 || big_portrait { 0 } else { unx.out_of_play.saturating_add(1) };
+    let in_battle = unx.out_of_play <= 90;
     let host = input.as_ref().map_or(0, |input| input.host);
     let in_play = !unx.bottom.update(host, said);
-    unx.system.gpu.flags().in_play.store(in_play, std::sync::atomic::Ordering::Relaxed);
+    let flags = unx.system.gpu.flags();
+    flags.in_play.store(in_play, std::sync::atomic::Ordering::Relaxed);
+    flags.in_battle.store(in_battle, std::sync::atomic::Ordering::Relaxed);
     if said != 0 && unx.frame % 120 == 0 {
         log::info!("unx: overrides say {said} (frame {})", unx.frame);
     }

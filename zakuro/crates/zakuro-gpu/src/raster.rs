@@ -1487,6 +1487,9 @@ pub(crate) struct Portraits {
     /// whether the game is in play, a battle, where its bottom screen's
     /// portraits are dialogue; in menus the same kind of picture is not.
     pub(crate) in_play: bool,
+    /// whether the game is actively in a battle (flying, on foot, or a boss
+    /// dialogue cutscene), rather than in menus with the bottom screen hidden.
+    pub(crate) in_battle: bool,
     /// whether the bottom screen drew a large dialogue portrait since the
     /// frontend last asked, see note_big_portrait: a conversation in a
     /// battle, before the player has control, that the game's overrides say
@@ -1680,27 +1683,32 @@ fn is_bottom(registers: &[u32]) -> bool {
 /// needed, the portraits and the small pieces of the battle display. whole
 /// bottom-screen pictures and meshes that no one sees are skipped, which
 /// saves decoding, vertex setup and shading for them.
-fn skip_bottom_in_play(registers: &[u32], vertex_count: u32) -> bool {
+fn skip_bottom_in_play(registers: &[u32], in_battle: bool, vertex_count: u32) -> bool {
     if !on_bottom(registers) {
         return true;
+    }
+    let portrait = is_portrait(registers);
+    if !in_battle {
+        return !portrait;
     }
     let base = TEXTURE_UNIT_BASES[0];
     if TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4 {
         return true;
     }
-    !is_portrait(registers) && vertex_count > 16
+    !portrait && vertex_count > 16
 }
 
 /// a dialogue portrait as Kid Icarus Uprising draws it, an Etc1 256x256
-/// picture on the whole bottom screen.
-// ponytail: matched by its shape alone, a per-title list when another game
-// draws the same way.
+/// picture on the whole bottom screen using its two-stage TEV pedestal-cut
+/// combiner (`0x0CA == 0x0002_0001 && 0x0D2 == 0x0009_0001`).
 fn is_portrait(registers: &[u32]) -> bool {
     let base = TEXTURE_UNIT_BASES[0];
     on_bottom(registers)
         && registers[base + 1] == (256 << 16 | 256)
         && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
         && (registers[REG_COLOR_OPERATION] & 0x100 != 0 || registers[REG_ALPHA_TEST] & 1 != 0)
+        && registers[0x0CA] == 0x0002_0001
+        && registers[0x0D2] == 0x0009_0001
 }
 
 /// a textured draw over the whole bottom screen's 240x320, the way the
@@ -2037,6 +2045,12 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     // how much of a portrait fades in or out each frame, 8 frames in all
     let step = 1.0 / 8.0;
     resources.portraits.hud_islands = 0;
+    if resources.portraits.in_play && !resources.portraits.in_battle {
+        resources.portraits.sides = Default::default();
+        resources.portraits.hud.clear();
+        resources.portraits.text_lines.clear();
+        return false;
+    }
     let mut sides = std::mem::take(&mut resources.portraits.sides);
     let mut drew = false;
     for side in &mut sides {
@@ -3579,7 +3593,10 @@ pub fn draw<M: GpuMemory>(
             }
         }
     }
-    if is_bottom(registers) && resources.portraits.in_play && skip_bottom_in_play(registers, vertex_count) {
+    if is_bottom(registers)
+        && resources.portraits.in_play
+        && skip_bottom_in_play(registers, resources.portraits.in_battle, vertex_count)
+    {
         return vertex_count;
     }
 
@@ -3840,7 +3857,10 @@ pub fn draw_immediate<M: GpuMemory>(
     resources: &mut Resources,
     vertices: &[[Vec4; 16]],
 ) -> u32 {
-    if is_bottom(registers) && resources.portraits.in_play && skip_bottom_in_play(registers, vertices.len() as u32) {
+    if is_bottom(registers)
+        && resources.portraits.in_play
+        && skip_bottom_in_play(registers, resources.portraits.in_battle, vertices.len() as u32)
+    {
         return vertices.len() as u32;
     }
     // immediate mode sizes its vertices by GPUREG_VSH_NUM_ATTR.
@@ -3986,7 +4006,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
     if portraits_on() && !resources.portraits.adding {
         if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0 {
             note_top_buffer(registers, resources);
-            if is_subtitle(registers) {
+            if resources.portraits.in_play && resources.portraits.in_battle && is_subtitle(registers) {
                 // the CPU decodes its arrays, so its lines can be centered
                 #[cfg(feature = "vulkan")]
                 if matches!(vertices, Vertices::Raw { .. }) {
@@ -4012,7 +4032,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 resources.portraits.adding = false;
                 return Some(0);
             }
-        } else if is_text_buffer(registers) {
+        } else if resources.portraits.in_play && resources.portraits.in_battle && is_text_buffer(registers) {
             // the CPU decodes its arrays, so its letters say where they are
             #[cfg(feature = "vulkan")]
             if matches!(vertices, Vertices::Raw { .. }) {
@@ -4025,10 +4045,12 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             // out of play only a portrait's are looked at, to see whether it is
             // a big one, a conversation
             #[cfg(feature = "vulkan")]
-            if (resources.portraits.in_play || portrait) && matches!(vertices, Vertices::Raw { .. }) {
+            if ((resources.portraits.in_play && resources.portraits.in_battle) || portrait)
+                && matches!(vertices, Vertices::Raw { .. })
+            {
                 return None;
             }
-            if !resources.portraits.in_play && portrait {
+            if (!resources.portraits.in_play || !resources.portraits.in_battle) && portrait {
                 note_big_portrait(registers, resources, &vertices);
             }
             if !resources.portraits.in_play && !portrait && on_bottom(registers) && vertices.len() <= 16 && battle_detection() {
@@ -4045,7 +4067,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 if on_bottom(registers) {
                     if portrait {
                         mirror_portrait(registers, resources, vertices);
-                    } else {
+                    } else if resources.portraits.in_battle {
                         mirror_hud(registers, resources, vertices);
                     }
                 }

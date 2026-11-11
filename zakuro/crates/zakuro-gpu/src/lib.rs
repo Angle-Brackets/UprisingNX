@@ -157,6 +157,7 @@ pub struct ScreenRef {
 #[derive(Default)]
 pub struct Flags {
     pub in_play: std::sync::atomic::AtomicBool,
+    pub in_battle: std::sync::atomic::AtomicBool,
     pub big_portrait: std::sync::atomic::AtomicBool,
 }
 
@@ -748,7 +749,9 @@ impl Gpu {
     /// out of play, in menus, pictures of their kind are not taken.
     pub fn set_in_play(&mut self, on: bool) {
         self.flags.in_play.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.flags.in_battle.store(on, std::sync::atomic::Ordering::Relaxed);
         self.resources.portraits.in_play = on;
+        self.resources.portraits.in_battle = on;
     }
 
     /// takes the frontend's flags before the GPU works on a command, in
@@ -756,6 +759,7 @@ impl Gpu {
     fn take_flags(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         self.resources.portraits.in_play = self.flags.in_play.load(Relaxed);
+        self.resources.portraits.in_battle = self.flags.in_battle.load(Relaxed);
     }
 
     /// hands what the GPU noted for the frontend over, after a command.

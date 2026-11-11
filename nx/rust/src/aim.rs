@@ -281,22 +281,27 @@ impl Aim {
             Some(off) => off,
             None => {
                 self.msbt_offset = None;
-                if !frame.is_multiple_of(4) {
-                    return;
-                }
-                let search_end = fcram.len().min(0x0400_0000).saturating_sub(MSBT_MENU_SIZE as usize);
-                let mut found = None;
-                let mut off = 0;
-                while off <= search_end {
-                    if fcram[off] == b'M' && is_menu_msbt(fcram, off) {
-                        found = Some(off);
-                        break;
+                if is_menu_msbt(fcram, 0x0172_d300) {
+                    self.msbt_offset = Some(0x0172_d300);
+                    0x0172_d300
+                } else {
+                    if !frame.is_multiple_of(30) {
+                        return;
                     }
-                    off += 0x80;
+                    let search_end = fcram.len().min(0x0280_0000).saturating_sub(MSBT_MENU_SIZE as usize);
+                    let mut found = None;
+                    let mut off = 0x0100_0000.min(search_end);
+                    while off <= search_end {
+                        if fcram[off] == b'M' && is_menu_msbt(fcram, off) {
+                            found = Some(off);
+                            break;
+                        }
+                        off += 0x100;
+                    }
+                    let Some(off) = found else { return };
+                    self.msbt_offset = Some(off);
+                    off
                 }
-                let Some(off) = found else { return };
-                self.msbt_offset = Some(off);
-                off
             }
         };
 
