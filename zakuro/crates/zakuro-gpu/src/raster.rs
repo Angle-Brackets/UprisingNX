@@ -1705,12 +1705,18 @@ fn is_bottom(registers: &[u32]) -> bool {
 /// needed, the portraits and the small pieces of the battle display. whole
 /// bottom-screen pictures and meshes that no one sees are skipped, which
 /// saves decoding, vertex setup and shading for them.
-fn skip_bottom_in_play(registers: &[u32], in_battle: bool, on_title: bool, vertex_count: u32) -> bool {
+fn skip_bottom_in_play(
+    registers: &[u32],
+    in_battle: bool,
+    on_title: bool,
+    title_ready: bool,
+    vertex_count: u32,
+) -> bool {
     if !on_bottom(registers) {
         return true;
     }
     if on_title {
-        return is_title_bottom_sky(registers);
+        return is_title_bottom_sky(registers) || title_ready;
     }
     let portrait = is_portrait(registers);
     if !in_battle {
@@ -1762,9 +1768,11 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         }
     } else if on_bottom(registers) && is_title_bottom_sky(registers) {
         portraits.title_bottom_drawing = true;
-        portraits.title.clear();
         portraits.title_seen = true;
         portraits.title_frames = portraits.title_frames.saturating_add(1);
+        if portraits.title_frames <= 16 || portraits.title.len() < 2 {
+            portraits.title.clear();
+        }
     } else if !is_bottom(registers) {
         portraits.title_bottom_drawing = false;
     }
@@ -2162,7 +2170,13 @@ fn draw_title_faded<M: GpuMemory>(
         .first()
         .is_some_and(|v| v.clip[0] < -0.7 * v.clip[3]);
     let s = corner_t * corner_t * (3.0 - 2.0 * corner_t);
-    let effective_alpha = if is_copyright { alpha * (1.0 - s) } else { alpha };
+    let effective_alpha = if warmup_only {
+        0.0
+    } else if is_copyright {
+        alpha * (1.0 - s)
+    } else {
+        alpha
+    };
     if !warmup_only && effective_alpha <= 0.004 {
         return;
     }
@@ -2177,26 +2191,18 @@ fn draw_title_faded<M: GpuMemory>(
             registers[REG_COLOR_BUFFER_ADDRESS] = (source & !0x7_FFFF) >> 3;
         }
     }
-    if effective_alpha < 1.0 || warmup_only {
-        registers[REG_COLOR_OPERATION] = (registers[REG_COLOR_OPERATION] & !0xFF) | 0x00E4_0100;
-        registers[REG_BLEND_FUNC] = 0x0176_0000;
-        registers[0x0F8] = 0x00EF_000F;
-        registers[0x0F9] = 0x0000_0000;
-        registers[0x0FA] = 0x0001_0000;
-        registers[0x0FB] = ((effective_alpha * 255.0).round() as u32) << 24;
-        registers[0x0FC] = 0x0000_0000;
-    }
+    registers[REG_COLOR_OPERATION] = (registers[REG_COLOR_OPERATION] & !0xFF) | 0x00E4_0100;
+    registers[REG_BLEND_FUNC] = 0x0176_0000;
+    registers[0x0F8] = 0x00EF_000F;
+    registers[0x0F9] = 0x0000_0000;
+    registers[0x0FA] = 0x0001_0000;
+    registers[0x0FB] = ((effective_alpha * 255.0).round() as u32) << 24;
+    registers[0x0FC] = 0x0000_0000;
     resources.portraits.adding = true;
-    if warmup_only {
-        let mut hidden = draw.vertices.clone();
-        for vertex in &mut hidden {
-            vertex.clip = [0.0, 0.0, 0.0, 1.0];
-        }
-        rasterize(&registers, memory, resources, Vertices::Shaded(&hidden));
-    } else if !is_copyright && s > 0.0 {
+    if !warmup_only && !is_copyright && s > 0.0 {
         let scale = 1.0 + (0.42 - 1.0) * s;
         let cx = 125.85 + (201.35 - 125.85) * s;
-        let cy = 192.75 + (66.20 - 192.75) * s;
+        let cy = 192.75 + (333.80 - 192.75) * s;
         let mut transformed = draw.vertices.clone();
         for vertex in &mut transformed {
             let w = vertex.clip[3];
@@ -2234,6 +2240,7 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
             resources.portraits.title_sky_active = false;
             resources.portraits.title_alpha = 0.0;
             resources.portraits.title_frames = 0;
+            resources.portraits.title.clear();
         }
     }
     let mut drew_title = false;
@@ -2241,16 +2248,17 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     // frames (~8.3s) and disappears in a starburst flash at the top-right as
     // the Triumphal trumpets sound. Around frame ~335 (~11.2s), as the title
     // screen transitions into the sizzle reel, the logo smoothly scales and
-    // glides into the top-right corner over 42 guest frames (~1.4s).
+    // glides into the top-left corner over 42 guest frames (~1.4s).
     const TITLE_LOGO_DELAY_FRAMES: u32 = 248;
     const TITLE_LOGO_FADE_FRAMES: f32 = 36.0;
     const TITLE_SIZZLE_START_FRAMES: u32 = 335;
     const TITLE_SIZZLE_TRANSITION_FRAMES: f32 = 42.0;
     if resources.portraits.title_sky_active && !resources.portraits.title.is_empty() {
-        if resources.portraits.title_frames == 2 {
-            // Warm up the TEV stage 5 fade-in pipeline with a degenerate triangle
-            // at the start of the title screen so the shader is already compiled
-            // before the logo fade-in begins.
+        if resources.portraits.title_frames == 16 {
+            // Warm up the TEV stage 5 fade-in pipeline and upload the logo and
+            // copyright textures to Vulkan with alpha = 0.0 early in the title
+            // screen so no texture upload or pipeline stall occurs when Pit
+            // zooms away at frame 248.
             let title = resources.portraits.title.clone();
             for draw in &title {
                 draw_title_faded(memory, resources, draw, 0.0, 0.0, true);
@@ -3825,9 +3833,16 @@ pub fn draw<M: GpuMemory>(
     let on_title = resources.portraits.title_bottom_drawing
         || resources.portraits.title_sky_active
         || resources.portraits.title_sky_seen;
+    let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
     if is_bottom(registers)
         && resources.portraits.in_play
-        && skip_bottom_in_play(registers, resources.portraits.in_battle, on_title, vertex_count)
+        && skip_bottom_in_play(
+            registers,
+            resources.portraits.in_battle,
+            on_title,
+            title_ready,
+            vertex_count,
+        )
     {
         return vertex_count;
     }
@@ -4093,9 +4108,16 @@ pub fn draw_immediate<M: GpuMemory>(
     let on_title = resources.portraits.title_bottom_drawing
         || resources.portraits.title_sky_active
         || resources.portraits.title_sky_seen;
+    let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
     if is_bottom(registers)
         && resources.portraits.in_play
-        && skip_bottom_in_play(registers, resources.portraits.in_battle, on_title, vertices.len() as u32)
+        && skip_bottom_in_play(
+            registers,
+            resources.portraits.in_battle,
+            on_title,
+            title_ready,
+            vertices.len() as u32,
+        )
     {
         return vertices.len() as u32;
     }

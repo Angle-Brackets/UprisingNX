@@ -220,6 +220,13 @@ impl Default for Gpu {
 
 impl Gpu {
     pub fn new() -> Gpu {
+        #[cfg(all(feature = "jit", target_os = "horizon"))]
+        {
+            let mut warmup = shader::ShaderUnit::new();
+            warmup.program[0] = 0x22 << 26;
+            warmup.prepare();
+            let _ = shader::run_vertices_mapped(&warmup, &[], |_| ());
+        }
         Gpu {
             flags: Default::default(),
             external: vec![0; EXTERNAL_REGISTER_WORDS].into_boxed_slice(),
