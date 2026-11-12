@@ -984,7 +984,7 @@ impl System {
                     })
                     .collect();
                 let current = if self.kernel.current_thread == Some(thread.id) { " <- running" } else { "" };
-                format!("{:?} {:?} {:?} pc {:08X} prio {} wakeup {:?} waits [{}]{current}", thread.id, thread.name, thread.status, thread.context.regs[15], thread.priority, thread.wakeup_at, waits.join(", "))
+                format!("{:?} {:?} {:?} pc {:08X} lr {:08X} r0 {:08X} arbiter {:08X?} prio {} wakeup {:?} waits [{}]{current}", thread.id, thread.name, thread.status, thread.context.regs[15], thread.context.regs[14], thread.context.regs[0], thread.wait_address, thread.priority, thread.wakeup_at, waits.join(", "))
             }));
         lines
     }

@@ -1498,6 +1498,8 @@ pub(crate) struct Portraits {
     /// only shows on the top screen once it has stayed a few, a flash of the
     /// text buffer while the game rewrites it does not.
     dialogue_held: u32,
+    /// flushes in a row since the bottom screen last drew that text.
+    dialogue_missing: u32,
     /// whether the bottom screen has drawn since the last portrait flush.
     bottom_seen: bool,
     /// the title screen's logo and copyright draws redirected from the bottom
@@ -2428,9 +2430,22 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     const DIALOGUE_HOLD: u32 = 6;
     let dialogue = if bottom_seen || !resources.portraits.dialogue.is_empty() {
         let taken = std::mem::take(&mut resources.portraits.dialogue);
-        resources.portraits.dialogue_held = if taken.is_empty() { 0 } else { resources.portraits.dialogue_held.saturating_add(1) };
-        resources.portraits.last_dialogue = taken.clone();
-        taken
+        let portraits = &mut resources.portraits;
+        if taken.is_empty() {
+            // the game draws its bottom screen every other refresh at times,
+            // only a few flushes in a row without the text end it
+            portraits.dialogue_missing = portraits.dialogue_missing.saturating_add(1);
+            if portraits.dialogue_missing > 4 {
+                portraits.dialogue_held = 0;
+            }
+        } else {
+            portraits.dialogue_missing = 0;
+            portraits.dialogue_held = portraits.dialogue_held.saturating_add(1);
+        }
+        if !taken.is_empty() || resources.portraits.dialogue_missing > 4 {
+            resources.portraits.last_dialogue = taken;
+        }
+        resources.portraits.last_dialogue.clone()
     } else {
         resources.portraits.last_dialogue.clone()
     };

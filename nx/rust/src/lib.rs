@@ -937,7 +937,9 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             zakuro_gpu::stats::QUEUE_HELD_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
         );
         report!("  vulkan queue per frame: renderer waited {:.2} ms, presenter held {:.2} ms", queue_wait as f64 / 1e6 / frames, queue_held as f64 / 1e6 / frames);
-        if unx.window_emulating.as_secs_f64() * 1000.0 / frames < 2.0 && unx.frame % 600 < frames as u64 {
+        // quiet, or busy drawing nothing for a while (a stall), every 10 s
+        let stalled = unx.draws == 0 && unx.frame > 1200;
+        if (unx.window_emulating.as_secs_f64() * 1000.0 / frames < 2.0 || stalled) && unx.frame % 600 < frames as u64 {
             report!("  the game is quiet, its threads:");
             for line in unx.system.debug_threads() {
                 report!("    {line}");
