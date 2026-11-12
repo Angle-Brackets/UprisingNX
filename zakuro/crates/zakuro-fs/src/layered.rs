@@ -64,6 +64,30 @@ impl Layered {
     /// romfs, a RomFS in image, with the mod in dir over it. None when the
     /// mod changes nothing in it.
     pub fn new(romfs: &RomFs, image: &[u8], dir: &Path) -> Result<Option<Layered>, FsError> {
+        Self::new_with(romfs, &|at, out| {
+            let start = at as usize;
+            let bytes = image.get(start..start + out.len()).ok_or(FsError::BadRomFs("a file runs past the end of the image"))?;
+            out.copy_from_slice(bytes);
+            Ok(())
+        }, dir)
+    }
+
+    /// romfs, a RomFS in image, with the mod in dir over it, reading uncached
+    /// ROM file data through `RomImage::read_at` on Horizon.
+    pub fn new_image(romfs: &RomFs, image: &crate::RomImage, dir: &Path) -> Result<Option<Layered>, FsError> {
+        Self::new_with(romfs, &|at, out| {
+            if image.read_at(at, out) != out.len() {
+                return Err(FsError::BadRomFs("a file runs past the end of the image"));
+            }
+            Ok(())
+        }, dir)
+    }
+
+    fn new_with(
+        romfs: &RomFs,
+        read_rom: &dyn Fn(u64, &mut [u8]) -> Result<(), FsError>,
+        dir: &Path,
+    ) -> Result<Option<Layered>, FsError> {
         let mut tree = Tree::read(romfs)?;
         let content = tree.content();
         let mut changes = Changes::default();
@@ -73,12 +97,12 @@ impl Layered {
         }
         let patches = dir.join("romfs_ext");
         if patches.is_dir() {
-            tree.patch(&patches, content, (romfs, image), &mut changes)?;
+            tree.patch(&patches, content, (romfs, read_rom), &mut changes)?;
         }
         if !changes.any() {
             return Ok(None);
         }
-        Ok(Some(tree.layout(romfs, changes)))
+        Ok(Some(tree.layout(romfs, read_rom, changes)))
     }
 
     /// how many bytes the layered image has.
@@ -93,6 +117,31 @@ impl Layered {
     /// reads the layered image from offset into out, image being the ROM's
     /// bytes. how many bytes there were to read.
     pub fn read(&self, image: &[u8], offset: u64, out: &mut [u8]) -> usize {
+        self.read_with(
+            |at, dest| {
+                let start = at as usize;
+                if let Some(bytes) = image.get(start..start + dest.len()) {
+                    dest.copy_from_slice(bytes);
+                }
+            },
+            offset,
+            out,
+        )
+    }
+
+    /// reads the layered image from offset into out using `RomImage::read_at`
+    /// so files beyond the in-memory header on Horizon read from the ROM cache.
+    pub fn read_image(&self, image: &crate::RomImage, offset: u64, out: &mut [u8]) -> usize {
+        self.read_with(
+            |at, dest| {
+                image.read_at(at, dest);
+            },
+            offset,
+            out,
+        )
+    }
+
+    fn read_with(&self, mut read_rom: impl FnMut(u64, &mut [u8]), offset: u64, out: &mut [u8]) -> usize {
         if offset >= self.size {
             return 0;
         }
@@ -118,12 +167,7 @@ impl Layered {
             let dest = &mut out[(from - offset) as usize..(to - offset) as usize];
             let within = from - piece.start;
             match &piece.source {
-                Source::Image(at) => {
-                    let start = (at + within) as usize;
-                    if let Some(bytes) = image.get(start..start + dest.len()) {
-                        dest.copy_from_slice(bytes);
-                    }
-                }
+                Source::Image(at) => read_rom(*at + within, dest),
                 Source::Memory(data) => dest.copy_from_slice(&data[within as usize..within as usize + dest.len()]),
                 Source::Host(path) => read_host(path, within, dest),
             }
@@ -174,6 +218,8 @@ impl Layered {
 struct Leaf {
     name: String,
     size: u64,
+    /// original size in the game's RomFS, when it is a game file.
+    game_size: u64,
     /// where its data is from the start of the game's file data, while it
     /// is the game's.
     game: Option<u64>,
@@ -193,18 +239,24 @@ impl Tree {
     fn read(romfs: &RomFs) -> Result<Tree, FsError> {
         let root = romfs.root()?;
         let mut tree = Tree { dirs: vec![dir(root.name.clone(), 0)], leaves: Vec::new(), game_data: 0 };
-        let mut pending = vec![(root, 0)];
-        while let Some((entry, index)) = pending.pop() {
+        let mut pending = std::collections::VecDeque::from([(root, 0)]);
+        while let Some((entry, index)) = pending.pop_front() {
             for (_, file) in romfs.files(&entry) {
                 tree.game_data = tree.game_data.max(file.data_offset + file.data_size);
-                tree.leaves.push(Leaf { name: file.name, size: file.data_size, game: Some(file.data_offset), modded: None });
+                tree.leaves.push(Leaf {
+                    name: file.name,
+                    size: file.data_size,
+                    game_size: file.data_size,
+                    game: Some(file.data_offset),
+                    modded: None,
+                });
                 tree.dirs[index].files.push(tree.leaves.len() - 1);
             }
             for (_, child) in romfs.subdirs(&entry) {
                 tree.dirs.push(dir(child.name.clone(), index));
                 let child_index = tree.dirs.len() - 1;
                 tree.dirs[index].children.push(child_index);
-                pending.push((child, child_index));
+                pending.push_back((child, child_index));
             }
         }
         Ok(tree)
@@ -251,15 +303,20 @@ impl Tree {
                 continue;
             }
             let size = std::fs::metadata(&path)?.len();
+            let source = if size <= 8 * 1024 * 1024 {
+                Source::Memory(std::fs::read(&path)?)
+            } else {
+                Source::Host(path)
+            };
             match self.find_file(at, &name) {
                 Some(leaf) => {
                     self.leaves[leaf].size = size;
-                    self.leaves[leaf].modded = Some(Source::Host(path));
+                    self.leaves[leaf].modded = Some(source);
                     changes.replaced += 1;
                 }
                 None => {
                     let leaf = self.leaves.len();
-                    self.leaves.push(Leaf { name, size, game: None, modded: Some(Source::Host(path)) });
+                    self.leaves.push(Leaf { name, size, game_size: 0, game: None, modded: Some(source) });
                     self.dirs[at].files.push(leaf);
                     changes.added += 1;
                 }
@@ -269,7 +326,13 @@ impl Tree {
     }
 
     /// the patches and stubs in host, for the files of the directory at.
-    fn patch(&mut self, host: &Path, at: usize, game: (&RomFs, &[u8]), changes: &mut Changes) -> Result<(), FsError> {
+    fn patch(
+        &mut self,
+        host: &Path,
+        at: usize,
+        game: (&RomFs, &dyn Fn(u64, &mut [u8]) -> Result<(), FsError>),
+        changes: &mut Changes,
+    ) -> Result<(), FsError> {
         for (path, name) in entries(host)? {
             if path.is_dir() {
                 match self.find_dir(at, &name) {
@@ -313,47 +376,104 @@ impl Tree {
 
     /// a leaf's bytes as they are now, a patch goes over what romfs/ put
     /// there when it put something.
-    fn data(&self, leaf: usize, (romfs, image): (&RomFs, &[u8])) -> Result<Vec<u8>, FsError> {
+    fn data(
+        &self,
+        leaf: usize,
+        (romfs, read_rom): (&RomFs, &dyn Fn(u64, &mut [u8]) -> Result<(), FsError>),
+    ) -> Result<Vec<u8>, FsError> {
         let leaf = &self.leaves[leaf];
         match (&leaf.modded, leaf.game) {
             (Some(Source::Host(path)), _) => Ok(std::fs::read(path)?),
             (Some(Source::Memory(data)), _) => Ok(data.clone()),
             (_, Some(at)) => {
-                let start = (romfs.base + romfs.header.file_data_offset as u64 + at) as usize;
-                let bytes = image.get(start..start + leaf.size as usize);
-                Ok(bytes.ok_or(FsError::BadRomFs("a file runs past the end of the image"))?.to_vec())
+                let start = romfs.base + romfs.header.file_data_offset as u64 + at;
+                let mut bytes = vec![0u8; leaf.size as usize];
+                read_rom(start, &mut bytes)?;
+                Ok(bytes)
             }
             _ => Ok(Vec::new()),
         }
     }
 
-    /// the image, the game's file data keeping its offsets and the mod's
+    /// the image, the game's file data keeping its offsets (including modded
+    /// files that fit in their original slots) and larger or added files
     /// coming after it.
-    fn layout(mut self, romfs: &RomFs, changes: Changes) -> Layered {
+    fn layout(
+        mut self,
+        romfs: &RomFs,
+        read_rom: &dyn Fn(u64, &mut [u8]) -> Result<(), FsError>,
+        changes: Changes,
+    ) -> Layered {
         let mut end = self.game_data.next_multiple_of(16);
         let mut files = Vec::new();
+        let mut in_place = Vec::new();
         let mut modded = Vec::new();
+        let mut same_layout = changes.added == 0 && changes.removed == 0;
         for index in 0..self.dirs.len() {
             for leaf in std::mem::take(&mut self.dirs[index].files) {
                 let leaf = &mut self.leaves[leaf];
-                let data_offset = match leaf.modded.take() {
-                    Some(source) => {
+                if leaf.size != leaf.game_size {
+                    same_layout = false;
+                }
+                let data_offset = match (leaf.modded.take(), leaf.game) {
+                    (Some(source), Some(at)) if leaf.size <= leaf.game_size => {
+                        in_place.push(Piece { start: at, size: leaf.size, source });
+                        at
+                    }
+                    (Some(source), _) => {
+                        same_layout = false;
                         let at = end;
                         end = (end + leaf.size).next_multiple_of(16);
                         modded.push(Piece { start: at, size: leaf.size, source });
                         at
                     }
-                    None => leaf.game.unwrap_or(0),
+                    (None, game) => game.unwrap_or(0),
                 };
                 self.dirs[index].files.push(files.len());
                 files.push(File { name: std::mem::take(&mut leaf.name), parent: index, data_offset, data_size: leaf.size, offset: 0 });
             }
         }
+        if modded.is_empty() {
+            end = self.game_data;
+        }
 
-        let meta = romfs_build::metadata(&mut self.dirs, &mut files);
+        let meta = if same_layout {
+            let mut orig_meta = vec![0u8; romfs.header.file_data_offset as usize];
+            if read_rom(romfs.base, &mut orig_meta).is_ok() {
+                orig_meta
+            } else {
+                romfs_build::metadata(&mut self.dirs, &mut files)
+            }
+        } else {
+            romfs_build::metadata(&mut self.dirs, &mut files)
+        };
         let base = meta.len() as u64;
-        let game = Piece { start: base, size: self.game_data, source: Source::Image(romfs.base + romfs.header.file_data_offset as u64) };
-        let mut pieces = vec![game];
+        let rom_data_base = romfs.base + romfs.header.file_data_offset as u64;
+        in_place.sort_by_key(|piece| piece.start);
+        let mut pieces = Vec::new();
+        let mut cursor = 0u64;
+        for piece in in_place {
+            if cursor < piece.start {
+                pieces.push(Piece {
+                    start: base + cursor,
+                    size: piece.start - cursor,
+                    source: Source::Image(rom_data_base + cursor),
+                });
+            }
+            cursor = piece.start + piece.size;
+            pieces.push(Piece {
+                start: base + piece.start,
+                size: piece.size,
+                source: piece.source,
+            });
+        }
+        if cursor < self.game_data {
+            pieces.push(Piece {
+                start: base + cursor,
+                size: self.game_data - cursor,
+                source: Source::Image(rom_data_base + cursor),
+            });
+        }
         pieces.extend(modded.into_iter().map(|piece| Piece { start: base + piece.start, ..piece }));
         Layered { meta, pieces, size: base + end, changes }
     }

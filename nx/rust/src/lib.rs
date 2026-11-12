@@ -572,7 +572,12 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     // see zakuro_gpu::raster::mirror_portrait. When it is shown is the
     // player's to say, see Bottom.
     let big_portrait = unx.system.gpu.flags().big_portrait.swap(false, std::sync::atomic::Ordering::Relaxed);
-    unx.out_of_play = if said != 0 || big_portrait { 0 } else { unx.out_of_play.saturating_add(1) };
+    let was_in_battle = unx.out_of_play <= 90;
+    unx.out_of_play = if said != 0 || (was_in_battle && big_portrait) {
+        0
+    } else {
+        unx.out_of_play.saturating_add(1)
+    };
     let in_battle = unx.out_of_play <= 90;
     let host = input.as_ref().map_or(0, |input| input.host);
     let in_play = !unx.bottom.update(host, said);

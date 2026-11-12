@@ -2625,11 +2625,12 @@ impl Hardware {
         if next == self.scale {
             return self.scale;
         }
-        let _ = keep;
         let dirty: Vec<usize> = (0..self.surfaces.len())
             .filter(|&i| {
                 self.surfaces[i].dirty.is_some()
                     && matches!(self.surfaces[i].kind, Kind::Color(_))
+                    && (keep.is_empty()
+                        || keep.iter().any(|&(addr, len)| self.surfaces[i].dirty_overlaps(addr, len)))
             })
             .collect();
         if let Err(error) = self.write_back(memory, dirty) {
@@ -6895,14 +6896,21 @@ impl Hardware {
             let mut now = vec![0u8; rows.len()];
             memory.read(addr + rows.start as u32, &mut now);
             let was = &s.shadow[rows.clone()];
-            // the title reused the memory, for its heap say (Chapter 15): what
-            // it wrote is newer than anything drawn there, all of it, also
-            // where it wrote what the bytes held before, a zero over a black
-            // pixel, which compares as untouched and would get the drawing's
-            // byte, a broken pointer or float in the title's data
+            // the title reused the memory, for its heap say (Chapter 15, or
+            // LensFlareShader in How to Play where 99% of a 64 KiB struct is
+            // zero-initialized and only 159 of 16,384 words differ from the
+            // zero shadow): what it wrote is newer than anything drawn there,
+            // all of it, also where it wrote what the bytes held before, a
+            // zero over a black pixel, which compares as untouched and would
+            // get the drawing's byte, a broken pointer or float in the title's data
             let words = now.len() / 4;
             let changed = now.chunks_exact(4).zip(was.chunks_exact(4)).filter(|(held, was)| held != was).count();
-            if words > 0 && changed * 8 > words {
+            if words > 0
+                && s.stale.is_none()
+                && (changed > 16
+                    || changed * 8 > words
+                    || (changed > 0 && (matches!(s.kind, Kind::Depth(_)) || (0x1400_0000..0x1800_0000).contains(&addr))))
+            {
                 static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
                     log::warn!(

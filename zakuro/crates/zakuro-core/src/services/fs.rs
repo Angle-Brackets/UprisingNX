@@ -1219,7 +1219,7 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
         }
         FileBacking::Layered(layered, image) => {
             let mut data = vec![0u8; (size as u64).min(layered.len().saturating_sub(offset)) as usize];
-            let count = layered.read(image.data(), offset, &mut data);
+            let count = layered.read_image(&image, offset, &mut data);
             system.write_from_service(dest, &data[..count]);
             count as u32
         }

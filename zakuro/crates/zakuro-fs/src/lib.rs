@@ -505,7 +505,7 @@ impl Title {
         let Some(romfs) = &self.romfs else {
             return Ok(None);
         };
-        let layered = layered::Layered::new(romfs, self.image.data(), dir)?;
+        let layered = layered::Layered::new_image(romfs, &self.image, dir)?;
         let changes = layered.as_ref().map(|layered| layered.changes);
         self.layered = layered.map(std::sync::Arc::new);
         Ok(changes)

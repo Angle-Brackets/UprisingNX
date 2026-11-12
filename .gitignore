@@ -29,3 +29,7 @@ nx/c/*.nro
 nx/c/*.nacp
 nx/c/*.map
 __pycache__/
+
+# Tutorial voiceover / mod tooling & datasets
+tools/
+mods/
