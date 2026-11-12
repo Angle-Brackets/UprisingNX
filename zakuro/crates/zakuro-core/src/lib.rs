@@ -653,10 +653,18 @@ impl System {
         // Bet menu). Charge memory-bound ARM11 CPI (8 cycles/instruction)
         // past 750,000 instructions in a single refresh so a 16.67 ms video
         // frame never executes 4.48M recompiled instructions (~55 ms).
-        const FAST_FRAME_INSTRUCTIONS: u64 = 750_000;
+        // How to Play's moflex videos need ~1.5M instructions a refresh to
+        // decode (3M a picture at 30 fps): at 750k the decoder fell behind
+        // and the player stalled for good, so the bar is 2M.
+        // ZAKURO_FAST_FRAME=<instructions>, 0 turns the slowdown off
+        static FAST_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let fast_frame_instructions = *FAST_FRAME.get_or_init(|| {
+            std::env::var("ZAKURO_FAST_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000)
+        });
+        let fast_frame_instructions = if fast_frame_instructions == 0 { u64::MAX } else { fast_frame_instructions };
         const BACKGROUND_CPI: u64 = 8;
-        let (step_budget, cpi_extra) = if self.frame_recompiled < FAST_FRAME_INSTRUCTIONS {
-            let fast_left = FAST_FRAME_INSTRUCTIONS - self.frame_recompiled;
+        let (step_budget, cpi_extra) = if self.frame_recompiled < fast_frame_instructions {
+            let fast_left = fast_frame_instructions - self.frame_recompiled;
             (budget.min(fast_left).max(1), 0)
         } else {
             ((budget / BACKGROUND_CPI).max(1), BACKGROUND_CPI - 1)
