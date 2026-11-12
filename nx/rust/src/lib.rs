@@ -160,6 +160,9 @@ pub struct Unx {
     shade_wait: f64,
     /// frames since the game's overrides last said it was in play (a battle)
     out_of_play: u32,
+    /// the same, but only kept going by a portrait while already in a battle,
+    /// for the resolution
+    res_out_of_play: u32,
     /// the bottom screen is shown: see Bottom
     bottom: Bottom,
     /// a benchmark under way, see Bench
@@ -476,6 +479,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         hardware: 0.0,
         shade_wait: 0.0,
         out_of_play: u32::MAX,
+        res_out_of_play: u32::MAX,
         bottom: Bottom::new(),
         bench: None,
         in_play: true,
@@ -572,13 +576,18 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     // see zakuro_gpu::raster::mirror_portrait. When it is shown is the
     // player's to say, see Bottom.
     let big_portrait = unx.system.gpu.flags().big_portrait.swap(false, std::sync::atomic::Ordering::Relaxed);
-    let was_in_battle = unx.out_of_play <= 90;
-    unx.out_of_play = if said != 0 || (was_in_battle && big_portrait) {
+    unx.out_of_play = if said != 0 || big_portrait { 0 } else { unx.out_of_play.saturating_add(1) };
+    let in_battle = unx.out_of_play <= 90;
+    // the resolution follows battles only: a conversation's portrait keeps
+    // one going, but out of one (How to Play's videos) it would flip the
+    // scale back and forth, each flip a hitch
+    let was_res_battle = unx.res_out_of_play <= 90;
+    unx.res_out_of_play = if said != 0 || (was_res_battle && big_portrait) {
         0
     } else {
-        unx.out_of_play.saturating_add(1)
+        unx.res_out_of_play.saturating_add(1)
     };
-    let in_battle = unx.out_of_play <= 90;
+    let res_battle = unx.res_out_of_play <= 90;
     let host = input.as_ref().map_or(0, |input| input.host);
     let in_play = !unx.bottom.update(host, said);
     let flags = unx.system.gpu.flags();
@@ -612,7 +621,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     } else {
         unx.title_quiet.saturating_add(1)
     };
-    let title_boost = !in_battle;
+    let title_boost = !res_battle;
     if title_boost != unx.title_boosted {
         unx.title_boosted = title_boost;
         if unx.fixed_resolution.is_none() && !unx.docked {
