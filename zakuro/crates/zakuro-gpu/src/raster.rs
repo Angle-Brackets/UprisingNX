@@ -1494,6 +1494,10 @@ pub(crate) struct Portraits {
     last_dialogue: Vec<PortraitDraw>,
     /// flushes since the top screen last drew subtitles of its own.
     top_subtitle_quiet: u32,
+    /// flushes in a row the bottom screen drew the dialogue box's text, which
+    /// only shows on the top screen once it has stayed a few, a flash of the
+    /// text buffer while the game rewrites it does not.
+    dialogue_held: u32,
     /// whether the bottom screen has drawn since the last portrait flush.
     bottom_seen: bool,
     /// the title screen's logo and copyright draws redirected from the bottom
@@ -2420,13 +2424,17 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     }
     // the dialogue box's text, over the portraits, with the subtitles' shadow
     resources.portraits.top_subtitle_quiet = resources.portraits.top_subtitle_quiet.saturating_add(1);
+    /// how many flushes the text must stay before it shows.
+    const DIALOGUE_HOLD: u32 = 6;
     let dialogue = if bottom_seen || !resources.portraits.dialogue.is_empty() {
         let taken = std::mem::take(&mut resources.portraits.dialogue);
+        resources.portraits.dialogue_held = if taken.is_empty() { 0 } else { resources.portraits.dialogue_held.saturating_add(1) };
         resources.portraits.last_dialogue = taken.clone();
         taken
     } else {
         resources.portraits.last_dialogue.clone()
     };
+    let dialogue = if resources.portraits.dialogue_held >= DIALOGUE_HOLD { dialogue } else { Vec::new() };
     for mut draw in dialogue {
         if let Some([address, format, dimensions]) = top_target {
             draw.registers[REG_COLOR_BUFFER_ADDRESS] = address;
