@@ -1487,6 +1487,13 @@ pub(crate) struct Portraits {
     /// the last battle display draws flushed, reused if a subtitle flush
     /// follows an end-of-frame transfer flush before the bottom screen runs.
     last_hud: Vec<PortraitDraw>,
+    /// the dialogue box's text the bottom screen drew this frame, for the
+    /// top screen when the title draws no subtitles there itself (How to
+    /// Play), and the last of it, as with the battle display.
+    dialogue: Vec<PortraitDraw>,
+    last_dialogue: Vec<PortraitDraw>,
+    /// flushes since the top screen last drew subtitles of its own.
+    top_subtitle_quiet: u32,
     /// whether the bottom screen has drawn since the last portrait flush.
     bottom_seen: bool,
     /// the title screen's logo and copyright draws redirected from the bottom
@@ -2144,6 +2151,31 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
     resources.portraits.hud.push(PortraitDraw { registers, vertices });
 }
 
+/// takes the bottom screen's dialogue box text, the title's text buffer
+/// drawn there, for the top screen: centered across it, just above its
+/// bottom edge, where subtitles go. for flush_portraits to draw.
+fn mirror_dialogue(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
+    let Some(top) = resources.portraits.top else { return };
+    let Some(vertices) = shaded_in_order(registers, vertices) else { return };
+    let Some((low, high)) = bottom_box(&vertices) else { return };
+    // buffer terms: x up from the screen's bottom edge, y along it, 320
+    // wide below and 400 above
+    const ABOVE_BOTTOM: f32 = 8.0;
+    let x = ABOVE_BOTTOM - low[0];
+    let y = 200.0 - (low[1] + high[1]) / 2.0;
+    let mut vertices = vertices;
+    for vertex in &mut vertices {
+        let w = vertex.clip[3];
+        let below = [(vertex.clip[0] / w * 0.5 + 0.5) * 240.0, (vertex.clip[1] / w * 0.5 + 0.5) * 320.0];
+        let above = [x + below[0], y + below[1]];
+        vertex.clip[0] = (above[0] / 120.0 - 1.0) * w;
+        vertex.clip[1] = (above[1] / 200.0 - 1.0) * w;
+    }
+    let mut registers = onto_top(registers, top, 1.0, 0.0, 0.0);
+    registers[REG_VIEWPORT_HEIGHT] = float24(200.0);
+    resources.portraits.dialogue.push(PortraitDraw { registers, vertices });
+}
+
 /// redirects the bottom screen's Kid Icarus: Uprising logo and copyright
 /// notice onto the top screen during the title screen, dropping the
 /// bottom-screen sky backdrop and the "Touch!" call-to-action.
@@ -2324,6 +2356,8 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
         resources.portraits.sides = Default::default();
         resources.portraits.hud.clear();
         resources.portraits.last_hud.clear();
+        resources.portraits.dialogue.clear();
+        resources.portraits.last_dialogue.clear();
         resources.portraits.text_lines.clear();
         return drew_title;
     }
@@ -2381,6 +2415,25 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
             draw.registers[REG_COLOR_BUFFER_FORMAT] = format;
             draw.registers[REG_FRAMEBUFFER_DIMENSIONS] = dimensions;
         }
+        rasterize(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
+        drew = true;
+    }
+    // the dialogue box's text, over the portraits, with the subtitles' shadow
+    resources.portraits.top_subtitle_quiet = resources.portraits.top_subtitle_quiet.saturating_add(1);
+    let dialogue = if bottom_seen || !resources.portraits.dialogue.is_empty() {
+        let taken = std::mem::take(&mut resources.portraits.dialogue);
+        resources.portraits.last_dialogue = taken.clone();
+        taken
+    } else {
+        resources.portraits.last_dialogue.clone()
+    };
+    for mut draw in dialogue {
+        if let Some([address, format, dimensions]) = top_target {
+            draw.registers[REG_COLOR_BUFFER_ADDRESS] = address;
+            draw.registers[REG_COLOR_BUFFER_FORMAT] = format;
+            draw.registers[REG_FRAMEBUFFER_DIMENSIONS] = dimensions;
+        }
+        draw_subtitle_shadow(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
         rasterize(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
         drew = true;
     }
@@ -4634,6 +4687,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 if matches!(vertices, Vertices::Raw { .. }) {
                     return None;
                 }
+                resources.portraits.top_subtitle_quiet = 0;
                 resources.portraits.adding = true;
                 // the portraits go under the subtitles, in the buffer that
                 // goes out, once a frame
@@ -4690,6 +4744,8 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 if on_bottom(registers) {
                     if portrait {
                         mirror_portrait(registers, resources, vertices);
+                    } else if is_subtitle(registers) && resources.portraits.top_subtitle_quiet > 30 {
+                        mirror_dialogue(registers, resources, vertices);
                     } else if resources.portraits.in_battle {
                         mirror_hud(registers, resources, vertices);
                     } else if on_title {
