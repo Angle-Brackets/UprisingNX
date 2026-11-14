@@ -6,6 +6,7 @@
 target = "aarch64-nintendo-switch-freestanding"
 rustflags = [
     "-C", "target-cpu=cortex-a57",
+    "-C", "force-frame-pointers=yes",
     "--cfg", "target_family=\"unix\"",
     "--cfg", "target_env=\"newlib\"",
     "--cfg", "unix",

@@ -2082,6 +2082,8 @@ pub struct Hardware {
     compiler: Compiler,
     /// whether the device does logic ops.
     logic_ops: bool,
+    /// whether a viewport's depth range may go past 0..1, see render_device.
+    unrestricted_depth: bool,
     /// the state draws set as they go, and what sets it.
     dynamic: Dynamic,
     blend_state: Option<ash::ext::extended_dynamic_state3::Device>,
@@ -2220,6 +2222,7 @@ impl Hardware {
         let kept_pipelines: Option<Arc<std::path::Path>> = kept_pipelines.map(Into::into);
         let (instance, device, physical, family) = (shared.instance.clone(), shared.device.clone(), shared.physical, shared.family);
         let (logic_ops, statistics, dynamic) = (shared.logic_ops, shared.statistics, shared.dynamic);
+        let unrestricted_depth = shared.unrestricted_depth;
         // SAFETY: the physical device came from this instance
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let name = properties.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2379,6 +2382,7 @@ impl Hardware {
                 generic: std::env::var_os("ZAKURO_GENERIC_SHADERS").is_some(),
                 compiler,
                 logic_ops,
+                unrestricted_depth,
                 dynamic,
                 blend_state,
                 logic_op_state,
@@ -5088,8 +5092,26 @@ impl Hardware {
             _ if depth_map.w_buffer => (true, (0.0, 1.0)),
             Geometry::Placed { .. } => (false, (0.0, 1.0)),
             Geometry::Shaded(_) if [mapped.0, mapped.1].iter().all(|d| (0.0..=1.0).contains(d)) => (false, mapped),
+            // past 0..1: the viewport maps it all the same where the device
+            // allows, and a depth attachment of fixed point clamps to 0..1
+            // as the shader did
+            Geometry::Shaded(_) if self.unrestricted_depth => (false, mapped),
             Geometry::Shaded(_) => (true, (0.0, 1.0)),
         };
+        {
+            static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *LOG.get_or_init(|| std::env::var_os("ZAKURO_DEPTH_LOG").is_some()) {
+                use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+                static N: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+                let past = matches!(draw.geometry, Geometry::Shaded(_)) && ![mapped.0, mapped.1].iter().all(|d| (0.0..=1.0).contains(d));
+                let kind = if depth_map.w_buffer { 0 } else if past { 1 } else { 2 };
+                let n = N[kind].fetch_add(1, Relaxed);
+                if n % 2000 == 0 {
+                    log::info!(target: "zakuro_gpu::diag", "depth map: w-buffer {} / past 0..1 {} / in range {} draws so far; this one {} scale {} offset {} placed {}",
+                        N[0].load(Relaxed), N[1].load(Relaxed), N[2].load(Relaxed), ["w-buffer", "past 0..1", "in range"][kind], depth_map.scale, depth_map.offset, matches!(draw.geometry, Geometry::Placed { .. }));
+                }
+            }
+        }
         words.extend([depth_flags, draw.lighting.is_some() as u32, depth_map.scale.to_bits(), depth_map.offset.to_bits()]);
         match draw.lighting {
             Some(lighting) => lighting.pack(words),
@@ -7325,6 +7347,19 @@ pub(crate) fn render_device(
     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
     let mut extensions = vec![ash::khr::push_descriptor::NAME.as_ptr()];
     extensions.extend_from_slice(extra);
+    // a viewport depth range past 0..1, for the depth maps that need one:
+    // without it those draws work their depth out in the fragment shader,
+    // which turns the early depth test off for them. ZAKURO_DEPTH_IN_SHADER=1
+    // keeps them there, to compare
+    let unrestricted_depth = std::env::var_os("ZAKURO_DEPTH_IN_SHADER").is_none() && {
+        // SAFETY: the physical device came from this instance
+        let available = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+        available.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::ext::depth_range_unrestricted::NAME))
+    };
+    if unrestricted_depth {
+        extensions.push(ash::ext::depth_range_unrestricted::NAME.as_ptr());
+    }
+    log::info!("depth ranges past 0..1 in the viewport: {unrestricted_depth}");
     // SAFETY: the physical device came from this instance
     let supported = unsafe { instance.get_physical_device_features(physical) };
     let logic_ops = supported.logic_op == vk::TRUE;
@@ -7383,7 +7418,7 @@ pub(crate) fn render_device(
     // SAFETY: a queue the device was made with
     let queue = unsafe { device.get_device_queue(family, 0) };
     let (_entry, instance) = (entry.clone(), instance.clone());
-    Ok(SharedDevice { _entry, instance, physical, family, device, queue, queue_lock: Default::default(), logic_ops, statistics, dynamic })
+    Ok(SharedDevice { _entry, instance, physical, family, device, queue, queue_lock: Default::default(), logic_ops, statistics, unrestricted_depth, dynamic })
 }
 
 /// which of the blend state the device lets draws set as they go, none

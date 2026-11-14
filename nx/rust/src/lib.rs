@@ -32,6 +32,82 @@ impl log::Log for Logger {
 
 static LOGGER: Logger = Logger;
 
+static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct CrashBuf {
+    bytes: [u8; 2048],
+    len: usize,
+}
+
+impl std::fmt::Write for CrashBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let room = self.bytes.len().saturating_sub(self.len);
+        let take = s.len().min(room);
+        self.bytes[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+/// a panic aborts the process (panic = "abort"), and its message went only to
+/// stderr, which nobody reads away from nxlink: the abort then closes HID and
+/// the game's thread faults there, all Atmosphère's report shows. so the
+/// message, the thread and the return addresses (frame pointer chain, as
+/// offsets into the module for addr2line) go to crash.txt first on the stack,
+/// without touching the allocator.
+fn install_panic_hook() {
+    extern "C" {
+        fn _start();
+        fn unx_write_crash(buf: *const u8, len: usize);
+        fn unx_note_panic_logged();
+        fn unx_kernel_memory_mib(used: *mut u64, total: *mut u64);
+    }
+    let shown = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::fmt::Write as _;
+        let base = _start as *const () as usize;
+        let frame = CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+        let (mut used_mib, mut total_mib) = (0u64, 0u64);
+        unsafe { unx_kernel_memory_mib(&mut used_mib, &mut total_mib) };
+        let thread = std::thread::current();
+        let mut buf = CrashBuf { bytes: [0; 2048], len: 0 };
+        let _ = writeln!(
+            buf,
+            "PANIC frame {frame} thread '{}' (mem {used_mib}/{total_mib} MiB): {info}",
+            thread.name().unwrap_or("<unnamed>"),
+        );
+        let _ = writeln!(buf, "  module base {base:#x}, return addresses (uprising_nx+offset):");
+        let mut fp: usize;
+        unsafe { std::arch::asm!("mov {}, x29", out(reg) fp) };
+        for _ in 0..48 {
+            if fp == 0 || fp % 8 != 0 {
+                break;
+            }
+            let (next, lr) = unsafe { (*(fp as *const usize), *((fp + 8) as *const usize)) };
+            if lr == 0 {
+                break;
+            }
+            if lr >= base {
+                let _ = writeln!(buf, "    uprising_nx+{:#x}", lr - base);
+            } else {
+                let _ = writeln!(buf, "    {lr:#x}");
+            }
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        unsafe {
+            unx_note_panic_logged();
+            unx_write_crash(buf.bytes.as_ptr(), buf.len);
+        }
+        if let Ok(text) = std::str::from_utf8(&buf.bytes[..buf.len]) {
+            println!("{text}");
+        }
+        shown(info);
+    }));
+}
+
 /// lines to print, and the frame rate ones to keep in fps.log, handed to a
 /// thread of their own: printing goes over the network and the log to the
 /// SD card, 30 ms a report, which stalled the frame it came in.
@@ -632,6 +708,7 @@ pub unsafe extern "C" fn unx_set_font(data: *const u8, len: usize) {
 /// tables, which live as long as the program.
 #[no_mangle]
 pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, data_dir: *const c_char, recomp: *const UnxRecomp) -> *mut Unx {
+    install_panic_hook();
     let _ = log::set_logger(&LOGGER);
     let _ = zakuro_gpu::THREAD_ROLE.set(place_thread);
     log::set_max_level(log::LevelFilter::Info);
@@ -900,6 +977,7 @@ static REPORT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 #[no_mangle]
 pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32 {
     let unx = &mut *unx;
+    CURRENT_FRAME.store(unx.frame, std::sync::atomic::Ordering::Relaxed);
     if let Some(done) = unx_menu(unx, input.as_ref()) {
         return done;
     }

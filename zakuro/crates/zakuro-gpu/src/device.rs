@@ -20,6 +20,10 @@ pub struct SharedDevice {
     /// whether the device does logic ops, and counts pipeline statistics.
     pub(crate) logic_ops: bool,
     pub(crate) statistics: bool,
+    /// VK_EXT_depth_range_unrestricted: a viewport depth range past 0..1,
+    /// so a depth map the viewport can't otherwise hold stays out of the
+    /// fragment shader (which writing depth would cost the early depth test)
+    pub(crate) unrestricted_depth: bool,
     /// the blend state draws set as they go.
     pub(crate) dynamic: crate::raster::hardware::Dynamic,
 }

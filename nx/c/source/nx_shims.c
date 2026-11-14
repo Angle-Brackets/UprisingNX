@@ -161,3 +161,72 @@ ssize_t getrandom(void *buf, size_t len, unsigned flags) {
     randomGet(buf, len);
     return (ssize_t)len;
 }
+
+// ---- abort leaves a note ---------------------------------------------------
+// abort (a Rust panic, an allocation failure, an assert) runs exit, which
+// closes HID under the game's thread: Atmosphère then reports that thread's
+// fault in padUpdate, not the abort. so the aborting thread's return addresses
+// go to crash.txt first, as offsets for addr2line, using raw open/write and a
+// stack buffer so an out-of-memory or heap-corrupted abort never touches malloc.
+#include <fcntl.h>
+
+static int s_panic_logged = 0;
+static int s_in_abort = 0;
+
+void unx_note_panic_logged(void) {
+    __atomic_store_n(&s_panic_logged, 1, __ATOMIC_RELEASE);
+}
+
+void unx_write_crash(const char *buf, size_t len) {
+    int fd = open("sdmc:/switch/uprisingnx/crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) {
+        size_t off = 0;
+        while (off < len) {
+            ssize_t n = write(fd, buf + off, len - off);
+            if (n <= 0) break;
+            off += (size_t)n;
+        }
+        fsync(fd);
+        close(fd);
+    }
+}
+
+void unx_kernel_memory_mib(unsigned long long *used_mib, unsigned long long *total_mib) {
+    u64 used = 0, total = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    *used_mib = (unsigned long long)(used >> 20);
+    *total_mib = (unsigned long long)(total >> 20);
+}
+
+void __real_abort(void) __attribute__((noreturn));
+void _start(void);
+void __wrap_abort(void) {
+    if (!__atomic_load_n(&s_panic_logged, __ATOMIC_ACQUIRE)
+        && __atomic_exchange_n(&s_in_abort, 1, __ATOMIC_SEQ_CST) == 0) {
+        char buf[2048];
+        unsigned long long used_mib = 0, total_mib = 0;
+        unx_kernel_memory_mib(&used_mib, &total_mib);
+        uintptr_t base = (uintptr_t)&_start;
+        int n = snprintf(
+            buf, sizeof buf,
+            "ABORT on thread %p (mem %llu/%llu MiB, base 0x%lx), return addresses:\n",
+            (void *)threadGetSelf(), used_mib, total_mib, (unsigned long)base
+        );
+        size_t len = (n > 0 && (size_t)n < sizeof buf) ? (size_t)n : 0;
+        uintptr_t *fp = __builtin_frame_address(0);
+        for (int i = 0; i < 48 && fp && ((uintptr_t)fp & 7) == 0 && len + 64 < sizeof buf; i++) {
+            uintptr_t lr = fp[1];
+            if (lr == 0) break;
+            int w = (lr >= base)
+                ? snprintf(buf + len, sizeof buf - len, "    uprising_nx+0x%lx\n", (unsigned long)(lr - base))
+                : snprintf(buf + len, sizeof buf - len, "    0x%lx\n", (unsigned long)lr);
+            if (w > 0 && len + (size_t)w < sizeof buf) len += (size_t)w;
+            uintptr_t *next = (uintptr_t *)fp[0];
+            if (next <= fp) break;
+            fp = next;
+        }
+        unx_write_crash(buf, len);
+    }
+    __real_abort();
+}
