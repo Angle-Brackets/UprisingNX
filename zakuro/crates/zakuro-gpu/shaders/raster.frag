@@ -667,14 +667,17 @@ void combine_stage(
     }
 }
 
-#ifdef WRITES_DEPTH
 // what the GPU shaded maps z/w itself, which the clipper got exactly.
-// precise as the combiners are. built so only for a w-buffer and for a
-// depth map the viewport can't hold, the rest leave depth to the
-// rasterizer, which lets the GPU skip what is hidden before shading it
+// precise as the combiners are. for a w-buffer whose depth the rasterizer
+// handles, fog still takes the PICA's linear w-depth here
 float fragment_depth() {
-    precise float depth = in_depth;
     uint depth_mode = DYNAMIC != 0u ? flags.x : DEPTH_MODE;
+#ifndef WRITES_DEPTH
+    if ((depth_mode & 1u) == 0u) {
+        return gl_FragCoord.z;
+    }
+#endif
+    precise float depth = in_depth;
     if ((depth_mode & 2u) != 0u) {
         depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);
     }
@@ -683,12 +686,6 @@ float fragment_depth() {
     }
     return clamp(depth, 0.0, 1.0);
 }
-#else
-// the viewport mapped the depth as the PICA does
-float fragment_depth() {
-    return gl_FragCoord.z;
-}
-#endif
 
 void main() {
     vec4 primary = clamp(in_color, 0.0, 1.0);

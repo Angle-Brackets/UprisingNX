@@ -1355,11 +1355,16 @@ pub(crate) struct DrawnTexture {
     pub(crate) format: ColorFormat,
 }
 
-/// whether a draw reading its own target samples it directly, ZAKURO_FEEDBACK_LOOP=1
-/// (a test of what the driver does with the feedback loop).
+/// whether a draw reading its own target samples it directly; on by default
+/// (ZAKURO_FEEDBACK_LOOP=0 falls back to a snapshot copy).
 pub(crate) fn feedback_loop() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ZAKURO_FEEDBACK_LOOP").is_some())
+    *ON.get_or_init(|| {
+        std::env::var("ZAKURO_FEEDBACK_LOOP")
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(!cfg!(test))
+    })
 }
 
 /// how a texture minifies: the magnification filter's bit says it by default

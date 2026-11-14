@@ -319,6 +319,9 @@ pub struct Unx {
     title_quiet: u32,
     /// whether internal resolution is currently boosted to 2x for the title screen
     title_boosted: bool,
+    /// battle resolution steps dropped by smooth_guard during the current
+    /// battle so smooth mode stays on (0 or 1, cleared when the scene changes)
+    battle_scale_drop: u32,
     /// last frame's host buttons, for the resolution buttons' presses
     host_last: u32,
     smooth: Smooth,
@@ -451,6 +454,7 @@ fn bench_next(unx: &mut Unx) {
     bench.gaps.clear();
     bench.spent = [0.0; 5];
     bench.fallbacks = [0; 4];
+    unx.scene_changed("a benchmark slot");
 }
 
 extern "C" {
@@ -468,7 +472,11 @@ impl Unx {
     /// or out of one (see settings::Mode::video)
     fn auto_scale(&self) -> u32 {
         let video = self.settings.mode(self.docked).video(self.docked);
-        if self.title_boosted { video.menu_scale } else { video.battle_scale }
+        if self.title_boosted {
+            video.menu_scale
+        } else {
+            video.battle_scale.saturating_sub(self.battle_scale_drop).max(1)
+        }
     }
 
     /// puts the settings for this mode in place: resolution (unless fixed)
@@ -526,6 +534,14 @@ impl Unx {
     /// a new scene says nothing of what the last one cost: smooth mode, if
     /// wanted and off, tries again now, and the backoff starts over
     fn scene_changed(&mut self, why: &str) {
+        if self.battle_scale_drop != 0 {
+            self.battle_scale_drop = 0;
+            if self.fixed_resolution.is_none() {
+                let target = self.auto_scale();
+                let scale = self.set_scale(target);
+                log::info!("unx: battle resolution restored -> {scale}x, {why} (frame {})", self.frame);
+            }
+        }
         self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
         if self.smooth.wanted && !self.smooth.on && self.smooth.retry_at > self.frame {
             self.smooth.retry_at = self.frame;
@@ -609,6 +625,31 @@ impl Unx {
             }
             return;
         }
+        // UNX_SMOOTH_SCALE_DROP=0 skips stepping battle resolution down first
+        static ALLOW_SCALE_DROP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let allow_drop = *ALLOW_SCALE_DROP.get_or_init(|| {
+            std::env::var("UNX_SMOOTH_SCALE_DROP").map_or(true, |v| v.trim() != "0")
+        });
+        if allow_drop && !self.title_boosted && self.fixed_resolution.is_none() && self.battle_scale_drop == 0 {
+            let before = self.system.gpu.scale();
+            if before > 1 {
+                self.battle_scale_drop = 1;
+                let target = self.auto_scale();
+                let scale = self.set_scale(target);
+                if scale < before {
+                    self.smooth.wait = 0.0;
+                    self.smooth.frames = 0;
+                    self.smooth.last = None;
+                    self.smooth.slow = 0;
+                    self.smooth.kept_up = 0;
+                    log::info!(
+                        "unx: smooth guard stepped battle resolution {before}x -> {scale}x to keep smooth mode on ({average:.1} ms waited a refresh, {slow} of {frames} refreshes slow, frame {})",
+                        self.frame
+                    );
+                    return;
+                }
+            }
+        }
         let backoff = self.smooth.backoff;
         self.smooth.retry_at = self.frame + backoff;
         self.smooth.backoff = (backoff * 2).min(SMOOTH_BACKOFF_MOST);
@@ -642,6 +683,7 @@ impl Unx {
             return;
         };
         self.fixed_resolution = None;
+        self.battle_scale_drop = 0;
         self.apply_settings();
         self.settings_changed(what);
         self.notify_video();
@@ -649,6 +691,7 @@ impl Unx {
 
     fn apply_docked(&mut self, docked: bool) {
         self.docked = docked;
+        self.battle_scale_drop = 0;
         let (width, height) = if docked { (1920, 1080) } else { (1280, 720) };
         self.presenter.resize(width, height);
         if let Some(fixed) = self.fixed_resolution {
@@ -833,6 +876,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         smooth_forced,
         title_quiet: u32::MAX,
         title_boosted: true,
+        battle_scale_drop: 0,
         host_last: 0,
         smooth: Smooth {
             wanted: smooth_wanted,
@@ -938,6 +982,7 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
     match unx.menu.input(buttons, &mut unx.settings, docked) {
         Some(menu::Changed::Video) => {
             unx.fixed_resolution = None;
+            unx.battle_scale_drop = 0;
             unx.smooth_forced = None;
             unx.apply_settings();
             unx.settings_changed("menu");
@@ -1080,6 +1125,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let title_boost = !res_battle;
     if title_boost != unx.title_boosted {
         unx.title_boosted = title_boost;
+        unx.battle_scale_drop = 0;
         unx.scene_changed(if title_boost { "out of a battle" } else { "into a battle" });
         if unx.fixed_resolution.is_none() {
             let target = unx.auto_scale();
@@ -1117,6 +1163,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 "scale" => match slot {
                     "auto" => {
                         unx.fixed_resolution = None;
+                        unx.battle_scale_drop = 0;
                         let target = unx.auto_scale();
                         let scale = unx.set_scale(target);
                         Ok(format!("auto resolution -> {scale}x"))

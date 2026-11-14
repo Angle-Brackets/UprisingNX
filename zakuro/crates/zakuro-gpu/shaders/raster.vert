@@ -18,9 +18,9 @@ layout(location = 4) out vec4 out_quaternion;
 layout(location = 5) out vec3 out_view;
 
 void main() {
-    // the mapped depth on the rasterizer's side too, for draws whose
-    // fragment shader leaves depth alone
-    gl_Position = vec4(position.xy, texcoord2_depth.z * position.w, position.w);
+    // the mapped depth (or -z for a w-buffer) on the rasterizer's side too,
+    // for draws whose fragment shader leaves depth alone
+    gl_Position = vec4(position.xy, position.z, position.w);
     out_color = color;
     out_texcoords01 = texcoords01;
     out_texcoord2 = vec3(texcoord2_depth.xy, texcoord2_depth.w);

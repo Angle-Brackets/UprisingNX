@@ -352,6 +352,7 @@ struct Surface {
     addr: u32,
     width: u32,
     height: u32,
+    scale: u32,
     kind: Kind,
     /// tiled the way the PICA draws, or in plain rows, as a display
     /// transfer can leave its output.
@@ -585,6 +586,37 @@ static TRANSFER_BLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn transfer_blit() -> bool {
     std::env::var("ZAKURO_TRANSFER_BLIT").map_or(true, |v| v != "0")
+}
+
+/// ZAKURO_HW_WBUFFER=0 keeps w-buffer draws writing gl_FragDepth in the
+/// fragment shader instead of letting hardware z/w depth (with Early-Z) do
+/// the test while fog still uses linear w-depth.
+fn hw_wbuffer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        return false;
+    }
+    *ON.get_or_init(|| std::env::var("ZAKURO_HW_WBUFFER").map_or(true, |v| v != "0"))
+}
+
+/// ZAKURO_TWIN_BLOOM=1 twins small offscreen glow/bloom targets (<= 128x256)
+/// on Pass::Real draws too, instead of reusing Real's blurred glow in Twin.
+fn twin_bloom() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        return true;
+    }
+    *ON.get_or_init(|| std::env::var("ZAKURO_TWIN_BLOOM").is_ok_and(|v| v != "0"))
+}
+
+/// ZAKURO_1X_BLOOM=0 scales small offscreen tiled targets (<= 128x256) up by
+/// the rendering resolution instead of keeping them at 1x native scale.
+fn one_x_bloom() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        return false;
+    }
+    *ON.get_or_init(|| std::env::var("ZAKURO_1X_BLOOM").map_or(true, |v| v != "0"))
 }
 
 /// the format, the uses and the aspects of the image a surface of a kind
@@ -3135,6 +3167,8 @@ impl Hardware {
     /// before the rendering they follow, behind its barrier, and nothing
     /// else wrote the twins since.
     fn draw_twins(&mut self) {
+        let was = self.timing.as_ref().map(|t| t.current);
+        self.mark(Work::Draw, false);
         let draws = std::mem::take(&mut self.twin_draws);
         let mut into = None;
         for recorded in &draws {
@@ -3167,6 +3201,9 @@ impl Hardware {
         self.unfenced = true;
         self.twin_draws = draws;
         self.twin_draws.clear();
+        if let Some(work) = was {
+            self.mark(work, false);
+        }
     }
 
     /// room for size bytes in the ring, where it starts.
@@ -3245,8 +3282,7 @@ impl Hardware {
     /// records clearing rows of a surface's image or its twin's.
     fn clear_rows_of(&mut self, index: usize, view: vk::ImageView, rows: (u32, u32), pixel: &[u8]) {
         let surface = &self.surfaces[index];
-        let (width, height, kind) = (surface.width, surface.height, surface.kind);
-        let scale = self.scale;
+        let (width, height, kind, scale) = (surface.width, surface.height, surface.kind, surface.scale);
         self.renderings += 1;
         let attachment = [vk::RenderingAttachmentInfo::default()
             .image_view(view)
@@ -3305,6 +3341,14 @@ impl Hardware {
             .fold(height, u32::max)
     }
 
+    fn surface_scale(&self, width: u32, height: u32, tiled: bool) -> u32 {
+        if tiled && width <= 128 && height <= 256 && one_x_bloom() {
+            1
+        } else {
+            self.scale
+        }
+    }
+
     fn surface_rows<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -3321,9 +3365,10 @@ impl Hardware {
         {
             Some(index) => index,
             None => {
+                let scale = self.surface_scale(width, height, tiled);
                 let (format, usage, aspect) = surface_image(kind, self.depth_format);
-                let image = self.image(width * self.scale, height * self.scale, format, usage, aspect)?;
-                let native = match self.scale {
+                let image = self.image(width * scale, height * scale, format, usage, aspect)?;
+                let native = match scale {
                     1 => None,
                     // scaled on the CPU on its way to and from memory
                     _ if matches!(kind, Kind::Depth(_)) && !self.depth_blits => None,
@@ -3338,6 +3383,7 @@ impl Hardware {
                     addr,
                     width,
                     height,
+                    scale,
                     kind,
                     tiled,
                     shadow: Vec::new(),
@@ -3512,7 +3558,7 @@ impl Hardware {
         self.end_rendering();
         let (width, height, kind) = {
             let s = &self.surfaces[index];
-            (s.width * self.scale, s.height * self.scale, s.kind)
+            (s.width * s.scale, s.height * s.scale, s.kind)
         };
         if self.surfaces[index].twin.is_none() {
             let (format, usage, aspect) = surface_image(kind, self.depth_format);
@@ -3625,7 +3671,7 @@ impl Hardware {
                 // goes straight to its scaled one, scaled here the way a blit
                 // up scales, through a buffer of its own when that is more
                 // than the ring takes
-                let n = if self.surfaces[index].native.is_some() { 1 } else { self.scale };
+                let n = if self.surfaces[index].native.is_some() { 1 } else { self.surfaces[index].scale };
                 if n > 1 {
                     values = scale_up(&values, width, height, n);
                     stencil = scale_up(&stencil, width, height, n);
@@ -3666,7 +3712,7 @@ impl Hardware {
                 }
             }
         }
-        if self.scale > 1 {
+        if self.surfaces[index].scale > 1 {
             self.barrier();
             self.blit(index, true);
         }
@@ -3691,7 +3737,7 @@ impl Hardware {
         let layers = vk::ImageSubresourceLayers::default().aspect_mask(aspect).layer_count(1);
         let corner = |width: u32, height: u32| [vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }];
         let small = corner(s.width, s.height);
-        let big = corner(s.width * self.scale, s.height * self.scale);
+        let big = corner(s.width * s.scale, s.height * s.scale);
         let (from, to, from_corner, to_corner) =
             if up { (native.image, s.image.image, small, big) } else { (s.image.image, native.image, big, small) };
         let region = [vk::ImageBlit::default()
@@ -4280,7 +4326,7 @@ impl Hardware {
             self.end_rendering();
             // SAFETY: recording, outside rendering, on an image in the
             // general layout that allows transfers into it
-            let mut cleared_to = vk::ClearValue::default();
+            let cleared_to;
             unsafe {
                 match kind {
                     Kind::Color(format) => {
@@ -4396,8 +4442,9 @@ impl Hardware {
         made.extend(vertices.iter().map(|v| {
             let depth = v.z * depth_map.scale + depth_map.offset;
             let w = 1.0 / v.inv_w;
+            let clip_z = if depth_map.w_buffer { -v.z * w } else { depth * w };
             [
-                (v.x * inv_width_2 - 1.0) * w, (v.y * inv_height_2 - 1.0) * w, 0.0, w,
+                (v.x * inv_width_2 - 1.0) * w, (v.y * inv_height_2 - 1.0) * w, clip_z, w,
                 v.color[0], v.color[1], v.color[2], v.color[3],
                 v.texcoords[0][0], if flip & 1 != 0 { 1.0 - v.texcoords[0][1] } else { v.texcoords[0][1] },
                 v.texcoords[1][0], if flip & 2 != 0 { 1.0 - v.texcoords[1][1] } else { v.texcoords[1][1] },
@@ -4880,12 +4927,17 @@ impl Hardware {
         // frame interpolation draws it into the twins of its buffers too, the
         // draw in between where it moved, as it is where its buffers or what
         // it reads have twins, which hold the picture in between
+        let bloom_surface = !twin_bloom()
+            && matches!(self.surfaces[color].kind, Kind::Color(_))
+            && self.surfaces[color].width <= 128
+            && self.surfaces[color].height <= 256;
         let twinned = self.twins
             && match pass {
                 Pass::Real => {
                     self.surfaces[color].twinned
-                        || depth.is_some_and(|depth| self.surfaces[depth].twinned)
-                        || draw.textures.iter().flatten().filter_map(|bound| bound.drawn).any(|drawn| self.reads_twin(&drawn))
+                        || (!bloom_surface
+                            && (depth.is_some_and(|depth| self.surfaces[depth].twinned)
+                                || draw.textures.iter().flatten().filter_map(|bound| bound.drawn).any(|drawn| self.reads_twin(&drawn))))
                 }
                 Pass::Twinned | Pass::Twin => true,
             };
@@ -4907,7 +4959,7 @@ impl Hardware {
         let real = pass != Pass::Twin;
         let twin = twinned && pass != Pass::Twinned;
 
-        let mut flip = 0u8;
+        let flip = 0u8;
         // the units sampling a surface's own image rather than a copy, whose
         // rows the fragment shader reads the other way up
         let mut direct = 0u8;
@@ -4928,23 +4980,7 @@ impl Hardware {
                         }
                         Some(drawn) => {
                             if real {
-                                // ZAKURO_FEEDBACK_LOOP=1: a draw reading the target it draws into
-                                // samples that image as it is being drawn, without a snapshot
-                                // copy, its v flipped as the surface's rows run the other way
-                                let direct = super::feedback_loop()
-                                    && !twinned
-                                    && matches!(self.surfaces[color].kind, Kind::Color(_))
-                                    && self.texture_source(&drawn) == Some((color, 0))
-                                    && self.surfaces[color].width == drawn.width
-                                    && self.surfaces[color].height == drawn.height;
-                                if direct {
-                                    views[unit] = self.surfaces[color].image.view;
-                                    if std::env::var("ZAKURO_FEEDBACK_LOOP").as_deref() != Ok("noflip") {
-                                        flip |= 1 << unit;
-                                    }
-                                } else {
-                                    views[unit] = self.copy_texture(&drawn, bound, false)?;
-                                }
+                                views[unit] = self.copy_texture(&drawn, bound, false)?;
                             }
                             if twin {
                                 twin_views[unit] = self.copy_texture(&drawn, bound, true)?;
@@ -4971,7 +5007,7 @@ impl Hardware {
                     } else if bound.replacement.is_some() {
                         -128
                     } else {
-                        let scale_bias = ((self.scale as f32).log2() * 256.0).round() as i32;
+                        let scale_bias = ((self.surfaces[color].scale as f32).log2() * 256.0).round() as i32;
                         (bound.lod_bias as i32 + scale_bias).clamp(i16::MIN as i32, i16::MAX as i32) as i16
                     };
                     samplers[unit] = self.sampler(filters, bound.wrap_s, bound.wrap_t, smallest, lod_bias)?;
@@ -5081,22 +5117,39 @@ impl Hardware {
         for (unit, base) in TEXTURE_UNIT_BASES.into_iter().enumerate() {
             words.extend([r[base + 2], r[base], (direct >> unit) as u32 & 1, 0]);
         }
+        // what the draw may change
+        let color_mask = if r[REG_COLOR_BUFFER_WRITE] != 0 { (r[REG_DEPTH_COLOR_MASK] >> 8) & 0xF } else { 0 };
+        let mask = r[REG_DEPTH_COLOR_MASK];
+        let writable = r[REG_DEPTH_STENCIL_WRITE] != 0;
+        let depth_test = mask & 1 != 0;
+        let depth_write = writable && mask & (1 << 12) != 0;
+        let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && r[REG_STENCIL_TEST] & 1 != 0;
+        // test switch: ZAKURO_DEPTH_TEST_NOWRITE=0 draws what tests depth
+        // without writing it (the translucent layers) over everything
+        let depth_compare = if depth_test && (depth_write || nowrite_tests()) {
+            COMPARES[((mask >> 4) & 7) as usize]
+        } else {
+            vk::CompareOp::ALWAYS
+        };
+        let uses_depth_values = depth.is_some() && (depth_write || (depth_test && depth_compare != vk::CompareOp::ALWAYS));
+
         let depth_flags = depth_map.w_buffer as u32 | (shaded.is_some() as u32) << 1;
         // the depth map goes through the viewport where it fits, and what
         // the CPU placed carries its depth in its position, so the fragment
         // shader leaves depth alone and the GPU skips what is hidden before
-        // shading it. a w-buffer is not linear on the screen, the fragment
-        // shader works that out as before
+        // shading it. when depth values are unused, or ZAKURO_HW_WBUFFER=1
+        // tests monotonic z/w depth in hardware, gl_FragDepth stays off while
+        // fog still computes linear w-depth in fragment_depth()
         let mapped = (depth_map.offset, depth_map.offset - depth_map.scale);
         let (writes_depth, depth_range) = match draw.geometry {
-            _ if depth_map.w_buffer => (true, (0.0, 1.0)),
+            _ if depth_map.w_buffer => (uses_depth_values && !hw_wbuffer(), (0.0, 1.0)),
             Geometry::Placed { .. } => (false, (0.0, 1.0)),
             Geometry::Shaded(_) if [mapped.0, mapped.1].iter().all(|d| (0.0..=1.0).contains(d)) => (false, mapped),
             // past 0..1: the viewport maps it all the same where the device
             // allows, and a depth attachment of fixed point clamps to 0..1
             // as the shader did
             Geometry::Shaded(_) if self.unrestricted_depth => (false, mapped),
-            Geometry::Shaded(_) => (true, (0.0, 1.0)),
+            Geometry::Shaded(_) => (uses_depth_values, (0.0, 1.0)),
         };
         {
             static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5131,14 +5184,6 @@ impl Hardware {
         let uniform_offset = self.stage_block(&mut block, UNIFORM_SIZE, self.uniform_alignment);
         self.uniforms = block;
         let uniform_offset = uniform_offset?;
-
-        // what the draw may change
-        let color_mask = if r[REG_COLOR_BUFFER_WRITE] != 0 { (r[REG_DEPTH_COLOR_MASK] >> 8) & 0xF } else { 0 };
-        let mask = r[REG_DEPTH_COLOR_MASK];
-        let writable = r[REG_DEPTH_STENCIL_WRITE] != 0;
-        let depth_test = mask & 1 != 0;
-        let depth_write = writable && mask & (1 << 12) != 0;
-        let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && r[REG_STENCIL_TEST] & 1 != 0;
         // only the bits compile_pipeline reads, so draws that differ
         // elsewhere share a pipeline
         // blending that adds one of the fragment to none of the pixel is no
@@ -5263,7 +5308,7 @@ impl Hardware {
             Geometry::Shaded(shading) if shading.cull != 0 => vk::CullModeFlags::BACK,
             _ => vk::CullModeFlags::NONE,
         };
-        let scale = self.scale;
+        let scale = self.surfaces[color].scale;
         let recorded = Recorded {
             color,
             depth,
@@ -5284,13 +5329,7 @@ impl Hardware {
             // with the test off the PICA still writes depth, which Vulkan
             // only does while testing
             depth_test: depth.is_some() && (depth_test || depth_write),
-            // test switch: ZAKURO_DEPTH_TEST_NOWRITE=0 draws what tests depth
-            // without writing it (the translucent layers) over everything
-            depth_compare: if depth_test && (depth_write || nowrite_tests()) {
-                COMPARES[((mask >> 4) & 7) as usize]
-            } else {
-                vk::CompareOp::ALWAYS
-            },
+            depth_compare,
             depth_write: depth.is_some() && depth_write,
             stencil_test,
             stencil: (r[REG_STENCIL_TEST], r[REG_STENCIL_OP]),
@@ -5478,7 +5517,7 @@ impl Hardware {
         let surface = &self.surfaces[color];
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D { width: surface.width * self.scale, height: surface.height * self.scale },
+            extent: vk::Extent2D { width: surface.width * surface.scale, height: surface.height * surface.scale },
         };
         let attachment = |view: vk::ImageView| {
             vk::RenderingAttachmentInfo::default()
@@ -5633,7 +5672,11 @@ impl Hardware {
         };
         // drawn scaled, every size and row is that many times more, and the
         // pixels averaged stay as many
-        let n = self.scale as i32;
+        let s_scale = self.surfaces[source].scale;
+        if s_scale != self.surfaces[target].scale {
+            return Ok(false);
+        }
+        let n = s_scale as i32;
         let constants: [i32; 11] = [
             t.copy.0 as i32 * n,
             t.copy.1 as i32 * n,
@@ -5661,7 +5704,7 @@ impl Hardware {
                 }
             };
         let views = (self.surfaces[source].image.view, self.surfaces[target].image.view);
-        let size = (t.copy.0 * self.scale, t.copy.1 * self.scale);
+        let size = (t.copy.0 * s_scale, t.copy.1 * s_scale);
         // a plain copy, rows turned over or not, as a blit, which the GPU's
         // texture and color paths do far faster than storage images
         // the picture in between the same way, from the input's twin into the
@@ -5724,7 +5767,7 @@ impl Hardware {
             return false;
         }
         let (w, h) = (size.0 as i32, size.1 as i32);
-        let n = self.scale as i32;
+        let n = self.surfaces[source].scale as i32;
         let (source_width, source_rows) = (self.surfaces[source].width as i32 * n, self.surfaces[source].height as i32 * n);
         let (target_width, target_rows) = (self.surfaces[target].width as i32 * n, self.surfaces[target].height as i32 * n);
         // the source's image rows, its buffer row y at source_height - 1 -
@@ -5929,10 +5972,11 @@ impl Hardware {
         // marking it put what the GPU did next (the draw's own work) under
         // copies
         self.mark(Work::Copy, false);
+        let s_scale = self.surfaces[source].scale;
         if !self.copies(twin).contains_key(texture) {
             let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST;
             self.end_rendering();
-            let image = self.image(texture.width * self.scale, texture.height * self.scale, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
+            let image = self.image(texture.width * s_scale, texture.height * s_scale, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
             self.copies(twin).insert(*texture, Copied { image, surface: source, generation, memory: None, used: batch });
         }
         let (view, image) = (self.copies(twin)[texture].image.view, self.copies(twin)[texture].image.image);
@@ -5944,7 +5988,7 @@ impl Hardware {
             let from = self.textures.get(&key).ok_or("a texture reaching past the buffer drawn into it was not uploaded")?.image.image;
             self.end_rendering();
             self.barrier();
-            let n = self.scale;
+            let n = s_scale;
             let rect = |n: u32| {
                 let (width, top, bottom) = ((texture.width * n) as i32, (rows * n) as i32, (texture.height * n) as i32);
                 [vk::Offset3D { x: 0, y: top, z: 0 }, vk::Offset3D { x: width, y: bottom, z: 1 }]
@@ -5979,7 +6023,7 @@ impl Hardware {
             if *ALPHA1.get_or_init(|| std::env::var_os("ZAKURO_COPY_ALPHA1").is_some()) && texture.format == ColorFormat::Rgba8 && texture.width >= 128 {
                 format = format_index(ColorFormat::Rgb8);
             }
-            let n = self.scale;
+            let n = s_scale;
             let (width, height) = ((texture.width * n) as i32, (rows * n) as i32);
             let (row, source_height) = ((row * n) as i32, (self.surfaces[source].height * n) as i32);
             let constants = [width, height, height, height, 1, 1, 1, format, format, row, source_height];
@@ -6042,7 +6086,8 @@ impl Hardware {
         }
         let (source, row) = self.texture_source(texture)?;
         let surface = &self.surfaces[source];
-        (row == 0 && source != target && surface.kind == Kind::Color(ColorFormat::Rgba8) && surface.width == texture.width && surface.height == texture.height)
+        let allow_self = super::feedback_loop();
+        (row == 0 && (source != target || allow_self) && surface.kind == Kind::Color(ColorFormat::Rgba8) && surface.width == texture.width && surface.height == texture.height)
             .then_some(source)
     }
 
@@ -6068,7 +6113,7 @@ impl Hardware {
     /// as, or out of its twin.
     #[allow(clippy::too_many_arguments)]
     fn copy_depth(&mut self, source: usize, row: u32, bytes: u32, view: vk::ImageView, texture: &DrawnTexture, twin: bool) -> Result<(), String> {
-        let n = self.scale;
+        let n = self.surfaces[source].scale;
         let (width, height) = (self.surfaces[source].width * n, self.surfaces[source].height * n);
         let pixels = (width * height) as u64;
         let samples = self.samples(pixels * 5)?;
@@ -6138,7 +6183,7 @@ impl Hardware {
         }
         self.end_rendering();
         self.barrier();
-        if self.scale > 1 {
+        if self.surfaces[index].scale > 1 {
             self.blit(index, false);
             self.barrier();
         }
@@ -6173,7 +6218,8 @@ impl Hardware {
         }
         self.mark(Work::Capture, false);
         // a row of the surface is a column of the screen
-        let (width, height) = (self.surfaces[index].height * self.scale, self.surfaces[index].width * self.scale);
+        let s_scale = self.surfaces[index].scale;
+        let (width, height) = (self.surfaces[index].height * s_scale, self.surfaces[index].width * s_scale);
         let size = (width * height * 4) as u64;
         if self.surfaces[index].screen.is_none() {
             let buffer = self.buffer(size, vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
@@ -6227,7 +6273,8 @@ impl Hardware {
     fn upright_image(&mut self, index: usize, twin: bool) -> Result<(), String> {
         self.mark(Work::Capture, false);
         // a row of the surface is a column of the screen
-        let (width, height) = (self.surfaces[index].height * self.scale, self.surfaces[index].width * self.scale);
+        let s_scale = self.surfaces[index].scale;
+        let (width, height) = (self.surfaces[index].height * s_scale, self.surfaces[index].width * s_scale);
         let made = match twin {
             true => self.surfaces[index].twin_upright.is_some(),
             false => self.surfaces[index].upright.is_some(),
@@ -6297,7 +6344,8 @@ impl Hardware {
             false => self.surfaces[index].upright.as_ref(),
         };
         let image = upright.ok_or("nothing upright")?.image.image;
-        let (width, height) = (rows * self.scale, row_pixels * self.scale);
+        let s_scale = self.surfaces[index].scale;
+        let (width, height) = (rows * s_scale, row_pixels * s_scale);
         let buffer = self.buffer(u64::from(width * height * 4), vk::BufferUsageFlags::TRANSFER_DST, true)?;
         self.begin()?;
         self.end_rendering();
@@ -6344,8 +6392,14 @@ impl Hardware {
     /// the screen shows it, and the scale it is at, read back from the GPU,
     /// which it waits for.
     pub(crate) fn upright_picture(&mut self, screen: ScreenRef, between: bool) -> Option<Picture> {
+        let (row_pixels, rows) = screen.size;
+        let s_scale = self
+            .surfaces
+            .iter()
+            .find(|s| s.addr == screen.addr && s.width == row_pixels && s.height == rows)
+            .map_or(self.scale, |s| s.scale);
         let (pixels, _) = self.upright_pixels(screen, between).ok()?;
-        Some((crop(Arc::new(pixels), screen, self.scale), self.scale))
+        Some((crop(Arc::new(pixels), screen, s_scale), s_scale))
     }
 
     /// the image the picture in between a screen's picture and the one
@@ -6377,7 +6431,7 @@ impl Hardware {
         }
         // the rows of the surface the screen shows are columns of the upright
         // picture, the pixels of each run down it from the bottom of a row
-        let scale = self.scale;
+        let scale = self.surfaces[index].scale;
         let (first, count) = screen.rows;
         let (width, height) = ((rows * scale) as f32, (row_pixels * scale) as f32);
         let (left, right) = ((first * scale) as f32, ((first + count) * scale) as f32);
@@ -6442,7 +6496,7 @@ impl Hardware {
             capture.pictures.iter().find(|(batch, _)| *batch == screen.batch).map(|(_, image)| image.clone())
         };
         let Some(index) = find(&self.surfaces) else { return Ok(None) };
-        let scale = self.scale;
+        let scale = self.surfaces[index].scale;
         let crop = |image: Arc<Vec<u8>>| Some((crop(image, screen, scale), scale));
         if let Some(image) = picture(&self.surfaces, index) {
             return Ok(crop(image));
@@ -6856,8 +6910,7 @@ impl Hardware {
         // word and stencil as a byte per sample. one with no image at the
         // console's resolution, a depth buffer on a GPU that can't blit them,
         // comes back at its scaled size and is scaled down here
-        let scale = self.scale;
-        let factor = move |s: &Surface| if scale > 1 && s.native.is_none() && matches!(s.kind, Kind::Depth(_)) { scale } else { 1 };
+        let factor = |s: &Surface| if s.scale > 1 && s.native.is_none() && matches!(s.kind, Kind::Depth(_)) { s.scale } else { 1 };
         let size_of = |s: &Surface| {
             let pixels = (s.width * s.height * factor(s) * factor(s)) as u64;
             match s.kind {
@@ -6880,10 +6933,14 @@ impl Hardware {
 
         let mut offsets = Vec::with_capacity(dirty.len());
         self.barrier();
-        if self.scale > 1 {
-            for &i in &dirty {
+        let mut blitted = false;
+        for &i in &dirty {
+            if self.surfaces[i].scale > 1 {
                 self.blit(i, false);
+                blitted = true;
             }
+        }
+        if blitted {
             self.barrier();
         }
         let readback = self.readback.as_ref().map_or(vk::Buffer::null(), |b| b.buffer);
@@ -7640,6 +7697,7 @@ mod tests {
                 addr: 0,
                 width,
                 height,
+                scale: 1,
                 kind,
                 tiled: true,
                 shadow: Vec::new(),
