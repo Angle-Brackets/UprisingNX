@@ -259,6 +259,19 @@ fn modifier(name: &str) -> PadState {
 }
 
 impl Aim {
+    /// takes the player's options from the env vars again (the menu changed
+    /// them), keeping what the aim is doing
+    pub fn reload(&mut self) {
+        let fresh = Aim::from_env();
+        self.right_stick = fresh.right_stick;
+        self.gyro = fresh.gyro;
+        self.gyro_speed = fresh.gyro_speed;
+        self.mode = fresh.mode;
+        self.modifier = fresh.modifier;
+        self.invert_y = fresh.invert_y;
+        self.speed = fresh.speed;
+    }
+
     pub fn from_env() -> Aim {
         let var = |name: &str| std::env::var(name).ok();
         let aim = Aim {

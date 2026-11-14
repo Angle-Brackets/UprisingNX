@@ -7,10 +7,14 @@
 # that changed. functions.h is left out of the key: it only declares
 # f_XXXXXXXX functions, all with one signature, and a stale reference to one
 # that went away fails at link time.
-#   scripts/build-recomp-nx.sh [opt=-Os] [jobs=11] [code dir]
+# -O2 is the default: on the console it cut the game code's time by ~20% over -Os (Chapter 14
+# flight, 7.8 -> 6.3 ms a refresh) for +90 MB of NRO, the same load time. devkitA64's gcc crashes
+# in its FRE pass on one huge function (code279.c f_0044C424), so a shard that fails is retried
+# with -fno-tree-fre.
+#   scripts/build-recomp-nx.sh [opt=-O2] [jobs=11] [code dir]
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OPT="${1:--Os}"; JOBS="${2:-11}"
+OPT="${1:--O2}"; JOBS="${2:-11}"
 # the port with the game's overrides in it (3dsrecomp port ... --overrides build/desktop/overrides-usa) if there is one
 DEFAULT_CODE="$ROOT/build/desktop/port-usa/code"; [ -d "$ROOT/build/desktop/port-usa-ovr/code" ] && DEFAULT_CODE="$ROOT/build/desktop/port-usa-ovr/code"
 CODE="$(realpath "${3:-$DEFAULT_CODE}")"
@@ -25,7 +29,8 @@ compile() {
   local src="$1" o="$OBJ/$(echo "$1" | tr / _).o"
   local key; key="$(cat "$CODE/$src" | sha1sum | cut -c1-40) $HEADERS $FLAGS_SUM"
   [ -f "$o" ] && [ "$(cat "$o.key" 2>/dev/null)" = "$key" ] && return 0
-  $CC $FLAGS_STR -c "$CODE/$src" -o "$o.tmp" && mv "$o.tmp" "$o" && echo "$key" > "$o.key" && echo "$src"
+  { $CC $FLAGS_STR -c "$CODE/$src" -o "$o.tmp" 2>/dev/null || $CC $FLAGS_STR -fno-tree-fre -c "$CODE/$src" -o "$o.tmp"; } \
+    && mv "$o.tmp" "$o" && echo "$key" > "$o.key" && echo "$src"
 }
 export -f compile
 export HEADERS="$(cat "$CODE/recomp.h" "$CODE/overrides.h" | sha1sum | cut -c1-40)"

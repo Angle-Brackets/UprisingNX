@@ -58,6 +58,9 @@ static bool g_initialized;
 static bool g_stretch = true;
 static uint64_t g_underruns, g_grains;
 static float g_last[2];
+// the settings menu paused the game: play silence, and start the tempo afresh
+// when it goes on rather than from where the empty ring pushed it
+static volatile bool g_paused, g_resumed;
 
 static inline float in_at(uint64_t i, int ch) { return (float)g_ring[i & RING_MASK][ch]; }
 
@@ -125,6 +128,19 @@ static bool wsola_step(void) {
 
 static void fill_buffer(int16_t *out) {
     const double step = IN_RATE / OUT_RATE;
+    if (g_paused) {
+        for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
+            g_last[0] *= 0.97f;
+            g_last[1] *= 0.97f;
+            out[i * 2] = (int16_t)g_last[0];
+            out[i * 2 + 1] = (int16_t)g_last[1];
+        }
+        return;
+    }
+    if (g_resumed) {
+        g_resumed = false;
+        g_tempo = 1.0;
+    }
     for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
         while ((int)g_st_pos + 1 >= g_st_count) {
             if (!wsola_step()) break;
@@ -229,6 +245,12 @@ void nx_audio_play(const int16_t *samples, uint32_t count) {
         g_ring[(w + i) & RING_MASK][1] = samples[i * 2 + 1];
     }
     __atomic_store_n(&g_write, w + count, __ATOMIC_RELEASE);
+}
+
+// the game paused (the settings menu) or goes on again
+void nx_audio_pause(bool paused) {
+    if (!paused && g_paused) g_resumed = true;
+    g_paused = paused;
 }
 
 void nx_audio_exit(void) {

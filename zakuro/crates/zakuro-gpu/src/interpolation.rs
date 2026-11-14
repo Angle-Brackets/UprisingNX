@@ -170,20 +170,33 @@ impl Interpolation {
         let (before, moved_before, restless) = (&drawn.uniforms[found], &drawn.moves[found], drawn.restless[found]);
         let (now, moved_now, still_restless) = (&now.uniforms[place], &mut now.moves[place], &mut now.restless[place]);
         *still_restless = restless.saturating_sub(1);
-        for ((moved, now), before) in moved_now.iter_mut().zip(now).zip(before) {
-            *moved = std::array::from_fn(|i| now[i] - before[i]);
+        // only the uniforms placing the vertices can move, the rest are as
+        // the frame has them, so only those are looked at (a few of the 96)
+        let mask = placing | shared;
+        let bits = || {
+            let mut left = mask;
+            std::iter::from_fn(move || {
+                (left != 0).then(|| {
+                    let uniform = left.trailing_zeros() as usize;
+                    left &= left - 1;
+                    uniform
+                })
+            })
+        };
+        for uniform in bits() {
+            moved_now[uniform] = std::array::from_fn(|i| now[uniform][i] - before[uniform][i]);
         }
         self.matched += 1;
-        let placed = |uniform: usize| (placing | shared) & (1 << uniform) != 0;
         let shared = |uniform: usize| shared & (1 << uniform) != 0;
         // what moves, the components that changed of the uniforms placing
         // the vertices, but for steps of those the coordinates may read
-        let moves = |uniform: usize, before: f32, now: f32| placed(uniform) && before != now && !(shared(uniform) && steps(before, now));
+        let moves = |uniform: usize, before: f32, now: f32| before != now && !(shared(uniform) && steps(before, now));
         let changes = |uniform: usize, before: &Vec4, now: &Vec4| (0..4).any(|i| moves(uniform, before[i], now[i]));
-        if !before.iter().zip(now.iter()).enumerate().any(|(uniform, (before, now))| changes(uniform, before, now)) {
+        if !bits().any(|uniform| changes(uniform, &before[uniform], &now[uniform])) {
             return None;
         }
         let mut between = self.spare.take().unwrap_or_else(|| Box::new([[0.0; 4]; FLOAT_UNIFORMS]));
+        *between = *now;
         let mut jumped = false;
         // a component jumps when its move differs from its move the frame
         // before by more than JUMP says. NaN and infinity compare false,
@@ -193,8 +206,8 @@ impl Interpolation {
             !(change <= JUMP || change <= JUMP_PART * before.abs().max(now.abs()))
         };
         let mut lerped = false;
-        let uniforms = between.iter_mut().zip(before.iter()).zip(now.iter()).zip(moved_before.iter());
-        for (uniform, (((out, before), now), moved_before)) in uniforms.enumerate() {
+        for uniform in bits() {
+            let (out, before, now, moved_before) = (&mut between[uniform], &before[uniform], &now[uniform], &moved_before[uniform]);
             let moving: [bool; 4] = std::array::from_fn(|i| moves(uniform, before[i], now[i]));
             let jumping: [bool; 4] = std::array::from_fn(|i| moving[i] && jumps(before[i], now[i], moved_before[i]));
             if jumping.contains(&true) {
@@ -259,8 +272,11 @@ impl Interpolation {
 }
 
 /// what a draw draws, the same from frame to frame for a model drawn the
-/// same way, its programs, its vertex arrays and the buffers it draws into
-/// and its first texture.
+/// same way, its programs, the layout of its vertex arrays and the buffers
+/// it draws into and its first texture. not where the arrays are: Kid
+/// Icarus: Uprising streams its vertices through a ring, so a model's
+/// arrays are somewhere else every frame, and keyed by address more than
+/// half its draws had no match and nothing was drawn in between.
 fn key(registers: &[u32], vertex: &ShaderUnit, geometry: Option<&ShaderUnit>) -> u64 {
     let mix = |hash: u64, word: u64| (hash.rotate_left(5) ^ word).wrapping_mul(0x517C_C1B7_2722_0A95);
     // from an odd start, so that words of zero still count
@@ -268,7 +284,17 @@ fn key(registers: &[u32], vertex: &ShaderUnit, geometry: Option<&ShaderUnit>) ->
     if let Some(geometry) = geometry {
         hash = mix(mix(mix(hash, 1), geometry.fingerprint()), geometry.entry_point as u64);
     }
-    let arrays = REG_ATTRIBUTE_BASE..=REG_INDEX_ARRAY;
+    // the formats and each loader's attributes and stride, not the base,
+    // the loaders' offsets or the index array's offset
+    let loaders = (0..REG_ATTRIBUTE_LOADER_COUNT).flat_map(|i| {
+        let config = REG_ATTRIBUTE_LOADER + i * REG_ATTRIBUTE_LOADER_STRIDE + 1;
+        [config, config + 1]
+    });
+    let arrays = [REG_ATTRIBUTE_FORMAT_LOW, REG_ATTRIBUTE_FORMAT_HIGH].into_iter().chain(loaders);
+    for register in arrays {
+        hash = mix(hash, registers[register] as u64);
+    }
+    hash = mix(hash, (registers[REG_INDEX_ARRAY] >> 31) as u64);
     let others = [
         REG_VERTEX_COUNT,
         REG_VERTEX_OFFSET,
@@ -278,7 +304,7 @@ fn key(registers: &[u32], vertex: &ShaderUnit, geometry: Option<&ShaderUnit>) ->
         REG_DEPTH_BUFFER_ADDRESS,
         REG_TEXTURE0_ADDRESS,
     ];
-    for register in arrays.chain(others) {
+    for register in others {
         hash = mix(hash, registers[register] as u64);
     }
     hash
@@ -304,6 +330,30 @@ mod tests {
     /// a draw that moved between two frames is drawn in between halfway,
     /// one that stayed or is new is not drawn again, and draws of the same
     /// model match in the order they come.
+    /// a model whose vertices are somewhere else every frame, streamed
+    /// through a ring, is still the same draw; one with another layout is not.
+    #[test]
+    fn draws_match_wherever_their_vertices_are() {
+        let mut interpolation = Interpolation::default();
+        let mut at = registers(3);
+        at[REG_ATTRIBUTE_BASE] = 0x1000;
+        at[REG_ATTRIBUTE_LOADER] = 0x20;
+        at[REG_INDEX_ARRAY] = 0x8000_0100;
+        assert!(interpolation.draw(&at, &unit(0.0), None, true).is_none());
+        interpolation.frame_done();
+
+        let mut moved = at.clone();
+        moved[REG_ATTRIBUTE_BASE] = 0x2000;
+        moved[REG_ATTRIBUTE_LOADER] = 0x40;
+        moved[REG_INDEX_ARRAY] = 0x8000_0200;
+        let between = interpolation.draw(&moved, &unit(0.5), None, true).expect("the same model");
+        interpolation.give_back(between);
+        let mut other = moved.clone();
+        other[REG_ATTRIBUTE_FORMAT_LOW] = 1;
+        assert!(interpolation.draw(&other, &unit(0.5), None, true).is_none(), "another layout");
+        assert_eq!(interpolation.frame_done(), Matches { draws: 2, matched: 1, moved: 1, jumped: 0, jumping: 0 });
+    }
+
     #[test]
     fn draws_match_the_frame_before_in_order() {
         let mut interpolation = Interpolation::default();

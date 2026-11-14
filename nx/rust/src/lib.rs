@@ -3,6 +3,8 @@
 //! frames and presents them through NVK.
 
 mod aim;
+mod menu;
+mod settings;
 
 use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
@@ -46,7 +48,7 @@ fn report_line(line: String) {
                 // the reports and their indented lines, slow frames among
                 // them, so a session played away from nxlink says where its
                 // time went
-                if line.starts_with("frame ") || line.starts_with("  ") {
+                if line.starts_with("frame ") || line.starts_with("  ") || line.starts_with("[ERROR]") || line.starts_with("[WARN]") {
                     // opened at the first line, the SD card is mounted by then
                     if fps_log.is_none() {
                         if fresh {
@@ -65,7 +67,7 @@ fn report_line(line: String) {
                         let _ = writeln!(log, "{line}");
                         let _ = log.flush();
                     }
-                    if quiet {
+                    if quiet && !line.starts_with('[') {
                         continue;
                     }
                 }
@@ -126,6 +128,61 @@ pub struct UnxInput {
 const HOST_BOTTOM: u32 = 1 << 0;
 /// UnxInput::host: the console is in the dock (AppletOperationMode_Console)
 const HOST_DOCKED: u32 = 1 << 2;
+/// UnxInput::host: the right stick's click held with the D-pad: Up raises the
+/// internal resolution, Down lowers it, Left gives it back to the automatic choice
+const HOST_SCALE_UP: u32 = 1 << 3;
+const HOST_SCALE_DOWN: u32 = 1 << 4;
+const HOST_SCALE_AUTO: u32 = 1 << 5;
+const HOST_SMOOTH: u32 = 1 << 6;
+/// UnxInput::host: the right stick's click held with Minus opens or closes
+/// the settings menu (menu.rs)
+const HOST_MENU: u32 = 1 << 7;
+
+/// smooth mode's guard looks at this many refreshes at a time
+const SMOOTH_CHECK: u32 = 30;
+/// what the emulation waited for the GPU per refresh, on average over a
+/// check, above which the GPU can't draw each frame twice and smooth mode
+/// turns off. it waits 0.3-1.5 ms when it keeps up (Chapter 14 at 1x
+/// handheld, 44-58 pictures/s) and 10+ ms when it doesn't (2x handheld,
+/// 21 pictures/s against 27-30 without)
+const SMOOTH_WAIT_MS: f64 = 4.0;
+/// ... or most refreshes of a check take longer than this in real time: the
+/// loop no longer keeps to the screen's 60 Hz, the presenter waiting on the
+/// host GPU (at 2x handheld in a battle the game fell to ~21 frames/s with
+/// no wait the first test sees). most, so a load's one long stall is not it
+const SMOOTH_REFRESH_MS: f64 = 20.0;
+/// how long smooth mode stays off before it tries again, doubling each
+/// time it fails up to the most, back to the first once it kept up for
+/// SMOOTH_SETTLED checks
+const SMOOTH_BACKOFF_FIRST: u64 = 5 * 60;
+const SMOOTH_BACKOFF_MOST: u64 = 120 * 60;
+const SMOOTH_SETTLED: u32 = 60;
+
+/// frame interpolation, smooth mode: a picture in between each two of the
+/// game's, which draws every other refresh. it doubles what the GPU draws,
+/// so a guard turns it off while the GPU falls behind and tries again later
+/// or when the resolution goes down.
+struct Smooth {
+    /// the player's choice: settings.ini's preset, right stick + Right, or
+    /// ZAKURO_INTERPOLATE in env.txt
+    wanted: bool,
+    /// whether it runs now
+    on: bool,
+    /// the frame it tries again at, after the guard turned it off
+    retry_at: u64,
+    backoff: u64,
+    /// the wait for the GPU summed over the current check
+    wait: f64,
+    frames: u32,
+    /// when the last refresh was, and the refreshes of the check that took
+    /// longer than SMOOTH_REFRESH_MS
+    last: Option<Instant>,
+    slow: u32,
+    /// checks in a row that kept up
+    kept_up: u32,
+}
+/// the highest scale the controller asks for, 1600x960 a screen
+const MAX_SCALE: u32 = 4;
 
 pub struct Unx {
     system: System,
@@ -174,12 +231,22 @@ pub struct Unx {
     hw_docked: bool,
     /// a docked state forced by cmd.txt `dock 0|1`, cleared when hardware state changes
     dock_override: Option<bool>,
-    /// a fixed resolution scale from ZAKURO_RESOLUTION in env.txt or cmd.txt `scale <n>`
+    /// a fixed resolution scale from ZAKURO_RESOLUTION in env.txt or cmd.txt
+    /// `scale <n>`, over settings.ini's; the hotkeys clear it
     fixed_resolution: Option<u32>,
+    /// sdmc:/switch/uprisingnx/settings.ini, see settings.rs
+    settings: settings::Settings,
+    /// ZAKURO_INTERPOLATE in env.txt decides smooth mode over settings.ini
+    smooth_forced: Option<bool>,
     /// frames since the GPU last reported drawing the title screen
     title_quiet: u32,
     /// whether internal resolution is currently boosted to 2x for the title screen
     title_boosted: bool,
+    /// last frame's host buttons, for the resolution buttons' presses
+    host_last: u32,
+    smooth: Smooth,
+    /// the in-game settings menu
+    menu: menu::Menu,
     aim: aim::Aim,
     gyro_test: ([f32; 3], u32),
 }
@@ -312,19 +379,194 @@ fn bench_next(unx: &mut Unx) {
 extern "C" {
     fn nx_audio_init();
     fn nx_audio_play(samples: *const i16, count: u32);
+    fn nx_audio_pause(paused: bool);
     fn nx_audio_exit();
     fn unx_thread_role(role: *const c_char, index: i32);
+    fn unx_memory(out: *mut u64);
     fn appletGetOperationMode() -> u32;
 }
 
 impl Unx {
+    /// the scale settings.ini's preset for this mode wants now, in a battle
+    /// or out of one (see settings::Mode::video)
+    fn auto_scale(&self) -> u32 {
+        let video = self.settings.mode(self.docked).video(self.docked);
+        if self.title_boosted { video.menu_scale } else { video.battle_scale }
+    }
+
+    /// puts the settings for this mode in place: resolution (unless fixed)
+    /// and smooth mode (unless env.txt decides it)
+    fn apply_settings(&mut self) {
+        if self.fixed_resolution.is_none() {
+            let target = self.auto_scale();
+            self.set_scale(target);
+        }
+        let wanted = self.smooth_forced.unwrap_or(self.settings.mode(self.docked).video(self.docked).smooth);
+        if wanted != self.smooth.wanted {
+            self.smooth.wanted = wanted;
+            self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
+            self.smooth.kept_up = 0;
+            self.set_smooth(wanted);
+        }
+    }
+
+    /// the menu's overlay for this refresh (nothing but frees when closed)
+    fn menu_overlay(&mut self) -> Overlay {
+        let (width, height) = self.presenter.extent();
+        let now = (self.system.gpu.scale(), self.smooth.on);
+        self.menu.overlay(&self.settings, self.docked, now, width, height)
+    }
+
+    /// writes the settings back and says what this mode runs at now
+    fn settings_changed(&mut self, what: &str) {
+        self.settings.save();
+        let mode = self.settings.mode(self.docked);
+        let video = mode.video(self.docked);
+        log::info!(
+            "unx: {what}: {} preset {:?}, battles {}x, menus {}x, smooth {} (now {}x, smooth {}, frame {})",
+            if self.docked { "docked" } else { "handheld" },
+            mode.preset,
+            video.battle_scale,
+            video.menu_scale,
+            if video.smooth { "on" } else { "off" },
+            self.system.gpu.scale(),
+            if self.smooth.on { "on" } else { "off" },
+            self.frame,
+        );
+    }
+
+    /// sets the internal resolution; a lower one may leave the GPU room for
+    /// smooth mode, which tries again
+    fn set_scale(&mut self, target: u32) -> u32 {
+        let before = self.system.gpu.scale();
+        let scale = self.system.set_resolution(target);
+        if scale < before {
+            self.smooth.retry_at = self.frame;
+        }
+        scale
+    }
+
+    fn set_smooth(&mut self, on: bool) {
+        self.smooth.on = self.system.set_interpolation(on);
+        self.smooth.wait = 0.0;
+        self.smooth.frames = 0;
+        self.smooth.last = None;
+        self.smooth.slow = 0;
+    }
+
+    /// right stick + Right turns smooth mode on or off: this mode's preset
+    /// becomes custom with smooth flipped
+    fn controller_smooth(&mut self, pressed: u32) {
+        if pressed & HOST_SMOOTH == 0 {
+            return;
+        }
+        let docked = self.docked;
+        let video = self.settings.mode_mut(docked).customize(docked);
+        video.smooth = !self.smooth.wanted;
+        self.smooth_forced = None;
+        self.apply_settings();
+        self.settings_changed("smooth mode");
+        self.notify_video();
+    }
+
+    /// a hotkey changed the video settings: says so over the game
+    fn notify_video(&mut self) {
+        let mode = *self.settings.mode(self.docked);
+        let video = mode.video(self.docked);
+        let preset = match mode.preset {
+            settings::Preset::Performance => "Performance",
+            settings::Preset::Quality => "Quality",
+            settings::Preset::Custom => "Custom",
+        };
+        self.menu.notify(format!(
+            "{preset}: battles {}x, menus {}x, smooth {}   ({}: settings)",
+            video.battle_scale,
+            video.menu_scale,
+            if video.smooth { "on" } else { "off" },
+            if self.settings.minus_opens_menu() { "Minus" } else { "RS + Minus" },
+        ));
+    }
+
+    /// smooth mode's guard, each refresh with what it waited for the GPU
+    fn smooth_guard(&mut self, waiting: f64) {
+        if !self.smooth.wanted {
+            return;
+        }
+        if !self.smooth.on {
+            if self.frame >= self.smooth.retry_at {
+                self.set_smooth(true);
+                log::info!("unx: smooth mode tries again (frame {})", self.frame);
+            }
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.smooth.last.replace(now) {
+            self.smooth.slow += ((now - last).as_secs_f64() * 1000.0 > SMOOTH_REFRESH_MS) as u32;
+        }
+        self.smooth.wait += waiting;
+        self.smooth.frames += 1;
+        if self.smooth.frames < SMOOTH_CHECK {
+            return;
+        }
+        let average = self.smooth.wait / self.smooth.frames as f64;
+        let slow = std::mem::take(&mut self.smooth.slow);
+        let frames = self.smooth.frames;
+        self.smooth.wait = 0.0;
+        self.smooth.frames = 0;
+        if average <= SMOOTH_WAIT_MS && slow * 2 <= frames {
+            self.smooth.kept_up += 1;
+            if self.smooth.kept_up >= SMOOTH_SETTLED {
+                self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
+            }
+            return;
+        }
+        let backoff = self.smooth.backoff;
+        self.smooth.retry_at = self.frame + backoff;
+        self.smooth.backoff = (backoff * 2).min(SMOOTH_BACKOFF_MOST);
+        self.smooth.kept_up = 0;
+        self.set_smooth(false);
+        log::info!(
+            "unx: smooth mode off, the GPU fell behind ({average:.1} ms waited a refresh, {slow} of {frames} refreshes slow), again in {} s (frame {})",
+            backoff / 60,
+            self.frame
+        );
+    }
+
+    /// the controller's resolution buttons. up or down changes this mode's
+    /// battle or menu scale, whichever is in use now, and makes its preset
+    /// custom; the auto button steps to the next preset (performance,
+    /// quality, custom). either gives the resolution back from a fixed one
+    fn controller_scale(&mut self, pressed: u32) {
+        let docked = self.docked;
+        let what = if pressed & HOST_SCALE_AUTO != 0 {
+            let mode = self.settings.mode_mut(docked);
+            mode.preset = mode.preset.next();
+            "preset"
+        } else if pressed & (HOST_SCALE_UP | HOST_SCALE_DOWN) != 0 {
+            let now = self.system.gpu.scale();
+            let target = if pressed & HOST_SCALE_UP != 0 { (now + 1).min(MAX_SCALE) } else { now.saturating_sub(1).max(1) };
+            let battle = !self.title_boosted;
+            let video = self.settings.mode_mut(docked).customize(docked);
+            *(if battle { &mut video.battle_scale } else { &mut video.menu_scale }) = target;
+            if battle { "battle resolution" } else { "menu resolution" }
+        } else {
+            return;
+        };
+        self.fixed_resolution = None;
+        self.apply_settings();
+        self.settings_changed(what);
+        self.notify_video();
+    }
+
     fn apply_docked(&mut self, docked: bool) {
         self.docked = docked;
         let (width, height) = if docked { (1920, 1080) } else { (1280, 720) };
         self.presenter.resize(width, height);
-        let auto_scale = if docked || self.title_boosted { 2 } else { 1 };
-        let target_scale = self.fixed_resolution.unwrap_or(auto_scale);
-        let scale = self.system.set_resolution(target_scale);
+        if let Some(fixed) = self.fixed_resolution {
+            self.set_scale(fixed);
+        }
+        self.apply_settings();
+        let scale = self.system.gpu.scale();
         log::info!(
             "unx: {} -> presenter {}x{}, internal resolution {}x (frame {})",
             if docked { "docked" } else { "handheld" },
@@ -359,7 +601,9 @@ fn cstr(p: *const c_char) -> Option<String> {
 #[no_mangle]
 pub unsafe extern "C" fn unx_set_font(data: *const u8, len: usize) {
     if !data.is_null() && len > 0 {
-        zakuro_core::services::shared_font::set_frontend_font(std::slice::from_raw_parts(data, len));
+        let font = std::slice::from_raw_parts(data, len);
+        zakuro_core::services::shared_font::set_frontend_font(font);
+        let _ = menu::FONT.set(font.to_vec());
     }
 }
 
@@ -387,7 +631,12 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     let fixed_resolution = std::env::var("ZAKURO_RESOLUTION")
         .ok()
         .and_then(|v| v.parse::<u32>().ok());
-    let resolution = fixed_resolution.unwrap_or(2);
+    let settings = settings::Settings::load();
+    settings.export_controls();
+    MINUS_MENU.store(settings.minus_opens_menu(), std::sync::atomic::Ordering::Relaxed);
+    let video = settings.mode(docked).video(docked);
+    // the game starts out of battle
+    let resolution = fixed_resolution.unwrap_or(video.menu_scale);
 
     let started = Instant::now();
     let mut presenter = match VulkanPresenter::new_vi(nwindow, window) {
@@ -415,15 +664,17 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         log::info!("unx: recompiled code linked in, ABI {}, {} entries, {} modules", r.abi, r.entry_count, r.module_count);
         zakuro_core::recompiled::Linked::new(0x0004000000030100, r.abi, r.entries, r.entry_count, r.modules, r.module_count)
     });
+    let smooth_forced = std::env::var("ZAKURO_INTERPOLATE").ok().map(|v| v.trim() != "0");
+    let smooth_wanted = smooth_forced.unwrap_or(video.smooth);
     let config = Config {
         data_dir: Some(PathBuf::from(&data_dir)),
         hardware_renderer: true,
         resolution,
         device: presenter.shared_device(),
         linked,
-        // a picture in between each two of the game's, which draws every
-        // other refresh: ZAKURO_INTERPOLATE=1
-        interpolate: std::env::var("ZAKURO_INTERPOLATE").is_ok_and(|v| v == "1"),
+        // smooth mode, a picture in between each two of the game's, which
+        // draws every other refresh: settings.ini's preset, or ZAKURO_INTERPOLATE
+        interpolate: smooth_wanted,
         find_recompiled: false,
         username: "Pit".into(),
         ..Config::default()
@@ -487,8 +738,23 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         hw_docked: docked,
         dock_override: None,
         fixed_resolution,
+        settings,
+        smooth_forced,
         title_quiet: u32::MAX,
         title_boosted: true,
+        host_last: 0,
+        smooth: Smooth {
+            wanted: smooth_wanted,
+            on: smooth_wanted,
+            retry_at: 0,
+            backoff: SMOOTH_BACKOFF_FIRST,
+            wait: 0.0,
+            frames: 0,
+            last: None,
+            slow: 0,
+            kept_up: 0,
+        },
+        menu: menu::Menu::new(),
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
     }))
@@ -520,6 +786,95 @@ fn touch_on_bottom(in_play: bool, x: u16, y: u16) -> Option<(u16, u16)> {
     ((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v)).then(|| ((u * 320.0) as u16, (v * 240.0) as u16))
 }
 
+/// settings.ini's minus_button: Minus alone opens the menu (the C shell
+/// asks each frame through unx_minus_opens_menu)
+static MINUS_MENU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[no_mangle]
+pub extern "C" fn unx_minus_opens_menu() -> u32 {
+    MINUS_MENU.load(std::sync::atomic::Ordering::Relaxed) as u32
+}
+
+/// shows the screens as they are, with the overlay over them
+fn present_screens(unx: &mut Unx, overlay: &Overlay) {
+    let top = shown(&mut unx.system, Screen::Top);
+    let blank = std::sync::Arc::new(Vec::new());
+    let ((top_px, tw, th), top_gpu) = top;
+    // the bottom screen is only drawn out of play
+    let ((bottom_px, bw, bh), bottom_gpu) = if unx.in_play {
+        (((blank.clone()), 0, 0), None)
+    } else {
+        shown(&mut unx.system, Screen::Bottom)
+    };
+    let result = unx.presenter.present(
+        ScreenImage { width: tw, height: th, pixels: &top_px, gpu: top_gpu },
+        ScreenImage { width: bw, height: bh, pixels: &bottom_px, gpu: bottom_gpu },
+        ScreenImage { width: tw, height: th, pixels: &blank, gpu: None },
+        overlay,
+    );
+    if let Err(error) = result {
+        if !matches!(error, PresentError::OutOfDate) {
+            log::error!("unx: present failed, {error}");
+        }
+    }
+}
+
+fn audio_pause(paused: bool) {
+    // SAFETY: nx/c audio.c, a flag for its thread
+    unsafe { nx_audio_pause(paused) }
+}
+
+/// the settings menu: opens and closes on right stick + Minus, and while it
+/// is open the game is paused, only the last picture and the menu shown.
+/// what unx_frame returns when it took the frame
+fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
+    let (host, buttons) = input.map_or((0, 0), |input| (input.host, input.buttons));
+    let was_open = unx.menu.open;
+    if host & HOST_MENU != 0 && unx.host_last & HOST_MENU == 0 {
+        unx.menu.toggle(buttons, unx.docked);
+    }
+    if !unx.menu.open {
+        if was_open {
+            audio_pause(false);
+        }
+        return None;
+    }
+    if !was_open {
+        audio_pause(true);
+    }
+    unx.host_last = host;
+    let docked = unx.docked;
+    match unx.menu.input(buttons, &mut unx.settings, docked) {
+        Some(menu::Changed::Video) => {
+            unx.fixed_resolution = None;
+            unx.smooth_forced = None;
+            unx.apply_settings();
+            unx.settings_changed("menu");
+        }
+        Some(menu::Changed::Controls) => {
+            unx.settings.export_controls();
+            MINUS_MENU.store(unx.settings.minus_opens_menu(), std::sync::atomic::Ordering::Relaxed);
+            unx.aim.reload();
+            unx.settings_changed("menu");
+        }
+        Some(menu::Changed::Quit) => {
+            log::info!("unx: quit from the menu (frame {})", unx.frame);
+            return Some(1);
+        }
+        None => {}
+    }
+    let overlay = unx.menu_overlay();
+    present_screens(unx, &overlay);
+    if !unx.menu.open {
+        audio_pause(false);
+    }
+    // the time paused is not a gap in the game's pictures, nor a hitch
+    unx.last_picture = None;
+    unx.last_exit = None;
+    unx.smooth.last = None;
+    Some(0)
+}
+
 /// how long the last 2 s report took, it runs between two frames.
 static REPORT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -531,6 +886,9 @@ static REPORT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 #[no_mangle]
 pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32 {
     let unx = &mut *unx;
+    if let Some(done) = unx_menu(unx, input.as_ref()) {
+        return done;
+    }
     let entered = Instant::now();
     // what the game's overrides say it is doing this frame (see below)
     let said = std::mem::take(&mut unx.system.memory.host_mailbox[3]);
@@ -543,13 +901,15 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let on_title = unx.system.gpu.flags().on_title.swap(false, std::sync::atomic::Ordering::Relaxed);
     let mut look = (0.0, 0.0);
     if let Some(input) = input.as_ref() {
+        // after the menu closes, nothing reaches the game until all is let go
+        let (game_buttons, game_touch) = unx.menu.filter(input.buttons, input.touching != 0);
         let mut state = InputState {
-            buttons: PadState::from_bits_truncate(input.buttons),
+            buttons: PadState::from_bits_truncate(game_buttons),
             circle_x: input.circle_x,
             circle_y: input.circle_y,
             c_stick_x: input.c_stick_x,
             c_stick_y: input.c_stick_y,
-            touch: (input.touching != 0).then(|| touch_on_bottom(unx.in_play, input.touch_x, input.touch_y)).flatten(),
+            touch: game_touch.then(|| touch_on_bottom(unx.in_play, input.touch_x, input.touch_y)).flatten(),
             tilt: [0.0, 0.0],
         };
         if unx.bench.as_ref().is_some_and(|bench| bench.fire) {
@@ -590,6 +950,10 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let res_battle = unx.res_out_of_play <= 90;
     let host = input.as_ref().map_or(0, |input| input.host);
     let in_play = !unx.bottom.update(host, said);
+    let host_pressed = host & !unx.host_last;
+    unx.host_last = host;
+    unx.controller_scale(host_pressed);
+    unx.controller_smooth(host_pressed);
     let flags = unx.system.gpu.flags();
     flags.in_play.store(in_play, std::sync::atomic::Ordering::Relaxed);
     flags.in_battle.store(in_battle, std::sync::atomic::Ordering::Relaxed);
@@ -624,9 +988,9 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let title_boost = !res_battle;
     if title_boost != unx.title_boosted {
         unx.title_boosted = title_boost;
-        if unx.fixed_resolution.is_none() && !unx.docked {
-            let target = if title_boost { 2 } else { 1 };
-            let scale = unx.system.set_resolution(target);
+        if unx.fixed_resolution.is_none() {
+            let target = unx.auto_scale();
+            let scale = unx.set_scale(target);
             log::info!(
                 "unx: non-battle resolution {} -> {}x (frame {})",
                 if title_boost { "boost" } else { "restore" },
@@ -656,14 +1020,14 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 "scale" => match slot {
                     "auto" => {
                         unx.fixed_resolution = None;
-                        let target = if unx.docked { 2 } else { 1 };
-                        let scale = unx.system.set_resolution(target);
+                        let target = unx.auto_scale();
+                        let scale = unx.set_scale(target);
                         Ok(format!("auto resolution -> {scale}x"))
                     }
                     _ => match slot.parse::<u32>() {
                         Ok(target) => {
                             unx.fixed_resolution = Some(target);
-                            let scale = unx.system.set_resolution(target);
+                            let scale = unx.set_scale(target);
                             Ok(format!("resolution -> {scale}x"))
                         }
                         Err(error) => Err(format!("bad scale {slot:?}, {error}")),
@@ -754,6 +1118,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     ]) {
         *sum += ms;
     }
+    unx.smooth_guard(gpu.waiting);
     unx.draws += gpu.draws;
     unx.syncs += gpu.syncs;
     for (sum, n) in unx.write_backs.iter_mut().zip(gpu.write_backs) {
@@ -782,26 +1147,8 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         }
     }
 
-    let top = shown(&mut unx.system, Screen::Top);
-    let blank = std::sync::Arc::new(Vec::new());
-    let ((top_px, tw, th), top_gpu) = top;
-    // the bottom screen is only drawn out of play
-    let ((bottom_px, bw, bh), bottom_gpu) = if unx.in_play {
-        (((blank.clone()), 0, 0), None)
-    } else {
-        shown(&mut unx.system, Screen::Bottom)
-    };
-    let result = unx.presenter.present(
-        ScreenImage { width: tw, height: th, pixels: &top_px, gpu: top_gpu },
-        ScreenImage { width: bw, height: bh, pixels: &bottom_px, gpu: bottom_gpu },
-        ScreenImage { width: tw, height: th, pixels: &blank, gpu: None },
-        &Overlay::default(),
-    );
-    if let Err(error) = result {
-        if !matches!(error, PresentError::OutOfDate) {
-            log::error!("unx: present failed, {error}");
-        }
-    }
+    let overlay = unx.menu_overlay();
+    present_screens(unx, &overlay);
 
     let presented = presenting.elapsed();
     unx.window_presenting += presented;
@@ -906,6 +1253,9 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 worst as f64 / 1000.0,
                 late,
             );
+            if unx.smooth.on {
+                report!("  smooth mode: last frame's draws {:?}", unx.system.interpolation_matches());
+            }
             gaps.clear();
             unx.picture_gaps = gaps;
             unx.window_drawn = 0;
@@ -963,6 +1313,16 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 let list: Vec<String> = top.iter().take(12).map(|(pc, n)| format!("{pc:08X}:{n}")).collect();
                 report!("  interpreted in the last 10 s: {total} at {} PCs; top: {}", top.len(), list.join(" "));
             }
+        }
+        if unx.frame % 600 < frames as u64 {
+            // the process's memory, to see a leak build up over a long session
+            let mut memory = [0u64; 4];
+            unsafe { unx_memory(memory.as_mut_ptr()) };
+            let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+            report!(
+                "  memory: process {:.1} of {:.1} MB, malloc in use {:.1} MB of {:.1} MB taken",
+                mb(memory[0]), mb(memory[1]), mb(memory[2]), mb(memory[3])
+            );
         }
         unx.spent = [0.0; 9];
         unx.draws = 0;

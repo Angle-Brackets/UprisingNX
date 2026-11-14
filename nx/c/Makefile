@@ -68,6 +68,17 @@ CFLAGS += -DUNX_RECOMP
 endif
 LIBS	:= $(RECOMP_LIBS) -L$(RUST_LIB_DIR) -L$(MESA_VK_DIR) -luprising_nx -lvulkan -lzstd -lexpat -lz -lnx -lm
 
+# libkickstand (the Kickstand dev tools' in-app helper: clean quits for hot
+# reloads), linked when it's there; KICKSTAND=0 leaves it out
+KICKSTAND_DIR ?= $(TOPDIR)/../../third_party/kickstand/libkickstand
+ifneq ($(KICKSTAND),0)
+ifneq ($(wildcard $(KICKSTAND_DIR)/libkickstand.a),)
+include $(KICKSTAND_DIR)/kickstand.mk
+LDFLAGS += $(KICKSTAND_LDFLAGS)
+LIBS := -L$(KICKSTAND_DIR) -lkickstand $(LIBS)
+endif
+endif
+
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
 # include and lib

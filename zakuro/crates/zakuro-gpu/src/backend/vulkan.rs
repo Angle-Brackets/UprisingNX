@@ -644,6 +644,12 @@ impl VulkanPresenter {
         self.shared.clone()
     }
 
+    /// the window's size in pixels as the swapchain has it, what overlay
+    /// positions are in
+    pub fn extent(&self) -> (u32, u32) {
+        (self.extent.width, self.extent.height)
+    }
+
     /// whether a present waits for the display, rather than handing the
     /// frame over and going on.
     pub fn waits_for_display(&self) -> bool {

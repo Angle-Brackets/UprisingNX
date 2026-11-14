@@ -6929,6 +6929,16 @@ impl Hardware {
                 surface.replaced();
                 return;
             }
+            if changed > 0 {
+                static MERGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if MERGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                    log::warn!(
+                        target: "zakuro_gpu::diag",
+                        "merging write-back {addr:08x} {}x{} {:?}: {changed} of {words} words changed under it",
+                        s.width, s.height, s.kind
+                    );
+                }
+            }
             // what the CPU wrote it wrote in runs, a changed byte has the
             // bytes around it be the CPU's as well
             const RUN: usize = 16;

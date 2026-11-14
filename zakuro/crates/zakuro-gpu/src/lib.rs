@@ -194,6 +194,13 @@ pub struct Gpu {
     /// that would show it, so the title's logic runs at full speed while
     /// the picture updates every other frame, see zakuro-core's gpu_thread.
     pub skip_frame: bool,
+    /// where the last display transfer into the top screen's right-eye
+    /// framebuffer read from, and how many transfers went by since, see
+    /// right_eye_draw.
+    right_eye_source: Option<u32>,
+    right_eye_age: u32,
+    /// draws left undrawn because they only made the right eye's picture.
+    pub right_eye_skipped: u64,
     pub fills: u64,
     pub transfers: u64,
     /// vertices actually rasterized, as opposed to draw calls issued, a
@@ -242,6 +249,9 @@ impl Gpu {
             command_lists: 0,
             draw_calls: 0,
             skip_frame: false,
+            right_eye_source: None,
+            right_eye_age: 0,
+            right_eye_skipped: 0,
             fills: 0,
             transfers: 0,
             vertices_drawn: 0,
@@ -398,6 +408,18 @@ impl Gpu {
         output_dimensions: u32,
         flags: u32,
     ) {
+        if skip_right_eye() {
+            let top = self.framebuffers[0];
+            let right = output_paddr != 0 && (output_paddr == top.address_a_right || output_paddr == top.address_b_right);
+            if right {
+                // the console's 3D screen's other eye, which no screen here
+                // shows: the picture is not made, see right_eye_draw
+                self.right_eye_source = Some(input_paddr);
+                self.right_eye_age = 0;
+                return;
+            }
+            self.right_eye_age = self.right_eye_age.saturating_add(1);
+        }
         self.take_flags();
         self.flush_draws(memory);
         self.give_flags();
@@ -1213,9 +1235,31 @@ impl Gpu {
     /// order or the ones the index buffer picks. kept out of write_internal,
     /// where every write paid for the stack a draw needs.
     #[inline(never)]
+    /// whether a draw only makes the right eye's picture of the top screen
+    /// in 3D, which no screen here shows: it goes into the color buffer the
+    /// title copies to the right eye's framebuffer, while the top screen is
+    /// in 3D and that copy was seen lately (a title draws both eyes even
+    /// with the slider down, the same picture twice).
+    fn right_eye_draw(&self) -> bool {
+        let Some(source) = self.right_eye_source else { return false };
+        if self.right_eye_age > 6 || self.framebuffers[0].format & 0x60 != 0x20 {
+            return false;
+        }
+        let color = self.internal[REG_COLOR_BUFFER_ADDRESS] << 3;
+        let dimensions = self.internal[REG_FRAMEBUFFER_DIMENSIONS];
+        let (width, height) = (dimensions & 0x7FF, ((dimensions >> 12) & 0x3FF) + 1);
+        // the bottom screen is drawn into the same memory first, at its
+        // 240x320, the eyes in buffers as tall as the top screen is wide
+        height >= 400 && color != 0 && color <= source && source < color + width * height * 4
+    }
+
     fn draw<M: GpuMemory>(&mut self, memory: &mut M, renderer: &mut dyn Renderer, indexed: bool) {
         self.draw_calls += 1;
         if self.skip_frame {
+            return;
+        }
+        if self.right_eye_draw() {
+            self.right_eye_skipped += 1;
             return;
         }
         renderer.draw(DrawCall {
@@ -2592,3 +2636,12 @@ mod tests {
         assert_eq!(&memory.0[0x200..start], &[0; 6], "nothing before where it starts");
     }
 }
+
+
+/// ZAKURO_SKIP_RIGHT_EYE=1: the right eye of the top screen in 3D is not
+/// drawn, for frontends that show no 3D.
+fn skip_right_eye() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZAKURO_SKIP_RIGHT_EYE").is_ok_and(|v| v == "1"))
+}
+

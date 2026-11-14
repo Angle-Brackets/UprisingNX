@@ -29,6 +29,15 @@ enum {
     UNX_HOST_BOTTOM = 1 << 0,
     UNX_HOST_RECENTER = 1 << 1,
     UNX_HOST_DOCKED = 1 << 2,
+    // the right stick's click held with the D-pad: Up/Down step the internal
+    // resolution, Left gives it back to the automatic choice, Right turns
+    // frame interpolation (smooth mode) on or off
+    UNX_HOST_SCALE_UP = 1 << 3,
+    UNX_HOST_SCALE_DOWN = 1 << 4,
+    UNX_HOST_SCALE_AUTO = 1 << 5,
+    UNX_HOST_SMOOTH = 1 << 6,
+    // the right stick's click held with Minus: the settings menu
+    UNX_HOST_MENU = 1 << 7,
 };
 
 typedef struct {
@@ -48,6 +57,7 @@ void *unx_create(void *nwindow, const char *rom, const char *data_dir, const Unx
 u32 unx_frame(void *unx, const UnxInput *input);
 void unx_destroy(void *unx);
 void unx_set_font(const u8 *data, size_t len);
+u32 unx_minus_opens_menu(void);
 void nx_tls_init(void);
 void prof_start(void);
 void prof_stop(void);
@@ -59,6 +69,10 @@ enum {
     P_R = 1 << 8, P_L = 1 << 9, P_X = 1 << 10, P_Y = 1 << 11,
     P_ZL = 1 << 14, P_ZR = 1 << 15,
 };
+
+// Plus and Minus held together: quit (read from the controller, as Minus may
+// not reach the 3DS buttons)
+static bool g_quit;
 
 static float axis(s32 v) { return fmaxf(-1.0f, fminf(1.0f, v / 32767.0f)); }
 
@@ -75,7 +89,44 @@ static void read_input(PadState *pad, UnxInput *in) {
     memset(in, 0, sizeof *in);
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (held & map[i].nx) in->buttons |= map[i].ds;
-    if (held & HidNpadButton_StickR) in->host |= UNX_HOST_BOTTOM;
+    // the right stick's click shows or hides the bottom screen when it is let
+    // go, unless the D-pad was used while it was held: then it was a
+    // resolution button, and the D-pad is kept from the game meanwhile
+    static bool stick_r_held, stick_r_combo;
+    bool stick_r = held & HidNpadButton_StickR;
+    if (stick_r) {
+        if (held & (HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_Left | HidNpadButton_Right | HidNpadButton_Minus)) stick_r_combo = true;
+        if (held & HidNpadButton_Minus) in->host |= UNX_HOST_MENU;
+        if (held & HidNpadButton_Up) in->host |= UNX_HOST_SCALE_UP;
+        if (held & HidNpadButton_Down) in->host |= UNX_HOST_SCALE_DOWN;
+        if (held & HidNpadButton_Left) in->host |= UNX_HOST_SCALE_AUTO;
+        if (held & HidNpadButton_Right) in->host |= UNX_HOST_SMOOTH;
+        in->buttons &= ~(u32)(P_UP | P_DOWN | P_LEFT | P_RIGHT | P_SELECT);
+    } else if (stick_r_held) {
+        if (!stick_r_combo) in->host |= UNX_HOST_BOTTOM;
+        stick_r_combo = false;
+    }
+    stick_r_held = stick_r;
+    // Minus alone opens the settings menu when it is let go (unless the menu's
+    // "Minus button" row gives it to the game as Select): another button
+    // pressed while it is held (Plus to quit, the right stick) makes it a combo
+    // instead. the game's Select only pauses in battles, as Plus does
+    static bool minus_held, minus_combo;
+    bool minus = held & HidNpadButton_Minus;
+    g_quit = (held & (HidNpadButton_Plus | HidNpadButton_Minus)) == (HidNpadButton_Plus | HidNpadButton_Minus);
+    if (unx_minus_opens_menu()) {
+        in->buttons &= ~(u32)P_SELECT;
+        if (minus) {
+            // the real buttons (bits 0-15), not the sticks' pseudo-buttons
+            if (held & ~(u64)HidNpadButton_Minus & 0xFFFF) minus_combo = true;
+        } else if (minus_held) {
+            if (!minus_combo) in->host |= UNX_HOST_MENU;
+            minus_combo = false;
+        }
+    } else {
+        minus_combo = false;
+    }
+    minus_held = minus;
     if (held & (HidNpadButton_R | HidNpadButton_StickL)) in->host |= UNX_HOST_RECENTER;
     if (appletGetOperationMode() == AppletOperationMode_Console) in->host |= UNX_HOST_DOCKED;
     HidAnalogStickState l = padGetStickPos(pad, 0), r = padGetStickPos(pad, 1);
@@ -122,6 +173,11 @@ static void load_env(void) {
     // self-sampling draws (the water/ripple moire) issued in 8 runs so each
     // run sees the image the earlier ones drew; ZAKURO_SELF_CHUNKS=1 turns it off
     setenv("ZAKURO_SELF_CHUNKS", "8", 0);
+    // the game draws both eyes of the 3D screen even with the slider down, the
+    // same picture twice; the Switch shows one, so the right eye is not drawn
+    // (Chapter 14 flight: draws 128 -> 70 a refresh, 2x handheld 26 -> 30 fps).
+    // ZAKURO_SKIP_RIGHT_EYE=0 draws it
+    setenv("ZAKURO_SKIP_RIGHT_EYE", "1", 0);
     // aiming with the right stick (UNX_RIGHT_STICK_AIM=1 default), gyro
     // (UNX_GYRO_AIM=1 default), and optional left stick mode (UNX_LEFT_STICK_AIM=0),
     // see nx/rust/src/aim.rs
@@ -213,7 +269,7 @@ static void *game(void *p) {
         while (appletMainLoop()) {
             read_input(&pad, &in);
             // + and - together quits (the game uses both alone)
-            if ((in.buttons & (P_START | P_SELECT)) == (P_START | P_SELECT)) break;
+            if (g_quit) break;
             if (unx_frame(unx, &in)) break;
         }
         if (getenv("UNX_PROF")) prof_stop();

@@ -77,6 +77,20 @@ static int place_core(const char *list, int index, int fallback) {
     return (c >= 0 && c <= 2) ? c : fallback;
 }
 
+#include <malloc.h>
+/* the process's memory for the frontend's report: used and total from the
+ * kernel, then malloc's bytes in use and the arena it took */
+void unx_memory(unsigned long long *out) {
+    u64 used = 0, total = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    struct mallinfo info = mallinfo();
+    out[0] = used;
+    out[1] = total;
+    out[2] = (unsigned long long)info.uordblks;
+    out[3] = (unsigned long long)info.arena;
+}
+
 void unx_thread_role(const char *role, int index) {
     // the pipeline compilers: a step below every other thread's priority, so
     // they never take a core from the game or the GPU, free to run on any
