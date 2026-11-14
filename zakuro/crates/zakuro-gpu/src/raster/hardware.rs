@@ -396,6 +396,10 @@ struct Surface {
     twinned: bool,
     /// counts the changes to the twin, as generation does the image's.
     twin_generation: u64,
+    /// what the whole image was last cleared to, at that generation: while
+    /// generation is still that, the image is nothing but the clear, and a
+    /// twin made of it is cleared the same rather than copied
+    cleared_to: Option<(u64, vk::ClearValue)>,
     /// the twin turned upright, as upright has the image.
     twin_upright: Option<Upright>,
 }
@@ -781,9 +785,20 @@ enum Work {
     Copy,
     Download,
     Barrier,
+    /// filling a surface's twin before a draw in between goes into it
+    Twin,
+    /// a depth buffer read as a texture, copied out and converted
+    Depth,
+    /// a color texture copied out of a surface drawn into, as a blit
+    Snapshot,
 }
 
-const WORK_NAMES: [&str; 9] = ["other", "draw", "upload", "clear", "transfer", "capture", "copy", "download", "barrier"];
+/// a blend function's bits as the pipeline keeps them (equations add,
+/// color and alpha one of the source and zero of the destination): the
+/// fragment as it is, the same as no blending
+const BLEND_COPY: u32 = 0x0101_0000;
+
+const WORK_NAMES: [&str; 12] = ["other", "draw", "upload", "clear", "transfer", "capture", "copy", "download", "barrier", "twin", "depth", "snapshot"];
 
 /// what the pipeline statistics count, in the order the results come.
 const STATISTICS: vk::QueryPipelineStatisticFlags = vk::QueryPipelineStatisticFlags::from_raw(
@@ -3337,6 +3352,7 @@ impl Hardware {
                     twin: None,
                     twinned: false,
                     twin_generation: 0,
+                    cleared_to: None,
                     twin_upright: None,
                 });
                 self.surfaces.len() - 1
@@ -3499,7 +3515,7 @@ impl Hardware {
             let image = self.image(width, height, format, usage, aspect)?;
             self.surfaces[index].twin = Some(image);
         }
-        self.mark(Work::Copy, false);
+        self.mark(Work::Twin, false);
         self.barrier();
         let s = &self.surfaces[index];
         let Some(twin) = &s.twin else { unreachable!("made above") };
@@ -3507,16 +3523,31 @@ impl Hardware {
             Kind::Color(_) => vk::ImageAspectFlags::COLOR,
             Kind::Depth(_) => vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
         };
+        // ZAKURO_TWIN_CLEAR=0 copies a twin even of an image that is only a
+        // clear, a test of what clearing it instead saves
+        static TWIN_CLEAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let twin_clear = *TWIN_CLEAR.get_or_init(|| std::env::var("ZAKURO_TWIN_CLEAR").map_or(true, |v| v != "0"));
+        let cleared_to = s.cleared_to.filter(|&(generation, _)| twin_clear && generation == s.generation).map(|(_, value)| value);
+        let range = [vk::ImageSubresourceRange::default().aspect_mask(aspect).level_count(1).layer_count(1)];
         let layers = vk::ImageSubresourceLayers::default().aspect_mask(aspect).layer_count(1);
         let region = [vk::ImageCopy::default()
             .src_subresource(layers)
             .dst_subresource(layers)
             .extent(vk::Extent3D { width, height, depth: 1 })];
         // SAFETY: recording, outside rendering, between two images of the
-        // same size and format in the general layout made for transfers
+        // same size and format in the general layout made for transfers; the
+        // clear value is the kind the clear of the image wrote
         unsafe {
             self.unfenced = true;
-            self.device.cmd_copy_image(self.commands, s.image.image, vk::ImageLayout::GENERAL, twin.image, vk::ImageLayout::GENERAL, &region);
+            match (cleared_to, kind) {
+                (Some(value), Kind::Color(_)) => {
+                    self.device.cmd_clear_color_image(self.commands, twin.image, vk::ImageLayout::GENERAL, &value.color, &range)
+                }
+                (Some(value), Kind::Depth(_)) => {
+                    self.device.cmd_clear_depth_stencil_image(self.commands, twin.image, vk::ImageLayout::GENERAL, &value.depth_stencil, &range)
+                }
+                (None, _) => self.device.cmd_copy_image(self.commands, s.image.image, vk::ImageLayout::GENERAL, twin.image, vk::ImageLayout::GENERAL, &region),
+            }
         }
         self.uploads = true;
         let s = &mut self.surfaces[index];
@@ -4245,11 +4276,13 @@ impl Hardware {
             self.end_rendering();
             // SAFETY: recording, outside rendering, on an image in the
             // general layout that allows transfers into it
+            let mut cleared_to = vk::ClearValue::default();
             unsafe {
                 match kind {
                     Kind::Color(format) => {
                         let rgba = format.decode(&pixel);
                         let color = vk::ClearColorValue { float32: rgba.map(|c| c as f32 / 255.0) };
+                        cleared_to = vk::ClearValue { color };
                         let range = [vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
                             .level_count(1)
@@ -4267,6 +4300,7 @@ impl Hardware {
                             _ => (u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]), pixel[3] as u32),
                         };
                         let value = vk::ClearDepthStencilValue { depth: float_depth(depth), stencil };
+                        cleared_to = vk::ClearValue { depth_stencil: value };
                         let range = [vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
                             .level_count(1)
@@ -4289,6 +4323,7 @@ impl Hardware {
             surface.stale = None;
             surface.checked = cfg!(target_os = "horizon");
             surface.replaced();
+            surface.cleared_to = Some((surface.generation, cleared_to));
         }
         Ok(())
     }
@@ -4869,6 +4904,9 @@ impl Hardware {
         let twin = twinned && pass != Pass::Twinned;
 
         let mut flip = 0u8;
+        // the units sampling a surface's own image rather than a copy, whose
+        // rows the fragment shader reads the other way up
+        let mut direct = 0u8;
         let mut views = [self.blank.view; 3];
         let mut twin_views = [self.blank.view; 3];
         let mut samplers = [vk::Sampler::null(); 3];
@@ -4877,6 +4915,13 @@ impl Hardware {
             match bound {
                 Some(bound) => {
                     let smallest = match bound.drawn {
+                        Some(drawn) if self.direct_source(&drawn, color).is_some() => {
+                            let Some(source) = self.direct_source(&drawn, color) else { unreachable!("checked above") };
+                            views[unit] = self.surface_view(source, false);
+                            twin_views[unit] = self.surface_view(source, true);
+                            direct |= 1 << unit;
+                            0
+                        }
                         Some(drawn) => {
                             if real {
                                 // ZAKURO_FEEDBACK_LOOP=1: a draw reading the target it draws into
@@ -5029,8 +5074,8 @@ impl Hardware {
         }
         let texture_config = (r[REG_TEXTURE_CONFIG] & !7) | enabled;
         words.extend([r[REG_UPDATE_BUFFER], r[REG_BUFFER_COLOR], r[REG_ALPHA_TEST], texture_config]);
-        for base in TEXTURE_UNIT_BASES {
-            words.extend([r[base + 2], r[base], 0, 0]);
+        for (unit, base) in TEXTURE_UNIT_BASES.into_iter().enumerate() {
+            words.extend([r[base + 2], r[base], (direct >> unit) as u32 & 1, 0]);
         }
         let depth_flags = depth_map.w_buffer as u32 | (shaded.is_some() as u32) << 1;
         // the depth map goes through the viewport where it fits, and what
@@ -5074,7 +5119,14 @@ impl Hardware {
         let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && r[REG_STENCIL_TEST] & 1 != 0;
         // only the bits compile_pipeline reads, so draws that differ
         // elsewhere share a pipeline
-        let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0).then_some(r[REG_BLEND_FUNC] & 0xFFFF_0707);
+        // blending that adds one of the fragment to none of the pixel is no
+        // blending, and left on it still reads every pixel it writes: off.
+        // ZAKURO_KEEP_COPY_BLEND=1 leaves it on, to measure
+        static KEEP_COPY_BLEND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let keep_copy_blend = *KEEP_COPY_BLEND.get_or_init(|| std::env::var_os("ZAKURO_KEEP_COPY_BLEND").is_some());
+        let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0)
+            .then_some(r[REG_BLEND_FUNC] & 0xFFFF_0707)
+            .filter(|&config| keep_copy_blend || config != BLEND_COPY);
         let mut logic_op = LogicOp::read(r);
         let mut color_mask = color_mask;
         if !self.logic_ops {
@@ -5808,7 +5860,6 @@ impl Hardware {
     /// surface's last row has the rows past it as memory holds them. a twin
     /// one is copied from the surface's twin, when it has one.
     fn copy_texture(&mut self, texture: &DrawnTexture, bound: &BoundTexture, twin: bool) -> Result<vk::ImageView, String> {
-        self.mark(Work::Copy, false);
         let (source, row) = self.texture_source(texture).ok_or("the buffer a texture was drawn into is gone")?;
         let twin = twin && self.surfaces[source].twinned;
         let generation = match twin {
@@ -5852,6 +5903,10 @@ impl Hardware {
                 return Ok(copy.image.view);
             }
         }
+        // marked only here: a copy kept from before records nothing, and
+        // marking it put what the GPU did next (the draw's own work) under
+        // copies
+        self.mark(Work::Copy, false);
         if !self.copies(twin).contains_key(texture) {
             let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST;
             self.end_rendering();
@@ -5925,7 +5980,7 @@ impl Hardware {
                     .dst_offsets([vk::Offset3D { x: 0, y: height, z: 0 }, vk::Offset3D { x: width, y: 0, z: 1 }]);
                 self.end_rendering();
                 self.barrier();
-                self.mark(Work::Transfer, false);
+                self.mark(Work::Snapshot, false);
                 // SAFETY: recording, outside rendering, both color images in
                 // the general layout made for transfers, the regions inside
                 unsafe {
@@ -5946,6 +6001,27 @@ impl Hardware {
             copy.used = batch;
         }
         Ok(view)
+    }
+
+    /// the surface a texture can be sampled straight out of, with no copy:
+    /// all of an rgba8 color surface (whose copy rounds to nothing) that the
+    /// draw does not draw into. its image is the copy turned upside down,
+    /// and what it holds is what a copy made now would: every change of
+    /// target ends the rendering behind a barrier, so whatever drew into it
+    /// is done, and twin draws replay in order before anything else writes
+    /// the twins. ZAKURO_DIRECT_TEXTURES=0 copies them as before.
+    fn direct_source(&self, texture: &DrawnTexture, target: usize) -> Option<usize> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            std::env::var("ZAKURO_DIRECT_TEXTURES").map_or(true, |v| v != "0") && std::env::var_os("ZAKURO_COPY_ALPHA1").is_none()
+        });
+        if !on || texture.format != ColorFormat::Rgba8 {
+            return None;
+        }
+        let (source, row) = self.texture_source(texture)?;
+        let surface = &self.surfaces[source];
+        (row == 0 && source != target && surface.kind == Kind::Color(ColorFormat::Rgba8) && surface.width == texture.width && surface.height == texture.height)
+            .then_some(source)
     }
 
     /// the textures copied from surfaces, or from their twins.
@@ -5977,6 +6053,7 @@ impl Hardware {
         let (layout, pipeline) = self.depth_pipeline()?;
         self.end_rendering();
         self.barrier();
+        self.mark(Work::Depth, false);
         let extent = vk::Extent3D { width, height, depth: 1 };
         let region = |offset: u64, aspect: vk::ImageAspectFlags| {
             vk::BufferImageCopy::default()
@@ -7546,6 +7623,7 @@ mod tests {
                 twin: None,
                 twinned: false,
                 twin_generation: 0,
+                cleared_to: None,
                 twin_upright: None,
             };
             let (size, bpp, row) = (surface.size() as usize, kind.bytes() as usize, surface.row_bytes() as usize);

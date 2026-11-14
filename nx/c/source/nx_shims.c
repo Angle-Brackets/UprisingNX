@@ -148,16 +148,16 @@ void *dlsym(void *handle, const char *name) { (void)handle; (void)name; return N
 int dlclose(void *handle) { (void)handle; return 0; }
 char *dlerror(void) { return (char *)"no dynamic loading on Horizon"; }
 
-// ---- getrandom from the kernel's CSPRNG ------------------------------------
+// ---- getrandom from libnx's own generator ----------------------------------
+// randomGet is a ChaCha generator in the process, seeded from the kernel's
+// entropy at start and behind a mutex: it cannot fail. Rust's std reads this
+// for every HashMap's keys and aborts the whole program on -1, which the
+// csrng service once gave mid-battle (a failed IPC call), so nothing here
+// asks a service any more
 #include <sys/types.h>
 #include <switch.h>
 ssize_t getrandom(void *buf, size_t len, unsigned flags) {
     (void)flags;
-    static int ready;
-    if (!ready) {
-        if (R_FAILED(csrngInitialize())) { errno = EIO; return -1; }
-        ready = 1;
-    }
-    if (R_FAILED(csrngGetRandomBytes(buf, len))) { errno = EIO; return -1; }
+    randomGet(buf, len);
     return (ssize_t)len;
 }

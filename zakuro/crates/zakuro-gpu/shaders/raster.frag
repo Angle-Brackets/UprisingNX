@@ -155,7 +155,9 @@ vec4 sample_unit(uint unit, vec2 uv) {
     uint wrap_s = (config >> 12) & 7u;
     // precise as the combiners are. the coordinate itself the driver may
     // still interpolate a hair apart from one shader to another
-    precise vec2 st = vec2(uv.x, 1.0 - uv.y);
+    // a unit reading a surface's own image (units[unit].z) has its rows
+    // bottom first already, as the PICA's
+    precise vec2 st = vec2(uv.x, units[unit].z != 0u ? uv.y : 1.0 - uv.y);
     // sampled before the border is decided on for each fragment, so that a
     // texture pack's picture picks which of its sizes to draw with from all
     // of a fragment's neighbours
