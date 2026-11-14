@@ -5590,11 +5590,16 @@ impl Hardware {
         let size = (t.copy.0 * self.scale, t.copy.1 * self.scale);
         // a plain copy, rows turned over or not, as a blit, which the GPU's
         // texture and color paths do far faster than storage images
-        if twinned || !self.blit_transfer(source, target, constants, size, t.output_tiled) {
+        // the picture in between the same way, from the input's twin into the
+        // output's (make_twin gave the output one)
+        let blitted = self.blit_transfer(source, target, constants, size, t.output_tiled, false);
+        if !blitted {
             self.dispatch_transfer(views, constants, size)?;
         }
         if twinned {
-            self.dispatch_transfer((self.surface_view(source, true), self.surface_view(target, true)), constants, size)?;
+            if !(blitted && self.blit_transfer(source, target, constants, size, t.output_tiled, true)) {
+                self.dispatch_transfer((self.surface_view(source, true), self.surface_view(target, true)), constants, size)?;
+            }
             self.surfaces[target].twin_changed();
         }
         self.surfaces[target].changed();
@@ -5620,7 +5625,8 @@ impl Hardware {
     /// blit, the rows turned over as transfer.comp turns them. false, with
     /// nothing recorded, for anything else. ZAKURO_TRANSFER_BLIT=0 keeps
     /// every transfer on the shader.
-    fn blit_transfer(&mut self, source: usize, target: usize, constants: [i32; 11], size: (u32, u32), output_tiled: bool) -> bool {
+    /// twin: between the twins of both, the picture in between.
+    fn blit_transfer(&mut self, source: usize, target: usize, constants: [i32; 11], size: (u32, u32), output_tiled: bool, twin: bool) -> bool {
         if !*TRANSFER_BLIT.get_or_init(transfer_blit) {
             return false;
         }
@@ -5671,15 +5677,20 @@ impl Hardware {
             .dst_offsets([vk::Offset3D { x: 0, y: target_y0, z: 0 }, vk::Offset3D { x: w, y: target_y1, z: 1 }]);
         self.end_rendering();
         self.barrier();
+        let image = |s: &Surface| match &s.twin {
+            Some(twin_image) if twin && s.twinned => twin_image.image,
+            _ => s.image.image,
+        };
+        let (from, to) = (image(&self.surfaces[source]), image(&self.surfaces[target]));
         self.mark(Work::Transfer, false);
         // SAFETY: recording, outside rendering, both images made for
         // transfers and kept in the general layout, the regions inside them
         unsafe {
             self.device.cmd_blit_image(
                 self.commands,
-                self.surfaces[source].image.image,
+                from,
                 vk::ImageLayout::GENERAL,
-                self.surfaces[target].image.image,
+                to,
                 vk::ImageLayout::GENERAL,
                 &[region],
                 vk::Filter::NEAREST,

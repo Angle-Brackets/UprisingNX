@@ -153,9 +153,10 @@ const SMOOTH_WAIT_MS: f64 = 4.0;
 const SMOOTH_REFRESH_MS: f64 = 20.0;
 /// how long smooth mode stays off before it tries again, doubling each
 /// time it fails up to the most, back to the first once it kept up for
-/// SMOOTH_SETTLED checks
+/// SMOOTH_SETTLED checks or the scene changes (into or out of a battle, a
+/// load). the most is short so a heavy moment doesn't keep it off for long
 const SMOOTH_BACKOFF_FIRST: u64 = 5 * 60;
-const SMOOTH_BACKOFF_MOST: u64 = 120 * 60;
+const SMOOTH_BACKOFF_MOST: u64 = 30 * 60;
 const SMOOTH_SETTLED: u32 = 60;
 
 /// frame interpolation, smooth mode: a picture in between each two of the
@@ -446,6 +447,16 @@ impl Unx {
         scale
     }
 
+    /// a new scene says nothing of what the last one cost: smooth mode, if
+    /// wanted and off, tries again now, and the backoff starts over
+    fn scene_changed(&mut self, why: &str) {
+        self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
+        if self.smooth.wanted && !self.smooth.on && self.smooth.retry_at > self.frame {
+            self.smooth.retry_at = self.frame;
+            log::info!("unx: smooth mode tries again, {why} (frame {})", self.frame);
+        }
+    }
+
     fn set_smooth(&mut self, on: bool) {
         self.smooth.on = self.system.set_interpolation(on);
         self.smooth.wait = 0.0;
@@ -489,7 +500,9 @@ impl Unx {
 
     /// smooth mode's guard, each refresh with what it waited for the GPU
     fn smooth_guard(&mut self, waiting: f64) {
-        if !self.smooth.wanted {
+        // UNX_SMOOTH_GUARD=0 keeps smooth mode on whatever it costs, to measure it
+        static UNGUARDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !self.smooth.wanted || *UNGUARDED.get_or_init(|| std::env::var("UNX_SMOOTH_GUARD").is_ok_and(|v| v.trim() == "0")) {
             return;
         }
         if !self.smooth.on {
@@ -566,6 +579,7 @@ impl Unx {
             self.set_scale(fixed);
         }
         self.apply_settings();
+        self.scene_changed(if docked { "docked" } else { "handheld" });
         let scale = self.system.gpu.scale();
         log::info!(
             "unx: {} -> presenter {}x{}, internal resolution {}x (frame {})",
@@ -988,6 +1002,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let title_boost = !res_battle;
     if title_boost != unx.title_boosted {
         unx.title_boosted = title_boost;
+        unx.scene_changed(if title_boost { "out of a battle" } else { "into a battle" });
         if unx.fixed_resolution.is_none() {
             let target = unx.auto_scale();
             let scale = unx.set_scale(target);
@@ -1016,7 +1031,11 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 "save" => unx.system.save_state().and_then(|bytes| {
                     std::fs::write(&file, &bytes).map(|_| format!("saved {} bytes", bytes.len())).map_err(|e| e.to_string())
                 }),
-                "load" => load_slot(&mut unx.system, slot),
+                "load" => {
+                    let loaded = load_slot(&mut unx.system, slot);
+                    unx.scene_changed("a state loaded");
+                    loaded
+                }
                 "scale" => match slot {
                     "auto" => {
                         unx.fixed_resolution = None;
