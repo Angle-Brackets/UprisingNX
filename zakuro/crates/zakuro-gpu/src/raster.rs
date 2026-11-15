@@ -8463,6 +8463,80 @@ mod tests {
         assert!(own != between);
     }
 
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn pictures_in_between_render_at_mixed_twin_scale() {
+        use crate::format::ColorFormat::Rgba8;
+        const SIZE: u32 = 32;
+        const OUTPUT: u32 = 0x10_0000;
+        let band = |left: f32, color: Vec4| -> Vec<Vertex> {
+            [[left, -1.0], [left + 1.0, -1.0], [left, 1.0], [left + 1.0, -1.0], [left + 1.0, 1.0], [left, 1.0]]
+                .into_iter()
+                .map(|[x, y]| Vertex { clip: [x, y, 0.0, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], ..Default::default() })
+                .collect()
+        };
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        let transfer = hardware::Transfer {
+            input: COLOR,
+            output: OUTPUT,
+            input_width: SIZE,
+            output_width: SIZE,
+            output_height: SIZE,
+            copy: (SIZE, SIZE),
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: false,
+            input_format: Rgba8,
+            output_format: Rgba8,
+        };
+        let scene = |scale: u32, mixed: bool, red: f32, between: Option<f32>| -> Option<((Vec<u8>, u32), Option<(Vec<u8>, u32)>)> {
+            let device = hardware::own_device().ok()?;
+            let mut hardware = hardware::Hardware::with_device(std::sync::Arc::new(device), true, None).unwrap();
+            hardware.mixed_twin_scale = mixed;
+            assert_eq!(hardware.set_scale(scale), scale);
+            hardware.set_twins(between.is_some());
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            let mut memory = ConsoleMemory::default();
+            let pass = |resources: &mut Resources, pass| resources.hardware.as_mut().unwrap().pass = pass;
+            rasterize_shaded(&registers, &mut memory, &mut resources, &cover(0.0, BLUE));
+            if let Some(between) = between {
+                pass(&mut resources, Pass::Twinned);
+                rasterize_shaded(&registers, &mut memory, &mut resources, &band(red, RED));
+                pass(&mut resources, Pass::Twin);
+                rasterize_shaded(&registers, &mut memory, &mut resources, &band(between, RED));
+                pass(&mut resources, Pass::Real);
+            } else {
+                rasterize_shaded(&registers, &mut memory, &mut resources, &band(red, RED));
+            }
+            rasterize_shaded(&registers, &mut memory, &mut resources, &band(0.5, GREEN));
+            let hardware = resources.hardware.as_mut().unwrap();
+            assert!(hardware.display_transfer(&mut memory, &transfer).unwrap());
+            let screen = hardware.screen(OUTPUT, (SIZE, SIZE), SIZE, Rgba8, &[]).expect("drawn on the GPU");
+            let real_gpu = hardware.screen_image(screen).unwrap().expect("real screen image");
+            let own = hardware.upright_pixels(screen, false).unwrap();
+            let twin = between.map(|_| {
+                let twin_gpu = hardware.between_image(screen).unwrap().expect("twin screen image");
+                assert_eq!(real_gpu.area, twin_gpu.area, "normalized screen UVs match across scales");
+                hardware.upright_pixels(screen, true).unwrap()
+            });
+            Some((own, twin))
+        };
+        // 3x Real + 2x Twin: Real matches 3x reference, Twin matches 2x reference!
+        let Some(((own_3x, own_w), Some((twin_2x, twin_w)))) = scene(3, true, -1.0, Some(-0.5)) else { return };
+        let ((ref_3x, _), _) = scene(3, false, -1.0, None).unwrap();
+        let ((ref_2x, _), _) = scene(2, false, -0.5, None).unwrap();
+        assert_eq!(own_w, SIZE * 3);
+        assert_eq!(twin_w, SIZE * 2);
+        assert_eq!(own_3x.len(), (SIZE * 3 * SIZE * 3 * 4) as usize);
+        assert_eq!(twin_2x.len(), (SIZE * 2 * SIZE * 2 * 4) as usize);
+        assert_eq!(own_3x, ref_3x, "3x real frame is full 3x sharpness");
+        assert_eq!(twin_2x, ref_2x, "2x twin frame matches 2x reference");
+    }
+
     /// a quad covering x from `x.0` to `x.1` and y from `y.0` to `y.1` in
     /// normalized device coordinates, as a list of two triangles.
     fn quad(x: (f32, f32), y: (f32, f32), color: Vec4) -> Vec<Vertex> {

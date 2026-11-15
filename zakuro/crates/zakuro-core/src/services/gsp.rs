@@ -392,14 +392,26 @@ fn outdrawn(system: &mut System) -> bool {
     system.services.gsp.held
 }
 
-/// the screens refresh, taking the pictures set for them, and a ring held
-/// for it runs.
-pub fn refresh(system: &mut System) {
+/// latches the pictures set for the screens at refresh before pacing inspects
+/// the finished frame.
+pub fn refresh_framebuffers(system: &mut System) {
     apply_framebuffer_updates(system);
     system.services.gsp.waiting = [None; 2];
+}
+
+/// runs a command ring that was held waiting for the refresh, after pacing has
+/// closed out the frame that just refreshed.
+pub fn release_held(system: &mut System) {
     if std::mem::take(&mut system.services.gsp.held) {
         process_command_queue(system);
     }
+}
+
+/// the screens refresh, taking the pictures set for them, and a ring held
+/// for it runs.
+pub fn refresh(system: &mut System) {
+    refresh_framebuffers(system);
+    release_held(system);
 }
 
 /// decodes the fill width from a memory-fill control word.

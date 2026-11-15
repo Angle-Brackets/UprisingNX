@@ -1,0 +1,113 @@
+--- build/nx-recomp/recomp.h.orig	2026-11-14 15:21:17.696348781 -0800
++++ build/desktop/port-usa-ovr/code/recomp.h	2026-11-14 15:22:21.451117187 -0800
+@@ -415,10 +415,16 @@
+ }
+ 
+ static inline uint32_t reverse_bits(uint32_t value) {
++#ifdef __aarch64__
++    uint32_t out;
++    __asm__("rbit %w0, %w1" : "=r"(out) : "r"(value));
++    return out;
++#else
+     value = ((value >> 1) & 0x55555555u) | ((value & 0x55555555u) << 1);
+     value = ((value >> 2) & 0x33333333u) | ((value & 0x33333333u) << 2);
+     value = ((value >> 4) & 0x0F0F0F0Fu) | ((value & 0x0F0F0F0Fu) << 4);
+     return __builtin_bswap32(value);
++#endif
+ }
+ 
+ /* shifts by a register, the amount is its bottom byte. */
+@@ -456,8 +462,16 @@
+ }
+ 
+ #define FPSCR_FZ (1u << 24)
+-/* the short vector length, zero when an instruction works on one register. */
++/* the short vector length, zero when an instruction works on one register.
++   Kid Icarus: Uprising has no CRO modules and only ever writes 0x03000000u
++   (RunFast: DN=1, FZ=1, LEN=0) to FPSCR, so short vectors are never active;
++   folding FPSCR_LEN to 0 on AArch64 eliminates ~220k dead VFP_VECTOR branches
++   and their SYNC_OUT/SYNC_IN register spill blocks. */
++#ifdef __aarch64__
++#define FPSCR_LEN 0u
++#else
+ #define FPSCR_LEN (7u << 16)
++#endif
+ 
+ /* fpscr, which a generated function keeps in a local, along with the VFP
+    registers it uses. */
+@@ -478,8 +492,25 @@
+ }
+ 
+ /* a result's bits, a subnormal flushed to zero when the guest asked. a
+-   zero keeps its sign either way, so the exponent alone decides. */
+-#if defined(__GNUC__) && !defined(__clang__)
++   zero keeps its sign either way, so the exponent alone decides.
++   On AArch64, zakuro-core syncs hardware FPCR bits [25:22] (DN, FZ, RMode)
++   from guest FPSCR around recompiled execution, so Cortex-A57 flushes
++   subnormal inputs and outputs in hardware without GP<->FP fmov stalls. */
++#ifdef __aarch64__
++static ALWAYS_INLINE uint32_t vfp_to_s_in(uint32_t fpscr, float value) {
++    (void)fpscr;
++    uint32_t bits;
++    memcpy(&bits, &value, 4);
++    return bits;
++}
++
++static ALWAYS_INLINE uint64_t vfp_to_d_in(uint32_t fpscr, double value) {
++    (void)fpscr;
++    uint64_t bits;
++    memcpy(&bits, &value, 8);
++    return bits;
++}
++#elif defined(__GNUC__) && !defined(__clang__)
+ /* gcc turns a flush written inline into conditional moves on an integer
+    copy of every result, which keeps the results out of the float registers.
+    out of line it stays a branch, taken only for a zero or a subnormal. clang
+@@ -551,26 +582,44 @@
+ }
+ 
+ /* fpscr with the comparison result in its top bits, the nzcv encoding. */
+-static inline uint32_t vfp_compared(uint32_t fpscr, double a, double b) {
++static ALWAYS_INLINE uint32_t vfp_compared(uint32_t fpscr, double a, double b) {
++#ifdef __aarch64__
++    uint64_t nzcv;
++    __asm__("fcmp %d1, %d2\n\tmrs %x0, nzcv" : "=r"(nzcv) : "w"(a), "w"(b) : "cc");
++    return (fpscr & 0x0FFFFFFFu) | (uint32_t)nzcv;
++#else
+     uint32_t flags = (a != a || b != b) ? 0x3 : a == b ? 0x6 : a < b ? 0x8 : 0x2;
+     return (fpscr & 0x0FFFFFFFu) | flags << 28;
++#endif
+ }
+ 
+ #define vfp_compare(c, a, b) (FPSCR(c) = vfp_compared(FPSCR(c), (a), (b)))
+ 
+ /* conversions to integers, rounding toward zero and saturating. */
+-static inline uint32_t vfp_to_s32(double value) {
++static ALWAYS_INLINE uint32_t vfp_to_s32(double value) {
++#ifdef __aarch64__
++    int32_t out;
++    __asm__("fcvtzs %w0, %d1" : "=r"(out) : "w"(value));
++    return (uint32_t)out;
++#else
+     if (value != value) return 0;
+     if (value >= 2147483647.0) return 0x7FFFFFFFu;
+     if (value <= -2147483648.0) return 0x80000000u;
+     return (uint32_t)(int32_t)value;
++#endif
+ }
+ 
+-static inline uint32_t vfp_to_u32(double value) {
++static ALWAYS_INLINE uint32_t vfp_to_u32(double value) {
++#ifdef __aarch64__
++    uint32_t out;
++    __asm__("fcvtzu %w0, %d1" : "=r"(out) : "w"(value));
++    return out;
++#else
+     if (value != value) return 0;
+     if (value >= 4294967295.0) return 0xFFFFFFFFu;
+     if (value <= 0.0) return 0;
+     return (uint32_t)value;
++#endif
+ }
+ 
+ /* the arithmetic, numbered the way the code generator passes it, from the

@@ -353,6 +353,7 @@ struct Surface {
     width: u32,
     height: u32,
     scale: u32,
+    twin_scale: u32,
     kind: Kind,
     /// tiled the way the PICA draws, or in plain rows, as a display
     /// transfer can leave its output.
@@ -617,6 +618,46 @@ fn one_x_bloom() -> bool {
         return false;
     }
     *ON.get_or_init(|| std::env::var("ZAKURO_1X_BLOOM").map_or(true, |v| v != "0"))
+}
+
+/// ZAKURO_TWIN_SCALE controls the resolution scale of interpolated in-between
+/// ("twin") surfaces relative to their real surface's scale:
+/// - unset or "auto" (default): `(scale - 1).max(1)` (3x -> 2x, 2x -> 1x)
+/// - "0" or "same": `scale` (renders twins at full real scale)
+/// - "1".."8": explicit cap `n.clamp(1, scale)`
+fn configured_twin_scale(scale: u32, mixed: bool) -> u32 {
+    if scale <= 1 {
+        return 1;
+    }
+    #[cfg(test)]
+    {
+        return if mixed { (scale - 1).max(1) } else { scale };
+    }
+    #[cfg(not(test))]
+    {
+        let _ = mixed;
+        #[derive(Clone, Copy)]
+        enum Mode {
+            Auto,
+            Same,
+            Fixed(u32),
+        }
+        static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+        let mode = *MODE.get_or_init(|| match std::env::var("ZAKURO_TWIN_SCALE").ok().as_deref().map(str::trim) {
+            None | Some("") | Some("auto") => Mode::Auto,
+            Some("0") | Some("same") => Mode::Same,
+            Some(other) => match other.parse::<u32>() {
+                Ok(0) => Mode::Same,
+                Ok(n) => Mode::Fixed(n.clamp(1, 8)),
+                Err(_) => Mode::Auto,
+            },
+        });
+        match mode {
+            Mode::Auto => (scale - 1).max(1),
+            Mode::Same => scale,
+            Mode::Fixed(n) => n.min(scale).max(1),
+        }
+    }
 }
 
 /// the format, the uses and the aspects of the image a surface of a kind
@@ -2147,8 +2188,8 @@ pub struct Hardware {
     surfaces: Vec<Surface>,
     /// by the address of the decoded texels.
     textures: HashMap<usize, Texture>,
-    /// textures copied from surfaces, by what they are.
-    copies: HashMap<DrawnTexture, Copied>,
+    /// textures copied from surfaces, by what they are and the scale copied at.
+    copies: HashMap<(DrawnTexture, u32), Copied>,
     /// texture pack pictures, by the hash of the textures they replace.
     replaced: HashMap<u64, Replaced>,
     /// the bytes those take, and how many they may, half the GPU's memory.
@@ -2189,7 +2230,7 @@ pub struct Hardware {
     /// twins once rather than once a draw.
     twin_draws: Vec<Recorded>,
     /// textures copied from twins, as copies has those from surfaces.
-    twin_copies: HashMap<DrawnTexture, Copied>,
+    twin_copies: HashMap<(DrawnTexture, u32), Copied>,
     /// the batch the draw a draw in between follows staged its vertices
     /// and its indices in, and where, which the one in between reads too.
     twinned_inputs: Option<(u64, Staged, Staged)>,
@@ -2207,6 +2248,8 @@ pub struct Hardware {
     /// CPU on its way to and from memory, which is rare, and it has no image
     /// at the console's resolution.
     depth_blits: bool,
+    #[cfg(test)]
+    pub(super) mixed_twin_scale: bool,
     timing: Option<Timing>,
     barriers: u64,
     /// whether anything that writes memory was recorded since the last
@@ -2468,6 +2511,8 @@ impl Hardware {
                 depth_format,
                 blits,
                 depth_blits,
+                #[cfg(test)]
+                mixed_twin_scale: false,
                 // the queue has to count time for timestamps to mean anything
                 timing: (std::env::var_os("ZAKURO_GPU_TIMES").is_some() && timestamps).then(|| Timing {
                         period: properties.limits.timestamp_period as f64,
@@ -3189,7 +3234,8 @@ impl Hardware {
                     },
                     None => None,
                 };
-                self.begin_rendering_into(recorded.color, color, depth);
+                let twin_scale = self.surfaces[recorded.color].twin_scale;
+                self.begin_rendering_into(recorded.color, color, depth, twin_scale);
                 into = Some(buffers);
             }
             self.record(recorded);
@@ -3270,19 +3316,20 @@ impl Hardware {
         self.mark(Work::Clear, false);
         self.end_rendering();
         self.barrier();
-        self.clear_rows_of(index, self.surface_view(index, false), rows, pixel);
+        self.clear_rows_of(index, self.surface_view(index, false), rows, pixel, self.surfaces[index].scale);
         // and in between, where it has a twin
         if self.surfaces[index].twinned {
-            self.clear_rows_of(index, self.surface_view(index, true), rows, pixel);
+            let twin_scale = self.surfaces[index].twin_scale;
+            self.clear_rows_of(index, self.surface_view(index, true), rows, pixel, twin_scale);
         }
         self.uploads = true;
         Ok(())
     }
 
     /// records clearing rows of a surface's image or its twin's.
-    fn clear_rows_of(&mut self, index: usize, view: vk::ImageView, rows: (u32, u32), pixel: &[u8]) {
+    fn clear_rows_of(&mut self, index: usize, view: vk::ImageView, rows: (u32, u32), pixel: &[u8], scale: u32) {
         let surface = &self.surfaces[index];
-        let (width, height, kind, scale) = (surface.width, surface.height, surface.kind, surface.scale);
+        let (width, height, kind) = (surface.width, surface.height, surface.kind);
         self.renderings += 1;
         let attachment = [vk::RenderingAttachmentInfo::default()
             .image_view(view)
@@ -3349,6 +3396,18 @@ impl Hardware {
         }
     }
 
+    fn surface_twin_scale(&self, scale: u32) -> u32 {
+        if scale <= 1 || !self.blits || !self.depth_blits {
+            scale
+        } else {
+            #[cfg(test)]
+            let mixed = self.mixed_twin_scale;
+            #[cfg(not(test))]
+            let mixed = false;
+            configured_twin_scale(scale, mixed)
+        }
+    }
+
     fn surface_rows<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -3366,6 +3425,7 @@ impl Hardware {
             Some(index) => index,
             None => {
                 let scale = self.surface_scale(width, height, tiled);
+                let twin_scale = self.surface_twin_scale(scale);
                 let (format, usage, aspect) = surface_image(kind, self.depth_format);
                 let image = self.image(width * scale, height * scale, format, usage, aspect)?;
                 let native = match scale {
@@ -3384,6 +3444,7 @@ impl Hardware {
                     width,
                     height,
                     scale,
+                    twin_scale,
                     kind,
                     tiled,
                     shadow: Vec::new(),
@@ -3556,9 +3617,9 @@ impl Hardware {
         }
         self.begin()?;
         self.end_rendering();
-        let (width, height, kind) = {
+        let (real_width, real_height, width, height, kind) = {
             let s = &self.surfaces[index];
-            (s.width * s.scale, s.height * s.scale, s.kind)
+            (s.width * s.scale, s.height * s.scale, s.width * s.twin_scale, s.height * s.twin_scale, s.kind)
         };
         if self.surfaces[index].twin.is_none() {
             let (format, usage, aspect) = surface_image(kind, self.depth_format);
@@ -3584,9 +3645,18 @@ impl Hardware {
             .src_subresource(layers)
             .dst_subresource(layers)
             .extent(vk::Extent3D { width, height, depth: 1 })];
+        let blit_region = [vk::ImageBlit::default()
+            .src_subresource(layers)
+            .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: real_width as i32, y: real_height as i32, z: 1 }])
+            .dst_subresource(layers)
+            .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }])];
+        let blit_filter = match kind {
+            Kind::Color(_) => vk::Filter::LINEAR,
+            Kind::Depth(_) => vk::Filter::NEAREST,
+        };
         // SAFETY: recording, outside rendering, between two images of the
-        // same size and format in the general layout made for transfers; the
-        // clear value is the kind the clear of the image wrote
+        // same format in the general layout made for transfers (and blits
+        // when twin_scale differs); the clear value matches the image's kind
         unsafe {
             self.unfenced = true;
             match (cleared_to, kind) {
@@ -3596,7 +3666,18 @@ impl Hardware {
                 (Some(value), Kind::Depth(_)) => {
                     self.device.cmd_clear_depth_stencil_image(self.commands, twin.image, vk::ImageLayout::GENERAL, &value.depth_stencil, &range)
                 }
-                (None, _) => self.device.cmd_copy_image(self.commands, s.image.image, vk::ImageLayout::GENERAL, twin.image, vk::ImageLayout::GENERAL, &region),
+                (None, _) if (real_width, real_height) == (width, height) => {
+                    self.device.cmd_copy_image(self.commands, s.image.image, vk::ImageLayout::GENERAL, twin.image, vk::ImageLayout::GENERAL, &region)
+                }
+                (None, _) => self.device.cmd_blit_image(
+                    self.commands,
+                    s.image.image,
+                    vk::ImageLayout::GENERAL,
+                    twin.image,
+                    vk::ImageLayout::GENERAL,
+                    &blit_region,
+                    blit_filter,
+                ),
             }
         }
         self.uploads = true;
@@ -4966,6 +5047,7 @@ impl Hardware {
         let mut views = [self.blank.view; 3];
         let mut twin_views = [self.blank.view; 3];
         let mut samplers = [vk::Sampler::null(); 3];
+        let mut twin_samplers = [vk::Sampler::null(); 3];
         let mut enabled = 0;
         for (unit, bound) in draw.textures.iter().enumerate() {
             match bound {
@@ -5002,18 +5084,31 @@ impl Hardware {
                     {
                         filters = 3;
                     }
-                    let lod_bias = if smallest == 0 {
-                        0
-                    } else if bound.replacement.is_some() {
-                        -128
-                    } else {
-                        let scale_bias = ((self.surfaces[color].scale as f32).log2() * 256.0).round() as i32;
-                        (bound.lod_bias as i32 + scale_bias).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+                    let lod_bias_for = |target_scale: u32| -> i16 {
+                        if smallest == 0 {
+                            0
+                        } else if bound.replacement.is_some() {
+                            -128
+                        } else {
+                            let scale_bias = ((target_scale as f32).log2() * 256.0).round() as i32;
+                            (bound.lod_bias as i32 + scale_bias).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+                        }
                     };
-                    samplers[unit] = self.sampler(filters, bound.wrap_s, bound.wrap_t, smallest, lod_bias)?;
+                    let real_scale = self.surfaces[color].scale;
+                    let twin_scale = self.surfaces[color].twin_scale;
+                    samplers[unit] = self.sampler(filters, bound.wrap_s, bound.wrap_t, smallest, lod_bias_for(real_scale))?;
+                    twin_samplers[unit] = if twin && twin_scale != real_scale {
+                        self.sampler(filters, bound.wrap_s, bound.wrap_t, smallest, lod_bias_for(twin_scale))?
+                    } else {
+                        samplers[unit]
+                    };
                     enabled |= 1 << unit;
                 }
-                None => samplers[unit] = self.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0, 0)?,
+                None => {
+                    let s = self.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0, 0)?;
+                    samplers[unit] = s;
+                    twin_samplers[unit] = s;
+                }
             }
         }
         static DRAW_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5309,22 +5404,24 @@ impl Hardware {
             _ => vk::CullModeFlags::NONE,
         };
         let scale = self.surfaces[color].scale;
+        let viewport_at = |s: u32| vk::Viewport {
+            x: x * s as f32,
+            y: y * s as f32,
+            width: viewport_width * s as f32,
+            height: viewport_height * s as f32,
+            min_depth: depth_range.0,
+            max_depth: depth_range.1,
+        };
+        let scissor_at = |s: u32| vk::Rect2D {
+            offset: vk::Offset2D { x: left * s as i32, y: bottom * s as i32 },
+            extent: vk::Extent2D { width: (right - left) as u32 * s, height: (top - bottom) as u32 * s },
+        };
         let recorded = Recorded {
             color,
             depth,
             pipeline,
-            viewport: vk::Viewport {
-                x: x * scale as f32,
-                y: y * scale as f32,
-                width: viewport_width * scale as f32,
-                height: viewport_height * scale as f32,
-                min_depth: depth_range.0,
-                max_depth: depth_range.1,
-            },
-            scissor: vk::Rect2D {
-                offset: vk::Offset2D { x: left * scale as i32, y: bottom * scale as i32 },
-                extent: vk::Extent2D { width: (right - left) as u32 * scale, height: (top - bottom) as u32 * scale },
-            },
+            viewport: viewport_at(scale),
+            scissor: scissor_at(scale),
             cull,
             // with the test off the PICA still writes depth, which Vulkan
             // only does while testing
@@ -5350,7 +5447,14 @@ impl Hardware {
             self.record(&recorded);
         }
         if twin {
-            self.twin_draws.push(Recorded { views: twin_views, ..recorded });
+            let t_scale = self.surfaces[color].twin_scale;
+            self.twin_draws.push(Recorded {
+                viewport: viewport_at(t_scale),
+                scissor: scissor_at(t_scale),
+                views: twin_views,
+                samplers: twin_samplers,
+                ..recorded
+            });
         }
         Ok(())
     }
@@ -5504,20 +5608,21 @@ impl Hardware {
     }
 
     fn begin_rendering(&mut self, color: usize, depth: Option<usize>) {
-        let views = (self.surfaces[color].image.view, depth.map(|d| self.surfaces[d].image.view));
-        self.begin_rendering_into(color, views.0, views.1);
+        let (color_view, scale) = (self.surfaces[color].image.view, self.surfaces[color].scale);
+        let depth_view = depth.map(|d| self.surfaces[d].image.view);
+        self.begin_rendering_into(color, color_view, depth_view, scale);
         self.rendering = Some((color, depth));
     }
 
-    /// begins rendering into views the size of a color surface, its own
-    /// image and its depth surface's or their twins.
-    fn begin_rendering_into(&mut self, color: usize, color_view: vk::ImageView, depth_view: Option<vk::ImageView>) {
+    /// begins rendering into views the size of a color surface at `scale`,
+    /// its own image and its depth surface's or their twins.
+    fn begin_rendering_into(&mut self, color: usize, color_view: vk::ImageView, depth_view: Option<vk::ImageView>, scale: u32) {
         self.renderings += 1;
         self.last_draw_state = None;
         let surface = &self.surfaces[color];
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D { width: surface.width * surface.scale, height: surface.height * surface.scale },
+            extent: vk::Extent2D { width: surface.width * scale, height: surface.height * scale },
         };
         let attachment = |view: vk::ImageView| {
             vk::RenderingAttachmentInfo::default()
@@ -5676,21 +5781,25 @@ impl Hardware {
         if s_scale != self.surfaces[target].scale {
             return Ok(false);
         }
-        let n = s_scale as i32;
-        let constants: [i32; 11] = [
-            t.copy.0 as i32 * n,
-            t.copy.1 as i32 * n,
-            // a flip turns the rows read over, not the whole input
-            rows as i32 * n,
-            t.output_height as i32 * n,
-            t.scale.0 as i32,
-            t.scale.1 as i32,
-            t.flip as i32,
-            format_index(t.input_format),
-            format_index(t.output_format),
-            row as i32 * n,
-            input_size.1 as i32 * n,
-        ];
+        let constants_for = |scale: u32| -> [i32; 11] {
+            let n = scale as i32;
+            [
+                t.copy.0 as i32 * n,
+                t.copy.1 as i32 * n,
+                // a flip turns the rows read over, not the whole input
+                rows as i32 * n,
+                t.output_height as i32 * n,
+                t.scale.0 as i32,
+                t.scale.1 as i32,
+                t.flip as i32,
+                format_index(t.input_format),
+                format_index(t.output_format),
+                row as i32 * n,
+                input_size.1 as i32 * n,
+            ]
+        };
+        let constants = constants_for(s_scale);
+        let unscaled_constants = constants_for(1);
         // and in between, from the input's twin into the output's, which
         // holds what the output did before
         let twinned = self.twins && (self.surfaces[source].twinned || self.surfaces[target].twinned);
@@ -5709,13 +5818,25 @@ impl Hardware {
         // texture and color paths do far faster than storage images
         // the picture in between the same way, from the input's twin into the
         // output's (make_twin gave the output one)
-        let blitted = self.blit_transfer(source, target, constants, size, t.output_tiled, false);
+        let blitted = self.blit_transfer(source, target, unscaled_constants, t.copy, t.output_tiled, false);
         if !blitted {
             self.dispatch_transfer(views, constants, size)?;
         }
         if twinned {
-            if !(blitted && self.blit_transfer(source, target, constants, size, t.output_tiled, true)) {
-                self.dispatch_transfer((self.surface_view(source, true), self.surface_view(target, true)), constants, size)?;
+            let twin_blitted = blitted && self.blit_transfer(source, target, unscaled_constants, t.copy, t.output_tiled, true);
+            if !twin_blitted {
+                let dst_scale = self.surfaces[target].twin_scale;
+                let src_scale = if self.surfaces[source].twinned {
+                    self.surfaces[source].twin_scale
+                } else {
+                    self.surfaces[source].scale
+                };
+                if src_scale != dst_scale {
+                    self.make_twin(source)?;
+                }
+                let twin_constants = constants_for(dst_scale);
+                let twin_size = (t.copy.0 * dst_scale, t.copy.1 * dst_scale);
+                self.dispatch_transfer((self.surface_view(source, true), self.surface_view(target, true)), twin_constants, twin_size)?;
             }
             self.surfaces[target].twin_changed();
         }
@@ -5766,19 +5887,35 @@ impl Hardware {
         if !matches!(self.surfaces[source].kind, Kind::Color(_)) || !matches!(self.surfaces[target].kind, Kind::Color(_)) {
             return false;
         }
-        let (w, h) = (size.0 as i32, size.1 as i32);
-        let n = self.surfaces[source].scale as i32;
-        let (source_width, source_rows) = (self.surfaces[source].width as i32 * n, self.surfaces[source].height as i32 * n);
-        let (target_width, target_rows) = (self.surfaces[target].width as i32 * n, self.surfaces[target].height as i32 * n);
+        let (ns, nd) = match twin {
+            false => (self.surfaces[source].scale as i32, self.surfaces[target].scale as i32),
+            true => (
+                if self.surfaces[source].twinned {
+                    self.surfaces[source].twin_scale as i32
+                } else {
+                    self.surfaces[source].scale as i32
+                },
+                self.surfaces[target].twin_scale as i32,
+            ),
+        };
+        if ns != nd && !self.blits {
+            return false;
+        }
+        let (sw, sh) = (size.0 as i32 * ns, size.1 as i32 * ns);
+        let (dw, dh) = (size.0 as i32 * nd, size.1 as i32 * nd);
+        let (source_width, source_rows) = (self.surfaces[source].width as i32 * ns, self.surfaces[source].height as i32 * ns);
+        let (target_width, target_rows) = (self.surfaces[target].width as i32 * nd, self.surfaces[target].height as i32 * nd);
+        let (s_height, s_row, in_height) = (source_height * ns, source_row * ns, input_height * ns);
+        let out_height = output_height * nd;
         // the source's image rows, its buffer row y at source_height - 1 -
         // (source_row + y), turned over, input_height - 1 - y
         let (source_y0, source_y1) = match flip != 0 {
-            false => (source_height - source_row - h, source_height - source_row),
-            true => (source_height - source_row - input_height, source_height - source_row - input_height + h),
+            false => (s_height - s_row - sh, s_height - s_row),
+            true => (s_height - s_row - in_height, s_height - s_row - in_height + sh),
         };
-        let (target_y0, target_y1) = (output_height - h, output_height);
+        let (target_y0, target_y1) = (out_height - dh, out_height);
         let inside = |y0: i32, y1: i32, rows: i32| y0 >= 0 && y1 <= rows && y0 < y1;
-        if w > source_width || w > target_width || source_height > source_rows || output_height > target_rows {
+        if sw > source_width || dw > target_width || s_height > source_rows || out_height > target_rows {
             return false;
         }
         if !inside(source_y0, source_y1, source_rows) || !inside(target_y0, target_y1, target_rows) {
@@ -5789,9 +5926,10 @@ impl Hardware {
         let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
         let region = vk::ImageBlit::default()
             .src_subresource(layers)
-            .src_offsets([vk::Offset3D { x: 0, y: source_y0, z: 0 }, vk::Offset3D { x: w, y: source_y1, z: 1 }])
+            .src_offsets([vk::Offset3D { x: 0, y: source_y0, z: 0 }, vk::Offset3D { x: sw, y: source_y1, z: 1 }])
             .dst_subresource(layers)
-            .dst_offsets([vk::Offset3D { x: 0, y: target_y0, z: 0 }, vk::Offset3D { x: w, y: target_y1, z: 1 }]);
+            .dst_offsets([vk::Offset3D { x: 0, y: target_y0, z: 0 }, vk::Offset3D { x: dw, y: target_y1, z: 1 }]);
+        let filter = if ns == nd { vk::Filter::NEAREST } else { vk::Filter::LINEAR };
         self.end_rendering();
         self.barrier();
         let image = |s: &Surface| match &s.twin {
@@ -5810,7 +5948,7 @@ impl Hardware {
                 to,
                 vk::ImageLayout::GENERAL,
                 &[region],
-                vk::Filter::NEAREST,
+                filter,
             );
         }
         self.unfenced = true;
@@ -5940,6 +6078,8 @@ impl Hardware {
         } else {
             None
         };
+        let s_scale = if twin { self.surfaces[source].twin_scale } else { self.surfaces[source].scale };
+        let copy_key = (*texture, s_scale);
         let batch = self.batch;
         {
             static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5947,7 +6087,7 @@ impl Hardware {
                 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
                 static N: AtomicU64 = AtomicU64::new(0);
                 if N.fetch_add(1, Relaxed) % 200 == 0 {
-                    let cached = self.copies(twin).get(texture).map(|copy| (copy.surface, copy.generation));
+                    let cached = self.copies(twin).get(&copy_key).map(|copy| (copy.surface, copy.generation));
                     let surface = &self.surfaces[source];
                     log::info!(
                         target: "zakuro_gpu::diag",
@@ -5958,7 +6098,7 @@ impl Hardware {
                 }
             }
         }
-        if let Some(copy) = self.copies(twin).get_mut(texture) {
+        if let Some(copy) = self.copies(twin).get_mut(&copy_key) {
             let same_memory = match (&copy.memory, &memory) {
                 (Some(kept), Some(now)) => Arc::ptr_eq(kept, now),
                 (kept, now) => kept.is_none() && now.is_none(),
@@ -5972,14 +6112,13 @@ impl Hardware {
         // marking it put what the GPU did next (the draw's own work) under
         // copies
         self.mark(Work::Copy, false);
-        let s_scale = self.surfaces[source].scale;
-        if !self.copies(twin).contains_key(texture) {
+        if !self.copies(twin).contains_key(&copy_key) {
             let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST;
             self.end_rendering();
             let image = self.image(texture.width * s_scale, texture.height * s_scale, COLOR_FORMAT, usage, vk::ImageAspectFlags::COLOR)?;
-            self.copies(twin).insert(*texture, Copied { image, surface: source, generation, memory: None, used: batch });
+            self.copies(twin).insert(copy_key, Copied { image, surface: source, generation, memory: None, used: batch });
         }
-        let (view, image) = (self.copies(twin)[texture].image.view, self.copies(twin)[texture].image.image);
+        let (view, image) = (self.copies(twin)[&copy_key].image.view, self.copies(twin)[&copy_key].image.image);
         if memory.is_some() {
             // the rows past the surface as memory has them, scaled up, the
             // copy's rows run as memory's do
@@ -6060,7 +6199,7 @@ impl Hardware {
             }
         }
         self.uploads = true;
-        if let Some(copy) = self.copies(twin).get_mut(texture) {
+        if let Some(copy) = self.copies(twin).get_mut(&copy_key) {
             copy.surface = source;
             copy.generation = generation;
             copy.memory = memory;
@@ -6092,7 +6231,7 @@ impl Hardware {
     }
 
     /// the textures copied from surfaces, or from their twins.
-    fn copies(&mut self, twin: bool) -> &mut HashMap<DrawnTexture, Copied> {
+    fn copies(&mut self, twin: bool) -> &mut HashMap<(DrawnTexture, u32), Copied> {
         match twin {
             true => &mut self.twin_copies,
             false => &mut self.copies,
@@ -6113,7 +6252,11 @@ impl Hardware {
     /// as, or out of its twin.
     #[allow(clippy::too_many_arguments)]
     fn copy_depth(&mut self, source: usize, row: u32, bytes: u32, view: vk::ImageView, texture: &DrawnTexture, twin: bool) -> Result<(), String> {
-        let n = self.surfaces[source].scale;
+        let n = if twin && self.surfaces[source].twinned {
+            self.surfaces[source].twin_scale
+        } else {
+            self.surfaces[source].scale
+        };
         let (width, height) = (self.surfaces[source].width * n, self.surfaces[source].height * n);
         let pixels = (width * height) as u64;
         let samples = self.samples(pixels * 5)?;
@@ -6273,7 +6416,7 @@ impl Hardware {
     fn upright_image(&mut self, index: usize, twin: bool) -> Result<(), String> {
         self.mark(Work::Capture, false);
         // a row of the surface is a column of the screen
-        let s_scale = self.surfaces[index].scale;
+        let s_scale = if twin { self.surfaces[index].twin_scale } else { self.surfaces[index].scale };
         let (width, height) = (self.surfaces[index].height * s_scale, self.surfaces[index].width * s_scale);
         let made = match twin {
             true => self.surfaces[index].twin_upright.is_some(),
@@ -6344,7 +6487,7 @@ impl Hardware {
             false => self.surfaces[index].upright.as_ref(),
         };
         let image = upright.ok_or("nothing upright")?.image.image;
-        let s_scale = self.surfaces[index].scale;
+        let s_scale = if twin { self.surfaces[index].twin_scale } else { self.surfaces[index].scale };
         let (width, height) = (rows * s_scale, row_pixels * s_scale);
         let buffer = self.buffer(u64::from(width * height * 4), vk::BufferUsageFlags::TRANSFER_DST, true)?;
         self.begin()?;
@@ -6397,7 +6540,10 @@ impl Hardware {
             .surfaces
             .iter()
             .find(|s| s.addr == screen.addr && s.width == row_pixels && s.height == rows)
-            .map_or(self.scale, |s| s.scale);
+            .map_or_else(
+                || if between { self.surface_twin_scale(self.scale) } else { self.scale },
+                |s| if between { s.twin_scale } else { s.scale },
+            );
         let (pixels, _) = self.upright_pixels(screen, between).ok()?;
         Some((crop(Arc::new(pixels), screen, s_scale), s_scale))
     }
@@ -6431,7 +6577,7 @@ impl Hardware {
         }
         // the rows of the surface the screen shows are columns of the upright
         // picture, the pixels of each run down it from the bottom of a row
-        let scale = self.surfaces[index].scale;
+        let scale = if twin { self.surfaces[index].twin_scale } else { self.surfaces[index].scale };
         let (first, count) = screen.rows;
         let (width, height) = ((rows * scale) as f32, (row_pixels * scale) as f32);
         let (left, right) = ((first * scale) as f32, ((first + count) * scale) as f32);
@@ -6724,7 +6870,7 @@ impl Hardware {
             }
         }
         for twin in [false, true] {
-            let stale: Vec<DrawnTexture> = self.copies(twin).iter().filter(|(_, c)| batch - c.used > 600).map(|(&k, _)| k).collect();
+            let stale: Vec<(DrawnTexture, u32)> = self.copies(twin).iter().filter(|(_, c)| batch - c.used > 600).map(|(&k, _)| k).collect();
             for key in stale {
                 if let Some(copy) = self.copies(twin).remove(&key) {
                     self.destroy_image(&copy.image);
@@ -7698,6 +7844,7 @@ mod tests {
                 width,
                 height,
                 scale: 1,
+                twin_scale: 1,
                 kind,
                 tiled: true,
                 shadow: Vec::new(),

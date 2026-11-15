@@ -34,7 +34,11 @@ pub struct Library {
 /// a slot of Library::found, an address and the code found for it.
 type Found = Cell<(u32, Option<Code>)>;
 
-/// slots of Library::found, a power of two.
+/// slots of Library::found, a power of two. Kept at 128 KiB (8192 * 16 B) on
+/// Horizon so indirect-call lookups stay warm inside Tegra X1's 2 MiB L2.
+#[cfg(target_os = "horizon")]
+const FOUND: usize = 8192;
+#[cfg(not(target_os = "horizon"))]
 const FOUND: usize = 65536;
 
 /// the slot of Library::found an address goes in, the top bits of the
@@ -43,6 +47,51 @@ const FOUND: usize = 65536;
 /// one of them.
 fn slot(address: u32) -> usize {
     (address.wrapping_mul(0x9E37_79B1) >> (32 - FOUND.trailing_zeros())) as usize
+}
+
+/// Syncs AArch64 hardware FPCR control bits [25:22] (DN, FZ, RMode) with the
+/// guest's FPSCR while recompiled ARMv6 VFP code runs, restoring the host
+/// thread's FPCR on exit.
+#[cfg(target_arch = "aarch64")]
+struct FpcrGuard {
+    saved: u64,
+    current: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl FpcrGuard {
+    const MASK: u64 = 0x03C0_0000;
+
+    #[inline(always)]
+    fn new(guest_fpscr: u32) -> Self {
+        let saved: u64;
+        // SAFETY: FPCR is an unprivileged EL0 floating-point control register on AArch64.
+        unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) saved, options(nomem, nostack, preserves_flags)) };
+        let mut guard = Self { saved, current: saved };
+        guard.sync(guest_fpscr);
+        guard
+    }
+
+    #[inline(always)]
+    fn sync(&mut self, guest_fpscr: u32) {
+        let wanted = (self.current & !Self::MASK) | ((guest_fpscr as u64) & Self::MASK);
+        if wanted != self.current {
+            // SAFETY: Only standard IEEE/ARMv6-compatible DN, FZ, and RMode bits [25:22] change.
+            unsafe { core::arch::asm!("msr fpcr, {}", in(reg) wanted, options(nomem, nostack, preserves_flags)) };
+            self.current = wanted;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Drop for FpcrGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.current != self.saved {
+            // SAFETY: Restores the exact FPCR value read on entry.
+            unsafe { core::arch::asm!("msr fpcr, {}", in(reg) self.saved, options(nomem, nostack, preserves_flags)) };
+        }
+    }
 }
 
 /// why a run of recompiled code ended.
@@ -269,6 +318,8 @@ impl Library {
         ctx.vfp = machine.cpu.vfp.regs.as_mut_ptr();
         ctx.fpscr = &mut machine.cpu.vfp.fpscr;
         ctx.user = &mut machine as *mut Machine as *mut c_void;
+        #[cfg(target_arch = "aarch64")]
+        let mut fpcr = FpcrGuard::new(unsafe { *ctx.fpscr });
 
         let stop = loop {
             if ctx.budget <= 0 {
@@ -279,6 +330,8 @@ impl Library {
             };
             ctx.exit = 0;
             ctx.depth = 0;
+            #[cfg(target_arch = "aarch64")]
+            fpcr.sync(unsafe { *ctx.fpscr });
             // SAFETY: the code came from the library and ctx is set up the
             // way it expects, with user pointing at machine
             unsafe { code(&mut ctx) };

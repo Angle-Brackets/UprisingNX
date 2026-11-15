@@ -10,6 +10,37 @@
 //! thirtieth of a second moves things.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+#[derive(Default)]
+pub(crate) struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517C_C1B7_2722_0A95);
+    }
+    #[inline(always)]
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+    #[inline(always)]
+    fn write_u16(&mut self, i: u16) {
+        self.write_u64(i as u64);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
 use crate::registers::*;
 use crate::shader::{ShaderUnit, Vec4, FLOAT_UNIFORMS};
@@ -93,9 +124,9 @@ fn nearest(drawn: &Drawn, place: usize, now: &Uniforms, placing: u128) -> Option
 #[derive(Default)]
 pub(crate) struct Interpolation {
     /// the uniforms of the frame before's draws, by what they drew.
-    before: HashMap<u64, Drawn>,
+    before: FastMap<u64, Drawn>,
     /// this frame's so far.
-    now: HashMap<u64, Drawn>,
+    now: FastMap<u64, Drawn>,
     /// uniforms in between given back, for the next ones rather than
     /// allocating.
     spare: Option<Box<Uniforms>>,
@@ -105,7 +136,7 @@ pub(crate) struct Interpolation {
     /// it may read for the coordinates too second. only those move in
     /// between, a texture's offset into a sheet of sprites or a flag are as
     /// the frame's.
-    placing: HashMap<(u64, u32, u16, u16), (u128, u128)>,
+    placing: FastMap<(u64, u32, u16, u16), (u128, u128)>,
     /// this frame's counts, see Matches.
     draws: u32,
     matched: u32,
@@ -146,11 +177,11 @@ impl Interpolation {
     pub(crate) fn draw(&mut self, registers: &[u32], vertex: &ShaderUnit, geometry: Option<&ShaderUnit>, between: bool) -> Option<Box<Uniforms>> {
         self.draws += 1;
         let key = key(registers, vertex, geometry);
-        let drawn = self.now.entry(key).or_default();
-        drawn.uniforms.push(*vertex.float_uniforms);
-        drawn.moves.push([[0.0; 4]; FLOAT_UNIFORMS]);
-        drawn.restless.push(0);
-        let place = drawn.uniforms.len() - 1;
+        let now_drawn = self.now.entry(key).or_default();
+        now_drawn.uniforms.push(*vertex.float_uniforms);
+        now_drawn.moves.push([[0.0; 4]; FLOAT_UNIFORMS]);
+        now_drawn.restless.push(0);
+        let place = now_drawn.uniforms.len() - 1;
         if !between {
             return None;
         }
@@ -164,11 +195,10 @@ impl Interpolation {
             .entry((vertex.fingerprint(), vertex.entry_point, outputs, coordinates))
             .or_insert_with(|| vertex.uniforms_feeding(outputs, coordinates));
         let drawn = self.before.get_mut(&key)?;
-        let now = self.now.get_mut(&key)?;
-        let found = nearest(drawn, place, &now.uniforms[place], placing | shared)?;
+        let found = nearest(drawn, place, &now_drawn.uniforms[place], placing | shared)?;
         drawn.taken[found] = true;
         let (before, moved_before, restless) = (&drawn.uniforms[found], &drawn.moves[found], drawn.restless[found]);
-        let (now, moved_now, still_restless) = (&now.uniforms[place], &mut now.moves[place], &mut now.restless[place]);
+        let (now, moved_now, still_restless) = (&now_drawn.uniforms[place], &mut now_drawn.moves[place], &mut now_drawn.restless[place]);
         *still_restless = restless.saturating_sub(1);
         // only the uniforms placing the vertices can move, the rest are as
         // the frame has them, so only those are looked at (a few of the 96)

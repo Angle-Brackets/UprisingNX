@@ -147,6 +147,10 @@ struct Pacing {
     /// the refresh the top screen got its last new picture at, and that
     /// picture.
     new_at: u64,
+    /// refreshes between the previous two pictures, so a single [3, 1] slip of
+    /// a 30 fps title does not turn twins off for the normal gap == 2 frame
+    /// right after it.
+    last_gap: u64,
     last: Option<zakuro_gpu::ScreenRef>,
     /// how the draws of the frame before it matched the frame before that.
     matches: Option<zakuro_gpu::Matches>,
@@ -820,11 +824,14 @@ impl System {
         self.queue_gx(Gx::EndFrame, None);
 
         // pick up any buffer swap the game queued directly in GSP shared
-        // memory before the LCDs latch whatever is currently configured.
-        services::gsp::refresh(self);
+        // memory before the LCDs latch whatever is currently configured, close
+        // out interpolation pacing for the refreshed frame, and only then let
+        // any command ring held for the next refresh run.
+        services::gsp::refresh_framebuffers(self);
         if self.gpu.interpolating() {
             self.pace();
         }
+        services::gsp::release_held(self);
 
         // both LCDs finish scanning out, in that order.
         services::gsp::signal_interrupt(self, services::gsp::InterruptId::Pdc0);
@@ -854,6 +861,7 @@ impl System {
             return;
         }
         let gap = pacing.refreshes - pacing.new_at;
+        let prev_gap = std::mem::replace(&mut pacing.last_gap, gap);
         pacing.new_at = pacing.refreshes;
         pacing.last = top;
         let matches = self.gpu.frame_done();
@@ -862,8 +870,10 @@ impl System {
         pacing.between = gap == 2 && matches.is_some_and(|matches| matches.smooth());
         pacing.shown += pacing.between as u64;
         // the next frame is drawn in between too while the title keeps to
-        // every other refresh
-        self.gpu.set_twins(gap == 2);
+        // every other refresh, or right after a single [3, 1] catch-up so the
+        // normal gap == 2 frame after it is not left without twins.
+        let keep_twins = gap == 2 || (gap == 1 && prev_gap == 3);
+        self.gpu.set_twins(keep_twins);
     }
 
     /// draws a picture in between each two of the title's own from now on,
