@@ -302,6 +302,8 @@ pub struct Unx {
     /// a benchmark under way, see Bench
     bench: Option<Bench>,
     in_play: bool,
+    /// the presenter's current screen arrangement
+    layout: ScreenLayout,
     /// whether the presenter and resolution are currently in docked mode
     docked: bool,
     /// the hardware's last reported docked state from appletGetOperationMode
@@ -329,6 +331,10 @@ pub struct Unx {
     menu: menu::Menu,
     aim: aim::Aim,
     gyro_test: ([f32; 3], u32),
+    /// Fiend's Cauldron live slider cursor X (0..320), floating badge opacity, and hold frames
+    cauldron_cursor_x: f32,
+    cauldron_opacity: f32,
+    cauldron_hold: u8,
 }
 
 /// when the bottom screen is shown. Nothing guesses it from what the game
@@ -345,26 +351,35 @@ struct Bottom {
     shown: bool,
     /// the game has said it is in play once
     played: bool,
+    /// while on Fuse Weapons, R-Stick click toggles between FuseSplitDeck and LargeTop
+    fuse_override: bool,
     /// last frame's host buttons, for presses
     host: u32,
 }
 
 impl Bottom {
     fn new() -> Bottom {
-        Bottom { shown: false, ..Bottom::default() }
+        Bottom { shown: true, ..Bottom::default() }
     }
 
     /// this frame's host input and what the overrides said; whether the bottom
     /// screen is shown now.
-    fn update(&mut self, host: u32, said: u32) -> bool {
+    fn update(&mut self, host: u32, said: u32, on_fuse: bool) -> bool {
         let host_pressed = host & !self.host;
         self.host = host;
+        if !on_fuse {
+            self.fuse_override = false;
+        }
         if said != 0 && !self.played {
             self.played = true;
             self.shown = false;
         }
         if host_pressed & HOST_BOTTOM != 0 {
-            self.shown = !self.shown;
+            if on_fuse {
+                self.fuse_override = !self.fuse_override;
+            } else {
+                self.shown = !self.shown;
+            }
         }
         self.shown
     }
@@ -767,6 +782,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         .and_then(|v| v.parse::<u32>().ok());
     let settings = settings::Settings::load();
     settings.export_controls();
+    zakuro_gpu::set_power_label_mode(settings.power_label_mode());
     MINUS_MENU.store(settings.minus_opens_menu(), std::sync::atomic::Ordering::Relaxed);
     let video = settings.mode(docked).video(docked);
     // the game starts out of battle
@@ -867,7 +883,8 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         res_out_of_play: u32::MAX,
         bottom: Bottom::new(),
         bench: None,
-        in_play: true,
+        in_play: false,
+        layout: ScreenLayout::TopOnly,
         docked,
         hw_docked: docked,
         dock_override: None,
@@ -892,6 +909,9 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         menu: menu::Menu::new(),
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
+        cauldron_cursor_x: 0.0,
+        cauldron_opacity: 0.48,
+        cauldron_hold: 0,
     }))
 }
 
@@ -906,15 +926,19 @@ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<za
 }
 
 /// where a touch on the 1280x720 screen lands on the 3DS bottom screen's 320x240,
-/// if it does. in play the bottom screen is not shown, and the touch aims the
-/// reticle over a 4:3 area in the middle of the screen; in a menu it is the
-/// small bottom screen of the layout, and only a touch there counts.
-fn touch_on_bottom(in_play: bool, x: u16, y: u16) -> Option<(u16, u16)> {
+/// if it does. in TopOnly the bottom screen is not shown, and the touch aims the
+/// reticle over a 4:3 area in the middle of the screen; otherwise it maps 1:1 to
+/// the layout's bottom viewport (R3 matrix in FuseSplitDeck, corner in LargeTop).
+fn touch_on_bottom(layout: ScreenLayout, x: u16, y: u16) -> Option<(u16, u16)> {
+    if layout == ScreenLayout::FiendsCauldron && x <= 140 && y >= 595 {
+        // Relocated bottom-left 16:9 Back button maps to native (16, 221) on 320x240.
+        return Some((16, 221));
+    }
     let (x, y) = (x as f32, y as f32);
-    let (left, top, width, height) = if in_play {
+    let (left, top, width, height) = if layout == ScreenLayout::TopOnly {
         (160.0, 0.0, 960.0, 720.0)
     } else {
-        let bottom = zakuro_gpu::layout(1280, 720, ScreenLayout::LargeTop, zakuro_gpu::backend::TOP_WIDTH, false).1?;
+        let bottom = zakuro_gpu::layout(1280, 720, layout, zakuro_gpu::backend::TOP_WIDTH, false).1?;
         (bottom.x, bottom.y, bottom.width, bottom.height)
     };
     let (u, v) = ((x - left) / width, (y - top) / height);
@@ -935,8 +959,8 @@ fn present_screens(unx: &mut Unx, overlay: &Overlay) {
     let top = shown(&mut unx.system, Screen::Top);
     let blank = std::sync::Arc::new(Vec::new());
     let ((top_px, tw, th), top_gpu) = top;
-    // the bottom screen is only drawn out of play
-    let ((bottom_px, bw, bh), bottom_gpu) = if unx.in_play {
+    // the bottom screen is only fetched when the active layout places it
+    let ((bottom_px, bw, bh), bottom_gpu) = if unx.layout == ScreenLayout::TopOnly {
         (((blank.clone()), 0, 0), None)
     } else {
         shown(&mut unx.system, Screen::Bottom)
@@ -989,6 +1013,7 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
         }
         Some(menu::Changed::Controls) => {
             unx.settings.export_controls();
+            zakuro_gpu::set_power_label_mode(unx.settings.power_label_mode());
             MINUS_MENU.store(unx.settings.minus_opens_menu(), std::sync::atomic::Ordering::Relaxed);
             unx.aim.reload();
             unx.settings_changed("menu");
@@ -1046,7 +1071,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             circle_y: input.circle_y,
             c_stick_x: input.c_stick_x,
             c_stick_y: input.c_stick_y,
-            touch: game_touch.then(|| touch_on_bottom(unx.in_play, input.touch_x, input.touch_y)).flatten(),
+            touch: game_touch.then(|| touch_on_bottom(unx.layout, input.touch_x, input.touch_y)).flatten(),
             tilt: [0.0, 0.0],
         };
         if unx.bench.as_ref().is_some_and(|bench| bench.fire) {
@@ -1086,7 +1111,16 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     };
     let res_battle = unx.res_out_of_play <= 90;
     let host = input.as_ref().map_or(0, |input| input.host);
-    let in_play = !unx.bottom.update(host, said);
+    let on_special_pre = (unx.system.gpu.flags().on_fuse.load(std::sync::atomic::Ordering::Relaxed)
+        || unx.system.gpu.flags().on_cauldron.load(std::sync::atomic::Ordering::Relaxed))
+        && !in_battle;
+    let bottom_shown = unx.bottom.update(host, said, on_special_pre);
+    unx.system
+        .gpu
+        .flags()
+        .menu_override
+        .store(unx.bottom.fuse_override, std::sync::atomic::Ordering::Relaxed);
+    let in_play = !bottom_shown && !on_special_pre;
     let host_pressed = host & !unx.host_last;
     unx.host_last = host;
     unx.controller_scale(host_pressed);
@@ -1100,7 +1134,6 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     if in_play != unx.in_play {
         log::info!("unx: bottom screen {} at frame {} (said {said}, quiet for {})", if in_play { "hidden" } else { "shown" }, unx.frame, unx.out_of_play);
         unx.in_play = in_play;
-        unx.presenter.set_layout(if in_play { ScreenLayout::TopOnly } else { ScreenLayout::LargeTop });
     }
 
     let hw_docked = if input.is_null() {
@@ -1289,6 +1322,77 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 let _ = std::fs::write(format!("sdmc:/switch/uprisingnx/{name}.ppm"), out);
             }
         }
+    }
+
+    if unx.system.gpu.flags().on_title.load(std::sync::atomic::Ordering::Relaxed) && !in_battle {
+        unx.title_quiet = 0;
+    }
+    let on_title_active = unx.title_quiet <= 15 && !in_battle;
+    let on_fuse_post = unx.system.gpu.flags().on_fuse.load(std::sync::atomic::Ordering::Relaxed)
+        && !in_battle
+        && !on_title_active;
+    let on_cauldron_post = unx.system.gpu.flags().on_cauldron.load(std::sync::atomic::Ordering::Relaxed)
+        && !in_battle
+        && !on_title_active
+        && !on_fuse_post;
+    let bottom_blank = unx.system.gpu.flags().bottom_blank.load(std::sync::atomic::Ordering::Relaxed);
+    let desired_layout = if on_fuse_post {
+        if unx.bottom.fuse_override {
+            ScreenLayout::LargeTop
+        } else {
+            ScreenLayout::FuseSplitDeck
+        }
+    } else if on_cauldron_post {
+        if unx.bottom.fuse_override {
+            ScreenLayout::LargeTop
+        } else {
+            ScreenLayout::FiendsCauldron
+        }
+    } else if !bottom_shown || on_title_active || bottom_blank {
+        ScreenLayout::TopOnly
+    } else {
+        ScreenLayout::LargeTop
+    };
+    if on_cauldron_post {
+        let raw_bits = unx.system.gpu.flags().cauldron_cursor_x.load(std::sync::atomic::Ordering::Relaxed);
+        let cx = if raw_bits != 0 { f32::from_bits(raw_bits) } else { 237.4 };
+        let touching_slider = input
+            .as_ref()
+            .is_some_and(|inp| inp.touching != 0 && !unx.menu.open && inp.touch_y < 320 && inp.touch_x >= 165 && inp.touch_x <= 1125);
+        if unx.cauldron_cursor_x > 0.0 && (cx - unx.cauldron_cursor_x).abs() > 0.04 {
+            unx.cauldron_hold = 30;
+        } else if touching_slider {
+            unx.cauldron_hold = 30;
+        }
+        unx.cauldron_cursor_x = cx;
+        if touching_slider || unx.cauldron_hold > 0 {
+            if !touching_slider {
+                unx.cauldron_hold = unx.cauldron_hold.saturating_sub(1);
+            }
+            unx.cauldron_opacity = (unx.cauldron_opacity + 0.16).min(1.0);
+        } else {
+            unx.cauldron_opacity = (unx.cauldron_opacity - 0.035).max(0.48);
+        }
+        let hud_visible = unx.system.gpu.flags().cauldron_hud.load(std::sync::atomic::Ordering::Relaxed);
+        let room_rgb = unx.system.gpu.flags().cauldron_room_rgb.load(std::sync::atomic::Ordering::Relaxed);
+        let hud_flags = (hud_visible as u32) | (room_rgb << 8);
+        unx.presenter
+            .set_cauldron_state(cx.clamp(16.0, 304.0), unx.cauldron_opacity, hud_flags);
+    } else {
+        unx.cauldron_cursor_x = 0.0;
+        unx.cauldron_opacity = 0.48;
+        unx.cauldron_hold = 0;
+    }
+    if desired_layout != unx.layout {
+        log::info!(
+            "unx: layout {:?} -> {:?} at frame {} (said {said}, quiet {}, on_fuse {on_fuse_post}, on_cauldron {on_cauldron_post}, blank {bottom_blank})",
+            unx.layout,
+            desired_layout,
+            unx.frame,
+            unx.out_of_play,
+        );
+        unx.layout = desired_layout;
+        unx.presenter.set_layout(desired_layout);
     }
 
     let overlay = unx.menu_overlay();

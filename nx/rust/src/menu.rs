@@ -170,6 +170,7 @@ enum Row {
     BattleScale,
     MenuScale,
     Smooth,
+    PowerLabel,
     RightStick,
     Gyro,
     GyroSpeed,
@@ -182,12 +183,13 @@ enum Row {
     Quit,
 }
 
-const ROWS: [Row; 15] = [
+const ROWS: [Row; 16] = [
     Row::Editing,
     Row::Preset,
     Row::BattleScale,
     Row::MenuScale,
     Row::Smooth,
+    Row::PowerLabel,
     Row::RightStick,
     Row::Gyro,
     Row::GyroSpeed,
@@ -201,6 +203,7 @@ const ROWS: [Row; 15] = [
 ];
 
 const MODIFIERS: [&str; 7] = ["ZL", "ZR", "L", "R", "X", "Y", "A"];
+const POWER_LABELS: [&str; 3] = ["bottom", "bar", "off"];
 
 impl Row {
     fn label(self) -> &'static str {
@@ -210,6 +213,7 @@ impl Row {
             Row::BattleScale => "Battle resolution",
             Row::MenuScale => "Menu resolution",
             Row::Smooth => "Smooth mode (60 fps)",
+            Row::PowerLabel => "Power label",
             Row::RightStick => "Right stick aim",
             Row::Gyro => "Gyro aim",
             Row::GyroSpeed => "Gyro speed",
@@ -236,6 +240,7 @@ impl Row {
             Row::BattleScale => "How sharp battles are drawn, in multiples of the 3DS screen. Higher looks better but can drop below 30 fps or turn smooth mode off. Changing it makes the preset Custom.",
             Row::MenuScale => "How sharp everything outside battles is drawn: menus, the hub and cutscenes. Changing it makes the preset Custom.",
             Row::Smooth => "Draws a picture between each two of the game's for 60 fps. It turns itself off for a while when the GPU can't keep up. Changing it makes the preset Custom.",
+            Row::PowerLabel => "Where the selected power's name appears on foot. Bottom: centered at the bottom in crisp white text. Above bar: in a bubble over the power icons. Off: icons only.",
             Row::RightStick => "Aims the reticle in the air and turns the camera on foot with the right stick, in place of the touch screen.",
             Row::Gyro => "Fine aiming by tilting the console or controller.",
             Row::GyroSpeed => "How far the reticle moves for a tilt. The game's own Controls options scale it further.",
@@ -308,6 +313,14 @@ fn on(settings: &Settings, key: &str) -> bool {
 fn modifier_index(settings: &Settings) -> usize {
     let name = control(settings, "aim_modifier").trim().to_ascii_uppercase();
     MODIFIERS.iter().position(|m| *m == name).unwrap_or(0)
+}
+
+fn power_label_index(settings: &Settings) -> usize {
+    match settings.power_label_mode() {
+        zakuro_gpu::PowerLabelMode::Bottom => 0,
+        zakuro_gpu::PowerLabelMode::AboveBar => 1,
+        zakuro_gpu::PowerLabelMode::Off => 2,
+    }
 }
 
 fn left_stick(settings: &Settings) -> u32 {
@@ -431,6 +444,11 @@ impl Menu {
                 let video = mode.customize(docked);
                 video.smooth = !video.smooth;
                 Changed::Video
+            }
+            Row::PowerLabel => {
+                let index = (power_label_index(settings) as i32 + delta).rem_euclid(POWER_LABELS.len() as i32) as usize;
+                set_control(settings, "power_label", POWER_LABELS[index].into());
+                Changed::Controls
             }
             Row::RightStick | Row::Gyro | Row::InvertY => {
                 let key = match row {
@@ -561,6 +579,11 @@ impl Menu {
                 Row::BattleScale => scale(video.battle_scale),
                 Row::MenuScale => scale(video.menu_scale),
                 Row::Smooth => flag(video.smooth),
+                Row::PowerLabel => match settings.power_label_mode() {
+                    zakuro_gpu::PowerLabelMode::Bottom => "Bottom".into(),
+                    zakuro_gpu::PowerLabelMode::AboveBar => "Above bar".into(),
+                    zakuro_gpu::PowerLabelMode::Off => "Off".into(),
+                },
                 Row::RightStick => flag(on(settings, "right_stick_aim")),
                 Row::Gyro => flag(on(settings, "gyro_aim")),
                 Row::GyroSpeed => format!("{:.2}", speed(settings, "gyro_speed")),

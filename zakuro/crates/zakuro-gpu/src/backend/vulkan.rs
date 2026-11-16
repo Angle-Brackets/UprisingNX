@@ -8,19 +8,21 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use super::vulkan_overlay::OverlayPainter;
-use super::{place, GpuScreen, Overlay, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Shown, Stereo, StereoMode, Viewport};
+use super::{fuse_backdrops, place_slices, GpuScreen, Overlay, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Shown, Stereo, StereoMode, Viewport};
 use crate::raster::hardware::{can_render, render_device};
 use crate::SharedDevice;
 
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/present.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
 const STEREO_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_stereo.frag.spv");
+const CAULDRON_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_cauldron.frag.spv");
 
 /// the bytes of push constants the fragment shader reads: where the screen
 /// lies in its image, the bounds its samples keep in and the filter, and
 /// for 3D how the eyes show and the right eye's place in its image.
 const CONSTANTS: u32 = 36;
 const STEREO_CONSTANTS: u32 = 80;
+const CAULDRON_CONSTANTS: u32 = 80;
 
 /// how many frames may be recorded before waiting on the oldest.
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -107,6 +109,11 @@ pub struct VulkanPresenter {
     stereo_pipeline_layout: vk::PipelineLayout,
     stereo_pipeline: vk::Pipeline,
     stereo_sets: Vec<vk::DescriptorSet>,
+    cauldron_layout: vk::DescriptorSetLayout,
+    cauldron_pipeline_layout: vk::PipelineLayout,
+    cauldron_pipeline: vk::Pipeline,
+    cauldron_sets: Vec<vk::DescriptorSet>,
+    cauldron_state: (f32, f32, u32),
     sampler: vk::Sampler,
     /// a set per frame in flight and screen, pointed at the renderer's
     /// images when screens are drawn straight from them.
@@ -264,6 +271,9 @@ impl VulkanPresenter {
         let stereo_layout = create_descriptor_layout(&device, 2)?;
         let (stereo_pipeline_layout, stereo_pipeline) =
             create_pipeline(&device, render_pass, stereo_layout, STEREO_FRAGMENT_SPIRV, STEREO_CONSTANTS)?;
+        let cauldron_layout = create_cauldron_descriptor_layout(&device)?;
+        let (cauldron_pipeline_layout, cauldron_pipeline) =
+            create_pipeline(&device, render_pass, cauldron_layout, CAULDRON_FRAGMENT_SPIRV, CAULDRON_CONSTANTS)?;
         let srgb = matches!(surface_format.format, vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB);
         let overlay = OverlayPainter::new(&device, render_pass, FRAMES_IN_FLIGHT, srgb)?;
 
@@ -286,11 +296,19 @@ impl VulkanPresenter {
             // a screen whose size changes is made again before the old one
             // goes and gives its set back, so there is room for both, then
             // the sets for the renderer's images and the 3D sets, which hold
-            // two pictures each
-            let sets = 6 + 4 * FRAMES_IN_FLIGHT as u32;
-            let sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(6 + 5 * FRAMES_IN_FLIGHT as u32)];
+            // two pictures each, plus Fiend's Cauldron's 2-image + 1-sampler sets
+            let sets = 6 + 5 * FRAMES_IN_FLIGHT as u32;
+            let sizes = [
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(6 + 5 * FRAMES_IN_FLIGHT as u32),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(2 * FRAMES_IN_FLIGHT as u32),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(FRAMES_IN_FLIGHT as u32),
+            ];
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
@@ -322,6 +340,15 @@ impl VulkanPresenter {
             )
         }
         .map_err(vk_fail("allocating descriptor sets"))?;
+        let cauldron_sets = unsafe {
+            let layouts = [cauldron_layout; FRAMES_IN_FLIGHT];
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .map_err(vk_fail("allocating cauldron descriptor sets"))?;
 
         let command_pool = unsafe {
             device.create_command_pool(
@@ -428,6 +455,11 @@ impl VulkanPresenter {
             stereo_pipeline_layout,
             stereo_pipeline,
             stereo_sets,
+            cauldron_layout,
+            cauldron_pipeline_layout,
+            cauldron_pipeline,
+            cauldron_sets,
+            cauldron_state: (237.4, 0.48, 1),
             sampler,
             gpu_sets,
             shared: ManuallyDrop::into_inner(shared),
@@ -706,6 +738,40 @@ impl VulkanPresenter {
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 
+    /// points the frame's Fiend's Cauldron set at `top` (`0`), `bottom` (`1`),
+    /// and `self.sampler` (`2`).
+    fn write_cauldron_set(&self, sources: &[Source; 3]) -> bool {
+        let view = |index: usize| match sources[index] {
+            Source::Gpu(gpu) => Some((gpu.view, vk::ImageLayout::GENERAL)),
+            Source::Own => Some((self.screens[index].view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)),
+            Source::Nothing => None,
+        };
+        let (Some(top), Some(bot)) = (view(0), view(1)) else { return false };
+        let top_info = [vk::DescriptorImageInfo::default().image_view(top.0).image_layout(top.1)];
+        let bot_info = [vk::DescriptorImageInfo::default().image_view(bot.0).image_layout(bot.1)];
+        let samp_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+        let set = self.cauldron_sets[self.frame];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&top_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&bot_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&samp_info),
+        ];
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+        true
+    }
+
     /// keeps the overlay's changes for the next frame drawn.
     fn defer(&mut self, overlay: &Overlay) {
         if let Some(painter) = &mut self.overlay {
@@ -813,43 +879,138 @@ impl VulkanPresenter {
                     .clear_values(&clear),
                 vk::SubpassContents::INLINE,
             );
-            // each screen's set and place in its image
-            let crop = |index: usize| match sources[index] {
+            if self.arrangement == ScreenLayout::FuseSplitDeck {
+                let srgb = matches!(self.surface_format.format, vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB);
+                let to_clear = |c: f32| {
+                    if !srgb {
+                        c
+                    } else if c <= 0.04045 {
+                        c / 12.92
+                    } else {
+                        ((c + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                for (vp, [r, g, b, a]) in fuse_backdrops(self.extent.width, self.extent.height, self.integer) {
+                    let x0 = vp.x.max(0.0) as u32;
+                    let y0 = vp.y.max(0.0) as u32;
+                    let x1 = (vp.x + vp.width).max(0.0).min(self.extent.width as f32) as u32;
+                    let y1 = (vp.y + vp.height).max(0.0).min(self.extent.height as f32) as u32;
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
+                    }
+                    let att = [vk::ClearAttachment {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        color_attachment: 0,
+                        clear_value: vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [to_clear(r), to_clear(g), to_clear(b), a],
+                            },
+                        },
+                    }];
+                    let rect = [vk::ClearRect {
+                        rect: vk::Rect2D {
+                            offset: vk::Offset2D { x: x0 as i32, y: y0 as i32 },
+                            extent: vk::Extent2D { width: x1 - x0, height: y1 - y0 },
+                        },
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }];
+                    device.cmd_clear_attachments(command_buffer, &att, &rect);
+                }
+            }
+            // each screen's set and place (or sub-crop) in its image
+            let crop = |index: usize, uv: [f32; 4]| match sources[index] {
                 Source::Nothing => None,
-                Source::Own => Some((self.screens[index].descriptor, WHOLE)),
-                Source::Gpu(gpu) => {
+                Source::Own if uv == [0.0, 0.0, 1.0, 1.0] => Some((self.screens[index].descriptor, WHOLE)),
+                Source::Own => {
+                    let [sx, sy, sw, sh] = uv;
+                    let half_u = 0.5 / self.screens[index].width.max(1) as f32;
+                    let half_v = 0.5 / self.screens[index].height.max(1) as f32;
+                    Some((
+                        self.screens[index].descriptor,
+                        [sx, sy, sw, sh, sx + half_u, sy + half_v, sx + sw - half_u, sy + sh - half_v],
+                    ))
+                }
+                Source::Gpu(gpu) if uv == [0.0, 0.0, 1.0, 1.0] => {
                     let [x, y, width, height] = gpu.area;
                     let [left, top, right, bottom] = gpu.bounds;
                     Some((self.gpu_sets[self.frame][index], [x, y, width, height, left, top, right, bottom]))
                 }
+                Source::Gpu(gpu) => {
+                    let [x, y, w, h] = gpu.area;
+                    let [sx, sy, sw, sh] = uv;
+                    let half_u = gpu.bounds[0] - x;
+                    let half_v = gpu.bounds[1] - y;
+                    let (ax, ay, aw, ah) = (x + sx * w, y + sy * h, sw * w, sh * h);
+                    Some((
+                        self.gpu_sets[self.frame][index],
+                        [ax, ay, aw, ah, ax + half_u, ay + half_v, ax + aw - half_u, ay + ah - half_v],
+                    ))
+                }
             };
-            let places = place(self.extent.width, self.extent.height, self.arrangement, self.top_width, self.integer, self.stereo, right);
-            for (viewport, shown) in places {
-                let index = match shown {
-                    Shown::Top | Shown::Both => 0,
-                    Shown::Bottom => 1,
-                    Shown::Right => 2,
-                };
-                let Some((descriptor, area)) = crop(index) else { continue };
-                let mut constants: Vec<u8> = area.iter().flat_map(|c| c.to_le_bytes()).collect();
-                constants.extend_from_slice(&self.filter.mode().to_le_bytes());
-                let (pipeline, layout, set) = if shown == Shown::Both {
-                    // then how the eyes show, and the right eye's place
-                    let Some((_, right)) = crop(2) else { continue };
-                    let stereo = if self.stereo.mode == StereoMode::Anaglyph { 1i32 } else { 2 };
-                    for word in [stereo, self.stereo.swap as i32, 0] {
-                        constants.extend_from_slice(&word.to_le_bytes());
-                    }
-                    constants.extend(right.iter().flat_map(|c| c.to_le_bytes()));
-                    (self.stereo_pipeline, self.stereo_pipeline_layout, self.stereo_sets[self.frame])
-                } else {
-                    (self.pipeline, self.pipeline_layout, descriptor)
-                };
-                set_viewport(device, command_buffer, viewport, self.extent);
-                device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
-                device.cmd_push_constants(command_buffer, layout, vk::ShaderStageFlags::FRAGMENT, 0, &constants);
-                device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            if self.arrangement == ScreenLayout::FiendsCauldron {
+                if let (Some((_, top_area)), Some((_, bot_area)), ( Some(stage_vp), _ )) = (
+                    crop(0, [0.0, 0.0, 1.0, 1.0]),
+                    crop(1, [0.0, 0.0, 1.0, 1.0]),
+                    super::layout(self.extent.width, self.extent.height, ScreenLayout::FiendsCauldron, self.top_width, self.integer),
+                ) {
+                    let (cursor_x, opacity, hud_flags) = self.cauldron_state;
+                    let mut constants = Vec::with_capacity(CAULDRON_CONSTANTS as usize);
+                    constants.extend(top_area.iter().flat_map(|c| c.to_le_bytes()));
+                    constants.extend(bot_area.iter().flat_map(|c| c.to_le_bytes()));
+                    constants.extend_from_slice(&cursor_x.to_le_bytes());
+                    constants.extend_from_slice(&opacity.to_le_bytes());
+                    constants.extend_from_slice(&hud_flags.to_le_bytes());
+                    constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                    set_viewport(device, command_buffer, stage_vp, self.extent);
+                    device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.cauldron_pipeline);
+                    device.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.cauldron_pipeline_layout,
+                        0,
+                        &[self.cauldron_sets[self.frame]],
+                        &[],
+                    );
+                    device.cmd_push_constants(
+                        command_buffer,
+                        self.cauldron_pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        &constants,
+                    );
+                    device.cmd_draw(command_buffer, 3, 1, 0, 0);
+                }
+            } else {
+                let places = place_slices(self.extent.width, self.extent.height, self.arrangement, self.top_width, self.integer, self.stereo, right);
+                for slice in places {
+                    let (viewport, shown, uv) = (slice.viewport, slice.shown, slice.uv);
+                    let index = match shown {
+                        Shown::Top | Shown::Both => 0,
+                        Shown::Bottom => 1,
+                        Shown::Right => 2,
+                    };
+                    let Some((descriptor, area)) = crop(index, uv) else { continue };
+                    let mut constants: Vec<u8> = area.iter().flat_map(|c| c.to_le_bytes()).collect();
+                    constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                    let (pipeline, layout, set) = if shown == Shown::Both {
+                        // then how the eyes show, and the right eye's place
+                        let Some((_, right)) = crop(2, uv) else { continue };
+                        let stereo = if self.stereo.mode == StereoMode::Anaglyph { 1i32 } else { 2 };
+                        for word in [stereo, self.stereo.swap as i32, 0] {
+                            constants.extend_from_slice(&word.to_le_bytes());
+                        }
+                        constants.extend(right.iter().flat_map(|c| c.to_le_bytes()));
+                        (self.stereo_pipeline, self.stereo_pipeline_layout, self.stereo_sets[self.frame])
+                    } else {
+                        (self.pipeline, self.pipeline_layout, descriptor)
+                    };
+                    set_viewport(device, command_buffer, viewport, self.extent);
+                    device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
+                    device.cmd_push_constants(command_buffer, layout, vk::ShaderStageFlags::FRAGMENT, 0, &constants);
+                    device.cmd_draw(command_buffer, 3, 1, 0, 0);
+                }
             }
 
             painter.draw(device, command_buffer, self.frame, overlay, self.extent);
@@ -938,6 +1099,9 @@ impl Presenter for VulkanPresenter {
         let sources = [self.source(0, &top)?, self.source(1, &bottom)?, self.source(2, &right)?];
         if has_right && matches!(self.stereo.mode, StereoMode::Anaglyph | StereoMode::Interlaced) {
             self.write_stereo_set(&sources);
+        }
+        if self.arrangement == ScreenLayout::FiendsCauldron {
+            self.write_cauldron_set(&sources);
         }
 
         let command_buffer = self.command_buffers[frame];
@@ -1030,6 +1194,10 @@ impl Presenter for VulkanPresenter {
     fn set_stereo(&mut self, stereo: Stereo) {
         self.stereo = stereo;
     }
+
+    fn set_cauldron_state(&mut self, cursor_x: f32, opacity: f32, hud_flags: u32) {
+        self.cauldron_state = (cursor_x, opacity, hud_flags);
+    }
 }
 
 impl Drop for VulkanPresenter {
@@ -1062,6 +1230,9 @@ impl Drop for VulkanPresenter {
             self.device.destroy_pipeline(self.stereo_pipeline, None);
             self.device.destroy_pipeline_layout(self.stereo_pipeline_layout, None);
             self.device.destroy_descriptor_set_layout(self.stereo_layout, None);
+            self.device.destroy_pipeline(self.cauldron_pipeline, None);
+            self.device.destroy_pipeline_layout(self.cauldron_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(self.cauldron_layout, None);
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
@@ -1214,6 +1385,35 @@ fn create_descriptor_layout(
         )
     }
     .map_err(vk_fail("creating the descriptor set layout"))
+}
+
+fn create_cauldron_descriptor_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout, PresentError> {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+    ];
+    unsafe {
+        device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+            None,
+        )
+    }
+    .map_err(vk_fail("creating the cauldron descriptor set layout"))
 }
 
 fn create_pipeline(
@@ -1610,5 +1810,41 @@ impl Screen {
             device.free_memory(self.staging_memory, None);
         }
         let _ = self.staging_size;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cauldron_shader_compiles_to_valid_spirv() {
+        use naga::back::spv;
+        use naga::front::glsl;
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let src_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/present_cauldron.frag");
+        let spv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/present_cauldron.frag.spv");
+        let source = std::fs::read_to_string(&src_path).expect("read present_cauldron.frag");
+        let module = glsl::Frontend::default()
+            .parse(&glsl::Options::from(naga::ShaderStage::Fragment), &source)
+            .unwrap_or_else(|e| panic!("GLSL parse failed:\n{}", e.emit_to_string(&source)));
+        let info = Validator::new(ValidationFlags::all(), Capabilities::IMMEDIATES)
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("Naga validation failed:\n{}", e.emit_to_string(&source)));
+        let options = spv::Options {
+            lang_version: (1, 0),
+            flags: spv::WriterFlags::empty(),
+            force_loop_bounding: false,
+            ..spv::Options::default()
+        };
+        let pipeline = spv::PipelineOptions {
+            shader_stage: naga::ShaderStage::Fragment,
+            entry_point: "main".into(),
+        };
+        let words = spv::write_vec(&module, &info, &options, Some(&pipeline)).expect("emit SPIR-V");
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(words[0], 0x0723_0203);
+        if std::fs::read(&spv_path).ok().as_deref() != Some(bytes.as_slice()) {
+            std::fs::write(&spv_path, &bytes).expect("write present_cauldron.frag.spv");
+        }
     }
 }

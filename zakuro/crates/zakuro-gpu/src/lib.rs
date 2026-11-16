@@ -38,6 +38,7 @@ pub use interpolation::Matches;
 use registers::*;
 pub use backend::{layout, place, GpuScreen, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Shown, Stereo, StereoMode, Viewport};
 pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
+pub use raster::{power_label_mode, set_power_label_mode, PowerLabelMode};
 #[cfg(feature = "vulkan")]
 pub use device::SharedDevice;
 
@@ -160,6 +161,13 @@ pub struct Flags {
     pub in_battle: std::sync::atomic::AtomicBool,
     pub big_portrait: std::sync::atomic::AtomicBool,
     pub on_title: std::sync::atomic::AtomicBool,
+    pub on_fuse: std::sync::atomic::AtomicBool,
+    pub on_cauldron: std::sync::atomic::AtomicBool,
+    pub cauldron_hud: std::sync::atomic::AtomicBool,
+    pub cauldron_cursor_x: std::sync::atomic::AtomicU32,
+    pub cauldron_room_rgb: std::sync::atomic::AtomicU32,
+    pub menu_override: std::sync::atomic::AtomicBool,
+    pub bottom_blank: std::sync::atomic::AtomicBool,
 }
 
 pub struct Gpu {
@@ -455,7 +463,11 @@ impl Gpu {
         }
         let bottom = [self.framebuffers[1].address_a_left, self.framebuffers[1].address_b_left].contains(&output_paddr)
             || (linear_screen_out && out_size == (240, 320));
-        if self.resources.portraits.in_play && bottom {
+        if self.resources.portraits.in_play
+            && !self.resources.portraits.fuse_active
+            && !self.resources.portraits.cauldron_active
+            && bottom
+        {
             return;
         }
 
@@ -800,6 +812,7 @@ impl Gpu {
         use std::sync::atomic::Ordering::Relaxed;
         self.resources.portraits.in_play = self.flags.in_play.load(Relaxed);
         self.resources.portraits.in_battle = self.flags.in_battle.load(Relaxed);
+        self.resources.portraits.menu_override = self.flags.menu_override.load(Relaxed);
     }
 
     /// hands what the GPU noted for the frontend over, after a command.
@@ -810,6 +823,32 @@ impl Gpu {
         if std::mem::take(&mut self.resources.portraits.title_seen) {
             self.flags.on_title.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.flags
+            .on_fuse
+            .store(self.resources.portraits.fuse_active, std::sync::atomic::Ordering::Relaxed);
+        self.flags
+            .on_cauldron
+            .store(self.resources.portraits.cauldron_active, std::sync::atomic::Ordering::Relaxed);
+        self.flags
+            .cauldron_hud
+            .store(self.resources.portraits.cauldron_hud_active, std::sync::atomic::Ordering::Relaxed);
+        if self.resources.portraits.cauldron_cursor_x > 0.0 {
+            self.flags.cauldron_cursor_x.store(
+                self.resources.portraits.cauldron_cursor_x.to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let [rr, rg, rb] = self.resources.portraits.cauldron_room_rgb;
+        let packed_rgb = ((rr.clamp(0.0, 1.0) * 255.0).round() as u32)
+            | (((rg.clamp(0.0, 1.0) * 255.0).round() as u32) << 8)
+            | (((rb.clamp(0.0, 1.0) * 255.0).round() as u32) << 16);
+        self.flags
+            .cauldron_room_rgb
+            .store(packed_rgb, std::sync::atomic::Ordering::Relaxed);
+        self.flags.bottom_blank.store(
+            self.resources.portraits.bottom_blank || self.resources.portraits.fuse_reveal,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// whether the bottom screen drew a large dialogue portrait since this

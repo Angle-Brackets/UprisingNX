@@ -1492,6 +1492,13 @@ pub(crate) struct Portraits {
     /// the last battle display draws flushed, reused if a subtitle flush
     /// follows an end-of-frame transfer flush before the bottom screen runs.
     last_hud: Vec<PortraitDraw>,
+    /// the selected land-battle power's name when shown centered at the bottom
+    /// of the top screen (`PowerLabelMode::Bottom`), drawn with subtitle shadow.
+    power_label: Vec<PortraitDraw>,
+    last_power_label: Vec<PortraitDraw>,
+    /// vertical bottom-screen bounds (`[low_x, high_x]` in buffer x) of the
+    /// active speech bubble above the power bar on this frame, if drawn.
+    power_bubble_x: Option<[f32; 2]>,
     /// the dialogue box's text the bottom screen drew this frame, for the
     /// top screen when the title draws no subtitles there itself (How to
     /// Play), and the last of it, as with the battle display.
@@ -1531,6 +1538,62 @@ pub(crate) struct Portraits {
     title_alpha: f32,
     /// whether the title screen was seen since the frontend last asked.
     pub(crate) title_seen: bool,
+    /// first 256x16 Etc1 card header texture address seen on the top screen
+    /// this frame (Fuse Weapons draws green A + yellow B).
+    fuse_first_header: u32,
+    /// whether both Fuse Weapons card headers were seen since last flush.
+    fuse_frame_seen: bool,
+    /// whether the 256x128 Etc1A4 result-weapon portrait was seen since last flush.
+    fuse_weapon_seen: bool,
+    /// whether the 64x64 Rgb565 workbench preview element was seen since last flush
+    /// (drawn on valid workbench previews, omitted during the full-screen reveal).
+    fuse_preview_seen: bool,
+    /// consecutive top-screen transfers without Fuse Weapons card headers.
+    fuse_missed: u8,
+    /// whether the game is currently rendering the Fuse Weapons dual-screen UI.
+    pub(crate) fuse_active: bool,
+    /// whether the full-screen weapon fusion reveal overlay is playing.
+    pub(crate) fuse_reveal: bool,
+    /// state machine step (0..=3) matching Fiend's Cauldron's 3-layer mural pass
+    /// (`128x64 Etc1` -> `64x64 La4` -> `256x256 L4`) on the top screen.
+    cauldron_mural_step: u8,
+    /// whether Fiend's Cauldron's top-screen mural was seen since last flush.
+    cauldron_top_seen: bool,
+    /// whether Fiend's Cauldron's bottom-screen slider cursor was drawn since last flush.
+    cauldron_cursor_seen: bool,
+    /// whether Fiend's Cauldron's 3D cauldron pot (`128x128 Etc1`) was drawn on
+    /// the bottom screen since last flush (stays true through the heart-dump launch).
+    cauldron_pot_seen: bool,
+    /// consecutive top-screen transfers without Fiend's Cauldron draws.
+    cauldron_missed: u8,
+    /// whether the game is currently rendering Fiend's Cauldron (prep or heart-dump).
+    pub(crate) cauldron_active: bool,
+    /// whether the interactive Fiend's Cauldron HUD (pouch & intensity card) is active.
+    pub(crate) cauldron_hud_active: bool,
+    /// horizontal clip-space delta parking the top-screen Intensity card at x = 255.
+    cauldron_card_dx: f32,
+    /// live bottom-screen slider cursor center X (`0.0..320.0`).
+    pub(crate) cauldron_cursor_x: f32,
+    /// whether `cauldron_curr_tier` has been seeded on entry to Fiend's Cauldron.
+    cauldron_tier_init: bool,
+    /// previous mural tier (`0..=9`) cross-dissolving out when Intensity changes.
+    cauldron_prev_tier: u8,
+    /// current mural tier (`0..=9`) cross-dissolving in when Intensity changes.
+    cauldron_curr_tier: u8,
+    /// `0.0..=1.0` cross-dissolve progress from `cauldron_prev_tier` to `cauldron_curr_tier`.
+    cauldron_mural_fade: f32,
+    /// left-eye top-screen buffer address used to step `cauldron_mural_fade` once per frame.
+    cauldron_fade_buf: u32,
+    /// smoothly lerped room tint RGB (`[0.0..1.0; 3]`: icy slate-blue `< 2.0` vs crimson `>= 2.0`).
+    pub(crate) cauldron_room_rgb: [f32; 3],
+    /// whether the user toggled `R-Stick` to view raw `LargeTop` instead of custom menu UI.
+    pub(crate) menu_override: bool,
+    /// whether any textured draw targeted the bottom screen since the last flush.
+    bottom_tex_seen: bool,
+    /// consecutive top-screen transfers without any textured bottom-screen draw.
+    bottom_tex_missed: u8,
+    /// whether the bottom screen has no textured UI content (logos, movies, 3D fusion reveal).
+    pub(crate) bottom_blank: bool,
     /// whether the game is in play, a battle, where its bottom screen's
     /// portraits are dialogue; in menus the same kind of picture is not.
     pub(crate) in_play: bool,
@@ -1552,9 +1615,24 @@ pub(crate) struct Portraits {
     /// while the portraits or a shadow are being drawn, which are not the
     /// game's draws to look at.
     adding: bool,
-    /// the lines of text the title last wrote into its text buffer, which
-    /// the subtitles show, see note_text.
+    /// the lines of text the title last wrote into its text buffers, paired
+    /// with each 512x128 buffer's physical address, see note_text.
     text_lines: Vec<TextLine>,
+    text_line_addrs: Vec<u32>,
+}
+
+impl Portraits {
+    fn text_lines_for(&self, tex_addr: u32) -> Vec<TextLine> {
+        if self.text_line_addrs.len() != self.text_lines.len() || tex_addr == 0 {
+            return self.text_lines.clone();
+        }
+        self.text_lines
+            .iter()
+            .zip(&self.text_line_addrs)
+            .filter(|(_, &addr)| addr == 0 || addr == tex_addr)
+            .map(|(&line, _)| line)
+            .collect()
+    }
 }
 
 /// a line of text in the title's 512x128 text buffer, in its pixels, rows
@@ -1594,23 +1672,47 @@ fn note_text(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
             }
         })
     });
-    let lines = &mut resources.portraits.text_lines;
+    let target_addr = loc_register(registers, REG_COLOR_BUFFER_ADDRESS);
+    let Portraits { text_lines: lines, text_line_addrs: addrs, .. } = &mut resources.portraits;
+    if addrs.len() != lines.len() {
+        addrs.resize(lines.len(), 0);
+    }
     for found in boxes {
         if !letters {
-            lines.retain(|line| line.top <= found.bottom || line.bottom >= found.top);
+            let mut i = 0;
+            while i < lines.len() {
+                let same_buf = addrs[i] == 0 || target_addr == 0 || addrs[i] == target_addr;
+                if same_buf && !(lines[i].top <= found.bottom || lines[i].bottom >= found.top) {
+                    lines.remove(i);
+                    addrs.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
             continue;
         }
         let overlap = |line: &TextLine| line.top.min(found.top) - line.bottom.max(found.bottom);
-        match lines.iter_mut().find(|line| overlap(line) * 2.0 >= found.top - found.bottom) {
-            Some(line) => {
+        let existing = lines.iter().enumerate().find_map(|(i, line)| {
+            let same_buf = addrs[i] == 0 || target_addr == 0 || addrs[i] == target_addr;
+            (same_buf && overlap(line) * 2.0 >= found.top - found.bottom).then_some(i)
+        });
+        match existing {
+            Some(i) => {
+                let line = &mut lines[i];
                 *line = TextLine {
                     bottom: line.bottom.min(found.bottom),
                     top: line.top.max(found.top),
                     left: line.left.min(found.left),
                     right: line.right.max(found.right),
+                };
+                if addrs[i] == 0 {
+                    addrs[i] = target_addr;
                 }
             }
-            None => lines.push(found),
+            None => {
+                lines.push(found);
+                addrs.push(target_addr);
+            }
         }
     }
 }
@@ -1755,7 +1857,10 @@ fn skip_bottom_in_play(
     if TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4 {
         return true;
     }
-    vertex_count > 16
+    // HUD batches reach 66 vertices for multi-digit kill/heart counters + corner
+    // cloud, 54 for the 9-slice item pickup card, and 114 for the power tray with
+    // its animated name bubble, while heavy 3D bottom-screen meshes stay skipped.
+    vertex_count > 144
 }
 
 /// whether the GPU is currently drawing the title screen (not a battle).
@@ -1784,8 +1889,604 @@ fn is_title_bottom_sky(registers: &[u32]) -> bool {
         && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
 }
 
+/// Kid Icarus Uprising's Fuse Weapons A/B card header banners on the top
+/// screen (two distinct 256x16 Etc1 textures drawn per frame).
+fn is_fuse_card_header(registers: &[u32]) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    registers[REG_TEXTURE_CONFIG] & 1 != 0
+        && registers[base + 1] == (256 << 16 | 16)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
+}
+
+/// Kid Icarus Uprising's 256x128 Etc1A4 result-weapon portrait on the top screen.
+fn is_fuse_result_weapon(registers: &[u32]) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    registers[REG_TEXTURE_CONFIG] & 1 != 0
+        && registers[base + 1] == (256 << 16 | 128)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1A4
+}
+
+/// Kid Icarus Uprising's 64x64 Rgb565 workbench preview texture, drawn whenever
+/// a result weapon is previewed on the Fuse Weapons workbench and omitted while
+/// the full-screen golden fusion reveal plays.
+fn is_fuse_small_preview(registers: &[u32]) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    registers[REG_TEXTURE_CONFIG] & 1 != 0
+        && registers[base + 1] == (64 << 16 | 64)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Rgb565
+}
+
+/// whether a top-screen draw during Fuse Weapons needs per-vertex inspection to
+/// pack the Result Card (`Ranged / Melee / Value` + alpha-composited weapon
+/// preview) onto a single continuous background strip (`x = 254..400, y = 0..45`).
+fn needs_fuse_top_adjust(registers: &[u32]) -> bool {
+    if registers[REG_TEXTURE_CONFIG] & 1 == 0 {
+        return false;
+    }
+    let base = TEXTURE_UNIT_BASES[0];
+    let dims = registers[base + 1];
+    let fmt = TextureFormat::from_raw(registers[base + 13]);
+    (dims == (256 << 16 | 128) && matches!(fmt, TextureFormat::Etc1A4 | TextureFormat::La4))
+        || (dims == (256 << 16 | 256) && fmt == TextureFormat::A4)
+        || (dims == (64 << 16 | 64)
+            && matches!(fmt, TextureFormat::L8 | TextureFormat::Etc1 | TextureFormat::Rgb565))
+}
+
+/// packs the Fuse Weapons result stats (`Ranged / Melee / Value` + up to 6
+/// stars) on the left and the alpha-masked result weapon + drop shadow + live
+/// radial glow/sparkles on the right of `Screen::Top`'s continuous upper-right
+/// filigree strip (`y = 0..45`), while omitting the 3DS battery icon so the
+/// Result Card background is completely seamless.
+fn adjust_fuse_top(registers: &[u32], mut shaded: Vec<Vertex>) -> Option<Vec<Vertex>> {
+    let base = TEXTURE_UNIT_BASES[0];
+    let dims = registers[base + 1];
+    let fmt = TextureFormat::from_raw(registers[base + 13]);
+
+    let to_top_xy = |v: &Vertex| -> [f32; 2] {
+        let w = v.clip[3];
+        let bx = (v.clip[0] / w * 0.5 + 0.5) * 240.0;
+        let by = (v.clip[1] / w * 0.5 + 0.5) * 400.0;
+        [400.0 - by, 240.0 - bx]
+    };
+    let set_top_xy = |v: &mut Vertex, nx: f32, ny: f32| {
+        let w = v.clip[3];
+        v.clip[0] = ((240.0 - ny) / 120.0 - 1.0) * w;
+        v.clip[1] = ((400.0 - nx) / 200.0 - 1.0) * w;
+    };
+
+    // 1. Relocate the 256x128 Etc1A4 result weapon & its drop shadow cleanly
+    //    into the right half of the y = 0..52 strip at 1:1 square pixels.
+    if dims == (256 << 16 | 128) && fmt == TextureFormat::Etc1A4 {
+        for v in &mut shaded {
+            let [sx, sy] = to_top_xy(v);
+            let nx = 369.0 + (sx - 323.0) * 0.42;
+            let ny = 26.0 + (sy - 123.5) * 0.42;
+            set_top_xy(v, nx, ny);
+        }
+        return Some(shaded);
+    }
+
+    // 2. Scale only the glyph/star triangles belonging to Ranged / Melee / Value
+    //    (x >= 252, y <= 56) so up to 6 stars fit cleanly beside the weapon at
+    //    matching card font size, leaving Card A/B and banner text untouched.
+    if dims == (256 << 16 | 256)
+        && fmt == TextureFormat::A4
+        && (registers[REG_PRIMITIVE_CONFIG] >> 8 & 3) == 0
+    {
+        for tri in shaded.chunks_exact_mut(3) {
+            let pts = [to_top_xy(&tri[0]), to_top_xy(&tri[1]), to_top_xy(&tri[2])];
+            if pts.iter().all(|&[x, y]| x >= 252.0 && y <= 56.0) {
+                for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
+                    let nx = 255.5 + (sx - 255.5) * 0.62;
+                    let ny = 12.0 + (sy - 5.0) * 0.62;
+                    set_top_xy(v, nx, ny);
+                }
+            }
+        }
+        return Some(shaded);
+    }
+
+    // Compute screen bounding box for the remaining small sprite checks.
+    let (mut left, mut upper, mut right, mut lower) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for v in &shaded {
+        let [sx, sy] = to_top_xy(v);
+        left = left.min(sx);
+        upper = upper.min(sy);
+        right = right.max(sx);
+        lower = lower.max(sy);
+    }
+
+    // 3. Omit the 3DS battery icon in the top-right corner ([382..400, 0..13]).
+    if dims == (256 << 16 | 128)
+        && fmt == TextureFormat::La4
+        && shaded.len() == 6
+        && left >= 378.0
+        && right <= 402.0
+        && upper >= -2.0
+        && lower <= 16.0
+    {
+        return None;
+    }
+
+    // 4. Relocate the radial sunburst aura (64x64 L8) and twinkling sparkle
+    //    particles (64x64 Etc1 / Rgb565) with the exact same transform as the
+    //    weapon so they blend radially onto the single continuous background
+    //    with zero box seam.
+    if dims == (64 << 16 | 64) {
+        let relocate = match fmt {
+            TextureFormat::L8 => left >= 165.0,
+            TextureFormat::Etc1 | TextureFormat::Rgb565 => left >= 200.0,
+            _ => false,
+        };
+        if relocate {
+            for v in &mut shaded {
+                let [sx, sy] = to_top_xy(v);
+                let nx = 369.0 + (sx - 323.0) * 0.42;
+                let ny = 26.0 + (sy - 123.5) * 0.42;
+                set_top_xy(v, nx, ny);
+            }
+            return Some(shaded);
+        }
+    }
+
+    Some(shaded)
+}
+
+/// whether a draw is Fiend's Cauldron's 10-panel parchment paper strip (`128x64 Etc1`, 300 vertices).
+fn is_cauldron_mural_paper(registers: &[u32], vertex_count: usize) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    registers[REG_TEXTURE_CONFIG] & 1 != 0
+        && vertex_count == 300
+        && registers[base + 1] == (128 << 16 | 64)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
+}
+
+/// whether a top-screen draw during Fiend's Cauldron needs per-vertex inspection
+/// to separate the full un-occluded Parchment Mural (`y = 25..161`, crossfaded
+/// smoothly across tier swaps) from the parked `Total Hearts` pouch (`x = 16..108,
+/// y = 165..237`) and `[Intensity X.X]` card (`x = 186..324, y = 166..240`).
+fn needs_cauldron_top_adjust(registers: &[u32]) -> bool {
+    registers[REG_TEXTURE_CONFIG] & 1 != 0
+}
+
+fn rasterize_cauldron_faded<M: GpuMemory>(
+    registers: &[u32],
+    memory: &mut M,
+    resources: &mut Resources,
+    mut vertices: Vec<Vertex>,
+    alpha: f32,
+) -> Option<u32> {
+    let alpha = alpha.clamp(0.0, 1.0);
+    if alpha <= 0.004 {
+        return Some(0);
+    }
+    if alpha >= 0.996 {
+        resources.portraits.adding = true;
+        let res = rasterize(registers, memory, resources, Vertices::Shaded(&vertices));
+        resources.portraits.adding = false;
+        return res;
+    }
+    let mut regs = registers.to_vec();
+    let alpha_u8 = ((alpha * 255.0).round() as u32).min(255);
+    if regs[REG_COLOR_OPERATION] & 0x100 == 0 {
+        regs[REG_COLOR_OPERATION] = (regs[REG_COLOR_OPERATION] & !0xFF) | 0x00E4_0100;
+        regs[REG_BLEND_FUNC] = 0x01DC_0000;
+        regs[REG_BLEND_COLOR] = alpha_u8 << 24;
+    } else {
+        let stage5 = TEV_STAGES[5];
+        if (regs[stage5] & 0xF) == 0xF
+            && ((regs[stage5] >> 16) & 0xF) == 0xF
+            && (regs[stage5 + 1] & 0xF_00FF) == 0
+            && regs[stage5 + 2] == 0
+        {
+            regs[stage5..stage5 + 5].copy_from_slice(&[
+                0x00EF_000F,
+                0,
+                0x0001_0000,
+                alpha_u8 << 24,
+                0,
+            ]);
+        } else {
+            for v in &mut vertices {
+                v.color[3] *= alpha;
+            }
+        }
+    }
+    resources.portraits.adding = true;
+    let res = rasterize(&regs, memory, resources, Vertices::Shaded(&vertices));
+    resources.portraits.adding = false;
+    res
+}
+
+fn draw_cauldron_top<M: GpuMemory>(
+    registers: &[u32],
+    memory: &mut M,
+    resources: &mut Resources,
+    mut shaded: Vec<Vertex>,
+) -> Option<u32> {
+    const MURAL_PITCH: f32 = 356.6287;
+    let base = TEXTURE_UNIT_BASES[0];
+    let dims = registers[base + 1];
+    let fmt = TextureFormat::from_raw(registers[base + 13]);
+
+    let to_top_xy = |v: &Vertex| -> [f32; 2] {
+        let w = v.clip[3];
+        let bx = (v.clip[0] / w * 0.5 + 0.5) * 240.0;
+        let by = (v.clip[1] / w * 0.5 + 0.5) * 400.0;
+        [400.0 - by, 240.0 - bx]
+    };
+    let set_top_xy = |v: &mut Vertex, nx: f32, ny: f32| {
+        let w = v.clip[3];
+        v.clip[0] = ((240.0 - ny) / 120.0 - 1.0) * w;
+        v.clip[1] = ((400.0 - nx) / 200.0 - 1.0) * w;
+    };
+    let map_mural_y = |sy: f32| -> f32 { 25.0 + (sy - 44.0) * (136.0 / 155.0) };
+
+    let (mut left, mut upper, mut right, mut lower) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for v in &shaded {
+        let [sx, sy] = to_top_xy(v);
+        left = left.min(sx);
+        upper = upper.min(sy);
+        right = right.max(sx);
+        lower = lower.max(sy);
+    }
+
+    // 1. Omit off-screen helper quads and the 3DS battery icon ([382..400, 0..13]).
+    if upper > 250.0 {
+        return Some(0);
+    }
+    if dims == (256 << 16 | 128)
+        && fmt == TextureFormat::La4
+        && shaded.len() == 6
+        && left >= 378.0
+        && right <= 402.0
+        && upper >= -2.0
+        && lower <= 16.0
+    {
+        return Some(0);
+    }
+
+    // 2. Mural Layer 1: 128x64 Etc1 parchment paper (`v == 300`, all 10 panels).
+    //    Closes the top-center pouch U-notch (`x = 148..252, y = 44..98`) and
+    //    smoothly cross-dissolves `prev_tier -> curr_tier` when Intensity swaps!
+    if dims == (128 << 16 | 64) && fmt == TextureFormat::Etc1 && shaded.len() == 300 {
+        let target = ((21.02 - left) / MURAL_PITCH).round().clamp(0.0, 9.0) as u8;
+        let buf_addr = registers[REG_COLOR_BUFFER_ADDRESS];
+        let p = &mut resources.portraits;
+        if !p.cauldron_tier_init {
+            p.cauldron_tier_init = true;
+            p.cauldron_curr_tier = target;
+            p.cauldron_prev_tier = target;
+            p.cauldron_mural_fade = 1.0;
+            p.cauldron_fade_buf = buf_addr;
+            p.cauldron_room_rgb = if target < 2 { [0.08, 0.09, 0.15] } else { [0.14, 0.03, 0.00] };
+        } else if p.cauldron_fade_buf == 0 || p.cauldron_fade_buf == buf_addr {
+            p.cauldron_fade_buf = buf_addr;
+            if target != p.cauldron_curr_tier {
+                if p.cauldron_mural_fade >= 0.30 {
+                    p.cauldron_prev_tier = p.cauldron_curr_tier;
+                }
+                p.cauldron_curr_tier = target;
+                p.cauldron_mural_fade = 0.06;
+            } else if p.cauldron_mural_fade < 1.0 {
+                p.cauldron_mural_fade = (p.cauldron_mural_fade + 0.055).min(1.0);
+            }
+        }
+        let (prev, curr, fade) = (p.cauldron_prev_tier, p.cauldron_curr_tier, p.cauldron_mural_fade);
+        let s_fade = fade * fade * (3.0 - 2.0 * fade);
+
+        let build_paper = |mut verts: Vec<Vertex>, dx: f32| -> Vec<Vertex> {
+            for v in &mut verts {
+                let [mut sx, mut sy] = to_top_xy(v);
+                sx += dx;
+                if (136.0..=264.0).contains(&sx) && (75.0..=118.0).contains(&sy) {
+                    sy = 43.8;
+                }
+                set_top_xy(v, sx, map_mural_y(sy));
+            }
+            verts
+        };
+
+        if s_fade < 0.996 && prev != curr {
+            let prev_dx = (curr as i32 - prev as i32) as f32 * MURAL_PITCH;
+            let prev_verts = build_paper(shaded.clone(), prev_dx);
+            let _ = rasterize_cauldron_faded(registers, memory, resources, prev_verts, 1.0);
+            let curr_verts = build_paper(shaded, 0.0);
+            return rasterize_cauldron_faded(registers, memory, resources, curr_verts, s_fade);
+        }
+        let curr_verts = build_paper(shaded, 0.0);
+        return rasterize_cauldron_faded(registers, memory, resources, curr_verts, 1.0);
+    }
+
+    // 3. Mural Layer 2: 64x64 La4 ornate border (`v == 960`), dropping the center
+    //    U-bracket quads and bridging the top border bar seamlessly across x = 148..252.
+    if dims == (64 << 16 | 64) && fmt == TextureFormat::La4 && shaded.len() >= 480 {
+        let (prev, curr, fade) = (
+            resources.portraits.cauldron_prev_tier,
+            resources.portraits.cauldron_curr_tier,
+            resources.portraits.cauldron_mural_fade,
+        );
+        let s_fade = fade * fade * (3.0 - 2.0 * fade);
+
+        let build_border = |verts: &[Vertex], dx: f32| -> Vec<Vertex> {
+            let mut out = Vec::with_capacity(verts.len());
+            for quad in verts.chunks_exact(6) {
+                let mut q_pts = [[0.0f32; 2]; 6];
+                let (mut ql, mut qu, mut qr, mut qd) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                for (i, v) in quad.iter().enumerate() {
+                    let [sx, sy] = to_top_xy(v);
+                    let sx = sx + dx;
+                    q_pts[i] = [sx, sy];
+                    ql = ql.min(sx);
+                    qu = qu.min(sy);
+                    qr = qr.max(sx);
+                    qd = qd.max(sy);
+                }
+                if ql >= 15.0 && qr <= 385.0 {
+                    // Omit the U-bracket framing the old center Pouch
+                    if ql >= 136.0 && qr <= 264.0 && qd > 56.0 && qu < 118.0 {
+                        continue;
+                    }
+                    // Stretch left & right top horizontal border bars to meet at x = 200
+                    if qu >= 33.0 && qd <= 58.0 {
+                        if (qr - 148.0).abs() < 18.0 {
+                            for pt in &mut q_pts {
+                                if pt[0] > qr - 3.0 {
+                                    pt[0] = 200.5;
+                                }
+                            }
+                        } else if (ql - 252.0).abs() < 18.0 {
+                            for pt in &mut q_pts {
+                                if pt[0] < ql + 3.0 {
+                                    pt[0] = 199.5;
+                                }
+                            }
+                        }
+                    }
+                }
+                for (v, [sx, sy]) in quad.iter().copied().zip(q_pts) {
+                    let mut nv = v;
+                    set_top_xy(&mut nv, sx, map_mural_y(sy));
+                    out.push(nv);
+                }
+            }
+            out
+        };
+
+        if s_fade < 0.996 && prev != curr {
+            let prev_dx = (curr as i32 - prev as i32) as f32 * MURAL_PITCH;
+            let prev_verts = build_border(&shaded, prev_dx);
+            let _ = rasterize_cauldron_faded(registers, memory, resources, prev_verts, 1.0 - s_fade);
+            let curr_verts = build_border(&shaded, 0.0);
+            return rasterize_cauldron_faded(registers, memory, resources, curr_verts, s_fade);
+        }
+        let curr_verts = build_border(&shaded, 0.0);
+        return rasterize_cauldron_faded(registers, memory, resources, curr_verts, 1.0);
+    }
+
+    // 4. Mural Layer 3: 256x256 L4 Reapers, Treasure Chests, Hearts & Winged Pit (`v == 2166`).
+    if dims == (256 << 16 | 256) && fmt == TextureFormat::L4 && shaded.len() >= 600 {
+        let (prev, curr, fade) = (
+            resources.portraits.cauldron_prev_tier,
+            resources.portraits.cauldron_curr_tier,
+            resources.portraits.cauldron_mural_fade,
+        );
+        let s_fade = fade * fade * (3.0 - 2.0 * fade);
+
+        let build_ink = |mut verts: Vec<Vertex>, dx: f32| -> Vec<Vertex> {
+            for v in &mut verts {
+                let [sx, sy] = to_top_xy(v);
+                set_top_xy(v, sx + dx, map_mural_y(sy));
+            }
+            verts
+        };
+
+        if s_fade < 0.996 && prev != curr {
+            let prev_dx = (curr as i32 - prev as i32) as f32 * MURAL_PITCH;
+            let prev_verts = build_ink(shaded.clone(), prev_dx);
+            let _ = rasterize_cauldron_faded(registers, memory, resources, prev_verts, 1.0 - s_fade);
+            let curr_verts = build_ink(shaded, 0.0);
+            return rasterize_cauldron_faded(registers, memory, resources, curr_verts, s_fade);
+        }
+        let curr_verts = build_ink(shaded, 0.0);
+        return rasterize_cauldron_faded(registers, memory, resources, curr_verts, 1.0);
+    }
+
+    // 5. Outer room wall (`v == 120`, `upper < 0`) & bottom vignette (`v == 120`, `upper > 40`):
+    //    on the outer wall pass (right after the 3 mural draws and right BEFORE the Pouch,
+    //    Intensity card, and Top Header draw!), record smoothly-lerped `cauldron_room_rgb`
+    //    and wipe `y = 0..25` & `y = 161..240` to `#000000` so overhanging Reaper scythes
+    //    never bleed behind the parked Header, Pouch, or Intensity card.
+    if dims == (256 << 16 | 256) && fmt == TextureFormat::L4 && shaded.len() == 120 {
+        if upper < 0.0 {
+            if let Some(&v0) = shaded.first() {
+                let buf_addr = registers[REG_COLOR_BUFFER_ADDRESS];
+                if resources.portraits.cauldron_fade_buf == 0 || resources.portraits.cauldron_fade_buf == buf_addr {
+                    for c in 0..3 {
+                        resources.portraits.cauldron_room_rgb[c] +=
+                            (v0.color[c] - resources.portraits.cauldron_room_rgb[c]) * 0.11;
+                    }
+                }
+                let mut regs = registers.to_vec();
+                regs[REG_FACE_CULLING] = 0;
+                regs[REG_ALPHA_TEST] &= !1;
+                regs[REG_DEPTH_COLOR_MASK] = (regs[REG_DEPTH_COLOR_MASK] & !0xFF) | 0x0F00;
+                regs[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
+                regs[REG_COLOR_OPERATION] = (regs[REG_COLOR_OPERATION] & !0xFF) | 0x00E4_0100;
+                regs[REG_BLEND_FUNC] = 0x0101_0000;
+                for (stage, &tbase) in TEV_STAGES.iter().enumerate() {
+                    let src = if stage == 0 { 0xE | (0xE << 16) } else { 0xF | (0xF << 16) };
+                    regs[tbase..tbase + 5].copy_from_slice(&[src, 0, 0, 0xFF00_0000, 0]);
+                }
+                let mk = |nx: f32, ny: f32| {
+                    let mut v = v0;
+                    v.color = [0.0, 0.0, 0.0, 1.0];
+                    set_top_xy(&mut v, nx, ny);
+                    v
+                };
+                let wipe = [
+                    mk(-4.0, -2.0), mk(404.0, -2.0), mk(404.0, 25.0),
+                    mk(-4.0, -2.0), mk(404.0, 25.0), mk(-4.0, 25.0),
+                    mk(-4.0, 161.0), mk(404.0, 161.0), mk(404.0, 242.0),
+                    mk(-4.0, 161.0), mk(404.0, 242.0), mk(-4.0, 242.0),
+                ];
+                resources.portraits.adding = true;
+                let res = rasterize(&regs, memory, resources, Vertices::Shaded(&wipe));
+                resources.portraits.adding = false;
+                return res;
+            }
+        }
+        return Some(0);
+    }
+
+    // 6. Park all 6 draws of the `[Intensity X.X]` card (`168 <= upper <= 242`) at
+    //    `x_center = 255.0` (`[186.4..323.6, 165.9..239.5]`) below the mural.
+    if (168.0..=242.0).contains(&upper) && lower <= 252.0 && !(left < -20.0 && right > 420.0) {
+        if dims == (64 << 16 | 64) && fmt == TextureFormat::La4 && upper < 185.0 {
+            resources.portraits.cauldron_card_dx = 255.0 - (left + right) * 0.5;
+        }
+        let dx = resources.portraits.cauldron_card_dx;
+        for v in &mut shaded {
+            let [sx, sy] = to_top_xy(v);
+            set_top_xy(v, sx + dx, sy - 6.0);
+        }
+        return rasterize_cauldron_faded(registers, memory, resources, shaded, 1.0);
+    }
+
+    // 7. Shift all 4 chunks of the top instruction header (`256x256 A4`, `topo == 0`,
+    //    `lower <= 28`) uniformly up by 3px so they sit on a single crisp baseline in `y = 6..21`.
+    if dims == (256 << 16 | 256)
+        && fmt == TextureFormat::A4
+        && (registers[REG_PRIMITIVE_CONFIG] >> 8 & 3) == 0
+        && lower <= 28.0
+    {
+        for v in &mut shaded {
+            let [sx, sy] = to_top_xy(v);
+            set_top_xy(v, sx, sy - 3.0);
+        }
+        return rasterize_cauldron_faded(registers, memory, resources, shaded, 1.0);
+    }
+
+    // 8. Park the `Total Hearts` pouch + highlight + `"Total"` tag + red digits
+    //    (`150 <= left .. right <= 252`, `12 <= upper .. lower <= 105`) cleanly
+    //    at `[16.0..102.4, 166.0..233.8]` (`0.80x` uniform) below the mural!
+    if left >= 150.0 && right <= 252.0 && upper >= 12.0 && lower <= 105.0 {
+        for v in &mut shaded {
+            let [sx, sy] = to_top_xy(v);
+            set_top_xy(v, 16.0 + (sx - 146.0) * 0.80, 166.0 + (sy - 21.0) * 0.80);
+        }
+        return rasterize_cauldron_faded(registers, memory, resources, shaded, 1.0);
+    }
+
+    rasterize_cauldron_faded(registers, memory, resources, shaded, 1.0)
+}
+
+/// whether a bottom-screen draw during Fiend's Cauldron needs per-vertex inspection
+/// to record `cauldron_cursor_x` and omit the circular Skull dial body (keeping
+/// only the native vertical line + upward blue pointer arrow under `0..9`).
+fn needs_cauldron_bot_adjust(registers: &[u32]) -> bool {
+    if registers[REG_TEXTURE_CONFIG] & 1 == 0 {
+        return true;
+    }
+    let base = TEXTURE_UNIT_BASES[0];
+    let dims = registers[base + 1];
+    let fmt = TextureFormat::from_raw(registers[base + 13]);
+    (dims == (256 << 16 | 128) && fmt == TextureFormat::Rgba4)
+        || (dims == (64 << 16 | 64) && fmt == TextureFormat::Rgb565)
+        || (dims == (128 << 16 | 128) && fmt == TextureFormat::L4)
+}
+
+fn adjust_cauldron_bot(
+    registers: &[u32],
+    shaded: Vec<Vertex>,
+    portraits: &mut Portraits,
+) -> Option<Vec<Vertex>> {
+    let textured = registers[REG_TEXTURE_CONFIG] & 1 != 0;
+    let base = TEXTURE_UNIT_BASES[0];
+    let dims = registers[base + 1];
+    let fmt = TextureFormat::from_raw(registers[base + 13]);
+
+    let to_bot_xy = |v: &Vertex| -> [f32; 2] {
+        let w = v.clip[3];
+        let bx = (v.clip[0] / w * 0.5 + 0.5) * 240.0;
+        let by = (v.clip[1] / w * 0.5 + 0.5) * 320.0;
+        [320.0 - by, 240.0 - bx]
+    };
+
+    let (mut left, mut upper, mut right, mut lower) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for v in &shaded {
+        let [sx, sy] = to_bot_xy(v);
+        left = left.min(sx);
+        upper = upper.min(sy);
+        right = right.max(sx);
+        lower = lower.max(sy);
+    }
+
+    // 0. While the Parchment Mural is behind the Cauldron, omit the untextured
+    //    full-screen tint quad (`v == 6`) and the two `128x128 L4` floor spotlight
+    //    ellipses (`v == 6`, `lower > 150`) so `bot_screen` is pure `#000000`
+    //    outside the Cauldron, Pan, Flames, Hearts, and UI!
+    if portraits.cauldron_hud_active {
+        if !textured && shaded.len() == 6 && (right - left) > 300.0 && (lower - upper) > 220.0 {
+            return None;
+        }
+        if textured
+            && dims == (128 << 16 | 128)
+            && fmt == TextureFormat::L4
+            && shaded.len() == 6
+            && lower > 150.0
+        {
+            return None;
+        }
+    }
+    if !textured {
+        return Some(shaded);
+    }
+
+    // 1. Omit twinkling sparkle sprite on the Skull dial (`64x64 Rgb565`, y in 30..90).
+    if dims == (64 << 16 | 64)
+        && fmt == TextureFormat::Rgb565
+        && shaded.len() == 6
+        && upper >= 28.0
+        && lower <= 92.0
+    {
+        return None;
+    }
+
+    if dims == (256 << 16 | 128) && fmt == TextureFormat::Rgba4 {
+        // 2. Skull dial + slider rail (`v == 48`, width ~44, lower ~79):
+        //    record exact `cursor_x` + mark interactive HUD active, keeping only
+        //    any thin vertical rail above the 0..9 bar (`sy <= 16.0`).
+        let width = right - left;
+        if (36..=60).contains(&shaded.len())
+            && (38.0..=52.0).contains(&width)
+            && (68.0..=90.0).contains(&lower)
+        {
+            let cx = (left + right) * 0.5;
+            portraits.cauldron_cursor_x = cx;
+            portraits.cauldron_cursor_seen = true;
+            portraits.cauldron_hud_active = true;
+            let mut kept = Vec::with_capacity(6);
+            for tri in shaded.chunks_exact(3) {
+                let pts = [to_bot_xy(&tri[0]), to_bot_xy(&tri[1]), to_bot_xy(&tri[2])];
+                if pts.iter().all(|&[x, y]| (x - cx).abs() <= 6.0 && y <= 16.5) {
+                    kept.extend_from_slice(tri);
+                }
+            }
+            return (!kept.is_empty()).then_some(kept);
+        }
+
+        // 3. Omit any Skull dial ring, ears, or release-ripple quads in `y = 31.5..96.0`.
+        if upper >= 31.5 && lower <= 96.0 {
+            return None;
+        }
+    }
+
+    Some(shaded)
+}
+
 /// tracks when the title screen's top-screen sky or bottom-screen logo pass is
-/// being drawn.
+/// being drawn, as well as Fuse Weapons' A/B card headers.
 fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
     if portraits.in_battle {
         portraits.title_bottom_drawing = false;
@@ -1793,6 +2494,22 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         portraits.title_sky_active = false;
         portraits.title_sky_seen = false;
         portraits.title_seen = false;
+        portraits.fuse_first_header = 0;
+        portraits.fuse_frame_seen = false;
+        portraits.fuse_weapon_seen = false;
+        portraits.fuse_preview_seen = false;
+        portraits.fuse_active = false;
+        portraits.fuse_reveal = false;
+        portraits.fuse_missed = 0;
+        portraits.cauldron_mural_step = 0;
+        portraits.cauldron_top_seen = false;
+        portraits.cauldron_cursor_seen = false;
+        portraits.cauldron_pot_seen = false;
+        portraits.cauldron_active = false;
+        portraits.cauldron_hud_active = false;
+        portraits.cauldron_tier_init = false;
+        portraits.cauldron_fade_buf = 0;
+        portraits.cauldron_missed = 0;
         return;
     }
     if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
@@ -1800,6 +2517,32 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
     {
         portraits.title_bottom_drawing = false;
         portraits.title_bottom_counted = false;
+        if !portraits.title_sky_active && !portraits.fuse_active && registers[REG_TEXTURE_CONFIG] & 1 != 0 {
+            let base = TEXTURE_UNIT_BASES[0];
+            let dims = registers[base + 1];
+            let fmt = TextureFormat::from_raw(registers[base + 13]);
+            if dims == (128 << 16 | 64) && fmt == TextureFormat::Etc1 {
+                portraits.cauldron_mural_step = 1;
+            } else if portraits.cauldron_mural_step == 1
+                && dims == (64 << 16 | 64)
+                && fmt == TextureFormat::La4
+            {
+                portraits.cauldron_mural_step = 2;
+            } else if portraits.cauldron_mural_step == 2
+                && dims == (256 << 16 | 256)
+                && fmt == TextureFormat::L4
+            {
+                portraits.cauldron_mural_step = 3;
+                portraits.cauldron_top_seen = true;
+                portraits.cauldron_active = true;
+                portraits.cauldron_hud_active = true;
+                portraits.cauldron_missed = 0;
+            } else {
+                portraits.cauldron_mural_step = 0;
+            }
+        } else {
+            portraits.cauldron_mural_step = 0;
+        }
         if is_title_sky(registers) {
             portraits.title_sky_seen = true;
             portraits.title_sky_active = true;
@@ -1810,6 +2553,28 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                 registers[REG_COLOR_BUFFER_FORMAT],
                 registers[REG_FRAMEBUFFER_DIMENSIONS],
             ]);
+        } else if !portraits.title_sky_active && is_fuse_card_header(registers) {
+            let addr = registers[TEXTURE_UNIT_BASES[0] + 4];
+            if addr != 0 {
+                if portraits.fuse_first_header == 0 {
+                    portraits.fuse_first_header = addr;
+                } else if portraits.fuse_first_header != addr {
+                    portraits.fuse_frame_seen = true;
+                    if !portraits.fuse_reveal {
+                        portraits.fuse_active = true;
+                        portraits.fuse_missed = 0;
+                    }
+                }
+            }
+        } else if !portraits.title_sky_active && portraits.fuse_frame_seen {
+            if is_fuse_result_weapon(registers) {
+                portraits.fuse_weapon_seen = true;
+            } else if is_fuse_small_preview(registers) {
+                portraits.fuse_preview_seen = true;
+                portraits.fuse_active = true;
+                portraits.fuse_reveal = false;
+                portraits.fuse_missed = 0;
+            }
         }
     } else if portraits.title_sky_active && on_bottom(registers) && is_title_bottom_sky(registers) {
         portraits.title_bottom_drawing = true;
@@ -1817,6 +2582,13 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         portraits.title_frames = portraits.title_frames.saturating_add(1);
         if portraits.title_frames <= 16 || portraits.title.len() < 2 {
             portraits.title.clear();
+        }
+    } else if portraits.cauldron_active && on_bottom(registers) {
+        let base = TEXTURE_UNIT_BASES[0];
+        if registers[base + 1] == (128 << 16 | 128)
+            && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
+        {
+            portraits.cauldron_pot_seen = true;
         }
     } else if !is_bottom(registers) {
         portraits.title_bottom_drawing = false;
@@ -1876,6 +2648,42 @@ fn draw_subtitle_shadow<M: GpuMemory>(registers: &[u32], memory: &mut M, resourc
     let shifted = |value: u32, by: i32| ((((value & 0x3FF) << 22) as i32 >> 22) + by) as u32 & 0x3FF;
     shadow[REG_VIEWPORT_XY] = shifted(xy, -1) | shifted(xy >> 16, 1) << 16;
     rasterize(&shadow, memory, resources, vertices);
+}
+
+/// draws a crisp 4-way dark outline plus drop shadow under the bottom-centered
+/// power name so white text stays legible even over bright explosions.
+fn draw_power_label_outline<M: GpuMemory>(
+    registers: &[u32],
+    memory: &mut M,
+    resources: &mut Resources,
+    vertices: &[Vertex],
+) {
+    let fade = vertices.first().map_or(1.0, |v| v.color[3]).clamp(0.0, 1.0);
+    if fade <= 0.01 {
+        return;
+    }
+    let mut shadow = registers.to_vec();
+    let mut shifted = Vec::with_capacity(vertices.len());
+    // Shift vertices in clip space rather than REG_VIEWPORT_XY: +1 on viewport_x
+    // makes viewport_right = 241 > buffer_width (240) and changes target stride!
+    for (dx, dy, base_alpha) in [(-1.0f32, 0.0f32, 145.0), (1.0, 0.0, 145.0), (0.0, -1.0, 145.0), (0.0, 1.0, 145.0), (-1.0, 1.0, 195.0)] {
+        let alpha = ((base_alpha * fade).round() as u32).min(255);
+        for (stage, &base) in TEV_STAGES.iter().enumerate() {
+            let (source, combiner) = match stage {
+                0 => (0xE | 3 << 16 | 0xE << 20, 1 << 16),
+                _ => (0xF | 0xF << 16, 0),
+            };
+            shadow[base..base + 5].copy_from_slice(&[source, 0, combiner, alpha << 24, 0]);
+        }
+        shifted.clear();
+        shifted.extend(vertices.iter().copied().map(|mut v| {
+            let w = v.clip[3];
+            v.clip[0] += (dx / 120.0) * w;
+            v.clip[1] += (dy / 200.0) * w;
+            v
+        }));
+        rasterize(&shadow, memory, resources, Vertices::Shaded(&shifted));
+    }
 }
 
 /// the texture combiner's six stages, each five registers from there.
@@ -2100,27 +2908,185 @@ fn faded_top(topology: u32, vertices: &[Vertex]) -> Vec<Vertex> {
     faded
 }
 
+/// cuts a triangle list along a clip-space plane (`plane(v) == 0`) so alpha
+/// ramps across a narrow bezel band stay confined to that band.
+fn split_triangles(triangles: &[Vertex], plane: impl Fn(&Vertex) -> f32) -> Vec<Vertex> {
+    let mut out = Vec::with_capacity(triangles.len() + 12);
+    for tri in triangles.chunks_exact(3) {
+        for side in [1.0, -1.0] {
+            let mut polygon = Vec::with_capacity(4);
+            for i in 0..3 {
+                let current = &tri[i];
+                let next = &tri[(i + 1) % 3];
+                let (d0, d1) = (side * plane(current), side * plane(next));
+                if d0 >= 0.0 {
+                    polygon.push(*current);
+                }
+                if d0 * d1 < 0.0 {
+                    polygon.push(current.lerp(next, d0 / (d0 - d1)));
+                }
+            }
+            for i in 1..polygon.len().saturating_sub(1) {
+                out.extend([polygon[0], polygon[i], polygon[i + 1]]);
+            }
+        }
+    }
+    out
+}
+
 /// a part of the bottom screen's battle display shown on the top screen:
 /// where it is on the bottom screen, left, top, right and bottom from its
 /// top left, where its top left goes on the top screen, and its scale.
+#[derive(Clone, Copy)]
 struct Island {
     from: [f32; 4],
     to: [f32; 2],
     scale: f32,
 }
 
-/// Kid Icarus Uprising's battle display: the counters (intensity, enemies
-/// defeated, hearts) under the score, and the powers (the orbs in the air,
-/// the power palette on foot) under the health bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HudKind {
+    Counters,
+    ItemCard,
+    Buffs,
+    Powers,
+}
+
+/// Kid Icarus Uprising's persistent battle display islands: the counters
+/// (intensity, monsters defeated, hearts) beside SCORE on the top bar, and the
+/// powers (air-battle orbs, land-battle power selector bar & callout) below
+/// Pit's health bar.
 // ponytail: fixed places for this one title, a per-title table when another
 // game needs islands.
 const ISLANDS: [Island; 2] = [
-    // against the screen's edges, as on the bottom screen
-    Island { from: [196.0, 0.0, 320.0, 52.0], to: [400.0 - 124.0 * 0.6, 44.0], scale: 0.6 },
-    // the orbs and the palette sit in the island's lower half, from 194 down,
-    // so it starts above the health bar's foot for them to land just below it
-    Island { from: [0.0, 150.0, 170.0, 240.0], to: [0.0, 16.0], scale: 0.5 },
+    Island { from: [196.0, 0.0, 320.0, 52.0], to: [232.0, 3.0], scale: 0.56 },
+    Island { from: [0.0, 135.0, 215.0, 240.0], to: [8.0, 24.0], scale: 0.46 },
 ];
+
+/// Land-battle item collection toast card (9-slice La4 backing, 64x64 item icon,
+/// crimson title + black description), placed compactly along the mid-right edge
+/// well clear of SCORE above and character portraits/subtitles below.
+const ITEM_CARD_ISLAND: Island = Island {
+    from: [23.0, 106.0, 301.0, 203.0],
+    to: [269.0, 74.0],
+    scale: 0.44,
+};
+
+/// Active buff / held-item status icons on the right edge of the bottom screen,
+/// tucked neatly under SCORE and above the item pickup card.
+const BUFFS_ISLAND: Island = Island {
+    from: [280.0, 52.0, 320.0, 160.0],
+    to: [374.0, 40.0],
+    scale: 0.50,
+};
+
+/// Where the selected land-battle power's name is displayed on the top screen.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerLabelMode {
+    /// Centered near the bottom of the top screen in crisp white shadowed text.
+    Bottom = 0,
+    /// Inside the speech bubble directly above the power selector bar.
+    AboveBar = 1,
+    /// Hidden (power icons only).
+    Off = 2,
+}
+
+static POWER_LABEL_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+
+pub fn set_power_label_mode(mode: PowerLabelMode) {
+    POWER_LABEL_MODE.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn power_label_mode() -> PowerLabelMode {
+    match POWER_LABEL_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => PowerLabelMode::Bottom,
+        1 => PowerLabelMode::AboveBar,
+        2 => PowerLabelMode::Off,
+        _ => match std::env::var("ZAKURO_POWER_LABEL").ok().as_deref().map(str::trim) {
+            Some("bar" | "above" | "above_bar") => PowerLabelMode::AboveBar,
+            Some("off" | "0" | "none") => PowerLabelMode::Off,
+            _ => PowerLabelMode::Bottom,
+        },
+    }
+}
+
+/// whether a bottom-screen draw from KIU's 512x128 RGBA8 text buffer is the
+/// top-of-bottom-screen dialogue box (used in How to Play) rather than a
+/// battle HUD label (power name callout or item pickup card text).
+fn is_bottom_dialogue_box(vertices: &[Vertex]) -> bool {
+    let Some((low, high)) = bottom_box(vertices) else { return false };
+    let (upper, lower) = (240.0 - high[0], 240.0 - low[0]);
+    upper < 64.0 && lower <= 96.0
+}
+
+/// whether a bottom-screen draw from KIU's 512x128 RGBA8 text buffer lies
+/// inside the active speech bubble above the power selector bar.
+fn is_power_label_text(portraits: &Portraits, vertices: &[Vertex]) -> bool {
+    let Some([b_low, b_high]) = portraits.power_bubble_x else { return false };
+    let Some((low, high)) = bottom_box(vertices) else { return false };
+    let [left, _upper, right, _lower] = [320.0 - high[1], 240.0 - high[0], 320.0 - low[1], 240.0 - low[0]];
+    left <= 96.0 && right <= 225.0 && low[0] >= b_low - 3.0 && high[0] <= b_high + 3.0
+}
+
+/// redirects the selected power's name onto the bottom center of the top screen
+/// at full readable scale in white shadowed text (`PowerLabelMode::Bottom`).
+fn mirror_power_label(registers: &[u32], resources: &mut Resources, vertices: &[Vertex]) {
+    let Some(top) = resources.portraits.top else { return };
+    let Some((low, high)) = bottom_box(vertices) else { return };
+    const SCALE: f32 = 1.28;
+    let pop_slide = ((low[0] - 61.5) * 0.35).clamp(-6.0, 2.0);
+    let target_low_x = 12.0 + pop_slide;
+    let mid_y = (low[1] + high[1]) * 0.5;
+    let mut moved: Vec<Vertex> = vertices
+        .iter()
+        .copied()
+        .map(|mut vertex| {
+            let w = vertex.clip[3];
+            let below = [(vertex.clip[0] / w * 0.5 + 0.5) * 240.0, (vertex.clip[1] / w * 0.5 + 0.5) * 320.0];
+            let above = [
+                target_low_x + (below[0] - low[0]) * SCALE,
+                200.0 + (below[1] - mid_y) * SCALE,
+            ];
+            vertex.clip[0] = (above[0] / 120.0 - 1.0) * w;
+            vertex.clip[1] = (above[1] / 200.0 - 1.0) * w;
+            // KIU tints the bottom-screen speech-bubble text black; on the top
+            // screen's open scene it draws crisp white over draw_subtitle_shadow.
+            vertex.color = [1.0, 1.0, 1.0, (vertex.color[3] * 0.92).clamp(0.0, 1.0)];
+            vertex
+        })
+        .collect();
+    let tex_addr = loc_register(registers, TEXTURE_UNIT_BASES[0] + 4);
+    let buf_lines = resources.portraits.text_lines_for(tex_addr);
+    if let Some(centered) = centered_subtitle(&moved, &buf_lines) {
+        moved = centered;
+    }
+    // Trim the padded bottom 23% of the text quad so ascenders from an adjacent
+    // packed row in the 512x128 scratch buffer (e.g. Practice Range stats) never
+    // poke into the bottom edge below g/p/y descenders.
+    let quad_h = (high[0] - low[0]) * SCALE;
+    if quad_h >= 12.0 && moved.len().is_multiple_of(3) {
+        let cut_x = target_low_x + quad_h * 0.23;
+        let split = split_triangles(&moved, |v| (cut_x / 120.0 - 1.0) * v.clip[3] - v.clip[0]);
+        moved = split
+            .chunks_exact(3)
+            .filter(|tri| {
+                let mean_x: f32 = tri
+                    .iter()
+                    .map(|v| (v.clip[0] / v.clip[3] * 0.5 + 0.5) * 240.0)
+                    .sum::<f32>()
+                    / 3.0;
+                mean_x >= cut_x - 0.02
+            })
+            .flatten()
+            .copied()
+            .collect();
+    }
+    let mut registers = onto_top(registers, top, 1.0, 0.0, 0.0);
+    registers[REG_VIEWPORT_HEIGHT] = float24(200.0);
+    registers[TEXTURE_UNIT_BASES[0] + 2] |= 0x6;
+    resources.portraits.power_label.push(PortraitDraw { registers, vertices: moved });
+}
 
 /// takes a bottom-screen draw that lies in one of the islands for the top
 /// screen's buffer, where that island goes, for flush_portraits to draw.
@@ -2132,12 +3098,144 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
     // rows run up from the screen's bottom edge and leftward from its right
     let [left, upper, right, lower] = [320.0 - high[1], 240.0 - high[0], 320.0 - low[1], 240.0 - low[0]];
     const SLACK: f32 = 2.0;
-    let Some(island) = ISLANDS.iter().find(|island| {
-        let [x0, y0, x1, y1] = island.from;
+    let within = |[x0, y0, x1, y1]: [f32; 4]| {
         left >= x0 - SLACK && upper >= y0 - SLACK && right <= x1 + SLACK && lower <= y1 + SLACK
-    }) else {
+    };
+    let tex_base = TEXTURE_UNIT_BASES[0];
+    let tex_fmt = TextureFormat::from_raw(registers[tex_base + 13]);
+    let tex_dims = registers[tex_base + 1];
+    let label_mode = power_label_mode();
+    let is_item_card = left >= 20.0 - SLACK
+        && upper >= 96.0 - SLACK
+        && right <= 306.0 + SLACK
+        && lower <= 208.0 + SLACK
+        && (right >= 230.0
+            || (is_subtitle(registers) && left >= 90.0 && upper < 155.0)
+            || (matches!(tex_fmt, TextureFormat::Etc1 | TextureFormat::Etc1A4)
+                && tex_dims == (64 << 16 | 64)
+                && upper <= 150.0));
+    let (kind, mut island) = if within(ISLANDS[0].from) {
+        (HudKind::Counters, ISLANDS[0])
+    } else if is_item_card {
+        (HudKind::ItemCard, ITEM_CARD_ISLAND)
+    } else if within(BUFFS_ISLAND.from) {
+        (HudKind::Buffs, BUFFS_ISLAND)
+    } else if within(ISLANDS[1].from)
+        && (!is_subtitle(registers) || is_power_label_text(&resources.portraits, &vertices))
+    {
+        (HudKind::Powers, ISLANDS[1])
+    } else {
         return;
     };
+    if kind == HudKind::Powers && label_mode != PowerLabelMode::AboveBar {
+        // without the speech bubble above the slots, dock the power bar snugly
+        // right beneath Pit's HP wing
+        island.to[1] = 12.0;
+    }
+
+    let topology = registers[REG_PRIMITIVE_CONFIG] >> 8 & 3;
+    let mut triangulated = false;
+    let mut vertices = vertices;
+    if tex_fmt == TextureFormat::La4 {
+        match kind {
+            HudKind::Counters => {
+                let mut cloud = Vec::new();
+                let mut glyphs = Vec::new();
+                for (a, b, c) in assemble(topology, vertices.len()) {
+                    let tri = [vertices[a], vertices[b], vertices[c]];
+                    let white = tri
+                        .iter()
+                        .all(|v| v.color[0] > 0.9 && v.color[1] > 0.9 && v.color[2] > 0.9);
+                    let xs = tri.map(|v| (v.clip[0] / v.clip[3] * 0.5 + 0.5) * 240.0);
+                    let ys = tri.map(|v| (v.clip[1] / v.clip[3] * 0.5 + 0.5) * 320.0);
+                    let h = xs.into_iter().fold(f32::MIN, f32::max)
+                        - xs.into_iter().fold(f32::MAX, f32::min);
+                    let w = ys.into_iter().fold(f32::MIN, f32::max)
+                        - ys.into_iter().fold(f32::MAX, f32::min);
+                    if white && (w > 18.0 || h > 18.0) {
+                        cloud.extend(tri);
+                    } else {
+                        glyphs.extend(tri);
+                    }
+                }
+                if !cloud.is_empty() {
+                    let mut cloud = split_triangles(&cloud, |v| {
+                        (233.0 / 120.0 - 1.0) * v.clip[3] - v.clip[0]
+                    });
+                    cloud = split_triangles(&cloud, |v| {
+                        (7.0 / 160.0 - 1.0) * v.clip[3] - v.clip[1]
+                    });
+                    for v in &mut cloud {
+                        let bx = (v.clip[0] / v.clip[3] * 0.5 + 0.5) * 240.0;
+                        let by = (v.clip[1] / v.clip[3] * 0.5 + 0.5) * 320.0;
+                        let fx = ((240.0 - bx) / 7.0).clamp(0.0, 1.0);
+                        let fy = (by / 7.0).clamp(0.0, 1.0);
+                        v.color[3] *= 0.62 * fx * fy;
+                    }
+                    cloud.extend(glyphs);
+                    vertices = cloud;
+                    triangulated = true;
+                }
+            }
+            HudKind::Powers
+                if vertices.len() >= 24
+                    && vertices
+                        .first()
+                        .is_some_and(|v| v.color[0] > 0.9 && v.color[1] > 0.9 && v.color[2] > 0.9) =>
+            {
+                let mut tris: Vec<Vertex> = assemble(topology, vertices.len())
+                    .flat_map(|(a, b, c)| [vertices[a], vertices[b], vertices[c]])
+                    .collect();
+                for edge_x in [6.0, 42.0, 48.0] {
+                    tris = split_triangles(&tris, |v| {
+                        (edge_x / 120.0 - 1.0) * v.clip[3] - v.clip[0]
+                    });
+                }
+                tris = split_triangles(&tris, |v| {
+                    (314.0 / 160.0 - 1.0) * v.clip[3] - v.clip[1]
+                });
+                let (mut b_low, mut b_high) = (f32::MAX, f32::MIN);
+                let mut tray_only = Vec::with_capacity(tris.len());
+                for tri in tris.chunks_exact(3) {
+                    let bxs = [tri[0], tri[1], tri[2]].map(|v| (v.clip[0] / v.clip[3] * 0.5 + 0.5) * 240.0);
+                    let mean_bx = (bxs[0] + bxs[1] + bxs[2]) / 3.0;
+                    if mean_bx > 42.05 {
+                        b_low = b_low.min(bxs[0].min(bxs[1]).min(bxs[2]));
+                        b_high = b_high.max(bxs[0].max(bxs[1]).max(bxs[2]));
+                    } else {
+                        tray_only.extend_from_slice(tri);
+                    }
+                }
+                if b_low < b_high {
+                    resources.portraits.power_bubble_x = Some([b_low, b_high]);
+                }
+                if label_mode != PowerLabelMode::AboveBar {
+                    tris = tray_only;
+                    if tris.is_empty() {
+                        return;
+                    }
+                }
+                for v in &mut tris {
+                    let bx = (v.clip[0] / v.clip[3] * 0.5 + 0.5) * 240.0;
+                    let by = (v.clip[1] / v.clip[3] * 0.5 + 0.5) * 320.0;
+                    let fx = (bx / 6.0).clamp(0.0, 1.0);
+                    let fy = ((320.0 - by) / 6.0).clamp(0.0, 1.0);
+                    let callout_t = ((bx - 42.0) / 6.0).clamp(0.0, 1.0);
+                    let panel_alpha = 0.60 + 0.28 * callout_t;
+                    v.color[3] *= panel_alpha * fx * fy;
+                }
+                vertices = tris;
+                triangulated = true;
+            }
+            HudKind::ItemCard if vertices.len() >= 36 => {
+                for v in &mut vertices {
+                    v.color[3] *= 0.70;
+                }
+            }
+            _ => {}
+        }
+    }
+
     // the island's top left on the bottom screen lands on its place on the
     // top screen; in buffer terms x runs up from the screen's bottom edge
     // and y leftward from its right edge, 320 wide below and 400 above
@@ -2149,7 +3247,6 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
     // the vertices move rather than the viewport, which would reach past
     // the top screen's buffer for an island moved up from the bottom, and
     // the GPU draws such a viewport wrong; it covers the whole top screen
-    let mut vertices = vertices;
     for vertex in &mut vertices {
         let w = vertex.clip[3];
         let below = [(vertex.clip[0] / w * 0.5 + 0.5) * 240.0, (vertex.clip[1] / w * 0.5 + 0.5) * 320.0];
@@ -2159,6 +3256,26 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
     }
     let mut registers = onto_top(registers, top, 1.0, 0.0, 0.0);
     registers[REG_VIEWPORT_HEIGHT] = float24(200.0);
+    registers[tex_base + 2] |= 0x6;
+    if triangulated {
+        registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
+    }
+    let hud_alpha: f32 = match kind {
+        HudKind::Counters | HudKind::Powers => 0.88,
+        HudKind::Buffs => 0.86,
+        HudKind::ItemCard => 0.92,
+    };
+    if (registers[0x0F8] & 0x000F_000F) == 0x000F_000F && registers[0x0FA] == 0 {
+        if registers[REG_COLOR_OPERATION] & 0x100 == 0 {
+            registers[REG_COLOR_OPERATION] = (registers[REG_COLOR_OPERATION] & !0xFF) | 0x00E4_0100;
+            registers[REG_BLEND_FUNC] = 0x0176_0000;
+        }
+        registers[0x0F8] = 0x00EF_000F;
+        registers[0x0F9] = 0x0000_0000;
+        registers[0x0FA] = 0x0001_0000;
+        registers[0x0FB] = ((hud_alpha * 255.0).round() as u32) << 24;
+        registers[0x0FC] = 0x0000_0000;
+    }
     resources.portraits.hud.push(PortraitDraw { registers, vertices });
 }
 
@@ -2301,7 +3418,67 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     // how much of a portrait fades in or out each frame, 8 frames in all
     let step = 1.0 / 8.0;
     let bottom_seen = std::mem::take(&mut resources.portraits.bottom_seen);
+    if bottom_seen {
+        resources.portraits.power_bubble_x = None;
+    }
+    if std::mem::take(&mut resources.portraits.bottom_tex_seen) {
+        resources.portraits.bottom_tex_missed = 0;
+        resources.portraits.bottom_blank = false;
+    } else {
+        resources.portraits.bottom_tex_missed = resources.portraits.bottom_tex_missed.saturating_add(1);
+        if resources.portraits.bottom_tex_missed > 2 {
+            resources.portraits.bottom_blank = true;
+        }
+    }
     resources.portraits.hud_islands = 0;
+    resources.portraits.fuse_first_header = 0;
+    let fuse_headers = std::mem::take(&mut resources.portraits.fuse_frame_seen);
+    let fuse_weapon = std::mem::take(&mut resources.portraits.fuse_weapon_seen);
+    let fuse_preview = std::mem::take(&mut resources.portraits.fuse_preview_seen);
+    if resources.portraits.in_battle {
+        resources.portraits.fuse_active = false;
+        resources.portraits.fuse_reveal = false;
+        resources.portraits.fuse_missed = 0;
+    } else if fuse_headers {
+        let reveal = fuse_weapon && !fuse_preview;
+        resources.portraits.fuse_active = !reveal;
+        resources.portraits.fuse_reveal = reveal;
+        resources.portraits.fuse_missed = 0;
+    } else if resources.portraits.fuse_active || resources.portraits.fuse_reveal {
+        resources.portraits.fuse_missed = resources.portraits.fuse_missed.saturating_add(1);
+        if resources.portraits.fuse_missed > 1 {
+            resources.portraits.fuse_active = false;
+            resources.portraits.fuse_reveal = false;
+        }
+    }
+    resources.portraits.cauldron_mural_step = 0;
+    let cauldron_top = std::mem::take(&mut resources.portraits.cauldron_top_seen);
+    let cauldron_cursor = std::mem::take(&mut resources.portraits.cauldron_cursor_seen);
+    let cauldron_pot = std::mem::take(&mut resources.portraits.cauldron_pot_seen);
+    if resources.portraits.in_battle || resources.portraits.fuse_active || resources.portraits.title_sky_active {
+        resources.portraits.cauldron_active = false;
+        resources.portraits.cauldron_hud_active = false;
+        resources.portraits.cauldron_tier_init = false;
+        resources.portraits.cauldron_fade_buf = 0;
+        resources.portraits.cauldron_missed = 0;
+    } else if cauldron_top && cauldron_cursor {
+        resources.portraits.cauldron_active = true;
+        resources.portraits.cauldron_hud_active = true;
+        resources.portraits.cauldron_missed = 0;
+    } else if resources.portraits.cauldron_active && (cauldron_pot || cauldron_top) {
+        // Keep FiendsCauldron active through the heart-dump launch animation
+        // while hiding the interactive pouch & intensity cursor thumb!
+        resources.portraits.cauldron_hud_active = false;
+        resources.portraits.cauldron_missed = 0;
+    } else if resources.portraits.cauldron_active {
+        resources.portraits.cauldron_missed = resources.portraits.cauldron_missed.saturating_add(1);
+        if resources.portraits.cauldron_missed > 2 {
+            resources.portraits.cauldron_active = false;
+            resources.portraits.cauldron_hud_active = false;
+            resources.portraits.cauldron_tier_init = false;
+            resources.portraits.cauldron_fade_buf = 0;
+        }
+    }
     if resources.portraits.in_battle {
         resources.portraits.title_sky_seen = false;
         resources.portraits.title_sky_active = false;
@@ -2363,13 +3540,21 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
             }
         }
     }
-    if resources.portraits.in_play && !resources.portraits.in_battle {
+    if (resources.portraits.in_play
+        || resources.portraits.fuse_active
+        || resources.portraits.cauldron_active)
+        && !resources.portraits.in_battle
+    {
         resources.portraits.sides = Default::default();
         resources.portraits.hud.clear();
         resources.portraits.last_hud.clear();
+        resources.portraits.power_label.clear();
+        resources.portraits.last_power_label.clear();
+        resources.portraits.power_bubble_x = None;
         resources.portraits.dialogue.clear();
         resources.portraits.last_dialogue.clear();
         resources.portraits.text_lines.clear();
+        resources.portraits.text_line_addrs.clear();
         return drew_title;
     }
     let mut sides = std::mem::take(&mut resources.portraits.sides);
@@ -2429,7 +3614,15 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
         rasterize(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
         drew = true;
     }
+    let power_label = if bottom_seen || !resources.portraits.power_label.is_empty() {
+        let taken = std::mem::take(&mut resources.portraits.power_label);
+        resources.portraits.last_power_label = taken.clone();
+        taken
+    } else {
+        resources.portraits.last_power_label.clone()
+    };
     // the dialogue box's text, over the portraits, with the subtitles' shadow
+    let subtitle_up = resources.portraits.top_subtitle_quiet <= 12;
     resources.portraits.top_subtitle_quiet = resources.portraits.top_subtitle_quiet.saturating_add(1);
     /// how many flushes the text must stay before it shows.
     const DIALOGUE_HOLD: u32 = 6;
@@ -2455,6 +3648,24 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
         resources.portraits.last_dialogue.clone()
     };
     let dialogue = if resources.portraits.dialogue_held >= DIALOGUE_HOLD { dialogue } else { Vec::new() };
+    let lift_power_label = subtitle_up || !dialogue.is_empty();
+    if power_label_mode() == PowerLabelMode::Bottom {
+        for mut draw in power_label {
+            if let Some([address, format, dimensions]) = top_target {
+                draw.registers[REG_COLOR_BUFFER_ADDRESS] = address;
+                draw.registers[REG_COLOR_BUFFER_FORMAT] = format;
+                draw.registers[REG_FRAMEBUFFER_DIMENSIONS] = dimensions;
+            }
+            if lift_power_label {
+                for vertex in &mut draw.vertices {
+                    vertex.clip[0] += (44.0 / 120.0) * vertex.clip[3];
+                }
+            }
+            draw_power_label_outline(&draw.registers, memory, resources, &draw.vertices);
+            rasterize(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
+            drew = true;
+        }
+    }
     for mut draw in dialogue {
         if let Some([address, format, dimensions]) = top_target {
             draw.registers[REG_COLOR_BUFFER_ADDRESS] = address;
@@ -4267,9 +5478,16 @@ pub fn draw<M: GpuMemory>(
     let bottom = is_bottom(registers);
     if bottom {
         resources.portraits.bottom_seen = true;
+        if on_bottom(registers) {
+            resources.portraits.bottom_tex_seen = true;
+            resources.portraits.bottom_tex_missed = 0;
+            resources.portraits.bottom_blank = false;
+        }
     }
     if bottom
         && resources.portraits.in_play
+        && !resources.portraits.fuse_active
+        && !resources.portraits.cauldron_active
         && skip_bottom_in_play(
             registers,
             resources.portraits.in_battle,
@@ -4544,9 +5762,16 @@ pub fn draw_immediate<M: GpuMemory>(
     let bottom = is_bottom(registers);
     if bottom {
         resources.portraits.bottom_seen = true;
+        if on_bottom(registers) {
+            resources.portraits.bottom_tex_seen = true;
+            resources.portraits.bottom_tex_missed = 0;
+            resources.portraits.bottom_blank = false;
+        }
     }
     if bottom
         && resources.portraits.in_play
+        && !resources.portraits.fuse_active
+        && !resources.portraits.cauldron_active
         && skip_bottom_in_play(
             registers,
             resources.portraits.in_battle,
@@ -4700,6 +5925,44 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
     if portraits_on() && !resources.portraits.adding {
         if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0 {
             note_top_buffer(registers, resources);
+            if resources.portraits.fuse_active
+                && !resources.portraits.menu_override
+                && needs_fuse_top_adjust(registers)
+            {
+                #[cfg(feature = "vulkan")]
+                if matches!(vertices, Vertices::Raw { .. }) {
+                    return None;
+                }
+                if let Some(shaded) = shaded_in_order(registers, vertices) {
+                    if let Some(adjusted) = adjust_fuse_top(registers, shaded) {
+                        resources.portraits.adding = true;
+                        let res = rasterize(registers, memory, resources, Vertices::Shaded(&adjusted));
+                        resources.portraits.adding = false;
+                        return res;
+                    }
+                    return Some(0);
+                }
+            }
+            if !resources.portraits.in_battle
+                && !resources.portraits.title_sky_active
+                && !resources.portraits.fuse_active
+                && is_cauldron_mural_paper(registers, vertices.len())
+            {
+                resources.portraits.cauldron_active = true;
+                resources.portraits.cauldron_hud_active = true;
+            }
+            if resources.portraits.cauldron_hud_active
+                && !resources.portraits.menu_override
+                && needs_cauldron_top_adjust(registers)
+            {
+                #[cfg(feature = "vulkan")]
+                if matches!(vertices, Vertices::Raw { .. }) {
+                    return None;
+                }
+                if let Some(shaded) = shaded_in_order(registers, vertices) {
+                    return draw_cauldron_top(registers, memory, resources, shaded);
+                }
+            }
             if !resources.portraits.in_battle && is_title_sky(registers) {
                 resources.portraits.title_sky_seen = true;
                 resources.portraits.title_seen = true;
@@ -4724,9 +5987,11 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     resources.portraits.flushed = true;
                     flush_portraits(memory, resources);
                 }
+                let tex_addr = loc_register(registers, TEXTURE_UNIT_BASES[0] + 4);
+                let buf_lines = resources.portraits.text_lines_for(tex_addr);
                 let centered = shaded_in_order(registers, vertices)
                     .as_deref()
-                    .and_then(|v| centered_subtitle(v, &resources.portraits.text_lines));
+                    .and_then(|v| centered_subtitle(v, &buf_lines));
                 let draw_vertices = match &centered {
                     Some(v) => Vertices::Shaded(v),
                     None => vertices,
@@ -4744,21 +6009,42 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             }
             note_text(registers, resources, vertices);
         } else if on_bottom(registers) || is_bottom(registers) {
+            if resources.portraits.cauldron_active
+                && !resources.portraits.menu_override
+                && read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
+                && read_float24(registers, REG_VIEWPORT_HEIGHT) == 160.0
+                && needs_cauldron_bot_adjust(registers)
+            {
+                #[cfg(feature = "vulkan")]
+                if matches!(vertices, Vertices::Raw { .. }) {
+                    return None;
+                }
+                if let Some(shaded) = shaded_in_order(registers, vertices) {
+                    if let Some(adjusted) = adjust_cauldron_bot(registers, shaded, &mut resources.portraits) {
+                        resources.portraits.adding = true;
+                        let res = rasterize(registers, memory, resources, Vertices::Shaded(&adjusted));
+                        resources.portraits.adding = false;
+                        return res;
+                    }
+                    return Some(0);
+                }
+            }
             let portrait = on_bottom(registers) && is_portrait(registers);
             let on_title = is_on_title(&resources.portraits);
             // the CPU decodes its arrays then, and its vertices say where it is.
             // out of play only a portrait's are looked at, to see whether it is
             // a big one, a conversation
+            let special_menu = resources.portraits.fuse_active || resources.portraits.cauldron_active;
             #[cfg(feature = "vulkan")]
-            if ((resources.portraits.in_play && (resources.portraits.in_battle || on_title)) || portrait)
+            if ((resources.portraits.in_play && !special_menu && (resources.portraits.in_battle || on_title)) || portrait)
                 && matches!(vertices, Vertices::Raw { .. })
             {
                 return None;
             }
-            if (!resources.portraits.in_play || !resources.portraits.in_battle) && portrait {
+            if !special_menu && (!resources.portraits.in_play || !resources.portraits.in_battle) && portrait {
                 note_big_portrait(registers, resources, &vertices);
             }
-            if !resources.portraits.in_play && !portrait && on_bottom(registers) && vertices.len() <= 16 && battle_detection() {
+            if !special_menu && !resources.portraits.in_play && !portrait && on_bottom(registers) && vertices.len() <= 16 && battle_detection() {
                 // a sprite of the battle display, looked at on the CPU
                 #[cfg(feature = "vulkan")]
                 if matches!(vertices, Vertices::Raw { .. }) {
@@ -4768,12 +6054,32 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             }
             // in play the bottom screen is not shown, so what it draws goes
             // onto the top screen or nowhere; in a menu it is drawn as it is
-            if resources.portraits.in_play {
+            if resources.portraits.in_play && !special_menu {
                 if on_bottom(registers) {
                     if portrait {
                         mirror_portrait(registers, resources, vertices);
-                    } else if is_subtitle(registers) && resources.portraits.top_subtitle_quiet > 30 {
-                        mirror_dialogue(registers, resources, vertices);
+                    } else if is_subtitle(registers) {
+                        if let Some(shaded) = shaded_in_order(registers, vertices) {
+                            if resources.portraits.top_subtitle_quiet > 30
+                                && is_bottom_dialogue_box(&shaded)
+                            {
+                                mirror_dialogue(registers, resources, Vertices::Shaded(&shaded));
+                            } else if resources.portraits.in_battle
+                                && is_power_label_text(&resources.portraits, &shaded)
+                            {
+                                match power_label_mode() {
+                                    PowerLabelMode::Bottom => {
+                                        mirror_power_label(registers, resources, &shaded);
+                                    }
+                                    PowerLabelMode::AboveBar => {
+                                        mirror_hud(registers, resources, Vertices::Shaded(&shaded));
+                                    }
+                                    PowerLabelMode::Off => {}
+                                }
+                            } else if resources.portraits.in_battle {
+                                mirror_hud(registers, resources, Vertices::Shaded(&shaded));
+                            }
+                        }
                     } else if resources.portraits.in_battle {
                         mirror_hud(registers, resources, vertices);
                     } else if on_title {
@@ -8613,7 +9919,7 @@ mod tests {
         assert!((area(&draw.vertices) - area(&quad)).abs() < 1e-4);
     }
 
-    /// a draw inside the counters' island goes under the score on the top
+    /// a draw inside the counters' island goes beside the score on the top
     /// screen; one over the whole bottom screen, a background, stays there.
     #[test]
     fn the_battle_display_goes_to_its_island_on_the_top_screen() {
@@ -8629,13 +9935,79 @@ mod tests {
         // drawn over the whole top screen, its vertices moved there
         assert_eq!(draw.registers[REG_VIEWPORT_XY], 0);
         assert_eq!((read_float24(&draw.registers, REG_VIEWPORT_WIDTH), read_float24(&draw.registers, REG_VIEWPORT_HEIGHT)), (120.0, 200.0));
-        // the island, 196 to 320 across and 0 to 52 down, lands 325.6 to 400
-        // across, against the right edge, and 44 to 75.2 down the top screen,
-        // scaled by 0.6: the corner 300 across and 40 down goes to 388 across
-        // and 68 down, which in the top screen's buffer is 172 up from its
-        // bottom edge and 12 left of its right one
+        // the island, 196 to 320 across and 0 to 52 down, lands 232 to 301.44
+        // across (beside SCORE) and 3 to 32.12 down the top screen, scaled by
+        // 0.56: the corner 300 across and 40 down goes to 290.24 across and
+        // 25.4 down, which in the top screen's buffer is 214.6 up from its
+        // bottom edge and 109.76 left of its right one
         let screen = to_screen(&draw.vertices[0], (0.0, 0.0, 240.0, 400.0)).unwrap();
-        assert!((screen.x - 172.0).abs() < 0.1 && (screen.y - 12.0).abs() < 0.1, "at {}, {}", screen.x, screen.y);
+        assert!((screen.x - 214.6).abs() < 0.1 && (screen.y - 109.76).abs() < 0.1, "at {}, {}", screen.x, screen.y);
+    }
+
+    /// bottom-screen text from the 512x128 RGBA8 text buffer routes How to
+    /// Play's top dialogue band to `dialogue`, while power name callouts and
+    /// item pickup cards stay in their respective HUD islands.
+    #[test]
+    fn bottom_text_and_item_pickup_card_route_to_hud_islands() {
+        let mut registers = target_registers();
+        sized(&mut registers, 240, 320);
+        let base = TEXTURE_UNIT_BASES[0];
+        registers[REG_TEXTURE_CONFIG] = 1;
+        registers[base + 1] = 512 << 16 | 128;
+        registers[base + 13] = 0; // Rgba8
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources::default();
+        resources.portraits.in_play = true;
+        resources.portraits.in_battle = true;
+        resources.portraits.top_subtitle_quiet = 60;
+        resources.portraits.top = Some([0x1F08_0000 >> 3, 0, 256 | (511 << 12)]);
+
+        let bottom_rect = |left: f32, upper: f32, right: f32, lower: f32| {
+            rect(240.0 - lower, 320.0 - right, 240.0 - upper, 320.0 - left, (240.0, 320.0))
+        };
+
+        // 1. How to Play top-of-bottom-screen tutorial text (`upper = 14..52`) -> dialogue
+        rasterize(&registers, &mut memory, &mut resources, Vertices::Shaded(&bottom_rect(12.0, 14.0, 290.0, 52.0)));
+        assert_eq!(resources.portraits.dialogue.len(), 1);
+        assert_eq!(resources.portraits.hud.len(), 0);
+
+        // 2. Power Name callout (`[18..120, 166..179]` inside speech bubble `56..78`) routes
+        //    according to PowerLabelMode, while Practice Range stat text above the bubble
+        //    (`[14..152, 148..161]`) is ignored.
+        resources.portraits.power_bubble_x = Some([56.0, 78.0]);
+        set_power_label_mode(PowerLabelMode::Bottom);
+        rasterize(&registers, &mut memory, &mut resources, Vertices::Shaded(&bottom_rect(14.0, 148.0, 152.0, 161.0)));
+        assert_eq!(resources.portraits.power_label.len(), 0);
+        assert_eq!(resources.portraits.hud.len(), 0);
+
+        rasterize(&registers, &mut memory, &mut resources, Vertices::Shaded(&bottom_rect(18.0, 166.0, 120.0, 179.0)));
+        assert_eq!(resources.portraits.dialogue.len(), 1);
+        assert_eq!(resources.portraits.power_label.len(), 1);
+        assert_eq!(resources.portraits.hud.len(), 0);
+        assert_eq!(&resources.portraits.power_label[0].vertices[0].color[..3], &[1.0, 1.0, 1.0]);
+
+        set_power_label_mode(PowerLabelMode::Off);
+        rasterize(&registers, &mut memory, &mut resources, Vertices::Shaded(&bottom_rect(18.0, 166.0, 120.0, 179.0)));
+        assert_eq!(resources.portraits.power_label.len(), 1);
+        assert_eq!(resources.portraits.hud.len(), 0);
+
+        set_power_label_mode(PowerLabelMode::AboveBar);
+        rasterize(&registers, &mut memory, &mut resources, Vertices::Shaded(&bottom_rect(18.0, 166.0, 120.0, 179.0)));
+        assert_eq!(resources.portraits.dialogue.len(), 1);
+        assert_eq!(resources.portraits.hud.len(), 1);
+        set_power_label_mode(PowerLabelMode::Bottom);
+
+        // 3. Item Collection text (`[105..284, 118..163]`) + 64x64 Etc1 icon (`[36..100, 118..182]`) -> ItemCard island
+        rasterize(&registers, &mut memory, &mut resources, Vertices::Shaded(&bottom_rect(105.0, 118.0, 284.0, 163.0)));
+        let mut icon_regs = registers.clone();
+        icon_regs[base + 1] = 64 << 16 | 64;
+        icon_regs[base + 13] = 12; // Etc1
+        rasterize(&icon_regs, &mut memory, &mut resources, Vertices::Shaded(&bottom_rect(36.0, 118.0, 100.0, 182.0)));
+        assert_eq!(resources.portraits.dialogue.len(), 1);
+        assert_eq!(resources.portraits.hud.len(), 3);
+        let icon_screen = to_screen(&resources.portraits.hud[2].vertices[0], (0.0, 0.0, 240.0, 400.0)).unwrap();
+        // bottom-right of `[36..100, 118..182]` -> `x_top < 395`, `y_top` in `74..120` (`screen.x` in `120..166`)
+        assert!(icon_screen.x > 120.0 && icon_screen.x < 166.0 && icon_screen.y < 130.0, "icon at {:?}", icon_screen);
     }
 
     /// a vertex at x, y of a viewport w by h, with texture coordinates u, v.
@@ -8745,12 +10117,16 @@ mod tests {
         flush_portraits(&mut memory, &mut resources);
         assert_eq!(alphas(&resources), (Some(0.125), Some(PORTRAIT_ALPHA - 0.125)), "the new one over the old");
 
-        // the game stops: the new one had an eighth to lose, the old one the rest
+        // the game stops drawing the portrait on its bottom-screen frames:
+        // the new one had an eighth to lose, the old one the rest
+        resources.portraits.bottom_seen = true;
         assert!(flush_portraits(&mut memory, &mut resources));
         assert_eq!(alphas(&resources), (None, Some(PORTRAIT_ALPHA - 0.25)));
         for _ in 0..4 {
+            resources.portraits.bottom_seen = true;
             assert!(flush_portraits(&mut memory, &mut resources));
         }
+        resources.portraits.bottom_seen = true;
         assert!(!flush_portraits(&mut memory, &mut resources), "the last step leaves nothing to draw");
         assert_eq!(alphas(&resources), (None, None));
     }

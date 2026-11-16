@@ -106,6 +106,16 @@ pub enum ScreenLayout {
     /// the top screen, with the bottom one over its middle, for menus played
     /// on the bottom screen while the window keeps the top screen's shape.
     BottomOverTop,
+    /// Kid Icarus: Uprising's Fuse Weapons workbench on a single 16:9 screen:
+    /// weapon cards A & B and the AxB banner on the left, result stats, live
+    /// preview, and the full 320x240 fusion matrix on the right, every slice
+    /// at 1:1 console pixel aspect.
+    FuseSplitDeck,
+    /// Kid Icarus: Uprising's Fiend's Cauldron on a single 16:9 screen:
+    /// full-width Reaper/Treasure Chest mural hearth backdrop, screen-blended
+    /// 3D Cauldron & flames, top-left Total Hearts pouch, bottom-left Back
+    /// button, and a dynamic-opacity floating Intensity cursor thumb.
+    FiendsCauldron,
 }
 
 /// how the screens' pixels are drawn when scaled to the window.
@@ -147,6 +157,7 @@ impl ScreenLayout {
             ScreenLayout::TopOnly | ScreenLayout::BottomOverTop => (top_width, 240.0),
             ScreenLayout::BottomOnly => (320.0, 240.0),
             ScreenLayout::LargeTop => (top_width + LARGE_TOP_BOTTOM.0 as f32, 240.0),
+            ScreenLayout::FuseSplitDeck | ScreenLayout::FiendsCauldron => (FUSE_DECK_WIDTH, 240.0),
         }
     }
 }
@@ -156,19 +167,16 @@ impl ScreenLayout {
 /// into the same 400x240.
 pub const TOP_WIDTH: f32 = 400.0;
 
+/// the 16:9 Fuse Split-Deck logical width at 240p console height.
+pub const FUSE_DECK_WIDTH: f32 = 240.0 * 16.0 / 9.0;
+
 /// the bottom screen's size next to the big top one, half the console's.
 const LARGE_TOP_BOTTOM: (u32, u32) = (160, 120);
 
 /// how big the bottom screen is over the top one, for the top's scale.
 const BOTTOM_OVER_TOP: f32 = 0.9;
 
-/// works out where the screens go inside a window, keeping the 3DS's
-/// aspect ratio, or the top screen top_w wide, and centring them, scaled by
-/// a whole number when integer asks and the window has room. a screen that
-/// does not show has no place.
-pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, top_w: f32, integer: bool) -> (Option<Viewport>, Option<Viewport>) {
-    let (total_width, total_height) = arrangement.size_f(top_w);
-
+fn window_scale_and_offset(window_width: u32, window_height: u32, total_width: f32, total_height: f32, integer: bool) -> (f32, f32, f32) {
     let mut scale = (window_width as f32 / total_width).min(window_height as f32 / total_height);
     if integer && scale >= 1.0 {
         scale = scale.floor();
@@ -179,6 +187,38 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
         // whole pixels, or every texel would not get the same size
         offset_x = offset_x.floor();
         offset_y = offset_y.floor();
+    }
+    (scale, offset_x, offset_y)
+}
+
+/// works out where the screens go inside a window, keeping the 3DS's
+/// aspect ratio, or the top screen top_w wide, and centring them, scaled by
+/// a whole number when integer asks and the window has room. a screen that
+/// does not show has no place.
+pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, top_w: f32, integer: bool) -> (Option<Viewport>, Option<Viewport>) {
+    let (total_width, total_height) = arrangement.size_f(top_w);
+    let (scale, offset_x, offset_y) = window_scale_and_offset(window_width, window_height, total_width, total_height, integer);
+
+    if arrangement == ScreenLayout::FuseSplitDeck {
+        // Left column holds Top's A/B stat cards; right column holds the
+        // continuous Result + Fusion Matrix stack so touch_on_bottom maps 1:1.
+        let slices = fuse_deck_slices(window_width, window_height, integer, Shown::Top);
+        return (Some(slices[0].viewport), Some(slices[3].viewport));
+    }
+    if arrangement == ScreenLayout::FiendsCauldron {
+        let stage = Viewport {
+            x: offset_x,
+            y: offset_y,
+            width: FUSE_DECK_WIDTH * scale,
+            height: 240.0 * scale,
+        };
+        let cauldron_bot = Viewport {
+            x: offset_x + 62.22222 * scale,
+            y: offset_y + 13.0 * scale,
+            width: (320.0 * (227.0 / 240.0)) * scale,
+            height: 227.0 * scale,
+        };
+        return (Some(stage), Some(cauldron_bot));
     }
 
     let top = (arrangement != ScreenLayout::BottomOnly).then_some(Viewport {
@@ -231,6 +271,7 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
             width: 320.0 * scale,
             height: 240.0 * scale,
         }),
+        ScreenLayout::FuseSplitDeck | ScreenLayout::FiendsCauldron => unreachable!(),
     };
     (top, bottom)
 }
@@ -311,6 +352,194 @@ pub fn place(window_width: u32, window_height: u32, arrangement: ScreenLayout, t
     }
 }
 
+/// one screen slice drawn into the window, with its normalized sub-rectangle
+/// `[x, y, width, height]` inside that screen's picture (`[0, 0, 1, 1]` for a
+/// whole screen).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacedSlice {
+    pub viewport: Viewport,
+    pub shown: Shown,
+    pub uv: [f32; 4],
+}
+
+fn fuse_deck_slices(window_width: u32, window_height: u32, integer: bool, top_eye: Shown) -> [PlacedSlice; 4] {
+    let (scale, offset_x, offset_y) = window_scale_and_offset(window_width, window_height, FUSE_DECK_WIDTH, 240.0, integer);
+    let l1_w = 228.0;
+    let l1_h = l1_w * (211.0 / 252.0);
+    let l1_y = (240.0 - l1_h) * 0.5;
+
+    let rx = (offset_x + 235.5 * scale).round();
+    let rw = (187.5 * scale).round();
+
+    let ban_h = ((187.5 * 28.0 / 400.0) * scale).round();
+    let sep = (0.45 * scale).round().max(1.0);
+    let body_h = ((187.5 * 52.0 / 146.0) * scale).round();
+    let r3_h = ((187.5 * 240.0 / 320.0) * scale).round();
+    let total_r_h = ban_h + sep + body_h + sep + r3_h;
+    let ban_y = (offset_y + (240.0 * scale - total_r_h) * 0.5).round();
+    let body_y = ban_y + ban_h + sep;
+    let r3_y = body_y + body_h + sep;
+
+    [
+        // L1: Weapon A & B stat/mod cards (252x211 px of Top 400x240)
+        PlacedSlice {
+            viewport: Viewport {
+                x: (offset_x + 3.5 * scale).round(),
+                y: (offset_y + l1_y * scale).round(),
+                width: (l1_w * scale).round(),
+                height: (l1_h * scale).round(),
+            },
+            shown: top_eye,
+            uv: [0.0, 0.0, 252.0 / 400.0, 211.0 / 240.0],
+        },
+        // R0: Result card header banner — weapon class icon + AxB-> + result name (400x28 px of Top 400x240)
+        PlacedSlice {
+            viewport: Viewport {
+                x: rx,
+                y: ban_y,
+                width: rw,
+                height: ban_h,
+            },
+            shown: top_eye,
+            uv: [0.0, 212.0 / 240.0, 1.0, 28.0 / 240.0],
+        },
+        // R1: Single continuous Result card body bridging directly onto R3 —
+        // Ranged / Melee / Value + sparkling result weapon over one seamless
+        // filigree strip (146x52 px of Top 400x240)
+        PlacedSlice {
+            viewport: Viewport {
+                x: rx,
+                y: body_y,
+                width: rw,
+                height: body_h,
+            },
+            shown: top_eye,
+            uv: [254.0 / 400.0, 0.0, 146.0 / 400.0, 52.0 / 240.0],
+        },
+        // R3: Full uncut 320x240 Fusion Matrix, sort bar, Back button & modals
+        PlacedSlice {
+            viewport: Viewport {
+                x: rx,
+                y: r3_y,
+                width: rw,
+                height: r3_h,
+            },
+            shown: Shown::Bottom,
+            uv: [0.0, 0.0, 1.0, 1.0],
+        },
+    ]
+}
+
+/// the screen slices a frame draws. For `FuseSplitDeck` this returns the four
+/// 1:1 sub-crops across the 16:9 workbench; for all other layouts each screen
+/// is drawn whole (`uv = [0, 0, 1, 1]`).
+pub fn place_slices(
+    window_width: u32,
+    window_height: u32,
+    arrangement: ScreenLayout,
+    top_width: f32,
+    integer: bool,
+    stereo: Stereo,
+    right: bool,
+) -> Vec<PlacedSlice> {
+    if arrangement != ScreenLayout::FuseSplitDeck {
+        return place(window_width, window_height, arrangement, top_width, integer, stereo, right)
+            .into_iter()
+            .map(|(viewport, shown)| PlacedSlice {
+                viewport,
+                shown,
+                uv: [0.0, 0.0, 1.0, 1.0],
+            })
+            .collect();
+    }
+    let (first, second) = match (right, stereo.swap) {
+        (false, _) => (Shown::Top, Shown::Top),
+        (true, false) => (Shown::Top, Shown::Right),
+        (true, true) => (Shown::Right, Shown::Top),
+    };
+    match stereo.mode {
+        StereoMode::Off => fuse_deck_slices(window_width, window_height, integer, Shown::Top).into(),
+        StereoMode::Anaglyph | StereoMode::Interlaced => {
+            let top = if right { Shown::Both } else { Shown::Top };
+            fuse_deck_slices(window_width, window_height, integer, top).into()
+        }
+        StereoMode::SideBySide => {
+            let half = window_width / 2;
+            let left_eye = fuse_deck_slices(half, window_height, integer, first);
+            let right_eye = fuse_deck_slices(half, window_height, integer, second).map(|s| PlacedSlice {
+                viewport: Viewport { x: s.viewport.x + half as f32, ..s.viewport },
+                ..s
+            });
+            left_eye.into_iter().chain(right_eye).collect()
+        }
+        StereoMode::HalfSideBySide => {
+            let half = window_width as f32 / 2.0;
+            let squeeze = |s: PlacedSlice, by: f32| PlacedSlice {
+                viewport: Viewport { x: s.viewport.x / 2.0 + by, width: s.viewport.width / 2.0, ..s.viewport },
+                ..s
+            };
+            let left_eye = fuse_deck_slices(window_width, window_height, integer, first).map(|s| squeeze(s, 0.0));
+            let right_eye = fuse_deck_slices(window_width, window_height, integer, second).map(|s| squeeze(s, half));
+            left_eye.into_iter().chain(right_eye).collect()
+        }
+    }
+}
+
+/// subtle obsidian workbench fill, antique-gold card borders, and center
+/// divider cleared behind `ScreenLayout::FuseSplitDeck` slices (colors in sRGB
+/// `[0..1]`).
+pub fn fuse_backdrops(window_width: u32, window_height: u32, integer: bool) -> Vec<(Viewport, [f32; 4])> {
+    let (scale, offset_x, offset_y) = window_scale_and_offset(window_width, window_height, FUSE_DECK_WIDTH, 240.0, integer);
+    let border = (0.45 * scale).round().max(1.0);
+    let divider_w = (0.35 * scale).round().max(1.0);
+    let slices = fuse_deck_slices(window_width, window_height, integer, Shown::Top);
+    let mut rects = Vec::with_capacity(7);
+    // Obsidian workbench canvas
+    rects.push((
+        Viewport {
+            x: offset_x.round(),
+            y: offset_y.round(),
+            width: (FUSE_DECK_WIDTH * scale).round(),
+            height: (240.0 * scale).round(),
+        },
+        [0.065, 0.072, 0.095, 1.0],
+    ));
+    // Center vertical divider between Left Column and Right Column
+    rects.push((
+        Viewport {
+            x: (offset_x + 233.5 * scale - divider_w * 0.5).round(),
+            y: (offset_y + 10.0 * scale).round(),
+            width: divider_w,
+            height: (220.0 * scale).round(),
+        },
+        [0.24, 0.23, 0.27, 1.0],
+    ));
+    // Two cohesive antique-gold deck frames:
+    // 1. Left A/B stat deck (slices[0])
+    // 2. Unified right Result + Fusion Matrix stack (slices[1..=3], bridged flush)
+    let cards = [
+        slices[0].viewport,
+        Viewport {
+            x: slices[1].viewport.x,
+            y: slices[1].viewport.y,
+            width: slices[1].viewport.width,
+            height: (slices[3].viewport.y + slices[3].viewport.height) - slices[1].viewport.y,
+        },
+    ];
+    for vp in cards {
+        rects.push((
+            Viewport {
+                x: vp.x - border,
+                y: vp.y - border,
+                width: vp.width + 2.0 * border,
+                height: vp.height + 2.0 * border,
+            },
+            [0.45, 0.39, 0.25, 1.0],
+        ));
+    }
+    rects
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PresentError {
     #[error("{0}")]
@@ -348,6 +577,11 @@ pub trait Presenter {
 
     /// how the 3D shows from the next frame on.
     fn set_stereo(&mut self, stereo: Stereo);
+
+    /// live state for `ScreenLayout::FiendsCauldron`: bottom-screen slider
+    /// cursor X (`0..320`), floating badge opacity (`0..1`), and packed HUD
+    /// flags (`bit 0` = interactive prep HUD visible, `bits 8..31` = room RGB).
+    fn set_cauldron_state(&mut self, _cursor_x: f32, _opacity: f32, _hud_flags: u32) {}
 }
 
 #[cfg(test)]
@@ -504,5 +738,34 @@ mod tests {
         let (top, bottom) = layout(1680, 720, ScreenLayout::LargeTop, TOP_WIDTH, true);
         assert_eq!(top.unwrap().width, 1200.0);
         assert_eq!((bottom.unwrap().width, bottom.unwrap().height), (320.0, 240.0));
+    }
+
+    #[test]
+    fn fuse_split_deck_keeps_square_pixels_and_non_overlapping_cards() {
+        for (w, h) in [(1920, 1080), (1280, 720)] {
+            let slices = place_slices(w, h, ScreenLayout::FuseSplitDeck, TOP_WIDTH, false, Stereo::default(), false);
+            assert_eq!(slices.len(), 4);
+            for (i, s) in slices.iter().enumerate() {
+                let (sw, sh) = if s.shown == Shown::Bottom { (320.0, 240.0) } else { (400.0, 240.0) };
+                let src_aspect = (s.uv[2] * sw) / (s.uv[3] * sh);
+                let dst_aspect = s.viewport.width / s.viewport.height;
+                assert!(
+                    ((dst_aspect / src_aspect) - 1.0).abs() < 0.015,
+                    "slice {i} aspect {dst_aspect} vs {src_aspect}"
+                );
+                assert!(s.viewport.x >= 0.0 && s.viewport.y >= 0.0);
+                assert!(s.viewport.x + s.viewport.width <= w as f32);
+                assert!(s.viewport.y + s.viewport.height <= h as f32);
+                for (j, other) in slices.iter().enumerate().skip(i + 1) {
+                    let separated = s.viewport.x + s.viewport.width <= other.viewport.x
+                        || other.viewport.x + other.viewport.width <= s.viewport.x
+                        || s.viewport.y + s.viewport.height <= other.viewport.y
+                        || other.viewport.y + other.viewport.height <= s.viewport.y;
+                    assert!(separated, "slice {i} overlaps slice {j} at {w}x{h}");
+                }
+            }
+            let (_, bottom_touch) = layout(w, h, ScreenLayout::FuseSplitDeck, TOP_WIDTH, false);
+            assert_eq!(bottom_touch.unwrap(), slices[3].viewport);
+        }
     }
 }
