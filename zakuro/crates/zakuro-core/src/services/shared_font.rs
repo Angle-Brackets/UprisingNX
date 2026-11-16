@@ -303,6 +303,7 @@ fn characters() -> Vec<char> {
         0x2190..=0x2199,
         0x2460..=0x2473,
         0x3000..=0x30FF,
+        0xE000..=0xE07F,
         0xFF01..=0xFF9F,
         0xFFE0..=0xFFE6,
     ];
@@ -312,13 +313,37 @@ fn characters() -> Vec<char> {
     characters
 }
 
+/// Stand-in Unicode characters for the 3DS shared font's Private Use Area
+/// symbols (`U+E000..=U+E07F`, button prompts and directional arrows) when
+/// the host or user-supplied font lacks Nintendo's PUA glyphs.
+fn pua_stand_in(character: char) -> Option<char> {
+    match character as u32 {
+        0xE000 => Some('A'),
+        0xE001 => Some('B'),
+        0xE002 => Some('X'),
+        0xE003 => Some('Y'),
+        0xE004 | 0xE052 => Some('L'),
+        0xE005 | 0xE053 => Some('R'),
+        0xE006 => Some('+'),
+        0xE015 => Some('\u{2605}'),
+        0xE016 => Some('\u{2606}'),
+        0xE017 => Some('\u{2665}'),
+        0xE019 | 0xE07C => Some('\u{2192}'),
+        0xE01A | 0xE07B => Some('\u{2190}'),
+        0xE01B | 0xE079 => Some('\u{2191}'),
+        0xE01C | 0xE07A => Some('\u{2193}'),
+        0xE073 => Some('\u{2022}'),
+        _ => None,
+    }
+}
+
 /// the host's font for Japanese made into glyphs, the first time a title
 /// asks for the shared font, none where the host has no such font.
 fn host_face() -> Option<&'static Face> {
     static FACE: std::sync::OnceLock<Option<Face>> = std::sync::OnceLock::new();
     FACE.get_or_init(|| {
-        let (path, data) = host_font()?;
-        let face = rasterize(&data)?;
+        let (path, data, fallback) = host_font()?;
+        let face = rasterize_with_fallback(&data, fallback.as_deref())?;
         log::info!("the shared font's stand-in draws {} characters from {}", face.glyphs.len(), path.display());
         Some(face)
     })
@@ -326,16 +351,26 @@ fn host_face() -> Option<&'static Face> {
 }
 
 /// glyphs for the characters a font has, at EM pixels an em.
+#[allow(dead_code)]
 fn rasterize(data: &[u8]) -> Option<Face> {
+    rasterize_with_fallback(data, None)
+}
+
+fn rasterize_with_fallback(data: &[u8], fallback: Option<&[u8]>) -> Option<Face> {
     use ab_glyph::{point, Font, FontRef, PxScale};
 
     let font = FontRef::try_from_slice_and_index(data, 0).ok()?;
     let per_unit = EM / font.units_per_em()?;
     let scale = PxScale::from(font.height_unscaled() * per_unit);
+    let fb = fallback.and_then(|bytes| {
+        let f = FontRef::try_from_slice_and_index(bytes, 0).ok()?;
+        let u = EM / f.units_per_em()?;
+        let s = PxScale::from(f.height_unscaled() * u);
+        Some((f, u, s))
+    });
     let (width, height) = (CELL_WIDTH as usize, CELL_HEIGHT as usize);
-    let make_glyph = |&character: &char| {
+    let raster_one = |font: &FontRef<'_>, per_unit: f32, scale: PxScale, character: char| -> Option<Glyph> {
         let id = font.glyph_id(character);
-        // the glyph a font has for what it lacks
         if id.0 == 0 {
             return None;
         }
@@ -356,6 +391,22 @@ fn rasterize(data: &[u8]) -> Option<Face> {
         }
         Some(Glyph { code: character as u16, alpha, left, width: drawn, advance })
     };
+    let make_glyph = |&character: &char| {
+        raster_one(&font, per_unit, scale, character)
+            .or_else(|| {
+                let (f, u, s) = fb.as_ref()?;
+                raster_one(f, *u, *s, character)
+            })
+            .or_else(|| {
+                let stand_in = pua_stand_in(character)?;
+                let mut g = raster_one(&font, per_unit, scale, stand_in).or_else(|| {
+                    let (f, u, s) = fb.as_ref()?;
+                    raster_one(f, *u, *s, stand_in)
+                })?;
+                g.code = character as u16;
+                Some(g)
+            })
+    };
     #[cfg(target_os = "horizon")]
     let glyphs: Vec<Glyph> = characters().iter().filter_map(make_glyph).collect();
     #[cfg(not(target_os = "horizon"))]
@@ -363,11 +414,20 @@ fn rasterize(data: &[u8]) -> Option<Face> {
         use rayon::prelude::*;
         characters().par_iter().filter_map(make_glyph).collect()
     };
-    // a font that has none of Japanese is no better than the bitmap one
-    if !glyphs.iter().any(|glyph| glyph.code == 0x3042) {
+    // a font (plus any system fallback) that lacks kana and basic Latin is unusable
+    let has_kana = glyphs.iter().any(|glyph| glyph.code == 0x3042);
+    let has_latin = fallback.is_some() && glyphs.iter().any(|glyph| glyph.code == b'A' as u16);
+    if !has_kana && !has_latin {
         return None;
     }
-    let advance = (font.h_advance_unscaled(font.glyph_id('\u{3042}')) * per_unit).round().clamp(0.0, 255.0) as u8;
+    let wide_ref = if font.glyph_id('\u{3042}').0 != 0 {
+        (font.h_advance_unscaled(font.glyph_id('\u{3042}')) * per_unit).round()
+    } else if let Some((f, u, _)) = fb.as_ref().filter(|(f, _, _)| f.glyph_id('\u{3042}').0 != 0) {
+        (f.h_advance_unscaled(f.glyph_id('\u{3042}')) * *u).round()
+    } else {
+        EM
+    };
+    let advance = wide_ref.clamp(0.0, 255.0) as u8;
     Some(Face { glyphs, baseline: HOST_BASELINE, advance })
 }
 
@@ -390,27 +450,42 @@ const USER_FONT_PATHS: &[&str] = &[
     "sdmc:/switch/uprisingnx/font.ttf",
 ];
 
-/// the first font for Japanese the host has, and where it is.
-fn host_font() -> Option<(std::path::PathBuf, Vec<u8>)> {
+/// the first font for Japanese (or user-placed Latin/serif font backed by
+/// FRONTEND_FONT for missing CJK glyphs) the host has, and where it is.
+fn host_font() -> Option<(std::path::PathBuf, Vec<u8>, Option<Vec<u8>>)> {
+    let frontend = FRONTEND_FONT.get().filter(|d| usable(d)).cloned();
     let user = std::env::var_os("ZAKURO_FONT")
         .map(std::path::PathBuf::from)
         .into_iter()
         .chain(USER_FONT_PATHS.iter().map(std::path::PathBuf::from));
-    let files = user.chain(font_candidates()).find_map(|path| {
+    for path in user {
+        if let Ok(data) = std::fs::read(&path) {
+            if usable(&data) || (frontend.is_some() && usable_latin(&data)) {
+                return Some((path, data, frontend));
+            }
+        }
+    }
+    let system_files = font_candidates().into_iter().find_map(|path| {
         let data = std::fs::read(&path).ok()?;
-        // a file that does not parse or lacks kana falls through to the next
-        usable(&data).then_some((path, data))
+        usable(&data).then_some((path, data, None))
     });
-    files.or_else(|| {
-        let data = FRONTEND_FONT.get()?;
-        usable(data).then(|| ("the frontend's system font".into(), data.clone()))
+    system_files.or_else(|| {
+        let data = frontend?;
+        Some(("the frontend's system font".into(), data, None))
     })
 }
 
-/// whether a font file is one the stand-in can use.
+/// whether a font file is one the stand-in can use standalone (has kana).
 fn usable(data: &[u8]) -> bool {
     use ab_glyph::{Font, FontRef};
     FontRef::try_from_slice_and_index(data, 0).is_ok_and(|font| font.glyph_id('\u{3042}').0 != 0)
+}
+
+/// whether a user-supplied font file has printable Latin glyphs (missing kana
+/// will be filled from FRONTEND_FONT).
+fn usable_latin(data: &[u8]) -> bool {
+    use ab_glyph::{Font, FontRef};
+    FontRef::try_from_slice_and_index(data, 0).is_ok_and(|font| font.glyph_id('A').0 != 0)
 }
 
 /// where Windows keeps its fonts for Japanese.

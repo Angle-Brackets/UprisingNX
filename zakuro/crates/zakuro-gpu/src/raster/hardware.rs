@@ -6662,6 +6662,7 @@ impl Hardware {
 
     /// reads the picture a finished batch left in a surface's screen buffer.
     fn read_picture(&mut self, index: usize) -> Result<(), String> {
+        let opaque = matches!(self.surfaces[index].kind, Kind::Color(ColorFormat::Rgb8 | ColorFormat::Rgb565));
         let Some(capture) = self.surfaces[index].screen.as_mut() else { return Ok(()) };
         let buffer = &capture.buffer;
         if buffer.incoherent {
@@ -6672,7 +6673,13 @@ impl Hardware {
         // SAFETY: the batch that filled the buffer is done, and nothing
         // writes it again before this returns
         let data = unsafe { std::slice::from_raw_parts(buffer.mapped, buffer.size as usize) };
-        capture.pictures.push_back((capture.batch, Arc::new(data.to_vec())));
+        let mut pixels = data.to_vec();
+        if opaque {
+            for px in pixels.chunks_exact_mut(4) {
+                px[3] = 0xFF;
+            }
+        }
+        capture.pictures.push_back((capture.batch, Arc::new(pixels)));
         while capture.pictures.len() > 2 {
             capture.pictures.pop_front();
         }
