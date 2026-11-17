@@ -165,10 +165,11 @@ void main() {
     }
 
     if (crop.layout_kind == 3) {
-        // WeaponSelect (Gear Hub, Weapon Category Select, & Weapon List Option B):
+        // WeaponSelect (Gear Hub, Weapon Category Select, Weapon List, & Power Configurator):
         vec3 col = sample_top(uv, duv);
         float bot_x0 = crop.pad0;
-        float bot_s = max(crop.pad1, 0.01);
+        bool is_power = crop.pad1 < 0.0;
+        float bot_s = max(abs(crop.pad1), 0.01);
         float bot_w = 320.0 * bot_s;
         float bot_h = 240.0 * bot_s;
         float bot_y0 = 240.0 - bot_h;
@@ -176,7 +177,12 @@ void main() {
             vec2 local_uv = (p - vec2(bot_x0, bot_y0)) / vec2(bot_w, bot_h);
             vec2 local_duv = dp / vec2(bot_w, bot_h);
             vec3 b_col = sample_bot(local_uv, local_duv);
-            float bg_amt = clamp(
+            vec2 bp = local_uv * vec2(320.0, 240.0);
+            bool in_opaque_well = is_power && (
+                (bp.x >= 1.0 && bp.x <= 148.0 && bp.y >= 50.0 && bp.y <= 200.0) ||
+                (bp.x >= 147.0 && bp.x <= 307.0 && bp.y >= 26.0 && bp.y <= 200.0)
+            );
+            float bg_amt = in_opaque_well ? 0.0 : clamp(
                 (min(b_col.r, b_col.b) - b_col.g - 3.2 * abs(b_col.r - b_col.b) - 0.03) / 0.97,
                 0.0,
                 1.0

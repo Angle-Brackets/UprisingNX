@@ -1055,6 +1055,7 @@ impl VulkanPresenter {
                         match self.weapon_sub {
                             2 => (0.0, 0.78),
                             3 => (4.0, 0.78),
+                            4 => (4.0, -0.80),
                             _ => (4.0, 0.77),
                         }
                     } else {

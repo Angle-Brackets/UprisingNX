@@ -1650,9 +1650,21 @@ pub(crate) struct Portraits {
     weapon_step: u8,
     /// state machine step (`0..=2`) matching Gear Hub's top pass (`256x256 L4` -> `256x256 Etc1`).
     gear_step: u8,
-    /// sub-screen (`1` = Weapon List, `2` = Category Select, `3` = Gear Hub) seen since last flush.
+    /// state machine step (`0..=2`) matching Power Configurator's top pass (`256x256 Etc1` -> `128x64 L4`).
+    power_step: u8,
+    /// whether Power Configurator's `64x64 Etc1` board tiles were seen on the bottom screen.
+    power_bot_etc1: bool,
+    /// whether Power Configurator's bottom workbench (or Gear Hub entry) is armed, excluding Vault's Power Portrait.
+    power_bot_latched: bool,
+    /// whether `~Power Set X~` summary overlay (`256x32 Etc1A4`) is active on the current top pass.
+    power_set_overlay: bool,
+    /// horizontal slide offset (`0` at rest) of `~Power Set X~` pills during slide-in/out.
+    power_set_shift: f32,
+    /// whether `~Power Set X~` has 8+ powers populating its second pill column.
+    power_set_two_cols: bool,
+    /// sub-screen (`1` = Weapon List, `2` = Category, `3` = Gear Hub, `4` = Power Configurator) seen since flush.
     weapon_sub_seen: u8,
-    /// active sub-screen (`1` = Weapon List, `2` = Category Select, `3` = Gear Hub).
+    /// active sub-screen (`1` = Weapon List, `2` = Category, `3` = Gear Hub, `4` = Power Configurator).
     pub(crate) weapon_sub: u8,
     /// consecutive top-screen transfers without Weapon / Category / Gear Hub draws.
     weapon_missed: u8,
@@ -3507,7 +3519,7 @@ fn draw_file_bot<M: GpuMemory>(
 
 fn needs_weapon_top_adjust(registers: &[u32], sub: u8, vertex_count: usize) -> bool {
     if registers[REG_TEXTURE_CONFIG] & 1 == 0 {
-        return false;
+        return sub == 4 && vertex_count == 6;
     }
     let base = TEXTURE_UNIT_BASES[0];
     let dims = registers[base + 1];
@@ -3532,6 +3544,16 @@ fn needs_weapon_top_adjust(registers: &[u32], sub: u8, vertex_count: usize) -> b
                 || (dims == (32 << 16 | 32) && matches!(fmt, TextureFormat::L8 | TextureFormat::La4))
                 || (dims == (8 << 16 | 8) && fmt == TextureFormat::La4)
         }
+        4 => {
+            (dims == (256 << 16 | 128) && fmt == TextureFormat::La4 && vertex_count == 6)
+                || (dims == (256 << 16 | 256) && matches!(fmt, TextureFormat::Etc1 | TextureFormat::A4))
+                || (dims == (64 << 16 | 64) && fmt == TextureFormat::La4)
+                || (vertex_count == 54 && matches!(fmt, TextureFormat::Etc1 | TextureFormat::Etc1A4))
+                || (dims == (32 << 16 | 32) && matches!(fmt, TextureFormat::La4 | TextureFormat::Etc1))
+                || (dims == (8 << 16 | 8) && fmt == TextureFormat::La4)
+                || (dims == (16 << 16 | 16) && fmt == TextureFormat::Etc1A4)
+                || (dims == (256 << 16 | 32) && fmt == TextureFormat::Etc1A4)
+        }
         _ => false,
     }
 }
@@ -3549,10 +3571,11 @@ fn draw_weapon_top<M: GpuMemory>(
         return res;
     }
 
+    let textured = registers[REG_TEXTURE_CONFIG] & 1 != 0;
     let base = TEXTURE_UNIT_BASES[0];
     let dims = registers[base + 1];
     let fmt = TextureFormat::from_raw(registers[base + 13]);
-    let sub = resources.portraits.weapon_sub;
+    let mut sub = resources.portraits.weapon_sub;
 
     let to_top_xy = |v: &Vertex| -> [f32; 2] {
         let w = v.clip[3];
@@ -3793,14 +3816,16 @@ fn draw_weapon_top<M: GpuMemory>(
             }
         }
     } else if sub == 3 {
+        // Gear Hub (`"Arm yourself for battle."` — `WEAPONS / POWERS`):
+        // If Power Configurator's `64x64 La4` (`v == 54`) board frame appears, switch directly to `sub = 4`.
         if dims == (64 << 16 | 64) && fmt == TextureFormat::La4 && shaded.len() >= 30 {
-            resources.portraits.weapon_active = false;
-            resources.portraits.weapon_sub = 0;
-            resources.portraits.adding = true;
-            let res = rasterize(registers, memory, resources, Vertices::Shaded(&shaded));
-            resources.portraits.adding = false;
-            return res;
+            resources.portraits.weapon_sub = 4;
+            resources.portraits.weapon_sub_seen = 4;
+            sub = 4;
         }
+    }
+
+    if sub == 3 {
         if dims == (256 << 16 | 256) && fmt == TextureFormat::Etc1 && shaded.len() == 6 {
             // Pit's rainbow winged silhouette on the Right Showcase:
             for v in &mut shaded {
@@ -3858,7 +3883,221 @@ fn draw_weapon_top<M: GpuMemory>(
                 }
             }
         }
+    } else if sub == 4 {
+        // Power Configurator (Option A: 0.80x Workbench Left | Power Inspector / Set Summary Right):
+        const S_BOX: f32 = 0.58;
+        const S_ROT: f32 = 0.78;
+        const S_DESC: f32 = 0.64;
+
+        if textured && dims == (256 << 16 | 256) && fmt == TextureFormat::Etc1 && shaded.len() >= 100 {
+            // Start of Power Configurator's top pass: lined cream parchment + gold seal + header ribbon.
+            resources.portraits.power_set_overlay = false;
+        } else if !textured && shaded.len() == 6 {
+            // Translucent white description card (`[-18.8..418.8, 163.8..208.5]`):
+            for v in &mut shaded {
+                let [sx, sy] = to_top_xy(v);
+                set_wide_top(
+                    v,
+                    263.0 + (sx + 18.8) * (160.0 / 437.6),
+                    144.0 + (sy - 163.8) * (40.0 / 44.7),
+                );
+            }
+        } else if textured && dims == (256 << 16 | 32) && fmt == TextureFormat::Etc1A4 {
+            if shaded.len() >= 30 {
+                // `~Power Set X~` sky-blue summary backing sheet (`[-49.5..449.5, 9.9..233.8]`):
+                if right <= 0.0 {
+                    resources.portraits.power_set_overlay = false;
+                    return Some(0);
+                }
+                resources.portraits.power_set_overlay = true;
+                let pill_shift = ((-49.5 - left) * 0.45276).max(0.0);
+                resources.portraits.power_set_shift = pill_shift;
+                let x_slide = pill_shift * 0.78;
+                let span_x = (right - left).max(1.0);
+                for v in &mut shaded {
+                    let [sx, sy] = to_top_xy(v);
+                    set_wide_top(
+                        v,
+                        263.0 + x_slide + (sx - left) * (165.0 / span_x),
+                        36.0 + (sy - 9.9) * (200.0 / 223.9),
+                    );
+                }
+            } else {
+                // Equipped power pill cards inside `~Power Set X~`:
+                if !resources.portraits.power_set_overlay || left > 500.0 {
+                    return Some(0);
+                }
+                let shift = resources.portraits.power_set_shift;
+                if left + shift >= 195.0 {
+                    resources.portraits.power_set_two_cols = true;
+                }
+                let s_set = if resources.portraits.power_set_two_cols { 0.40 } else { 0.78 };
+                let x_slide = shift * 0.78;
+                for v in &mut shaded {
+                    let [sx, sy] = to_top_xy(v);
+                    set_wide_top(
+                        v,
+                        265.0 + (sx + shift) * s_set + x_slide,
+                        44.0 + (sy - 23.0) * s_set,
+                    );
+                }
+            }
+        } else if resources.portraits.power_set_overlay {
+            // Mini icons (`32x32 Etc1`, `16x16 Etc1A4`), mini shapes (`32x32 La4`, `8x8 La4`),
+            // and `256x256 A4` labels belonging to the `~Power Set X~` summary overlay:
+            if left > 500.0 {
+                return Some(0);
+            }
+            let shift = resources.portraits.power_set_shift;
+            let s_set = if resources.portraits.power_set_two_cols { 0.40 } else { 0.78 };
+            let x_slide = shift * 0.78;
+            if textured
+                && dims == (256 << 16 | 256)
+                && fmt == TextureFormat::A4
+                && (registers[REG_PRIMITIVE_CONFIG] >> 8 & 3) == 0
+            {
+                for tri in shaded.chunks_exact_mut(3) {
+                    let pts = [to_top_xy(&tri[0]), to_top_xy(&tri[1]), to_top_xy(&tri[2])];
+                    let cx = (pts[0][0] + pts[1][0] + pts[2][0]) / 3.0;
+                    if cx + shift < -10.0 || cx > 500.0 {
+                        for v in tri.iter_mut() {
+                            v.clip = [0.0; 4];
+                        }
+                    } else {
+                        for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
+                            set_wide_top(
+                                v,
+                                265.0 + (sx + shift) * s_set + x_slide,
+                                44.0 + (sy - 23.0) * s_set,
+                            );
+                        }
+                    }
+                }
+            } else {
+                for v in &mut shaded {
+                    let [sx, sy] = to_top_xy(v);
+                    set_wide_top(
+                        v,
+                        265.0 + (sx + shift) * s_set + x_slide,
+                        44.0 + (sy - 23.0) * s_set,
+                    );
+                }
+            }
+        } else if textured && dims == (64 << 16 | 64) && fmt == TextureFormat::La4 {
+            // `6x6` Shape Preview outer frame (`cx < 175`); omit the oversized outer pink box (`cx >= 175`)
+            // around the Power Icon since the Power Icon already carries its own bold rounded border:
+            resources.portraits.power_set_two_cols = false;
+            if left > 500.0 {
+                return Some(0);
+            }
+            for tri in shaded.chunks_exact_mut(3) {
+                let pts = [to_top_xy(&tri[0]), to_top_xy(&tri[1]), to_top_xy(&tri[2])];
+                let cx = (pts[0][0] + pts[1][0] + pts[2][0]) / 3.0;
+                if cx < 175.0 {
+                    for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
+                        set_wide_top(
+                            v,
+                            302.0 + (sx - 103.1) * S_BOX,
+                            76.0 + (sy - 100.0) * S_BOX,
+                        );
+                    }
+                } else {
+                    for v in tri.iter_mut() {
+                        v.clip = [0.0; 4];
+                    }
+                }
+            }
+        } else if textured
+            && shaded.len() == 54
+            && matches!(fmt, TextureFormat::Etc1 | TextureFormat::Etc1A4)
+        {
+            // Selected Power Icon (`[219.2..330.5, 44.1..155.4]`):
+            if left > 500.0 {
+                return Some(0);
+            }
+            for v in &mut shaded {
+                let [sx, sy] = to_top_xy(v);
+                set_wide_top(
+                    v,
+                    382.0 + (sx - 274.85) * S_BOX,
+                    76.0 + (sy - 99.75) * S_BOX,
+                );
+            }
+        } else if textured && dims == (32 << 16 | 32) && fmt == TextureFormat::La4 {
+            if left > 500.0 {
+                return Some(0);
+            }
+            if upper >= 205.0 {
+                // `[L]` shoulder badge of `L/R: Rotate` (`[67.5..84.7, 219.5..236.7]`, `cy ≈ 228`):
+                if upper > 231.0 {
+                    return Some(0);
+                }
+                for v in &mut shaded {
+                    let [sx, sy] = to_top_xy(v);
+                    set_wide_top(
+                        v,
+                        343.5 + (sx - 137.0) * S_ROT,
+                        126.0 + (sy - 227.5) * S_ROT,
+                    );
+                }
+            } else {
+                // `6x6` tetromino footprint preview (`[44.8..161.4, 41.7..158.3]`):
+                for v in &mut shaded {
+                    let [sx, sy] = to_top_xy(v);
+                    set_wide_top(
+                        v,
+                        302.0 + (sx - 103.1) * S_BOX,
+                        76.0 + (sy - 100.0) * S_BOX,
+                    );
+                }
+            }
+        } else if textured
+            && dims == (256 << 16 | 256)
+            && fmt == TextureFormat::A4
+            && (registers[REG_PRIMITIVE_CONFIG] >> 8 & 3) == 0
+        {
+            for tri in shaded.chunks_exact_mut(3) {
+                let pts = [to_top_xy(&tri[0]), to_top_xy(&tri[1]), to_top_xy(&tri[2])];
+                let cx = (pts[0][0] + pts[1][0] + pts[2][0]) / 3.0;
+                let cy = (pts[0][1] + pts[1][1] + pts[2][1]) / 3.0;
+                if cx < 0.0 || cx > 405.0 || cy > 240.0 {
+                    for v in tri.iter_mut() {
+                        v.clip = [0.0; 4];
+                    }
+                } else if cy < 28.0 {
+                    // Header (`Power Name   Lv. X   Uses: Y`) at 1:1 square aspect:
+                    for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
+                        set_wide_top(v, sx, sy);
+                    }
+                } else if cy >= 212.0 {
+                    // `L/R: Rotate` footer text (`217.9..237.1`, rest `cy ≈ 227.5`):
+                    if cy > 234.0 {
+                        for v in tri.iter_mut() {
+                            v.clip = [0.0; 4];
+                        }
+                    } else {
+                        for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
+                            set_wide_top(
+                                v,
+                                343.5 + (sx - 137.0) * S_ROT,
+                                126.0 + (sy - 227.5) * S_ROT,
+                            );
+                        }
+                    }
+                } else {
+                    // Power Description text (`173.9..200.9`), centered inside Right Inspector card:
+                    for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
+                        set_wide_top(
+                            v,
+                            343.5 + (sx - 200.0) * S_DESC,
+                            164.0 + (sy - 187.4) * S_DESC,
+                        );
+                    }
+                }
+            }
+        }
     }
+
     resources.portraits.adding = true;
     let res = if disable_cull {
         let mut regs = registers.to_vec();
@@ -3952,7 +4191,54 @@ fn draw_weapon_bot<M: GpuMemory>(
     if textured && dims == (64 << 16 | 8) && fmt == TextureFormat::Rgb565 {
         return Some(0);
     }
-    if sub == 2 {
+    if sub == 4 {
+        // Power Configurator (Option A):
+        // 1. `64x64 Etc1` (`v == 6`, width > 300): clamp KIU's dark charcoal damask strictly
+        //    inside the Power List well (`[146.5..307.5, 25.5..200.0]`) so sparse lists stay
+        //    neatly framed while the outer border around Tabs/Back/OK stays `#FF00FF`.
+        // 2. `64x64 Etc1` (`v == 12`, width > 300): KIU's top & bottom scroll-clip mask quads
+        //    drawn over scrolled-off list rows — paint as `#FF00FF` so scrolled-off rows are
+        //    masked cleanly before `Autofill` / `Category` / `Back` / `OK (START)` draw on top!
+        if textured && dims == (64 << 16 | 64) && fmt == TextureFormat::Etc1 && (right - left) > 300.0 {
+            if shaded.len() == 6 {
+                for v in &mut shaded {
+                    let [sx, sy] = to_bot_xy(v);
+                    set_bot_xy(v, sx.clamp(146.5, 307.5), sy.clamp(25.5, 200.0));
+                }
+            } else {
+                let mut mask_regs = registers.to_vec();
+                mask_regs[REG_PRIMITIVE_CONFIG] &= !0x300;
+                mask_regs[REG_FACE_CULLING] = 0;
+                mask_regs[0x0065] = 0;
+                mask_regs[REG_TEXTURE_CONFIG] &= !0x7;
+                mask_regs[REG_ALPHA_TEST] = 0;
+                mask_regs[REG_STENCIL_TEST] = 0;
+                mask_regs[REG_COLOR_OPERATION] = 0x00E4_0100;
+                mask_regs[REG_BLEND_FUNC] = 0x0101_0000;
+                mask_regs[REG_COLOR_BUFFER_WRITE] = 0xF;
+                mask_regs[REG_DEPTH_COLOR_MASK] = 0xF << 8;
+                for (stage, &stage_base) in TEV_STAGES.iter().enumerate() {
+                    let vals = match stage {
+                        0 => [0x000E_000E, 0, 0, 0xFFFF_00FF, 0],
+                        _ => [0x000F_000F, 0, 0, 0, 0],
+                    };
+                    mask_regs[stage_base..stage_base + 5].copy_from_slice(&vals);
+                }
+                for v in &mut shaded {
+                    v.color = [1.0, 0.0, 1.0, 1.0];
+                }
+                resources.portraits.adding = true;
+                let res = rasterize(&mask_regs, memory, resources, Vertices::Shaded(&shaded));
+                resources.portraits.adding = false;
+                return res;
+            }
+        } else if !textured && (right - left) > 340.0 {
+            for v in &mut shaded {
+                let [sx, sy] = to_bot_xy(v);
+                set_bot_xy(v, sx.clamp(0.0, 312.0), sy.clamp(0.0, 202.0));
+            }
+        }
+    } else if sub == 2 {
         if (!textured && shaded.len() >= 18 && (right - left) > 400.0)
             || (textured && dims == (128 << 16 | 128) && fmt == TextureFormat::L4)
             || (textured && dims == (8 << 16 | 16) && fmt == TextureFormat::L4)
@@ -4047,6 +4333,12 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         portraits.file_missed = 0;
         portraits.weapon_step = 0;
         portraits.gear_step = 0;
+        portraits.power_step = 0;
+        portraits.power_bot_etc1 = false;
+        portraits.power_bot_latched = false;
+        portraits.power_set_overlay = false;
+        portraits.power_set_shift = 0.0;
+        portraits.power_set_two_cols = false;
         portraits.weapon_sub_seen = 0;
         portraits.weapon_sub = 0;
         portraits.weapon_active = false;
@@ -4249,6 +4541,7 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                     && fmt == TextureFormat::Etc1
                 {
                     portraits.gear_step = 2;
+                    portraits.power_bot_latched = true;
                     portraits.weapon_sub_seen = 3;
                     portraits.weapon_sub = 3;
                     portraits.weapon_active = true;
@@ -4263,11 +4556,35 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                     portraits.gear_step = 0;
                 }
 
+                // Power Configurator (`256x256 Etc1` -> `128x64 L4`, armed via Gear Hub or bottom `6x6` + Set Tabs):
+                if dims == (256 << 16 | 256) && fmt == TextureFormat::Etc1 {
+                    portraits.power_step = 1;
+                } else if portraits.power_step == 1
+                    && dims == (128 << 16 | 64)
+                    && fmt == TextureFormat::L4
+                {
+                    portraits.power_step = 2;
+                    if portraits.power_bot_latched {
+                        portraits.weapon_sub_seen = 4;
+                        portraits.weapon_sub = 4;
+                        portraits.weapon_active = true;
+                        portraits.weapon_missed = 0;
+                        portraits.weapon_modal_top = false;
+                        portraits.mode_active = false;
+                        portraits.mode_top_latched = false;
+                        portraits.solo_active = false;
+                        portraits.file_active = false;
+                        portraits.frontend_menu_seen = true;
+                    }
+                } else {
+                    portraits.power_step = 0;
+                }
             } else {
                 portraits.mode_top_step = 0;
                 portraits.solo_top_step = 0;
                 portraits.weapon_step = 0;
                 portraits.gear_step = 0;
+                portraits.power_step = 0;
             }
         } else {
             portraits.cauldron_mural_step = 0;
@@ -4276,6 +4593,7 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
             portraits.solo_top_step = 0;
             portraits.weapon_step = 0;
             portraits.gear_step = 0;
+            portraits.power_step = 0;
         }
         if is_title_sky(registers) {
             portraits.title_sky_seen = true;
@@ -4344,6 +4662,18 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
             portraits.mode_active = true;
             portraits.mode_missed = 0;
             portraits.solo_active = false;
+            portraits.power_bot_etc1 = false;
+            portraits.power_bot_latched = false;
+        }
+        if !portraits.in_battle && !portraits.mode_active {
+            if dims == (64 << 16 | 64) && fmt == TextureFormat::Etc1 {
+                portraits.power_bot_etc1 = true;
+            } else if portraits.power_bot_etc1
+                && dims == (256 << 16 | 64)
+                && fmt == TextureFormat::Rgba4
+            {
+                portraits.power_bot_latched = true;
+            }
         }
     } else if !is_bottom(registers) {
         portraits.title_bottom_drawing = false;
@@ -5375,6 +5705,7 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
         }
     }
 
+    resources.portraits.power_bot_etc1 = false;
     if resources.portraits.in_battle
         || resources.portraits.fuse_active
         || resources.portraits.cauldron_active
@@ -5388,6 +5719,8 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
         resources.portraits.weapon_sub = 0;
         resources.portraits.weapon_missed = 0;
         resources.portraits.weapon_modal_top = false;
+        resources.portraits.power_bot_latched = false;
+        resources.portraits.power_set_overlay = false;
     } else if weapon_sub_seen != 0 {
         resources.portraits.weapon_active = true;
         resources.portraits.weapon_sub = weapon_sub_seen;
@@ -5398,6 +5731,8 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
             resources.portraits.weapon_active = false;
             resources.portraits.weapon_sub = 0;
             resources.portraits.weapon_modal_top = false;
+            resources.portraits.power_bot_latched = false;
+            resources.portraits.power_set_overlay = false;
         }
     }
 

@@ -1088,6 +1088,7 @@ fn touch_on_bottom(layout: ScreenLayout, weapon_sub: u8, x: u16, y: u16) -> Opti
         let (bot_x0, bot_s) = match weapon_sub {
             2 => (0.0, 0.78),
             3 => (4.0, 0.78),
+            4 => (4.0, 0.80),
             _ => (4.0, 0.77),
         };
         let bot_y0 = 240.0 - 240.0 * bot_s;
