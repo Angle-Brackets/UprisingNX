@@ -321,6 +321,8 @@ pub struct Unx {
     title_quiet: u32,
     /// whether internal resolution is currently boosted to 2x for the title screen
     title_boosted: bool,
+    /// last seen sub-screen (`1..=3`) for `ScreenLayout::WeaponSelect`
+    weapon_sub: u8,
     /// battle resolution steps dropped by smooth_guard during the current
     /// battle so smooth mode stays on (0 or 1, cleared when the scene changes)
     battle_scale_drop: u32,
@@ -933,6 +935,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         smooth_forced,
         title_quiet: u32::MAX,
         title_boosted: true,
+        weapon_sub: 1,
         battle_scale_drop: 0,
         host_last: 0,
         smooth: Smooth {
@@ -969,7 +972,7 @@ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<za
 /// if it does. in TopOnly the bottom screen is not shown, and the touch aims the
 /// reticle over a 4:3 area in the middle of the screen; otherwise it maps 1:1 to
 /// the layout's bottom viewport (R3 matrix in FuseSplitDeck, corner in LargeTop).
-fn touch_on_bottom(layout: ScreenLayout, x: u16, y: u16) -> Option<(u16, u16)> {
+fn touch_on_bottom(layout: ScreenLayout, weapon_sub: u8, x: u16, y: u16) -> Option<(u16, u16)> {
     if layout == ScreenLayout::FiendsCauldron && x <= 140 && y >= 595 {
         // Relocated bottom-left 16:9 Back button maps to native (16, 221) on 320x240.
         return Some((16, 221));
@@ -1070,6 +1073,40 @@ fn touch_on_bottom(layout: ScreenLayout, x: u16, y: u16) -> Option<(u16, u16)> {
         let sy = 95.0 + (wy - zakuro_gpu::raster::FILE_BOT_TOMES_Y) / zakuro_gpu::raster::FILE_BOT_SCALE;
         if (0.0..=319.0).contains(&sx) && (0.0..=239.0).contains(&sy) {
             return Some((sx as u16, sy as u16));
+        }
+        return None;
+    }
+    if layout == ScreenLayout::WeaponSelect {
+        let bottom = zakuro_gpu::layout(1280, 720, layout, zakuro_gpu::backend::TOP_WIDTH, false).1?;
+        let u = (x as f32 - bottom.x) / bottom.width;
+        let v = (y as f32 - bottom.y) / bottom.height;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        let wx = u * 426.66666;
+        let wy = v * 240.0;
+        let (bot_x0, bot_s) = match weapon_sub {
+            2 => (0.0, 0.78),
+            3 => (4.0, 0.78),
+            _ => (4.0, 0.77),
+        };
+        let bot_y0 = 240.0 - 240.0 * bot_s;
+        let bx = (wx - bot_x0) / bot_s;
+        let by = (wy - bot_y0) / bot_s;
+        if !(0.0..320.0).contains(&bx) || !(0.0..240.0).contains(&by) {
+            return None;
+        }
+        let sx = if weapon_sub == 2 {
+            if bx <= 56.0 && by >= 194.0 {
+                bx - 4.0
+            } else {
+                bx + 48.0
+            }
+        } else {
+            bx
+        };
+        if (0.0..320.0).contains(&sx) {
+            return Some((sx as u16, by as u16));
         }
         return None;
     }
@@ -1210,7 +1247,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             circle_y: input.circle_y,
             c_stick_x: input.c_stick_x,
             c_stick_y: input.c_stick_y,
-            touch: game_touch.then(|| touch_on_bottom(unx.layout, input.touch_x, input.touch_y)).flatten(),
+            touch: game_touch.then(|| touch_on_bottom(unx.layout, unx.weapon_sub, input.touch_x, input.touch_y)).flatten(),
             tilt: [0.0, 0.0],
         };
         if unx.bench.as_ref().is_some_and(|bench| bench.fire) {
@@ -1267,6 +1304,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         || gpu_flags.on_chapter.load(std::sync::atomic::Ordering::Relaxed)
         || gpu_flags.on_mode.load(std::sync::atomic::Ordering::Relaxed)
         || gpu_flags.on_solo.load(std::sync::atomic::Ordering::Relaxed)
+        || gpu_flags.on_weapon.load(std::sync::atomic::Ordering::Relaxed)
         || on_file_pre)
         && !in_battle;
     let on_tutorial_movie = in_battle && !res_battle;
@@ -1509,12 +1547,21 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         && !on_cauldron_post
         && !on_chapter_post
         && !on_solo_post;
-    let on_file_post = on_file_post
+    let on_weapon_post = unx.system.gpu.flags().on_weapon.load(std::sync::atomic::Ordering::Relaxed)
+        && !in_battle
+        && !on_title_active
         && !on_fuse_post
         && !on_cauldron_post
         && !on_chapter_post
         && !on_solo_post
         && !on_mode_post;
+    let on_file_post = on_file_post
+        && !on_fuse_post
+        && !on_cauldron_post
+        && !on_chapter_post
+        && !on_solo_post
+        && !on_mode_post
+        && !on_weapon_post;
     let bottom_blank = unx.system.gpu.flags().bottom_blank.load(std::sync::atomic::Ordering::Relaxed);
     let desired_layout = if on_fuse_post {
         if unx.bottom.fuse_override {
@@ -1546,6 +1593,12 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         } else {
             ScreenLayout::ModeSelect
         }
+    } else if on_weapon_post {
+        if unx.bottom.fuse_override {
+            ScreenLayout::LargeTop
+        } else {
+            ScreenLayout::WeaponSelect
+        }
     } else if on_file_post {
         if unx.bottom.fuse_override {
             ScreenLayout::LargeTop
@@ -1567,6 +1620,14 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         let raw_bits = unx.system.gpu.flags().chapter_title_right.load(std::sync::atomic::Ordering::Relaxed);
         let title_r = if raw_bits != 0 { f32::from_bits(raw_bits) } else { 302.0 };
         unx.presenter.set_chapter_state(title_r);
+    }
+    if on_weapon_post {
+        let sub = unx.system.gpu.flags().weapon_sub.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        if sub != unx.weapon_sub {
+            unx.weapon_sub = sub;
+            unx.system.reset_interpolation();
+        }
+        unx.presenter.set_weapon_state(sub);
     }
     if on_cauldron_post {
         let raw_bits = unx.system.gpu.flags().cauldron_cursor_x.load(std::sync::atomic::Ordering::Relaxed);

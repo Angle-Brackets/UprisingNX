@@ -13,6 +13,10 @@
 //     Displays KIU's full-bleed lined rainbow parchment + outer ink filigree + centered
 //     1:1 Speech-Bubble Summary above the 3 leather-bound Tomes (`I / II / III`), with
 //     KIU's native speech-bubble pointer tail connecting into the selected Tome.
+//   layout_kind == 3 (WeaponSelect — Unified 16:9 Gear Hub, Category Select, & Armory):
+//     Displays KIU's full-bleed 16:9 rose-damask & crimson-thorn stage with right-aligned
+//     weapon inspector / showcase and left-aligned 1:1 interactive Armory panel (`pad0` =
+//     `bot_x0`, `pad1` = `bot_scale`), analytically chroma-keyed from `#FF00FF`.
 // Compiled via naga (glsl-in -> spv-out):
 //   binding 0: top_screen (SAMPLED_IMAGE)
 //   binding 1: bot_screen (SAMPLED_IMAGE)
@@ -154,6 +158,31 @@ void main() {
             );
             float fg_a = (1.0 - bg_amt) * clamp(ref_cyan, 0.0, 1.0);
             vec3 premul_fg = clamp(c_norm - bg_amt * vec3(0.0, 1.0, 1.0), 0.0, 1.0) * clamp(ref_cyan, 0.0, 1.0);
+            col = clamp(col * (1.0 - fg_a) + premul_fg, 0.0, 1.0);
+        }
+        colour = vec4(clamp(col, 0.0, 1.0), 1.0);
+        return;
+    }
+
+    if (crop.layout_kind == 3) {
+        // WeaponSelect (Gear Hub, Weapon Category Select, & Weapon List Option B):
+        vec3 col = sample_top(uv, duv);
+        float bot_x0 = crop.pad0;
+        float bot_s = max(crop.pad1, 0.01);
+        float bot_w = 320.0 * bot_s;
+        float bot_h = 240.0 * bot_s;
+        float bot_y0 = 240.0 - bot_h;
+        if (p.x >= bot_x0 && p.x <= bot_x0 + bot_w && p.y >= bot_y0 && p.y <= bot_y0 + bot_h) {
+            vec2 local_uv = (p - vec2(bot_x0, bot_y0)) / vec2(bot_w, bot_h);
+            vec2 local_duv = dp / vec2(bot_w, bot_h);
+            vec3 b_col = sample_bot(local_uv, local_duv);
+            float bg_amt = clamp(
+                (min(b_col.r, b_col.b) - b_col.g - 3.2 * abs(b_col.r - b_col.b) - 0.03) / 0.97,
+                0.0,
+                1.0
+            );
+            float fg_a = 1.0 - bg_amt;
+            vec3 premul_fg = clamp(b_col - bg_amt * vec3(1.0, 0.0, 1.0), 0.0, 1.0);
             col = clamp(col * (1.0 - fg_a) + premul_fg, 0.0, 1.0);
         }
         colour = vec4(clamp(col, 0.0, 1.0), 1.0);

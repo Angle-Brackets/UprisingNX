@@ -134,6 +134,12 @@ pub enum ScreenLayout {
     /// full-bleed lined rainbow parchment with centered 1:1 Speech-Bubble Summary
     /// connected via its native pointer tail to the 3 leather-bound Tomes below.
     FileSelect,
+    /// Kid Icarus: Uprising's Gear Hub, Weapon Category Select, and Weapon List on
+    /// a single 16:9 screen (Option B): left-hand 1:1 interactive Armory / Category /
+    /// Gear panel with canonical bottom-left Back button, and right-hand Weapon
+    /// Inspector with mirrored right-aligned Stars Plaque, left-side Weapon-Type
+    /// icon, right-aligned Modifier pills, and 3D Weapon showcase.
+    WeaponSelect,
 }
 
 /// how the screens' pixels are drawn when scaled to the window.
@@ -180,7 +186,8 @@ impl ScreenLayout {
             | ScreenLayout::ChapterSelect
             | ScreenLayout::ModeSelect
             | ScreenLayout::SoloHub
-            | ScreenLayout::FileSelect => (FUSE_DECK_WIDTH, 240.0),
+            | ScreenLayout::FileSelect
+            | ScreenLayout::WeaponSelect => (FUSE_DECK_WIDTH, 240.0),
         }
     }
 }
@@ -264,6 +271,7 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
         ScreenLayout::ModeSelect
             | ScreenLayout::SoloHub
             | ScreenLayout::FileSelect
+            | ScreenLayout::WeaponSelect
     ) {
         let stage = Viewport {
             x: offset_x,
@@ -329,7 +337,8 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
         | ScreenLayout::ChapterSelect
         | ScreenLayout::ModeSelect
         | ScreenLayout::SoloHub
-        | ScreenLayout::FileSelect => unreachable!(),
+        | ScreenLayout::FileSelect
+        | ScreenLayout::WeaponSelect => unreachable!(),
     };
     (top, bottom)
 }
@@ -646,6 +655,9 @@ pub trait Presenter {
     /// dynamically centered over the 16:9 ribbon.
     fn set_chapter_state(&mut self, _title_right: f32) {}
 
+    /// live sub-state for `ScreenLayout::WeaponSelect` (`1` = Weapon List,
+    /// `2` = Weapon Category Select, `3` = Gear Hub).
+    fn set_weapon_state(&mut self, _sub: u8) {}
 }
 
 #[cfg(test)]

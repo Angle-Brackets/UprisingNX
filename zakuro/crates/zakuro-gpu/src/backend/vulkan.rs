@@ -121,6 +121,7 @@ pub struct VulkanPresenter {
     chapter_pipeline_layout: vk::PipelineLayout,
     chapter_pipeline: vk::Pipeline,
     chapter_title_right: f32,
+    weapon_sub: u8,
     hub_pipeline_layout: vk::PipelineLayout,
     hub_pipeline: vk::Pipeline,
     sampler: vk::Sampler,
@@ -476,6 +477,7 @@ impl VulkanPresenter {
             chapter_pipeline_layout,
             chapter_pipeline,
             chapter_title_right: 302.0,
+            weapon_sub: 1,
             hub_pipeline_layout,
             hub_pipeline,
             sampler,
@@ -1036,6 +1038,7 @@ impl VulkanPresenter {
                 ScreenLayout::ModeSelect
                     | ScreenLayout::SoloHub
                     | ScreenLayout::FileSelect
+                    | ScreenLayout::WeaponSelect
             ) {
                 if let (Some((_, top_area)), Some((_, bot_area)), (Some(stage_vp), _)) = (
                     crop(0, [0.0, 0.0, 1.0, 1.0]),
@@ -1045,9 +1048,18 @@ impl VulkanPresenter {
                     let kind: i32 = match self.arrangement {
                         ScreenLayout::SoloHub => 1,
                         ScreenLayout::FileSelect => 2,
+                        ScreenLayout::WeaponSelect => 3,
                         _ => 0,
                     };
-                    let (pad0, pad1): (f32, f32) = (0.0, 0.0);
+                    let (pad0, pad1): (f32, f32) = if self.arrangement == ScreenLayout::WeaponSelect {
+                        match self.weapon_sub {
+                            2 => (0.0, 0.78),
+                            3 => (4.0, 0.78),
+                            _ => (4.0, 0.77),
+                        }
+                    } else {
+                        (0.0, 0.0)
+                    };
                     let mut constants = Vec::with_capacity(HUB_CONSTANTS as usize);
                     constants.extend(top_area.iter().flat_map(|c| c.to_le_bytes()));
                     constants.extend(bot_area.iter().flat_map(|c| c.to_le_bytes()));
@@ -1200,6 +1212,7 @@ impl Presenter for VulkanPresenter {
                 | ScreenLayout::ModeSelect
                 | ScreenLayout::SoloHub
                 | ScreenLayout::FileSelect
+                | ScreenLayout::WeaponSelect
         ) {
             self.write_cauldron_set(&sources);
         }
@@ -1303,6 +1316,9 @@ impl Presenter for VulkanPresenter {
         self.chapter_title_right = title_right;
     }
 
+    fn set_weapon_state(&mut self, sub: u8) {
+        self.weapon_sub = sub;
+    }
 }
 
 impl Drop for VulkanPresenter {
