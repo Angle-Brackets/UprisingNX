@@ -1512,6 +1512,9 @@ pub(crate) struct Portraits {
     dialogue_held: u32,
     /// flushes in a row since the bottom screen last drew that text.
     dialogue_missing: u32,
+    /// remaining flushes keeping tutorial portrait/subtitle layout active while
+    /// bottom-screen How-to-Play / S14 / S15 dialogue is playing (`0` in normal battles).
+    tutorial_dialogue_hold: u8,
     /// whether the bottom screen has drawn since the last portrait flush.
     bottom_seen: bool,
     /// the title screen's logo and copyright draws redirected from the bottom
@@ -1526,11 +1529,19 @@ pub(crate) struct Portraits {
     /// last top-screen transfer.
     title_sky_seen: bool,
     /// whether the title screen is currently active.
-    title_sky_active: bool,
+    pub(crate) title_sky_active: bool,
     /// consecutive top-screen transfers without a title-screen logo draw.
     title_sky_missed: u8,
+    /// whether the title screen's sizzle-reel attract video is playing.
+    title_sizzle_active: bool,
+    /// whether the bottom-screen title sky was seen since the last flush during the sizzle reel.
+    title_sizzle_seen: bool,
+    /// consecutive flushes without bottom-screen title sky during the sizzle reel.
+    title_sizzle_missed: u8,
     /// number of title-screen guest frames elapsed since the opening fly-in started.
     title_frames: u32,
+    /// whether a complete bottom-screen title logo pass has been captured.
+    title_captured: bool,
     /// warmup passes completed for the current title screen visit (0..=2).
     title_warmups: u8,
     /// fade-in opacity (0.0..=1.0) for the title logo on the top screen,
@@ -1865,12 +1876,40 @@ fn skip_bottom_in_play(
     vertex_count > 144
 }
 
+impl Portraits {
+    fn reset_title(&mut self) {
+        self.title_bottom_drawing = false;
+        self.title_bottom_counted = false;
+        self.title_sky_seen = false;
+        self.title_sky_active = false;
+        self.title_sky_missed = 0;
+        self.title_sizzle_active = false;
+        self.title_sizzle_seen = false;
+        self.title_sizzle_missed = 0;
+        self.title_frames = 0;
+        self.title_captured = false;
+        self.title_warmups = 0;
+        self.title_alpha = 0.0;
+        self.title_seen = false;
+        self.title.clear();
+    }
+}
+
 /// whether the GPU is currently drawing the title screen (not a battle).
 fn is_on_title(portraits: &Portraits) -> bool {
     !portraits.in_battle
         && (portraits.title_bottom_drawing
             || portraits.title_sky_active
             || portraits.title_sky_seen)
+}
+
+/// whether the title screen (or its sizzle reel) is shown as single-screen
+/// `TopOnly`, redirecting the logo onto the top screen and skipping bottom draws.
+pub(crate) fn is_capturing_title(portraits: &Portraits) -> bool {
+    (is_on_title(portraits) || portraits.title_sizzle_active)
+        && !portraits.menu_override
+        && !portraits.fuse_active
+        && !portraits.cauldron_active
 }
 
 /// Kid Icarus Uprising's real-time title screen sky layer on the top screen
@@ -2491,11 +2530,7 @@ fn adjust_cauldron_bot(
 /// being drawn, as well as Fuse Weapons' A/B card headers.
 fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
     if portraits.in_battle {
-        portraits.title_bottom_drawing = false;
-        portraits.title_bottom_counted = false;
-        portraits.title_sky_active = false;
-        portraits.title_sky_seen = false;
-        portraits.title_seen = false;
+        portraits.reset_title();
         portraits.fuse_first_header = 0;
         portraits.fuse_frame_seen = false;
         portraits.fuse_weapon_seen = false;
@@ -2542,6 +2577,7 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
             } else {
                 portraits.cauldron_mural_step = 0;
             }
+
         } else {
             portraits.cauldron_mural_step = 0;
         }
@@ -2549,6 +2585,9 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
             portraits.title_sky_seen = true;
             portraits.title_sky_active = true;
             portraits.title_sky_missed = 0;
+            portraits.title_sizzle_active = false;
+            portraits.title_sizzle_seen = false;
+            portraits.title_sizzle_missed = 0;
             portraits.title_seen = true;
             portraits.top = Some([
                 registers[REG_COLOR_BUFFER_ADDRESS],
@@ -2582,14 +2621,17 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         portraits.title_bottom_drawing = true;
         portraits.title_seen = true;
         portraits.title_frames = portraits.title_frames.saturating_add(1);
-        if portraits.title_frames <= 16 || portraits.title.len() < 2 {
+        if portraits.title_frames <= 16 || !portraits.title_captured {
             portraits.title.clear();
         }
-    } else if portraits.cauldron_active && on_bottom(registers) {
+    } else if portraits.title_sizzle_active && on_bottom(registers) && is_title_bottom_sky(registers) {
+        portraits.title_sizzle_seen = true;
+        portraits.title_seen = true;
+    } else if on_bottom(registers) {
         let base = TEXTURE_UNIT_BASES[0];
-        if registers[base + 1] == (128 << 16 | 128)
-            && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
-        {
+        let dims = registers[base + 1];
+        let fmt = TextureFormat::from_raw(registers[base + 13]);
+        if portraits.cauldron_active && dims == (128 << 16 | 128) && fmt == TextureFormat::Etc1 {
             portraits.cauldron_pot_seen = true;
         }
     } else if !is_bottom(registers) {
@@ -2833,6 +2875,7 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
     /// none, the bottom screen's side edge cuts some, and that cut goes on
     /// the top screen's side edge so it does not show either.
     const SCALE: f32 = 0.4;
+    const TUT_SCALE: f32 = 0.26;
     const MARGIN: f32 = 0.0;
     let Some(top) = resources.portraits.top else { return };
     let Some(vertices) = shaded_in_order(registers, vertices) else { return };
@@ -2845,14 +2888,21 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
     }
     // its lowest x on the bottom edge, and its y against the end of its own
     // side of the top screen's 400; y runs leftward from the screen's right
-    // edge on both screens, so a low y is on the right
+    // edge on both screens, so a low y is on the right.
+    // During tutorial movies (`tutorial_dialogue_hold > 0`), both portraits sit
+    // on the same bottom level framing the squeezed subtitle text (`x_screen = 0..51`
+    // for Palutena, `53..193` for text, `194..245` for Pit), leaving `[246..400]`
+    // completely clear for the 3D Switch control cards.
+    let tutorial_mode = resources.portraits.tutorial_dialogue_hold > 0;
+    let scale = if tutorial_mode { TUT_SCALE } else { SCALE };
     let right = (low[1] + high[1]) / 2.0 < 160.0;
-    let x = -low[0] * SCALE;
-    let y = match right {
-        true => MARGIN - low[1] * SCALE,
-        false => 400.0 - MARGIN - high[1] * SCALE,
+    let x = -low[0] * scale;
+    let y = match (tutorial_mode, right) {
+        (true, true) => 155.0 - low[1] * scale,
+        (false, true) => MARGIN - low[1] * scale,
+        (_, false) => 400.0 - MARGIN - high[1] * scale,
     };
-    let mut registers = onto_top(registers, top, SCALE, x, y);
+    let mut registers = onto_top(registers, top, scale, x, y);
     registers[TEXTURE_UNIT_BASES[0] + 2] |= 0x6;
     if registers[0x0CA] == 0x0002_0001 && registers[0x0D2] == 0x0009_0001 {
         // clean_portrait_texels decodes the Etc1 portrait's alpha into A and
@@ -2862,7 +2912,16 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
     }
     // the title's pictures stop at the bottom screen's top edge, some cut
     // there, Medusa's snakes; on the top screen that edge fades out
-    let vertices = faded_top(registers[REG_PRIMITIVE_CONFIG] >> 8 & 3, &vertices);
+    let mut vertices = faded_top(registers[REG_PRIMITIVE_CONFIG] >> 8 & 3, &vertices);
+    if tutorial_mode && right && low[1] <= 4.0 {
+        const WING_FADE: f32 = 20.0;
+        let cut_y = low[1] + WING_FADE;
+        vertices = split_triangles(&vertices, |v| (cut_y / 160.0 - 1.0) * v.clip[3] - v.clip[1]);
+        for vertex in &mut vertices {
+            let col = (vertex.clip[1] / vertex.clip[3] * 0.5 + 0.5) * 320.0;
+            vertex.color[3] *= ((col - low[1]) / WING_FADE).clamp(0.0, 1.0);
+        }
+    }
     registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
     resources.portraits.sides[!right as usize].incoming.push(PortraitDraw { registers, vertices });
 }
@@ -3288,21 +3347,30 @@ fn mirror_dialogue(registers: &[u32], resources: &mut Resources, vertices: Verti
     let Some(top) = resources.portraits.top else { return };
     let Some(vertices) = shaded_in_order(registers, vertices) else { return };
     let Some((low, high)) = bottom_box(&vertices) else { return };
-    // buffer terms: x up from the screen's bottom edge, y along it, 320
-    // wide below and 400 above
+    // buffer terms: x up from the screen's bottom edge, y along it leftward
+    // from the right edge, 320 wide below and 400 above.
+    // Squeeze the bottom-screen dialogue (`0.50x`) neatly between Palutena
+    // (`x_screen = 0..51`) and Pit (`x_screen = 194..245`) along the same bottom
+    // row (`x_screen = 51..195`), keeping `[246..400]` clear for Switch cards.
     const ABOVE_BOTTOM: f32 = 8.0;
-    let x = ABOVE_BOTTOM - low[0];
-    let y = 200.0 - (low[1] + high[1]) / 2.0;
+    const SCALE: f32 = 0.50;
+    let mid_y = (low[1] + high[1]) * 0.5;
+    let half_w = (high[1] - low[1]) * 0.5 * SCALE;
+    let center_y_buf = 277.0f32.clamp((205.0 + half_w).min(277.0), (349.0 - half_w).max(277.0));
     let mut vertices = vertices;
     for vertex in &mut vertices {
         let w = vertex.clip[3];
         let below = [(vertex.clip[0] / w * 0.5 + 0.5) * 240.0, (vertex.clip[1] / w * 0.5 + 0.5) * 320.0];
-        let above = [x + below[0], y + below[1]];
+        let above = [
+            ABOVE_BOTTOM + (below[0] - low[0]) * SCALE,
+            center_y_buf + (below[1] - mid_y) * SCALE,
+        ];
         vertex.clip[0] = (above[0] / 120.0 - 1.0) * w;
         vertex.clip[1] = (above[1] / 200.0 - 1.0) * w;
     }
     let mut registers = onto_top(registers, top, 1.0, 0.0, 0.0);
     registers[REG_VIEWPORT_HEIGHT] = float24(200.0);
+    registers[TEXTURE_UNIT_BASES[0] + 2] |= 0x6;
     resources.portraits.dialogue.push(PortraitDraw { registers, vertices });
 }
 
@@ -3481,40 +3549,63 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
             resources.portraits.cauldron_fade_buf = 0;
         }
     }
-    if resources.portraits.in_battle {
-        resources.portraits.title_sky_seen = false;
-        resources.portraits.title_sky_active = false;
-        resources.portraits.title_bottom_drawing = false;
-        resources.portraits.title_bottom_counted = false;
-        resources.portraits.title_alpha = 0.0;
-        resources.portraits.title_frames = 0;
-        resources.portraits.title_warmups = 0;
-        resources.portraits.title.clear();
-    } else if std::mem::take(&mut resources.portraits.title_sky_seen) {
+    let title_sky_this_frame = std::mem::take(&mut resources.portraits.title_sky_seen);
+    let title_sizzle_this_frame = std::mem::take(&mut resources.portraits.title_sizzle_seen);
+    const TITLE_LOGO_DELAY_FRAMES: u32 = 248;
+    const TITLE_LOGO_FADE_FRAMES: f32 = 36.0;
+    const TITLE_SIZZLE_FADE_START: u32 = 335;
+    const TITLE_SIZZLE_FADE_FRAMES: f32 = 16.0;
+    if resources.portraits.in_battle
+        || resources.portraits.fuse_active
+        || resources.portraits.cauldron_active
+    {
+        resources.portraits.reset_title();
+    } else if title_sky_this_frame {
         resources.portraits.title_sky_missed = 0;
+        resources.portraits.title_sizzle_active = false;
+        resources.portraits.title_sizzle_missed = 0;
     } else if resources.portraits.title_sky_active {
         resources.portraits.title_sky_missed = resources.portraits.title_sky_missed.saturating_add(1);
         if resources.portraits.title_sky_missed > 1 {
+            let enter_sizzle = resources.portraits.title_frames >= TITLE_LOGO_DELAY_FRAMES;
             resources.portraits.title_sky_active = false;
             resources.portraits.title_alpha = 0.0;
             resources.portraits.title_frames = 0;
+            resources.portraits.title_captured = false;
             resources.portraits.title_warmups = 0;
             resources.portraits.title.clear();
+            if enter_sizzle {
+                resources.portraits.title_sizzle_active = true;
+                resources.portraits.title_sizzle_missed = 0;
+            }
         }
     } else {
         resources.portraits.title.clear();
+        if resources.portraits.title_sizzle_active {
+            if title_sizzle_this_frame {
+                resources.portraits.title_sizzle_missed = 0;
+            } else {
+                resources.portraits.title_sizzle_missed =
+                    resources.portraits.title_sizzle_missed.saturating_add(1);
+                if resources.portraits.title_sizzle_missed > 3 {
+                    resources.portraits.title_sizzle_active = false;
+                }
+            }
+        }
     }
     let mut drew_title = false;
     // Pit flies in across the top screen for the first ~248 title-screen guest
-    // frames (~8.3s) and disappears in a starburst at the top-right as
-    // the Triumphal trumpets sound. Around frame ~335 (~11.2s), as the title
-    // screen transitions into the sizzle reel, the logo smoothly scales and
-    // glides into the top-left corner over 42 guest frames (~1.4s).
-    const TITLE_LOGO_DELAY_FRAMES: u32 = 248;
-    const TITLE_LOGO_FADE_FRAMES: f32 = 36.0;
-    const TITLE_SIZZLE_START_FRAMES: u32 = 335;
-    const TITLE_SIZZLE_TRANSITION_FRAMES: f32 = 42.0;
-    if resources.portraits.title_sky_active && !resources.portraits.title.is_empty() {
+    // frames (~8.3s) and disappears in a starburst at the top-right as the
+    // Triumphal trumpets sound. Only composite onto frames that actually rendered
+    // the 3D title sky (`title_sky_this_frame`) and when `LargeTop` override is off.
+    if resources.portraits.title_sky_active
+        && title_sky_this_frame
+        && !resources.portraits.menu_override
+        && !resources.portraits.title.is_empty()
+    {
+        if resources.portraits.title_frames >= 16 && resources.portraits.title.len() >= 2 {
+            resources.portraits.title_captured = true;
+        }
         if resources.portraits.title_frames >= 16
             && (resources.portraits.title_warmups as usize) < resources.portraits.title.len()
         {
@@ -3525,26 +3616,31 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
                 draw_title_faded(memory, resources, &draw, 0.0, 0.0, true);
             }
         } else if resources.portraits.title_frames >= TITLE_LOGO_DELAY_FRAMES {
-            let elapsed = (resources.portraits.title_frames - TITLE_LOGO_DELAY_FRAMES + 1) as f32;
-            resources.portraits.title_alpha = (elapsed / TITLE_LOGO_FADE_FRAMES).clamp(0.0, 1.0);
-            let alpha = resources.portraits.title_alpha;
-            let corner_t = if resources.portraits.title_frames >= TITLE_SIZZLE_START_FRAMES {
-                ((resources.portraits.title_frames - TITLE_SIZZLE_START_FRAMES) as f32
-                    / TITLE_SIZZLE_TRANSITION_FRAMES)
+            let fade_in = ((resources.portraits.title_frames - TITLE_LOGO_DELAY_FRAMES + 1) as f32
+                / TITLE_LOGO_FADE_FRAMES)
+                .clamp(0.0, 1.0);
+            let fade_out = if resources.portraits.title_frames >= TITLE_SIZZLE_FADE_START {
+                (1.0 - (resources.portraits.title_frames - TITLE_SIZZLE_FADE_START + 1) as f32
+                    / TITLE_SIZZLE_FADE_FRAMES)
                     .clamp(0.0, 1.0)
             } else {
-                0.0
+                1.0
             };
-            let title = resources.portraits.title.clone();
-            for draw in &title {
-                draw_title_faded(memory, resources, draw, alpha, corner_t, false);
-                drew_title = true;
+            let alpha = fade_in * fade_out;
+            resources.portraits.title_alpha = alpha;
+            if alpha > 0.004 {
+                let title = resources.portraits.title.clone();
+                for draw in &title {
+                    draw_title_faded(memory, resources, draw, alpha, 0.0, false);
+                    drew_title = true;
+                }
             }
         }
     }
     if (resources.portraits.in_play
         || resources.portraits.fuse_active
-        || resources.portraits.cauldron_active)
+        || resources.portraits.cauldron_active
+)
         && !resources.portraits.in_battle
     {
         resources.portraits.sides = Default::default();
@@ -3555,6 +3651,7 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
         resources.portraits.power_bubble_x = None;
         resources.portraits.dialogue.clear();
         resources.portraits.last_dialogue.clear();
+        resources.portraits.tutorial_dialogue_hold = 0;
         resources.portraits.text_lines.clear();
         resources.portraits.text_line_addrs.clear();
         return drew_title;
@@ -3626,6 +3723,11 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     // the dialogue box's text, over the portraits, with the subtitles' shadow
     let subtitle_up = resources.portraits.top_subtitle_quiet <= 12;
     resources.portraits.top_subtitle_quiet = resources.portraits.top_subtitle_quiet.saturating_add(1);
+    if !resources.portraits.in_battle {
+        resources.portraits.tutorial_dialogue_hold = 0;
+    } else {
+        resources.portraits.tutorial_dialogue_hold = resources.portraits.tutorial_dialogue_hold.saturating_sub(1);
+    }
     /// how many flushes the text must stay before it shows.
     const DIALOGUE_HOLD: u32 = 6;
     let dialogue = if bottom_seen || !resources.portraits.dialogue.is_empty() {
@@ -5476,7 +5578,10 @@ pub fn draw<M: GpuMemory>(
     }
     note_title_draw(registers, &mut resources.portraits);
     let on_title = is_on_title(&resources.portraits);
-    let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
+    let capturing_title = is_capturing_title(&resources.portraits);
+    let title_ready = resources.portraits.title_sizzle_active
+        || resources.portraits.title_frames < 16
+        || resources.portraits.title_captured;
     let bottom = is_bottom(registers);
     if bottom {
         resources.portraits.bottom_seen = true;
@@ -5487,13 +5592,13 @@ pub fn draw<M: GpuMemory>(
         }
     }
     if bottom
-        && resources.portraits.in_play
+        && (resources.portraits.in_play || capturing_title)
         && !resources.portraits.fuse_active
         && !resources.portraits.cauldron_active
         && skip_bottom_in_play(
             registers,
             resources.portraits.in_battle,
-            on_title,
+            on_title || resources.portraits.title_sizzle_active,
             title_ready,
             vertex_count,
         )
@@ -5760,7 +5865,10 @@ pub fn draw_immediate<M: GpuMemory>(
 ) -> u32 {
     note_title_draw(registers, &mut resources.portraits);
     let on_title = is_on_title(&resources.portraits);
-    let title_ready = resources.portraits.title_frames < 16 || resources.portraits.title.len() >= 2;
+    let capturing_title = is_capturing_title(&resources.portraits);
+    let title_ready = resources.portraits.title_sizzle_active
+        || resources.portraits.title_frames < 16
+        || resources.portraits.title_captured;
     let bottom = is_bottom(registers);
     if bottom {
         resources.portraits.bottom_seen = true;
@@ -5771,13 +5879,13 @@ pub fn draw_immediate<M: GpuMemory>(
         }
     }
     if bottom
-        && resources.portraits.in_play
+        && (resources.portraits.in_play || capturing_title)
         && !resources.portraits.fuse_active
         && !resources.portraits.cauldron_active
         && skip_bottom_in_play(
             registers,
             resources.portraits.in_battle,
-            on_title,
+            on_title || resources.portraits.title_sizzle_active,
             title_ready,
             vertices.len() as u32,
         )
@@ -6009,6 +6117,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     return None;
                 }
                 resources.portraits.top_subtitle_quiet = 0;
+                resources.portraits.tutorial_dialogue_hold = 0;
                 resources.portraits.adding = true;
                 // the portraits go under the subtitles, in the buffer that
                 // goes out, once a frame
@@ -6061,12 +6170,17 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             }
             let portrait = on_bottom(registers) && is_portrait(registers);
             let on_title = is_on_title(&resources.portraits);
+            let capturing_title = is_capturing_title(&resources.portraits);
             // the CPU decodes its arrays then, and its vertices say where it is.
             // out of play only a portrait's are looked at, to see whether it is
             // a big one, a conversation
-            let special_menu = resources.portraits.fuse_active || resources.portraits.cauldron_active;
+            let special_menu = resources.portraits.fuse_active
+                || resources.portraits.cauldron_active
+                                        || resources.portraits.file_active;
             #[cfg(feature = "vulkan")]
-            if ((resources.portraits.in_play && !special_menu && (resources.portraits.in_battle || on_title)) || portrait)
+            if ((resources.portraits.in_play && !special_menu && resources.portraits.in_battle)
+                || (capturing_title && on_title)
+                || portrait)
                 && matches!(vertices, Vertices::Raw { .. })
             {
                 return None;
@@ -6082,6 +6196,12 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 }
                 note_battle_display(registers, resources, &vertices);
             }
+            if capturing_title {
+                if on_title && on_bottom(registers) {
+                    mirror_title(registers, resources, vertices);
+                }
+                return Some(0);
+            }
             // in play the bottom screen is not shown, so what it draws goes
             // onto the top screen or nowhere; in a menu it is drawn as it is
             if resources.portraits.in_play && !special_menu {
@@ -6093,6 +6213,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                             if resources.portraits.top_subtitle_quiet > 30
                                 && is_bottom_dialogue_box(&shaded)
                             {
+                                resources.portraits.tutorial_dialogue_hold = 120;
                                 mirror_dialogue(registers, resources, Vertices::Shaded(&shaded));
                             } else if resources.portraits.in_battle
                                 && is_power_label_text(&resources.portraits, &shaded)

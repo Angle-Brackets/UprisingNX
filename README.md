@@ -48,6 +48,7 @@ Prepare your SD card with the following structure:
 
 - **ROM Path**: `sdmc:/switch/uprisingnx/roms/Kid Icarus - Uprising (USA) (En,Fr,Es) (Rev 1).cci` (or `.3ds`)
 - **NRO Path**: `sdmc:/switch/uprisingnx/uprising_nx.nro`
+- **Switch Tutorial Videos (RomFS Mod)**: `sdmc:/switch/uprisingnx/data/mods/0004000000030100/romfs/us/movie/` (copy `mods/0004000000030100/` into `sdmc:/switch/uprisingnx/data/mods/` to replace the 3DS hardware diagrams in *How to Play* and Chapter 1 tutorials with 3D Nintendo Switch hardware)
 
 ---
 
@@ -62,3 +63,12 @@ Prepare your SD card with the following structure:
    ```bash
    make -C nx/c RECOMP=1
    ```
+
+---
+
+## Credits & Third-Party Assets
+
+- **3D Nintendo Switch Tutorial Assets** (licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); modified for UprisingNX with articulated button/stick sub-meshes, dry-matte PBR materials, and animated control choreographies, see `tools/models/switch/CREDITS.md`):
+  - *"Nintendo Switch"* console body & screen mesh by **gabrieljuan0322** ([Sketchfab](https://sketchfab.com/3d-models/nintendo-switch-19f3d13edffd4e85acfbbe8adefb72fb))
+  - *"Joy-con Switch"* sculpted Neon-Blue & Neon-Red Joy-Con controllers, analog sticks, triggers, and buttons by **Wevensson** ([Sketchfab](https://sketchfab.com/3d-models/joy-con-switch-f8cf0fb92ac544d38079e8d294a5330a))
+- **MobiClip `.moflex` Video Encoding**: [`quatric/mobipeg`](https://github.com/quatric/mobipeg) + [`quatric/x264`](https://github.com/quatric/x264) open-source stereoscopic MobiClip encoder

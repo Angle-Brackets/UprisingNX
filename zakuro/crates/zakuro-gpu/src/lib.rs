@@ -464,7 +464,7 @@ impl Gpu {
         }
         let bottom = [self.framebuffers[1].address_a_left, self.framebuffers[1].address_b_left].contains(&output_paddr)
             || (linear_screen_out && out_size == (240, 320));
-        if self.resources.portraits.in_play
+        if (self.resources.portraits.in_play || raster::is_capturing_title(&self.resources.portraits))
             && !self.resources.portraits.fuse_active
             && !self.resources.portraits.cauldron_active
             && bottom

@@ -1125,7 +1125,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             }
         }
         look = unx.aim.apply(&mut state, gyro, input.host);
-        if on_title && !state.buttons.is_empty() {
+        if on_title && (!state.buttons.is_empty() || game_touch) {
             state.buttons |= PadState::A;
         }
         unx.system.set_input(state);
@@ -1153,7 +1153,14 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let host = input.as_ref().map_or(0, |input| input.host);
     let gpu_flags = unx.system.gpu.flags();
     let in_frontend_menu = gpu_flags.on_frontend_menu.swap(false, std::sync::atomic::Ordering::Relaxed) && !in_battle;
-    let on_special_pre = (gpu_flags.on_fuse.load(std::sync::atomic::Ordering::Relaxed)
+    unx.title_quiet = if on_title && !in_battle {
+        0
+    } else {
+        unx.title_quiet.saturating_add(1)
+    };
+    let on_title_pre = unx.title_quiet <= 15 && !in_battle;
+    let on_special_pre = (on_title_pre
+        || gpu_flags.on_fuse.load(std::sync::atomic::Ordering::Relaxed)
         || gpu_flags.on_cauldron.load(std::sync::atomic::Ordering::Relaxed)
 )
         && !in_battle;
@@ -1194,11 +1201,6 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         unx.apply_docked(docked);
     }
 
-    unx.title_quiet = if on_title && !in_battle {
-        0
-    } else {
-        unx.title_quiet.saturating_add(1)
-    };
     let title_boost = !res_battle;
     if title_boost != unx.title_boosted {
         unx.title_boosted = title_boost;
@@ -1392,7 +1394,13 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         } else {
             ScreenLayout::FiendsCauldron
         }
-    } else if !bottom_shown || on_title_active || bottom_blank {
+    } else if on_title_active {
+        if unx.bottom.fuse_override {
+            ScreenLayout::LargeTop
+        } else {
+            ScreenLayout::TopOnly
+        }
+    } else if !bottom_shown || bottom_blank {
         ScreenLayout::TopOnly
     } else {
         ScreenLayout::LargeTop
