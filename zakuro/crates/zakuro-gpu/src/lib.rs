@@ -163,7 +163,9 @@ pub struct Flags {
     pub on_title: std::sync::atomic::AtomicBool,
     pub on_fuse: std::sync::atomic::AtomicBool,
     pub on_cauldron: std::sync::atomic::AtomicBool,
+    pub on_chapter: std::sync::atomic::AtomicBool,
     pub on_frontend_menu: std::sync::atomic::AtomicBool,
+    pub chapter_title_right: std::sync::atomic::AtomicU32,
     pub cauldron_hud: std::sync::atomic::AtomicBool,
     pub cauldron_cursor_x: std::sync::atomic::AtomicU32,
     pub cauldron_room_rgb: std::sync::atomic::AtomicU32,
@@ -467,6 +469,7 @@ impl Gpu {
         if (self.resources.portraits.in_play || raster::is_capturing_title(&self.resources.portraits))
             && !self.resources.portraits.fuse_active
             && !self.resources.portraits.cauldron_active
+            && !self.resources.portraits.chapter_active
             && bottom
         {
             return;
@@ -839,8 +842,17 @@ impl Gpu {
         self.flags
             .on_cauldron
             .store(self.resources.portraits.cauldron_active, std::sync::atomic::Ordering::Relaxed);
+        self.flags
+            .on_chapter
+            .store(self.resources.portraits.chapter_active, std::sync::atomic::Ordering::Relaxed);
         if std::mem::take(&mut self.resources.portraits.frontend_menu_seen) {
             self.flags.on_frontend_menu.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.resources.portraits.chapter_title_right > 0.0 {
+            self.flags.chapter_title_right.store(
+                self.resources.portraits.chapter_title_right.to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         self.flags
             .cauldron_hud

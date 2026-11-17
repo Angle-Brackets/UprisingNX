@@ -16,6 +16,7 @@ const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/present.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
 const STEREO_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_stereo.frag.spv");
 const CAULDRON_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_cauldron.frag.spv");
+const CHAPTER_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_chapter.frag.spv");
 
 /// the bytes of push constants the fragment shader reads: where the screen
 /// lies in its image, the bounds its samples keep in and the filter, and
@@ -23,6 +24,7 @@ const CAULDRON_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_cau
 const CONSTANTS: u32 = 36;
 const STEREO_CONSTANTS: u32 = 80;
 const CAULDRON_CONSTANTS: u32 = 80;
+const CHAPTER_CONSTANTS: u32 = 80;
 
 /// how many frames may be recorded before waiting on the oldest.
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -114,6 +116,9 @@ pub struct VulkanPresenter {
     cauldron_pipeline: vk::Pipeline,
     cauldron_sets: Vec<vk::DescriptorSet>,
     cauldron_state: (f32, f32, u32),
+    chapter_pipeline_layout: vk::PipelineLayout,
+    chapter_pipeline: vk::Pipeline,
+    chapter_title_right: f32,
     sampler: vk::Sampler,
     /// a set per frame in flight and screen, pointed at the renderer's
     /// images when screens are drawn straight from them.
@@ -274,6 +279,8 @@ impl VulkanPresenter {
         let cauldron_layout = create_cauldron_descriptor_layout(&device)?;
         let (cauldron_pipeline_layout, cauldron_pipeline) =
             create_pipeline(&device, render_pass, cauldron_layout, CAULDRON_FRAGMENT_SPIRV, CAULDRON_CONSTANTS)?;
+        let (chapter_pipeline_layout, chapter_pipeline) =
+            create_pipeline(&device, render_pass, cauldron_layout, CHAPTER_FRAGMENT_SPIRV, CHAPTER_CONSTANTS)?;
         let srgb = matches!(surface_format.format, vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB);
         let overlay = OverlayPainter::new(&device, render_pass, FRAMES_IN_FLIGHT, srgb)?;
 
@@ -460,6 +467,9 @@ impl VulkanPresenter {
             cauldron_pipeline,
             cauldron_sets,
             cauldron_state: (237.4, 0.48, 1),
+            chapter_pipeline_layout,
+            chapter_pipeline,
+            chapter_title_right: 302.0,
             sampler,
             gpu_sets,
             shared: ManuallyDrop::into_inner(shared),
@@ -981,6 +991,38 @@ impl VulkanPresenter {
                     );
                     device.cmd_draw(command_buffer, 3, 1, 0, 0);
                 }
+            } else if self.arrangement == ScreenLayout::ChapterSelect {
+                if let (Some((_, top_area)), Some((_, bot_area)), (Some(stage_vp), _)) = (
+                    crop(0, [0.0, 0.0, 1.0, 1.0]),
+                    crop(1, [0.0, 0.0, 1.0, 1.0]),
+                    super::layout(self.extent.width, self.extent.height, ScreenLayout::ChapterSelect, self.top_width, self.integer),
+                ) {
+                    let mut constants = Vec::with_capacity(CHAPTER_CONSTANTS as usize);
+                    constants.extend(top_area.iter().flat_map(|c| c.to_le_bytes()));
+                    constants.extend(bot_area.iter().flat_map(|c| c.to_le_bytes()));
+                    constants.extend_from_slice(&self.chapter_title_right.to_le_bytes());
+                    constants.extend_from_slice(&0.0f32.to_le_bytes());
+                    constants.extend_from_slice(&0u32.to_le_bytes());
+                    constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                    set_viewport(device, command_buffer, stage_vp, self.extent);
+                    device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.chapter_pipeline);
+                    device.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.chapter_pipeline_layout,
+                        0,
+                        &[self.cauldron_sets[self.frame]],
+                        &[],
+                    );
+                    device.cmd_push_constants(
+                        command_buffer,
+                        self.chapter_pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        &constants,
+                    );
+                    device.cmd_draw(command_buffer, 3, 1, 0, 0);
+                }
             } else {
                 let places = place_slices(self.extent.width, self.extent.height, self.arrangement, self.top_width, self.integer, self.stereo, right);
                 for slice in places {
@@ -1100,7 +1142,11 @@ impl Presenter for VulkanPresenter {
         if has_right && matches!(self.stereo.mode, StereoMode::Anaglyph | StereoMode::Interlaced) {
             self.write_stereo_set(&sources);
         }
-        if self.arrangement == ScreenLayout::FiendsCauldron {
+        if matches!(
+            self.arrangement,
+            ScreenLayout::FiendsCauldron
+                | ScreenLayout::ChapterSelect
+        ) {
             self.write_cauldron_set(&sources);
         }
 
@@ -1198,6 +1244,11 @@ impl Presenter for VulkanPresenter {
     fn set_cauldron_state(&mut self, cursor_x: f32, opacity: f32, hud_flags: u32) {
         self.cauldron_state = (cursor_x, opacity, hud_flags);
     }
+
+    fn set_chapter_state(&mut self, title_right: f32) {
+        self.chapter_title_right = title_right;
+    }
+
 }
 
 impl Drop for VulkanPresenter {
@@ -1230,6 +1281,8 @@ impl Drop for VulkanPresenter {
             self.device.destroy_pipeline(self.stereo_pipeline, None);
             self.device.destroy_pipeline_layout(self.stereo_pipeline_layout, None);
             self.device.destroy_descriptor_set_layout(self.stereo_layout, None);
+            self.device.destroy_pipeline(self.chapter_pipeline, None);
+            self.device.destroy_pipeline_layout(self.chapter_pipeline_layout, None);
             self.device.destroy_pipeline(self.cauldron_pipeline, None);
             self.device.destroy_pipeline_layout(self.cauldron_pipeline_layout, None);
             self.device.destroy_descriptor_set_layout(self.cauldron_layout, None);
@@ -1847,4 +1900,38 @@ mod tests {
             std::fs::write(&spv_path, &bytes).expect("write present_cauldron.frag.spv");
         }
     }
+
+    #[test]
+    fn chapter_shader_compiles_to_valid_spirv() {
+        use naga::back::spv;
+        use naga::front::glsl;
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let src_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/present_chapter.frag");
+        let spv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/present_chapter.frag.spv");
+        let source = std::fs::read_to_string(&src_path).expect("read present_chapter.frag");
+        let module = glsl::Frontend::default()
+            .parse(&glsl::Options::from(naga::ShaderStage::Fragment), &source)
+            .unwrap_or_else(|e| panic!("GLSL parse failed:\n{}", e.emit_to_string(&source)));
+        let info = Validator::new(ValidationFlags::all(), Capabilities::IMMEDIATES)
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("Naga validation failed:\n{}", e.emit_to_string(&source)));
+        let options = spv::Options {
+            lang_version: (1, 0),
+            flags: spv::WriterFlags::empty(),
+            force_loop_bounding: false,
+            ..spv::Options::default()
+        };
+        let pipeline = spv::PipelineOptions {
+            shader_stage: naga::ShaderStage::Fragment,
+            entry_point: "main".into(),
+        };
+        let words = spv::write_vec(&module, &info, &options, Some(&pipeline)).expect("emit SPIR-V");
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(words[0], 0x0723_0203);
+        if std::fs::read(&spv_path).ok().as_deref() != Some(bytes.as_slice()) {
+            std::fs::write(&spv_path, &bytes).expect("write present_chapter.frag.spv");
+        }
+    }
+
 }

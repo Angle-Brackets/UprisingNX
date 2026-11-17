@@ -1597,6 +1597,23 @@ pub(crate) struct Portraits {
     cauldron_fade_buf: u32,
     /// smoothly lerped room tint RGB (`[0.0..1.0; 3]`: icy slate-blue `< 2.0` vs crimson `>= 2.0`).
     pub(crate) cauldron_room_rgb: [f32; 3],
+    /// state machine step (0..=3) matching Chapter Select's top-screen draw sequence
+    /// (`512x256 Etc1` page -> `128x128 Etc1A4` rose crest -> `256x64 Etc1` stage art).
+    chapter_step: u8,
+    /// whether Chapter Select's top-screen stage preview was seen since last flush.
+    chapter_top_seen: bool,
+    /// consecutive top-screen transfers without Chapter Select draws.
+    chapter_missed: u8,
+    /// whether the game is currently rendering the Chapter Select UI.
+    pub(crate) chapter_active: bool,
+    /// rightmost X (`0.0..400.0`) of header glyph vertices (`sy <= 60`) in the current frame.
+    chapter_frame_title_right: f32,
+    /// leftmost & rightmost X of `"Chapter XX"` (`sx <= 106, sy <= 54`) in the current frame.
+    chapter_frame_num_bounds: (f32, f32),
+    /// latched `[left, right]` X of `"Chapter XX"` so the laurel wreath hugs single- and double-digit chapters.
+    chapter_num_bounds: (f32, f32),
+    /// latched rightmost X of the Chapter Select title text, for centering in the presenter.
+    pub(crate) chapter_title_right: f32,
     /// whether the 3DS frontend-menu top-right battery icon was seen outside of battle.
     pub(crate) frontend_menu_seen: bool,
     /// whether the user toggled `R-Stick` to view raw `LargeTop` instead of custom menu UI.
@@ -1910,6 +1927,7 @@ pub(crate) fn is_capturing_title(portraits: &Portraits) -> bool {
         && !portraits.menu_override
         && !portraits.fuse_active
         && !portraits.cauldron_active
+        && !portraits.chapter_active
 }
 
 /// Kid Icarus Uprising's real-time title screen sky layer on the top screen
@@ -2526,6 +2544,226 @@ fn adjust_cauldron_bot(
     Some(shaded)
 }
 
+/// horizontal clip-space scale widening the 320px bottom screen across the full
+/// `x = 18.67..408.0` (`389.33 x 127.0`) 16:9 Chapter Select lower deck while
+/// keeping every Chapter Card, laurel, and glyph at 1:1 unstretched aspect.
+pub const CHAPTER_BOT_KX: f32 = 0.450;
+
+fn needs_chapter_top_adjust(registers: &[u32]) -> bool {
+    if registers[REG_TEXTURE_CONFIG] & 1 == 0 {
+        return false;
+    }
+    let base = TEXTURE_UNIT_BASES[0];
+    let dims = registers[base + 1];
+    let fmt = TextureFormat::from_raw(registers[base + 13]);
+    (dims == (256 << 16 | 256) && fmt == TextureFormat::A4)
+        || (dims == (256 << 16 | 128) && fmt == TextureFormat::La4)
+        || (dims == (32 << 16 | 32) && fmt == TextureFormat::La4)
+}
+
+fn adjust_chapter_top(
+    registers: &[u32],
+    mut shaded: Vec<Vertex>,
+    portraits: &mut Portraits,
+) -> Option<Vec<Vertex>> {
+    let base = TEXTURE_UNIT_BASES[0];
+    let dims = registers[base + 1];
+    let fmt = TextureFormat::from_raw(registers[base + 13]);
+    let to_top_xy = |v: &Vertex| -> [f32; 2] {
+        let w = v.clip[3];
+        let bx = (v.clip[0] / w * 0.5 + 0.5) * 240.0;
+        let by = (v.clip[1] / w * 0.5 + 0.5) * 400.0;
+        [400.0 - by, 240.0 - bx]
+    };
+    let set_top_xy = |v: &mut Vertex, nx: f32, ny: f32| {
+        let w = v.clip[3];
+        v.clip[0] = ((240.0 - ny) / 120.0 - 1.0) * w;
+        v.clip[1] = ((400.0 - nx) / 200.0 - 1.0) * w;
+    };
+
+    // Pull the Laurel Wreath (`32x32 La4`, 2 quads: wreath + drop-shadow) up and
+    // inward around the live `"Chapter X"` / `"Chapter XX"` bounds so it hugs the
+    // text snugly without drooping across the underline bar.
+    if dims == (32 << 16 | 32) && fmt == TextureFormat::La4 && shaded.len() == 12 {
+        let mut left = f32::MAX;
+        for v in &shaded {
+            left = left.min(to_top_xy(v)[0]);
+        }
+        let (nl, nr) = if portraits.chapter_num_bounds.1 > portraits.chapter_num_bounds.0 + 20.0 {
+            portraits.chapter_num_bounds
+        } else {
+            (30.1, 93.2)
+        };
+        let num_cx = (nl + nr) * 0.5;
+        let num_w = nr - nl;
+        let kx = ((num_w + 15.5) / 94.9).clamp(0.72, 0.90);
+        const KY: f32 = 0.82;
+        let is_shadow = left > 17.5;
+        let (src_cx, src_cy) = if is_shadow { (66.8, 49.0) } else { (61.45, 47.2) };
+        let (dst_cx, dst_cy) = if is_shadow {
+            (num_cx + 1.6, 42.6 + 1.5)
+        } else {
+            (num_cx, 42.6)
+        };
+        for v in &mut shaded {
+            let [sx, sy] = to_top_xy(v);
+            set_top_xy(v, dst_cx + (sx - src_cx) * kx, dst_cy + (sy - src_cy) * KY);
+        }
+        return Some(shaded);
+    }
+
+    if dims == (256 << 16 | 256) && fmt == TextureFormat::A4 {
+        for v in &shaded {
+            let [sx, sy] = to_top_xy(v);
+            if (24.0..=60.0).contains(&sy) && (25.0..=395.0).contains(&sx) {
+                portraits.chapter_frame_title_right = portraits.chapter_frame_title_right.max(sx);
+                if (28.0..=54.0).contains(&sy) && sx <= 106.0 {
+                    let (l, r) = portraits.chapter_frame_num_bounds;
+                    portraits.chapter_frame_num_bounds = (
+                        if l == 0.0 { sx } else { l.min(sx) },
+                        r.max(sx),
+                    );
+                }
+            }
+        }
+        return Some(shaded);
+    }
+
+    if dims == (256 << 16 | 128) && fmt == TextureFormat::La4 && shaded.len() == 6 {
+        let (mut left, mut upper, mut right, mut lower) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for v in &shaded {
+            let [sx, sy] = to_top_xy(v);
+            left = left.min(sx);
+            upper = upper.min(sy);
+            right = right.max(sx);
+            lower = lower.max(sy);
+        }
+        if left >= 378.0 && right <= 402.0 && upper >= -2.0 && lower <= 16.0 {
+            portraits.frontend_menu_seen = true;
+            return None;
+        }
+    }
+
+    Some(shaded)
+}
+
+fn adjust_chapter_bot(registers: &[u32], mut shaded: Vec<Vertex>) -> Option<Vec<Vertex>> {
+    let textured = registers[REG_TEXTURE_CONFIG] & 1 != 0;
+    let base = TEXTURE_UNIT_BASES[0];
+    let dims = registers[base + 1];
+    let fmt = TextureFormat::from_raw(registers[base + 13]);
+
+    let to_bot_xy = |v: &Vertex| -> [f32; 2] {
+        let w = v.clip[3];
+        let bx = (v.clip[0] / w * 0.5 + 0.5) * 240.0;
+        let by = (v.clip[1] / w * 0.5 + 0.5) * 320.0;
+        [320.0 - by, 240.0 - bx]
+    };
+    let set_bot_xy = |v: &mut Vertex, nx: f32, ny: f32| {
+        let w = v.clip[3];
+        v.clip[0] = ((240.0 - ny) / 120.0 - 1.0) * w;
+        v.clip[1] = ((320.0 - nx) / 160.0 - 1.0) * w;
+    };
+
+    let (mut left, mut upper, mut right, mut lower) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for v in &shaded {
+        let [sx, sy] = to_bot_xy(v);
+        left = left.min(sx);
+        upper = upper.min(sy);
+        right = right.max(sx);
+        lower = lower.max(sy);
+    }
+
+    // 1. Omit the 3DS book-unroll page cylinder, gutter shadow, and dark sanctuary-floor
+    //    backing (`256x256 Etc1`, `height > 200`) across the entire transition & idle state
+    //    so all Chapter Cards appear cleanly without a 0.45x-compressed black floor slab!
+    if !textured && (lower - upper) > 180.0 && (right - left) < 310.0 {
+        return None;
+    }
+    if textured
+        && dims == (256 << 16 | 128)
+        && fmt == TextureFormat::Etc1
+        && shaded.len() > 200
+        && (right - left) <= 1200.0
+    {
+        return None;
+    }
+    if textured
+        && dims == (256 << 16 | 256)
+        && fmt == TextureFormat::Etc1
+        && (lower - upper) > 200.0
+    {
+        return None;
+    }
+
+    // Keep the full-screen white paper backdrop quad (`v == 66`, `-1365..1580`) intact.
+    if textured
+        && dims == (256 << 16 | 128)
+        && fmt == TextureFormat::Etc1
+        && (right - left) > 1200.0
+    {
+        return Some(shaded);
+    }
+
+    // 2. Bottom navigation rail (`lower >= 194` and not an off-screen y > 1000 sprite):
+    //    - Back arrow (`right <= 65`): pin left at 1:1 aspect
+    //    - X : Gear (`left >= 215`): pin right (clear of Rose Crest) at 1:1 aspect
+    //    - Scrollbar rail (`16x64 La4`, wide): span cleanly between Back and X : Gear
+    //    - Scrollbar `[ || ]` thumb (`16x64 La4`, narrow): track rail position at 1:1 aspect
+    if lower >= 194.0 && upper < 500.0 {
+        if right <= 65.0 && upper >= 190.0 {
+            for v in &mut shaded {
+                let [sx, sy] = to_bot_xy(v);
+                set_bot_xy(v, 3.0 + (sx - 3.0) * CHAPTER_BOT_KX, sy);
+            }
+            return Some(shaded);
+        }
+        if left >= 215.0 && upper >= 190.0 {
+            const GEAR_SCALE: f32 = 1.32;
+            for v in &mut shaded {
+                let [sx, sy] = to_bot_xy(v);
+                set_bot_xy(
+                    v,
+                    280.0 - (286.0 - sx) * (CHAPTER_BOT_KX * GEAR_SCALE),
+                    195.0 + (sy - 195.0) * GEAR_SCALE,
+                );
+            }
+            return Some(shaded);
+        }
+        if textured && dims == (16 << 16 | 64) && fmt == TextureFormat::La4 {
+            const RAIL_OLD_L: f32 = 80.1;
+            const RAIL_OLD_R: f32 = 243.9;
+            const RAIL_NEW_L: f32 = 44.0;
+            const RAIL_NEW_R: f32 = 242.0;
+            if (right - left) > 90.0 {
+                for v in &mut shaded {
+                    let [sx, sy] = to_bot_xy(v);
+                    let t = (sx - RAIL_OLD_L) / (RAIL_OLD_R - RAIL_OLD_L);
+                    set_bot_xy(v, RAIL_NEW_L + t * (RAIL_NEW_R - RAIL_NEW_L), sy);
+                }
+            } else {
+                let cx = (left + right) * 0.5;
+                let t = ((cx - RAIL_OLD_L) / (RAIL_OLD_R - RAIL_OLD_L)).clamp(0.0, 1.0);
+                let cx_new = RAIL_NEW_L + t * (RAIL_NEW_R - RAIL_NEW_L);
+                for v in &mut shaded {
+                    let [sx, sy] = to_bot_xy(v);
+                    set_bot_xy(v, cx_new + (sx - cx) * CHAPTER_BOT_KX, sy);
+                }
+            }
+            return Some(shaded);
+        }
+    }
+
+    // 3. All 25 Chapter Card thumbnails, black ink frames, laurels, & pink rose-thorn
+    //    selection border: widen horizontal frustum by `1 / CHAPTER_BOT_KX` (~711 logical
+    //    px across) so ~7-8 unstretched 1:1 Chapter Cards fill the full 16:9 width!
+    for v in &mut shaded {
+        let [sx, sy] = to_bot_xy(v);
+        set_bot_xy(v, 160.0 + (sx - 160.0) * CHAPTER_BOT_KX, sy);
+    }
+    Some(shaded)
+}
+
 /// tracks when the title screen's top-screen sky or bottom-screen logo pass is
 /// being drawn, as well as Fuse Weapons' A/B card headers.
 fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
@@ -2547,6 +2785,12 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         portraits.cauldron_tier_init = false;
         portraits.cauldron_fade_buf = 0;
         portraits.cauldron_missed = 0;
+        portraits.chapter_step = 0;
+        portraits.chapter_top_seen = false;
+        portraits.chapter_active = false;
+        portraits.chapter_missed = 0;
+        portraits.chapter_frame_title_right = 0.0;
+        portraits.chapter_frame_num_bounds = (0.0, 0.0);
         return;
     }
     if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
@@ -2578,8 +2822,37 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                 portraits.cauldron_mural_step = 0;
             }
 
+            if !portraits.cauldron_active {
+                if dims == (512 << 16 | 256) && fmt == TextureFormat::Etc1 {
+                    portraits.chapter_step = 1;
+                } else if portraits.chapter_step == 1
+                    && dims == (128 << 16 | 128)
+                    && fmt == TextureFormat::Etc1A4
+                {
+                    portraits.chapter_step = 2;
+                } else if portraits.chapter_step == 2
+                    && dims == (32 << 16 | 32)
+                    && fmt == TextureFormat::La4
+                {
+                    // Optional cleared-chapter laurel wreath before the 256x64 stage preview.
+                } else if portraits.chapter_step == 2
+                    && dims == (256 << 16 | 64)
+                    && fmt == TextureFormat::Etc1
+                {
+                    portraits.chapter_step = 3;
+                    portraits.chapter_top_seen = true;
+                    portraits.chapter_active = true;
+                    portraits.chapter_missed = 0;
+                } else {
+                    portraits.chapter_step = 0;
+                }
+            } else {
+                portraits.chapter_step = 0;
+            }
+
         } else {
             portraits.cauldron_mural_step = 0;
+            portraits.chapter_step = 0;
         }
         if is_title_sky(registers) {
             portraits.title_sky_seen = true;
@@ -3549,6 +3822,33 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
             resources.portraits.cauldron_fade_buf = 0;
         }
     }
+    resources.portraits.chapter_step = 0;
+    let chapter_top = std::mem::take(&mut resources.portraits.chapter_top_seen);
+    let frame_title_r = std::mem::take(&mut resources.portraits.chapter_frame_title_right);
+    if frame_title_r > 0.0 {
+        resources.portraits.chapter_title_right = frame_title_r;
+    }
+    let frame_num = std::mem::take(&mut resources.portraits.chapter_frame_num_bounds);
+    if frame_num.1 > frame_num.0 + 20.0 {
+        resources.portraits.chapter_num_bounds = frame_num;
+    }
+    if resources.portraits.in_battle
+        || resources.portraits.fuse_active
+        || resources.portraits.cauldron_active
+        || resources.portraits.title_sky_active
+    {
+        resources.portraits.chapter_active = false;
+        resources.portraits.chapter_missed = 0;
+    } else if chapter_top {
+        resources.portraits.chapter_active = true;
+        resources.portraits.chapter_missed = 0;
+    } else if resources.portraits.chapter_active {
+        resources.portraits.chapter_missed = resources.portraits.chapter_missed.saturating_add(1);
+        if resources.portraits.chapter_missed > 2 {
+            resources.portraits.chapter_active = false;
+        }
+    }
+
     let title_sky_this_frame = std::mem::take(&mut resources.portraits.title_sky_seen);
     let title_sizzle_this_frame = std::mem::take(&mut resources.portraits.title_sizzle_seen);
     const TITLE_LOGO_DELAY_FRAMES: u32 = 248;
@@ -3558,6 +3858,7 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     if resources.portraits.in_battle
         || resources.portraits.fuse_active
         || resources.portraits.cauldron_active
+        || resources.portraits.chapter_active
     {
         resources.portraits.reset_title();
     } else if title_sky_this_frame {
@@ -3640,7 +3941,7 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
     if (resources.portraits.in_play
         || resources.portraits.fuse_active
         || resources.portraits.cauldron_active
-)
+        || resources.portraits.chapter_active)
         && !resources.portraits.in_battle
     {
         resources.portraits.sides = Default::default();
@@ -5595,6 +5896,7 @@ pub fn draw<M: GpuMemory>(
         && (resources.portraits.in_play || capturing_title)
         && !resources.portraits.fuse_active
         && !resources.portraits.cauldron_active
+        && !resources.portraits.chapter_active
         && skip_bottom_in_play(
             registers,
             resources.portraits.in_battle,
@@ -5882,6 +6184,7 @@ pub fn draw_immediate<M: GpuMemory>(
         && (resources.portraits.in_play || capturing_title)
         && !resources.portraits.fuse_active
         && !resources.portraits.cauldron_active
+        && !resources.portraits.chapter_active
         && skip_bottom_in_play(
             registers,
             resources.portraits.in_battle,
@@ -6073,6 +6376,24 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     return draw_cauldron_top(registers, memory, resources, shaded);
                 }
             }
+            if resources.portraits.chapter_active
+                && !resources.portraits.menu_override
+                && needs_chapter_top_adjust(registers)
+            {
+                #[cfg(feature = "vulkan")]
+                if matches!(vertices, Vertices::Raw { .. }) {
+                    return None;
+                }
+                if let Some(shaded) = shaded_in_order(registers, vertices) {
+                    if let Some(adjusted) = adjust_chapter_top(registers, shaded, &mut resources.portraits) {
+                        resources.portraits.adding = true;
+                        let res = rasterize(registers, memory, resources, Vertices::Shaded(&adjusted));
+                        resources.portraits.adding = false;
+                        return res;
+                    }
+                    return Some(0);
+                }
+            }
             if !resources.portraits.in_battle
                 && !resources.portraits.frontend_menu_seen
                 && vertices.len() == 6
@@ -6168,6 +6489,25 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     return Some(0);
                 }
             }
+            if resources.portraits.chapter_active
+                && !resources.portraits.menu_override
+                && read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
+                && read_float24(registers, REG_VIEWPORT_HEIGHT) == 160.0
+            {
+                #[cfg(feature = "vulkan")]
+                if matches!(vertices, Vertices::Raw { .. }) {
+                    return None;
+                }
+                if let Some(shaded) = shaded_in_order(registers, vertices) {
+                    if let Some(adjusted) = adjust_chapter_bot(registers, shaded) {
+                        resources.portraits.adding = true;
+                        let res = rasterize(registers, memory, resources, Vertices::Shaded(&adjusted));
+                        resources.portraits.adding = false;
+                        return res;
+                    }
+                    return Some(0);
+                }
+            }
             let portrait = on_bottom(registers) && is_portrait(registers);
             let on_title = is_on_title(&resources.portraits);
             let capturing_title = is_capturing_title(&resources.portraits);
@@ -6176,7 +6516,8 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             // a big one, a conversation
             let special_menu = resources.portraits.fuse_active
                 || resources.portraits.cauldron_active
-                                        || resources.portraits.file_active;
+                || resources.portraits.chapter_active
+                                || resources.portraits.file_active;
             #[cfg(feature = "vulkan")]
             if ((resources.portraits.in_play && !special_menu && resources.portraits.in_battle)
                 || (capturing_title && on_title)

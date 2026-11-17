@@ -116,6 +116,11 @@ pub enum ScreenLayout {
     /// 3D Cauldron & flames, top-left Total Hearts pouch, bottom-left Back
     /// button, and a dynamic-opacity floating Intensity cursor thumb.
     FiendsCauldron,
+    /// Kid Icarus: Uprising's Chapter Select on a single 16:9 screen:
+    /// centered chapter title ribbon at top, panoramic stage art + records
+    /// side-by-side in the upper showcase, and full-width unstretched 25-chapter
+    /// carousel across the lower half.
+    ChapterSelect,
 }
 
 /// how the screens' pixels are drawn when scaled to the window.
@@ -157,7 +162,12 @@ impl ScreenLayout {
             ScreenLayout::TopOnly | ScreenLayout::BottomOverTop => (top_width, 240.0),
             ScreenLayout::BottomOnly => (320.0, 240.0),
             ScreenLayout::LargeTop => (top_width + LARGE_TOP_BOTTOM.0 as f32, 240.0),
-            ScreenLayout::FuseSplitDeck | ScreenLayout::FiendsCauldron => (FUSE_DECK_WIDTH, 240.0),
+            ScreenLayout::FuseSplitDeck
+            | ScreenLayout::FiendsCauldron
+            | ScreenLayout::ChapterSelect
+            | ScreenLayout::ModeSelect
+            | ScreenLayout::SoloHub
+            | ScreenLayout::FileSelect => (FUSE_DECK_WIDTH, 240.0),
         }
     }
 }
@@ -220,6 +230,21 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
         };
         return (Some(stage), Some(cauldron_bot));
     }
+    if arrangement == ScreenLayout::ChapterSelect {
+        let stage = Viewport {
+            x: offset_x,
+            y: offset_y,
+            width: FUSE_DECK_WIDTH * scale,
+            height: 240.0 * scale,
+        };
+        let chapter_bot = Viewport {
+            x: offset_x + 18.67 * scale,
+            y: offset_y + 111.0 * scale,
+            width: (408.0 - 18.67) * scale,
+            height: (238.5 - 111.0) * scale,
+        };
+        return (Some(stage), Some(chapter_bot));
+    }
 
     let top = (arrangement != ScreenLayout::BottomOnly).then_some(Viewport {
         x: offset_x,
@@ -271,7 +296,9 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
             width: 320.0 * scale,
             height: 240.0 * scale,
         }),
-        ScreenLayout::FuseSplitDeck | ScreenLayout::FiendsCauldron => unreachable!(),
+        ScreenLayout::FuseSplitDeck
+        | ScreenLayout::FiendsCauldron
+        | ScreenLayout::ChapterSelect => unreachable!(),
     };
     (top, bottom)
 }
@@ -582,6 +609,12 @@ pub trait Presenter {
     /// cursor X (`0..320`), floating badge opacity (`0..1`), and packed HUD
     /// flags (`bit 0` = interactive prep HUD visible, `bits 8..31` = room RGB).
     fn set_cauldron_state(&mut self, _cursor_x: f32, _opacity: f32, _hud_flags: u32) {}
+
+    /// live state for `ScreenLayout::ChapterSelect`: rightmost X (`0..400`) of
+    /// the top-screen chapter title text so `[Laurel + Chapter XX + Title]` is
+    /// dynamically centered over the 16:9 ribbon.
+    fn set_chapter_state(&mut self, _title_right: f32) {}
+
 }
 
 #[cfg(test)]

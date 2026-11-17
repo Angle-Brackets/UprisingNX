@@ -974,6 +974,30 @@ fn touch_on_bottom(layout: ScreenLayout, x: u16, y: u16) -> Option<(u16, u16)> {
         // Relocated bottom-left 16:9 Back button maps to native (16, 221) on 320x240.
         return Some((16, 221));
     }
+    if layout == ScreenLayout::ChapterSelect {
+        let bottom = zakuro_gpu::layout(1280, 720, layout, zakuro_gpu::backend::TOP_WIDTH, false).1?;
+        let u = (x as f32 - bottom.x) / bottom.width;
+        let v = (y as f32 - bottom.y) / bottom.height;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        const KX: f32 = zakuro_gpu::raster::CHAPTER_BOT_KX;
+        let sx_buf = u * 320.0;
+        let by = (6.0 + v * 232.5).clamp(0.0, 239.0);
+        let bx = if by >= 194.0 {
+            if sx_buf <= 34.0 {
+                (3.0 + (sx_buf - 3.0) / KX).clamp(0.0, 319.0)
+            } else if sx_buf >= 254.0 {
+                (286.0 - (286.0 - sx_buf) / KX).clamp(0.0, 319.0)
+            } else {
+                let t = ((sx_buf - 44.0) / (242.0 - 44.0)).clamp(0.0, 1.0);
+                80.1 + t * (243.9 - 80.1)
+            }
+        } else {
+            (160.0 + (sx_buf - 160.0) / KX).clamp(0.0, 319.0)
+        };
+        return Some((bx as u16, by as u16));
+    }
     let (x, y) = (x as f32, y as f32);
     let (left, top, width, height) = if layout == ScreenLayout::TopOnly {
         (160.0, 0.0, 960.0, 720.0)
@@ -1162,6 +1186,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let on_special_pre = (on_title_pre
         || gpu_flags.on_fuse.load(std::sync::atomic::Ordering::Relaxed)
         || gpu_flags.on_cauldron.load(std::sync::atomic::Ordering::Relaxed)
+        || gpu_flags.on_chapter.load(std::sync::atomic::Ordering::Relaxed)
 )
         && !in_battle;
     let on_tutorial_movie = in_battle && !res_battle;
@@ -1381,6 +1406,11 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         && !in_battle
         && !on_title_active
         && !on_fuse_post;
+    let on_chapter_post = unx.system.gpu.flags().on_chapter.load(std::sync::atomic::Ordering::Relaxed)
+        && !in_battle
+        && !on_title_active
+        && !on_fuse_post
+        && !on_cauldron_post;
     let bottom_blank = unx.system.gpu.flags().bottom_blank.load(std::sync::atomic::Ordering::Relaxed);
     let desired_layout = if on_fuse_post {
         if unx.bottom.fuse_override {
@@ -1394,6 +1424,12 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         } else {
             ScreenLayout::FiendsCauldron
         }
+    } else if on_chapter_post {
+        if unx.bottom.fuse_override {
+            ScreenLayout::LargeTop
+        } else {
+            ScreenLayout::ChapterSelect
+        }
     } else if on_title_active {
         if unx.bottom.fuse_override {
             ScreenLayout::LargeTop
@@ -1405,6 +1441,11 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     } else {
         ScreenLayout::LargeTop
     };
+    if on_chapter_post {
+        let raw_bits = unx.system.gpu.flags().chapter_title_right.load(std::sync::atomic::Ordering::Relaxed);
+        let title_r = if raw_bits != 0 { f32::from_bits(raw_bits) } else { 302.0 };
+        unx.presenter.set_chapter_state(title_r);
+    }
     if on_cauldron_post {
         let raw_bits = unx.system.gpu.flags().cauldron_cursor_x.load(std::sync::atomic::Ordering::Relaxed);
         let cx = if raw_bits != 0 { f32::from_bits(raw_bits) } else { 237.4 };
