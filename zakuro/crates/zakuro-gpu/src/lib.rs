@@ -163,6 +163,7 @@ pub struct Flags {
     pub on_title: std::sync::atomic::AtomicBool,
     pub on_fuse: std::sync::atomic::AtomicBool,
     pub on_cauldron: std::sync::atomic::AtomicBool,
+    pub on_frontend_menu: std::sync::atomic::AtomicBool,
     pub cauldron_hud: std::sync::atomic::AtomicBool,
     pub cauldron_cursor_x: std::sync::atomic::AtomicU32,
     pub cauldron_room_rgb: std::sync::atomic::AtomicU32,
@@ -796,6 +797,15 @@ impl Gpu {
         on
     }
 
+    /// clears prior frame draw-matching history and twins across a scene or
+    /// layout cut so two different screens/menus are never blended in between.
+    pub fn reset_interpolation(&mut self) {
+        self.set_twins(false);
+        if self.interpolation.is_some() {
+            self.interpolation = Some(Default::default());
+        }
+    }
+
     /// says whether the title is in play, where the bottom screen's
     /// portraits are dialogue that ZAKURO_PORTRAITS puts on the top screen;
     /// out of play, in menus, pictures of their kind are not taken.
@@ -829,6 +839,9 @@ impl Gpu {
         self.flags
             .on_cauldron
             .store(self.resources.portraits.cauldron_active, std::sync::atomic::Ordering::Relaxed);
+        if std::mem::take(&mut self.resources.portraits.frontend_menu_seen) {
+            self.flags.on_frontend_menu.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.flags
             .cauldron_hud
             .store(self.resources.portraits.cauldron_hud_active, std::sync::atomic::Ordering::Relaxed);

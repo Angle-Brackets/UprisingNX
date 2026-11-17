@@ -7225,9 +7225,17 @@ impl Hardware {
             // get the drawing's byte, a broken pointer or float in the title's data
             let words = now.len() / 4;
             let changed = now.chunks_exact(4).zip(was.chunks_exact(4)).filter(|(held, was)| held != was).count();
-            // a handful of words is the CPU writing beside the drawing, those
-            // merge below; more is the memory having been given to something else
-            if words > 0 && s.stale.is_none() && (changed > 16 || changed * 8 > words) {
+            // a handful of words in VRAM is the CPU writing beside the drawing,
+            // those merge below; in FCRAM heap or a depth buffer (or >16 words
+            // anywhere) the memory has been given to something else
+            if words > 0
+                && s.stale.is_none()
+                && (changed > 16
+                    || changed * 8 > words
+                    || (changed > 0
+                        && (matches!(s.kind, Kind::Depth(_))
+                            || (0x1400_0000..0x1800_0000).contains(&addr))))
+            {
                 static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
                     log::warn!(

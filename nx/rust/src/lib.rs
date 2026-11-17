@@ -353,6 +353,9 @@ struct Bottom {
     played: bool,
     /// while on Fuse Weapons, R-Stick click toggles between FuseSplitDeck and LargeTop
     fuse_override: bool,
+    /// while watching a standalone How to Play video (`in_battle && !res_battle`),
+    /// R-Stick click toggles LargeTop without altering the menu's `shown` state
+    tutorial_override: bool,
     /// last frame's host buttons, for presses
     host: u32,
 }
@@ -364,24 +367,38 @@ impl Bottom {
 
     /// this frame's host input and what the overrides said; whether the bottom
     /// screen is shown now.
-    fn update(&mut self, host: u32, said: u32, on_fuse: bool) -> bool {
+    fn update(&mut self, host: u32, said: u32, on_fuse: bool, on_tutorial: bool, in_frontend_menu: bool) -> bool {
         let host_pressed = host & !self.host;
         self.host = host;
         if !on_fuse {
             self.fuse_override = false;
         }
+        if !on_tutorial {
+            self.tutorial_override = false;
+        }
         if said != 0 && !self.played {
             self.played = true;
             self.shown = false;
+        } else if in_frontend_menu && self.played {
+            // Returning from a battle into KIU's frontend menus (Solo, Hub,
+            // Chapter Select, Vault, Options) restores menu visibility automatically.
+            self.played = false;
+            self.shown = true;
         }
         if host_pressed & HOST_BOTTOM != 0 {
             if on_fuse {
                 self.fuse_override = !self.fuse_override;
+            } else if on_tutorial {
+                self.tutorial_override = !self.tutorial_override;
             } else {
                 self.shown = !self.shown;
             }
         }
-        self.shown
+        if on_tutorial {
+            self.tutorial_override
+        } else {
+            self.shown
+        }
     }
 }
 
@@ -494,6 +511,17 @@ impl Unx {
         }
     }
 
+    /// whether smooth frame interpolation is allowed right now: enabled in
+    /// settings, inside an active battle (`!title_boosted`), unpaused
+    /// (`out_of_play <= 2`), and in `TopOnly` gameplay layout so frontend menus
+    /// and menu transitions never display morphed in-between frames.
+    fn smooth_allowed(&self) -> bool {
+        self.smooth.wanted
+            && !self.title_boosted
+            && self.out_of_play <= 2
+            && self.layout == ScreenLayout::TopOnly
+    }
+
     /// puts the settings for this mode in place: resolution (unless fixed)
     /// and smooth mode (unless env.txt decides it)
     fn apply_settings(&mut self) {
@@ -506,7 +534,9 @@ impl Unx {
             self.smooth.wanted = wanted;
             self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
             self.smooth.kept_up = 0;
-            self.set_smooth(wanted);
+            self.smooth.retry_at = 0;
+            let on = self.smooth_allowed();
+            self.set_smooth(on);
         }
     }
 
@@ -557,6 +587,7 @@ impl Unx {
                 log::info!("unx: battle resolution restored -> {scale}x, {why} (frame {})", self.frame);
             }
         }
+        self.system.reset_interpolation();
         self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
         if self.smooth.wanted && !self.smooth.on && self.smooth.retry_at > self.frame {
             self.smooth.retry_at = self.frame;
@@ -607,9 +638,18 @@ impl Unx {
 
     /// smooth mode's guard, each refresh with what it waited for the GPU
     fn smooth_guard(&mut self, waiting: f64) {
+        if !self.smooth_allowed() {
+            if self.smooth.on {
+                self.set_smooth(false);
+            }
+            return;
+        }
         // UNX_SMOOTH_GUARD=0 keeps smooth mode on whatever it costs, to measure it
         static UNGUARDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !self.smooth.wanted || *UNGUARDED.get_or_init(|| std::env::var("UNX_SMOOTH_GUARD").is_ok_and(|v| v.trim() == "0")) {
+        if *UNGUARDED.get_or_init(|| std::env::var("UNX_SMOOTH_GUARD").is_ok_and(|v| v.trim() == "0")) {
+            if !self.smooth.on {
+                self.set_smooth(true);
+            }
             return;
         }
         if !self.smooth.on {
@@ -822,9 +862,9 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         resolution,
         device: presenter.shared_device(),
         linked,
-        // smooth mode, a picture in between each two of the game's, which
-        // draws every other refresh: settings.ini's preset, or ZAKURO_INTERPOLATE
-        interpolate: smooth_wanted,
+        // smooth mode runs during active battles (`smooth_allowed`) so menus
+        // and menu transitions never show interpolated frames
+        interpolate: false,
         find_recompiled: false,
         username: "Pit".into(),
         ..Config::default()
@@ -897,7 +937,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         host_last: 0,
         smooth: Smooth {
             wanted: smooth_wanted,
-            on: smooth_wanted,
+            on: false,
             retry_at: 0,
             backoff: SMOOTH_BACKOFF_FIRST,
             wait: 0.0,
@@ -1111,10 +1151,14 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     };
     let res_battle = unx.res_out_of_play <= 90;
     let host = input.as_ref().map_or(0, |input| input.host);
-    let on_special_pre = (unx.system.gpu.flags().on_fuse.load(std::sync::atomic::Ordering::Relaxed)
-        || unx.system.gpu.flags().on_cauldron.load(std::sync::atomic::Ordering::Relaxed))
+    let gpu_flags = unx.system.gpu.flags();
+    let in_frontend_menu = gpu_flags.on_frontend_menu.swap(false, std::sync::atomic::Ordering::Relaxed) && !in_battle;
+    let on_special_pre = (gpu_flags.on_fuse.load(std::sync::atomic::Ordering::Relaxed)
+        || gpu_flags.on_cauldron.load(std::sync::atomic::Ordering::Relaxed)
+)
         && !in_battle;
-    let bottom_shown = unx.bottom.update(host, said, on_special_pre);
+    let on_tutorial_movie = in_battle && !res_battle;
+    let bottom_shown = unx.bottom.update(host, said, on_special_pre, on_tutorial_movie, in_frontend_menu);
     unx.system
         .gpu
         .flags()
@@ -1393,6 +1437,10 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         );
         unx.layout = desired_layout;
         unx.presenter.set_layout(desired_layout);
+        unx.system.reset_interpolation();
+        if !unx.smooth_allowed() && unx.smooth.on {
+            unx.set_smooth(false);
+        }
     }
 
     let overlay = unx.menu_overlay();

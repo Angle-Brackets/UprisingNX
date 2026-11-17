@@ -886,6 +886,13 @@ impl System {
         on
     }
 
+    /// resets frame interpolation pacing and draw-matching state across a scene
+    /// or layout transition without turning interpolation off permanently.
+    pub fn reset_interpolation(&mut self) {
+        self.pacing = Pacing::default();
+        self.gpu.reset_interpolation();
+    }
+
     /// how the draws of the last frame matched the frame before's, for frame
     /// interpolation.
     pub fn interpolation_matches(&self) -> Option<zakuro_gpu::Matches> {

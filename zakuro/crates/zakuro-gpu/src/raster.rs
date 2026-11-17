@@ -1586,6 +1586,8 @@ pub(crate) struct Portraits {
     cauldron_fade_buf: u32,
     /// smoothly lerped room tint RGB (`[0.0..1.0; 3]`: icy slate-blue `< 2.0` vs crimson `>= 2.0`).
     pub(crate) cauldron_room_rgb: [f32; 3],
+    /// whether the 3DS frontend-menu top-right battery icon was seen outside of battle.
+    pub(crate) frontend_menu_seen: bool,
     /// whether the user toggled `R-Stick` to view raw `LargeTop` instead of custom menu UI.
     pub(crate) menu_override: bool,
     /// whether any textured draw targeted the bottom screen since the last flush.
@@ -5961,6 +5963,34 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 }
                 if let Some(shaded) = shaded_in_order(registers, vertices) {
                     return draw_cauldron_top(registers, memory, resources, shaded);
+                }
+            }
+            if !resources.portraits.in_battle
+                && !resources.portraits.frontend_menu_seen
+                && vertices.len() == 6
+                && registers[REG_TEXTURE_CONFIG] & 1 != 0
+                && registers[TEXTURE_UNIT_BASES[0] + 1] == (256 << 16 | 128)
+                && TextureFormat::from_raw(registers[TEXTURE_UNIT_BASES[0] + 13]) == TextureFormat::La4
+            {
+                #[cfg(feature = "vulkan")]
+                if matches!(vertices, Vertices::Raw { .. }) {
+                    return None;
+                }
+                if let Some(shaded) = shaded_in_order(registers, vertices.clone()) {
+                    let (mut l, mut u, mut r, mut d) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    for v in &shaded {
+                        let w = v.clip[3];
+                        let bx = (v.clip[0] / w * 0.5 + 0.5) * 240.0;
+                        let by = (v.clip[1] / w * 0.5 + 0.5) * 400.0;
+                        let (sx, sy) = (400.0 - by, 240.0 - bx);
+                        l = l.min(sx);
+                        u = u.min(sy);
+                        r = r.max(sx);
+                        d = d.max(sy);
+                    }
+                    if l >= 378.0 && r <= 402.0 && u >= -2.0 && d <= 16.0 {
+                        resources.portraits.frontend_menu_seen = true;
+                    }
                 }
             }
             if !resources.portraits.in_battle && is_title_sky(registers) {

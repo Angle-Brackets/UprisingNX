@@ -222,7 +222,10 @@ static void *game(void *p) {
     hidStartSixAxisSensor(sixaxis_joydual[0]);
     hidStartSixAxisSensor(sixaxis_joydual[1]);
     hidInitializeTouchScreen();
-    appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
+    AppletType at = appletGetAppletType();
+    if (at == AppletType_Application || at == AppletType_SystemApplication) {
+        appletSetFocusHandlingMode(AppletFocusHandlingMode_AlwaysSuspend);
+    }
 
     load_env();
     // UNX_CLOCKS=docked (or a hex PerformanceConfiguration such as 0x92220008) asks apm for
@@ -279,6 +282,7 @@ static void *game(void *p) {
 }
 
 int main(int argc, char **argv) {
+    appletLockExit();
     socketInitializeDefault();
     nxlinkStdio();
     nx_tls_init();
@@ -324,5 +328,6 @@ int main(int argc, char **argv) {
     printf("uprising_nx: exiting\n");
     fflush(stdout);
     socketExit();
+    appletUnlockExit();
     return 0;
 }
