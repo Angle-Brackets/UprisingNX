@@ -998,6 +998,81 @@ fn touch_on_bottom(layout: ScreenLayout, x: u16, y: u16) -> Option<(u16, u16)> {
         };
         return Some((bx as u16, by as u16));
     }
+    if layout == ScreenLayout::ModeSelect {
+        let bottom = zakuro_gpu::layout(1280, 720, layout, zakuro_gpu::backend::TOP_WIDTH, false).1?;
+        let u = (x as f32 - bottom.x) / bottom.width;
+        let v = (y as f32 - bottom.y) / bottom.height;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        let wx = u * 426.66666;
+        let wy = v * 240.0;
+        if wy >= 202.0 {
+            return None;
+        }
+        const S: f32 = zakuro_gpu::raster::MODE_BOT_SCALE;
+        const X0: f32 = zakuro_gpu::raster::MODE_BOT_X_ORIGIN;
+        let bx = (wx - X0) / S;
+        let by = (wy - 2.0) / S;
+        if (0.0..320.0).contains(&bx) && (0.0..240.0).contains(&by) {
+            return Some((bx as u16, by as u16));
+        }
+        return None;
+    }
+    if layout == ScreenLayout::SoloHub {
+        let bottom = zakuro_gpu::layout(1280, 720, layout, zakuro_gpu::backend::TOP_WIDTH, false).1?;
+        let u = (x as f32 - bottom.x) / bottom.width;
+        let v = (y as f32 - bottom.y) / bottom.height;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        let wx = u * 426.66666;
+        let wy = v * 240.0;
+        const BOUNDS: [[f32; 4]; 7] = [
+            [34.0, -22.0, 228.0, 145.0],  // 0: Move Out!
+            [220.0, 0.0, 320.0, 78.0],    // 1: Treasure Hunt
+            [0.0, 88.0, 92.0, 194.0],     // 2: Practice Range
+            [195.0, 68.0, 320.0, 176.0],  // 3: Arms Altar
+            [82.0, 176.0, 178.0, 232.0],  // 4: Idol Toss
+            [192.0, 172.0, 320.0, 240.0], // 5: Gear
+            [0.0, 194.0, 44.0, 239.0],    // 6: Back
+        ];
+        for ([ox, oy, dx, dy, scale], [x0, y0, x1, y1]) in
+            zakuro_gpu::raster::SOLO_PERIMETER_SLOTS.into_iter().zip(BOUNDS)
+        {
+            let sx = ox + (wx - dx) / scale;
+            let sy = oy + (wy - dy) / scale;
+            if sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1 {
+                return Some((sx.clamp(2.0, 317.0) as u16, sy.clamp(2.0, 237.0) as u16));
+            }
+        }
+        return None;
+    }
+    if layout == ScreenLayout::FileSelect {
+        let bottom = zakuro_gpu::layout(1280, 720, layout, zakuro_gpu::backend::TOP_WIDTH, false).1?;
+        let u = (x as f32 - bottom.x) / bottom.width;
+        let v = (y as f32 - bottom.y) / bottom.height;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        let wx = u * 426.66666;
+        let wy = v * 240.0;
+        if wx <= 56.0 && wy >= 195.0 {
+            return Some((27, 219));
+        }
+        if wx >= 312.0 && wy >= 192.0 {
+            return Some((258, 220));
+        }
+        if wy < 114.0 {
+            return None;
+        }
+        let sx = 160.0 + (wx - 213.33333) / zakuro_gpu::raster::FILE_BOT_SCALE;
+        let sy = 95.0 + (wy - zakuro_gpu::raster::FILE_BOT_TOMES_Y) / zakuro_gpu::raster::FILE_BOT_SCALE;
+        if (0.0..=319.0).contains(&sx) && (0.0..=239.0).contains(&sy) {
+            return Some((sx as u16, sy as u16));
+        }
+        return None;
+    }
     let (x, y) = (x as f32, y as f32);
     let (left, top, width, height) = if layout == ScreenLayout::TopOnly {
         (160.0, 0.0, 960.0, 720.0)
@@ -1177,17 +1252,22 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let host = input.as_ref().map_or(0, |input| input.host);
     let gpu_flags = unx.system.gpu.flags();
     let in_frontend_menu = gpu_flags.on_frontend_menu.swap(false, std::sync::atomic::Ordering::Relaxed) && !in_battle;
-    unx.title_quiet = if on_title && !in_battle {
+    let on_file_pre = gpu_flags.on_file_select.load(std::sync::atomic::Ordering::Relaxed) && !in_battle;
+    unx.title_quiet = if on_file_pre {
+        u32::MAX
+    } else if on_title && !in_battle {
         0
     } else {
         unx.title_quiet.saturating_add(1)
     };
-    let on_title_pre = unx.title_quiet <= 15 && !in_battle;
+    let on_title_pre = unx.title_quiet <= 15 && !in_battle && !on_file_pre;
     let on_special_pre = (on_title_pre
         || gpu_flags.on_fuse.load(std::sync::atomic::Ordering::Relaxed)
         || gpu_flags.on_cauldron.load(std::sync::atomic::Ordering::Relaxed)
         || gpu_flags.on_chapter.load(std::sync::atomic::Ordering::Relaxed)
-)
+        || gpu_flags.on_mode.load(std::sync::atomic::Ordering::Relaxed)
+        || gpu_flags.on_solo.load(std::sync::atomic::Ordering::Relaxed)
+        || on_file_pre)
         && !in_battle;
     let on_tutorial_movie = in_battle && !res_battle;
     let bottom_shown = unx.bottom.update(host, said, on_special_pre, on_tutorial_movie, in_frontend_menu);
@@ -1398,7 +1478,12 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     if unx.system.gpu.flags().on_title.load(std::sync::atomic::Ordering::Relaxed) && !in_battle {
         unx.title_quiet = 0;
     }
-    let on_title_active = unx.title_quiet <= 15 && !in_battle;
+    let on_file_post = unx.system.gpu.flags().on_file_select.load(std::sync::atomic::Ordering::Relaxed)
+        && !in_battle;
+    if on_file_post {
+        unx.title_quiet = u32::MAX;
+    }
+    let on_title_active = unx.title_quiet <= 15 && !in_battle && !on_file_post;
     let on_fuse_post = unx.system.gpu.flags().on_fuse.load(std::sync::atomic::Ordering::Relaxed)
         && !in_battle
         && !on_title_active;
@@ -1411,6 +1496,25 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         && !on_title_active
         && !on_fuse_post
         && !on_cauldron_post;
+    let on_solo_post = unx.system.gpu.flags().on_solo.load(std::sync::atomic::Ordering::Relaxed)
+        && !in_battle
+        && !on_title_active
+        && !on_fuse_post
+        && !on_cauldron_post
+        && !on_chapter_post;
+    let on_mode_post = unx.system.gpu.flags().on_mode.load(std::sync::atomic::Ordering::Relaxed)
+        && !in_battle
+        && !on_title_active
+        && !on_fuse_post
+        && !on_cauldron_post
+        && !on_chapter_post
+        && !on_solo_post;
+    let on_file_post = on_file_post
+        && !on_fuse_post
+        && !on_cauldron_post
+        && !on_chapter_post
+        && !on_solo_post
+        && !on_mode_post;
     let bottom_blank = unx.system.gpu.flags().bottom_blank.load(std::sync::atomic::Ordering::Relaxed);
     let desired_layout = if on_fuse_post {
         if unx.bottom.fuse_override {
@@ -1429,6 +1533,24 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
             ScreenLayout::LargeTop
         } else {
             ScreenLayout::ChapterSelect
+        }
+    } else if on_solo_post {
+        if unx.bottom.fuse_override {
+            ScreenLayout::LargeTop
+        } else {
+            ScreenLayout::SoloHub
+        }
+    } else if on_mode_post {
+        if unx.bottom.fuse_override {
+            ScreenLayout::LargeTop
+        } else {
+            ScreenLayout::ModeSelect
+        }
+    } else if on_file_post {
+        if unx.bottom.fuse_override {
+            ScreenLayout::LargeTop
+        } else {
+            ScreenLayout::FileSelect
         }
     } else if on_title_active {
         if unx.bottom.fuse_override {

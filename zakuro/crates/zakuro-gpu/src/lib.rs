@@ -164,6 +164,9 @@ pub struct Flags {
     pub on_fuse: std::sync::atomic::AtomicBool,
     pub on_cauldron: std::sync::atomic::AtomicBool,
     pub on_chapter: std::sync::atomic::AtomicBool,
+    pub on_mode: std::sync::atomic::AtomicBool,
+    pub on_solo: std::sync::atomic::AtomicBool,
+    pub on_file_select: std::sync::atomic::AtomicBool,
     pub on_frontend_menu: std::sync::atomic::AtomicBool,
     pub chapter_title_right: std::sync::atomic::AtomicU32,
     pub cauldron_hud: std::sync::atomic::AtomicBool,
@@ -466,10 +469,16 @@ impl Gpu {
         }
         let bottom = [self.framebuffers[1].address_a_left, self.framebuffers[1].address_b_left].contains(&output_paddr)
             || (linear_screen_out && out_size == (240, 320));
+        if bottom {
+            self.resources.portraits.file_bot_painted = false;
+        }
         if (self.resources.portraits.in_play || raster::is_capturing_title(&self.resources.portraits))
             && !self.resources.portraits.fuse_active
             && !self.resources.portraits.cauldron_active
             && !self.resources.portraits.chapter_active
+            && !self.resources.portraits.mode_active
+            && !self.resources.portraits.solo_active
+            && !self.resources.portraits.file_active
             && bottom
         {
             return;
@@ -845,6 +854,15 @@ impl Gpu {
         self.flags
             .on_chapter
             .store(self.resources.portraits.chapter_active, std::sync::atomic::Ordering::Relaxed);
+        self.flags
+            .on_mode
+            .store(self.resources.portraits.mode_active, std::sync::atomic::Ordering::Relaxed);
+        self.flags
+            .on_solo
+            .store(self.resources.portraits.solo_active, std::sync::atomic::Ordering::Relaxed);
+        self.flags
+            .on_file_select
+            .store(self.resources.portraits.file_active, std::sync::atomic::Ordering::Relaxed);
         if std::mem::take(&mut self.resources.portraits.frontend_menu_seen) {
             self.flags.on_frontend_menu.store(true, std::sync::atomic::Ordering::Relaxed);
         }

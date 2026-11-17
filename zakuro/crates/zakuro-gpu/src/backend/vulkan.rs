@@ -17,6 +17,7 @@ const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
 const STEREO_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_stereo.frag.spv");
 const CAULDRON_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_cauldron.frag.spv");
 const CHAPTER_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_chapter.frag.spv");
+const HUB_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_hub.frag.spv");
 
 /// the bytes of push constants the fragment shader reads: where the screen
 /// lies in its image, the bounds its samples keep in and the filter, and
@@ -25,6 +26,7 @@ const CONSTANTS: u32 = 36;
 const STEREO_CONSTANTS: u32 = 80;
 const CAULDRON_CONSTANTS: u32 = 80;
 const CHAPTER_CONSTANTS: u32 = 80;
+const HUB_CONSTANTS: u32 = 80;
 
 /// how many frames may be recorded before waiting on the oldest.
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -119,6 +121,8 @@ pub struct VulkanPresenter {
     chapter_pipeline_layout: vk::PipelineLayout,
     chapter_pipeline: vk::Pipeline,
     chapter_title_right: f32,
+    hub_pipeline_layout: vk::PipelineLayout,
+    hub_pipeline: vk::Pipeline,
     sampler: vk::Sampler,
     /// a set per frame in flight and screen, pointed at the renderer's
     /// images when screens are drawn straight from them.
@@ -281,6 +285,8 @@ impl VulkanPresenter {
             create_pipeline(&device, render_pass, cauldron_layout, CAULDRON_FRAGMENT_SPIRV, CAULDRON_CONSTANTS)?;
         let (chapter_pipeline_layout, chapter_pipeline) =
             create_pipeline(&device, render_pass, cauldron_layout, CHAPTER_FRAGMENT_SPIRV, CHAPTER_CONSTANTS)?;
+        let (hub_pipeline_layout, hub_pipeline) =
+            create_pipeline(&device, render_pass, cauldron_layout, HUB_FRAGMENT_SPIRV, HUB_CONSTANTS)?;
         let srgb = matches!(surface_format.format, vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB);
         let overlay = OverlayPainter::new(&device, render_pass, FRAMES_IN_FLIGHT, srgb)?;
 
@@ -470,6 +476,8 @@ impl VulkanPresenter {
             chapter_pipeline_layout,
             chapter_pipeline,
             chapter_title_right: 302.0,
+            hub_pipeline_layout,
+            hub_pipeline,
             sampler,
             gpu_sets,
             shared: ManuallyDrop::into_inner(shared),
@@ -1023,6 +1031,49 @@ impl VulkanPresenter {
                     );
                     device.cmd_draw(command_buffer, 3, 1, 0, 0);
                 }
+            } else if matches!(
+                self.arrangement,
+                ScreenLayout::ModeSelect
+                    | ScreenLayout::SoloHub
+                    | ScreenLayout::FileSelect
+            ) {
+                if let (Some((_, top_area)), Some((_, bot_area)), (Some(stage_vp), _)) = (
+                    crop(0, [0.0, 0.0, 1.0, 1.0]),
+                    crop(1, [0.0, 0.0, 1.0, 1.0]),
+                    super::layout(self.extent.width, self.extent.height, self.arrangement, self.top_width, self.integer),
+                ) {
+                    let kind: i32 = match self.arrangement {
+                        ScreenLayout::SoloHub => 1,
+                        ScreenLayout::FileSelect => 2,
+                        _ => 0,
+                    };
+                    let (pad0, pad1): (f32, f32) = (0.0, 0.0);
+                    let mut constants = Vec::with_capacity(HUB_CONSTANTS as usize);
+                    constants.extend(top_area.iter().flat_map(|c| c.to_le_bytes()));
+                    constants.extend(bot_area.iter().flat_map(|c| c.to_le_bytes()));
+                    constants.extend_from_slice(&pad0.to_le_bytes());
+                    constants.extend_from_slice(&pad1.to_le_bytes());
+                    constants.extend_from_slice(&kind.to_le_bytes());
+                    constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                    set_viewport(device, command_buffer, stage_vp, self.extent);
+                    device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.hub_pipeline);
+                    device.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.hub_pipeline_layout,
+                        0,
+                        &[self.cauldron_sets[self.frame]],
+                        &[],
+                    );
+                    device.cmd_push_constants(
+                        command_buffer,
+                        self.hub_pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        &constants,
+                    );
+                    device.cmd_draw(command_buffer, 3, 1, 0, 0);
+                }
             } else {
                 let places = place_slices(self.extent.width, self.extent.height, self.arrangement, self.top_width, self.integer, self.stereo, right);
                 for slice in places {
@@ -1146,6 +1197,9 @@ impl Presenter for VulkanPresenter {
             self.arrangement,
             ScreenLayout::FiendsCauldron
                 | ScreenLayout::ChapterSelect
+                | ScreenLayout::ModeSelect
+                | ScreenLayout::SoloHub
+                | ScreenLayout::FileSelect
         ) {
             self.write_cauldron_set(&sources);
         }
@@ -1281,6 +1335,8 @@ impl Drop for VulkanPresenter {
             self.device.destroy_pipeline(self.stereo_pipeline, None);
             self.device.destroy_pipeline_layout(self.stereo_pipeline_layout, None);
             self.device.destroy_descriptor_set_layout(self.stereo_layout, None);
+            self.device.destroy_pipeline(self.hub_pipeline, None);
+            self.device.destroy_pipeline_layout(self.hub_pipeline_layout, None);
             self.device.destroy_pipeline(self.chapter_pipeline, None);
             self.device.destroy_pipeline_layout(self.chapter_pipeline_layout, None);
             self.device.destroy_pipeline(self.cauldron_pipeline, None);
@@ -1934,4 +1990,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hub_shader_compiles_to_valid_spirv() {
+        use naga::back::spv;
+        use naga::front::glsl;
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let src_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/present_hub.frag");
+        let spv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/present_hub.frag.spv");
+        let source = std::fs::read_to_string(&src_path).expect("read present_hub.frag");
+        let module = glsl::Frontend::default()
+            .parse(&glsl::Options::from(naga::ShaderStage::Fragment), &source)
+            .unwrap_or_else(|e| panic!("GLSL parse failed:\n{}", e.emit_to_string(&source)));
+        let info = Validator::new(ValidationFlags::all(), Capabilities::IMMEDIATES)
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("Naga validation failed:\n{}", e.emit_to_string(&source)));
+        let options = spv::Options {
+            lang_version: (1, 0),
+            flags: spv::WriterFlags::empty(),
+            force_loop_bounding: false,
+            ..spv::Options::default()
+        };
+        let pipeline = spv::PipelineOptions {
+            shader_stage: naga::ShaderStage::Fragment,
+            entry_point: "main".into(),
+        };
+        let words = spv::write_vec(&module, &info, &options, Some(&pipeline)).expect("emit SPIR-V");
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(words[0], 0x0723_0203);
+        if std::fs::read(&spv_path).ok().as_deref() != Some(bytes.as_slice()) {
+            std::fs::write(&spv_path, &bytes).expect("write present_hub.frag.spv");
+        }
+    }
 }

@@ -121,6 +121,19 @@ pub enum ScreenLayout {
     /// side-by-side in the upper showcase, and full-width unstretched 25-chapter
     /// carousel across the lower half.
     ChapterSelect,
+    /// Kid Icarus: Uprising's Mode Select on a single 16:9 screen:
+    /// native bottom-screen interlocking buttons lifted to 1:1 aspect over the
+    /// full-width pastel backdrop, with the top screen's undulating black-wave
+    /// description banner composited along the bottom.
+    ModeSelect,
+    /// Kid Icarus: Uprising's Solo Hub on a single 16:9 screen (Perimeter Frame):
+    /// full-bleed 3D Sanctuary camera with top-left Total Hearts pouch and the
+    /// 7 native bottom-screen station sprites repurposed around the perimeter.
+    SoloHub,
+    /// Kid Icarus: Uprising's File Select on a single 16:9 screen (Vertical Stack):
+    /// full-bleed lined rainbow parchment with centered 1:1 Speech-Bubble Summary
+    /// connected via its native pointer tail to the 3 leather-bound Tomes below.
+    FileSelect,
 }
 
 /// how the screens' pixels are drawn when scaled to the window.
@@ -246,6 +259,21 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
         return (Some(stage), Some(chapter_bot));
     }
 
+    if matches!(
+        arrangement,
+        ScreenLayout::ModeSelect
+            | ScreenLayout::SoloHub
+            | ScreenLayout::FileSelect
+    ) {
+        let stage = Viewport {
+            x: offset_x,
+            y: offset_y,
+            width: FUSE_DECK_WIDTH * scale,
+            height: 240.0 * scale,
+        };
+        return (Some(stage), Some(stage));
+    }
+
     let top = (arrangement != ScreenLayout::BottomOnly).then_some(Viewport {
         x: offset_x,
         y: offset_y,
@@ -298,7 +326,10 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
         }),
         ScreenLayout::FuseSplitDeck
         | ScreenLayout::FiendsCauldron
-        | ScreenLayout::ChapterSelect => unreachable!(),
+        | ScreenLayout::ChapterSelect
+        | ScreenLayout::ModeSelect
+        | ScreenLayout::SoloHub
+        | ScreenLayout::FileSelect => unreachable!(),
     };
     (top, bottom)
 }
