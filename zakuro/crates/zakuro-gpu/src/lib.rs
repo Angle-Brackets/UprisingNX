@@ -159,6 +159,7 @@ pub struct ScreenRef {
 pub struct Flags {
     pub in_play: std::sync::atomic::AtomicBool,
     pub in_battle: std::sync::atomic::AtomicBool,
+    pub active_battle: std::sync::atomic::AtomicBool,
     pub big_portrait: std::sync::atomic::AtomicBool,
     pub on_title: std::sync::atomic::AtomicBool,
     pub on_fuse: std::sync::atomic::AtomicBool,
@@ -828,8 +829,10 @@ impl Gpu {
     pub fn set_in_play(&mut self, on: bool) {
         self.flags.in_play.store(on, std::sync::atomic::Ordering::Relaxed);
         self.flags.in_battle.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.flags.active_battle.store(on, std::sync::atomic::Ordering::Relaxed);
         self.resources.portraits.in_play = on;
         self.resources.portraits.in_battle = on;
+        self.resources.portraits.active_battle = on;
     }
 
     /// takes the frontend's flags before the GPU works on a command, in
@@ -838,6 +841,7 @@ impl Gpu {
         use std::sync::atomic::Ordering::Relaxed;
         self.resources.portraits.in_play = self.flags.in_play.load(Relaxed);
         self.resources.portraits.in_battle = self.flags.in_battle.load(Relaxed);
+        self.resources.portraits.active_battle = self.flags.active_battle.load(Relaxed);
         self.resources.portraits.menu_override = self.flags.menu_override.load(Relaxed);
     }
 

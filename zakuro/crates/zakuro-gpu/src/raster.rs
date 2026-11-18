@@ -1696,6 +1696,8 @@ pub(crate) struct Portraits {
     /// whether the game is actively in a battle (flying, on foot, or a boss
     /// dialogue cutscene), rather than in menus with the bottom screen hidden.
     pub(crate) in_battle: bool,
+    /// whether the current battle session is still active across quiet flight swoops.
+    pub(crate) active_battle: bool,
     /// whether the bottom screen drew a large dialogue portrait since the
     /// frontend last asked, see note_big_portrait: a conversation in a
     /// battle, before the player has control, that the game's overrides say
@@ -7948,7 +7950,7 @@ pub fn draw<M: GpuMemory>(
         && !resources.portraits.weapon_active
         && skip_bottom_in_play(
             registers,
-            resources.portraits.in_battle,
+            resources.portraits.in_battle || resources.portraits.active_battle,
             on_title || resources.portraits.title_sizzle_active,
             title_ready,
             vertex_count,
@@ -8240,7 +8242,7 @@ pub fn draw_immediate<M: GpuMemory>(
         && !resources.portraits.weapon_active
         && skip_bottom_in_play(
             registers,
-            resources.portraits.in_battle,
+            resources.portraits.in_battle || resources.portraits.active_battle,
             on_title || resources.portraits.title_sizzle_active,
             title_ready,
             vertices.len() as u32,
@@ -8549,7 +8551,10 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     registers[REG_FRAMEBUFFER_DIMENSIONS],
                 ]);
             }
-            if resources.portraits.in_play && resources.portraits.in_battle && is_subtitle(registers) {
+            if resources.portraits.in_play
+                && (resources.portraits.in_battle || resources.portraits.active_battle)
+                && is_subtitle(registers)
+            {
                 // the CPU decodes its arrays, so its lines can be centered
                 #[cfg(feature = "vulkan")]
                 if matches!(vertices, Vertices::Raw { .. }) {
@@ -8579,7 +8584,10 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 resources.portraits.adding = false;
                 return Some(0);
             }
-        } else if resources.portraits.in_play && resources.portraits.in_battle && is_text_buffer(registers) {
+        } else if resources.portraits.in_play
+            && (resources.portraits.in_battle || resources.portraits.active_battle)
+            && is_text_buffer(registers)
+        {
             // the CPU decodes its arrays, so its letters say where they are
             #[cfg(feature = "vulkan")]
             if matches!(vertices, Vertices::Raw { .. }) {
@@ -8692,7 +8700,9 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 || resources.portraits.file_active
                 || resources.portraits.weapon_active;
             #[cfg(feature = "vulkan")]
-            if ((resources.portraits.in_play && !special_menu && resources.portraits.in_battle)
+            if ((resources.portraits.in_play
+                && !special_menu
+                && (resources.portraits.in_battle || resources.portraits.active_battle))
                 || (capturing_title && on_title)
                 || portrait)
                 && matches!(vertices, Vertices::Raw { .. })
@@ -8729,7 +8739,7 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                             {
                                 resources.portraits.tutorial_dialogue_hold = 120;
                                 mirror_dialogue(registers, resources, Vertices::Shaded(&shaded));
-                            } else if resources.portraits.in_battle
+                            } else if (resources.portraits.in_battle || resources.portraits.active_battle)
                                 && is_power_label_text(&resources.portraits, &shaded)
                             {
                                 match power_label_mode() {
@@ -8741,11 +8751,11 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                                     }
                                     PowerLabelMode::Off => {}
                                 }
-                            } else if resources.portraits.in_battle {
+                            } else if resources.portraits.in_battle || resources.portraits.active_battle {
                                 mirror_hud(registers, resources, Vertices::Shaded(&shaded));
                             }
                         }
-                    } else if resources.portraits.in_battle {
+                    } else if resources.portraits.in_battle || resources.portraits.active_battle {
                         mirror_hud(registers, resources, vertices);
                     } else if on_title {
                         mirror_title(registers, resources, vertices);

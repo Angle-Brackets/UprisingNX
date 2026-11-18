@@ -117,29 +117,59 @@ fn safe_println(text: &str) {
     let _ = out.flush();
 }
 
+struct ReportQueue {
+    state: std::sync::Mutex<(std::collections::VecDeque<String>, bool)>,
+    cv: std::sync::Condvar,
+    handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+static REPORT_QUEUE: std::sync::OnceLock<ReportQueue> = std::sync::OnceLock::new();
+
+fn report_queue() -> &'static ReportQueue {
+    REPORT_QUEUE.get_or_init(|| ReportQueue {
+        state: std::sync::Mutex::new((std::collections::VecDeque::new(), false)),
+        cv: std::sync::Condvar::new(),
+        handle: std::sync::Mutex::new(None),
+    })
+}
+
 /// lines to print, and the frame rate ones to keep in fps.log, handed to a
 /// thread of their own: printing goes over the network and the log to the
 /// SD card, 30 ms a report, which stalled the frame it came in.
 fn report_line(line: String) {
-    static LINES: std::sync::OnceLock<Option<std::sync::mpsc::Sender<String>>> = std::sync::OnceLock::new();
-    let sender = LINES.get_or_init(|| {
-        let (send, receive) = std::sync::mpsc::channel::<String>();
+    static REPORT_STARTED: std::sync::Once = std::sync::Once::new();
+    let q = report_queue();
+    REPORT_STARTED.call_once(|| {
         let spawned = std::thread::Builder::new().name("report".to_owned()).spawn(move || {
             use std::io::Write;
             let quiet = std::env::var_os("UNX_QUIET").is_some();
             let mut fps_log: Option<std::fs::File> = None;
-            let mut fresh = true;
-            for line in receive {
+            let mut tried_open = false;
+            loop {
+                let line = {
+                    let mut guard = match q.state.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    while guard.0.is_empty() && !guard.1 {
+                        guard = match q.cv.wait(guard) {
+                            Ok(g) => g,
+                            Err(e) => e.into_inner(),
+                        };
+                    }
+                    match guard.0.pop_front() {
+                        Some(line) => line,
+                        None => break,
+                    }
+                };
                 // the reports and their indented lines, slow frames among
                 // them, so a session played away from nxlink says where its
                 // time went
                 if line.starts_with("frame ") || line.starts_with("  ") || line.starts_with("[ERROR]") || line.starts_with("[WARN]") {
                     // opened at the first line, the SD card is mounted by then
-                    if fps_log.is_none() {
-                        if fresh {
-                            let _ = std::fs::remove_file("sdmc:/switch/uprisingnx/fps.log");
-                        }
-                        fresh = false;
+                    if fps_log.is_none() && !tried_open {
+                        tried_open = true;
+                        let _ = std::fs::remove_file("sdmc:/switch/uprisingnx/fps.log");
                         fps_log = match std::fs::OpenOptions::new().create(true).append(true).open("sdmc:/switch/uprisingnx/fps.log") {
                             Ok(file) => Some(file),
                             Err(error) => {
@@ -163,13 +193,45 @@ fn report_line(line: String) {
                 safe_println(&line);
             }
         });
-        spawned.ok().map(|_| send)
-    });
-    match sender {
-        Some(sender) => {
-            let _ = sender.send(line);
+        if let Ok(handle) = spawned {
+            if let Ok(mut slot) = q.handle.lock() {
+                *slot = Some(handle);
+            }
         }
-        None => safe_println(&line),
+    });
+    let mut guard = match q.state.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if guard.1 {
+        drop(guard);
+        safe_println(&line);
+        return;
+    }
+    if guard.0.is_empty() && q.handle.lock().map_or(true, |h| h.is_none()) {
+        drop(guard);
+        safe_println(&line);
+        return;
+    }
+    guard.0.push_back(line);
+    q.cv.notify_one();
+}
+
+/// flushes queued log lines and joins the background reporter thread before shutdown.
+fn stop_reporter() {
+    let Some(q) = REPORT_QUEUE.get() else { return };
+    {
+        let mut guard = match q.state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        guard.1 = true;
+        q.cv.notify_all();
+    }
+    if let Ok(mut slot) = q.handle.lock() {
+        if let Some(handle) = slot.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -259,6 +321,7 @@ struct Smooth {
     backoff: u64,
     /// the wait for the GPU summed over the current check
     wait: f64,
+    elapsed: f64,
     frames: u32,
     /// when the last refresh was, and the refreshes of the check that took
     /// longer than SMOOTH_REFRESH_MS
@@ -266,6 +329,8 @@ struct Smooth {
     slow: u32,
     /// checks in a row that kept up
     kept_up: u32,
+    /// whether dropping battle resolution 1 step already failed to keep smooth mode on in this scene
+    scale_drop_failed: bool,
 }
 /// the highest scale the controller asks for, 1600x960 a screen
 const MAX_SCALE: u32 = 4;
@@ -303,9 +368,6 @@ pub struct Unx {
     shade_wait: f64,
     /// frames since the game's overrides last said it was in play (a battle)
     out_of_play: u32,
-    /// the same, but only kept going by a portrait while already in a battle,
-    /// for the resolution
-    res_out_of_play: u32,
     /// the bottom screen is shown: see Bottom
     bottom: Bottom,
     /// a benchmark under way, see Bench
@@ -392,9 +454,9 @@ impl Bottom {
         if said != 0 && !self.played {
             self.played = true;
             self.shown = false;
-        } else if in_frontend_menu && self.played {
-            // Returning from a battle into KIU's frontend menus (Solo, Hub,
-            // Chapter Select, Vault, Options) restores menu visibility automatically.
+        } else if (in_frontend_menu || on_fuse) && self.played {
+            // Returning from a battle into KIU's frontend menus restores menu visibility
+            // and non-battle resolution automatically.
             self.played = false;
             self.shown = true;
         }
@@ -499,6 +561,7 @@ fn bench_next(unx: &mut Unx) {
     bench.gaps.clear();
     bench.spent = [0.0; 5];
     bench.fallbacks = [0; 4];
+    unx.out_of_play = u32::MAX;
     unx.scene_changed("a benchmark slot");
 }
 
@@ -548,6 +611,14 @@ impl Unx {
             self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
             self.smooth.kept_up = 0;
             self.smooth.retry_at = 0;
+            self.smooth.scale_drop_failed = false;
+            if !wanted && self.battle_scale_drop != 0 {
+                self.battle_scale_drop = 0;
+                if self.fixed_resolution.is_none() {
+                    let target = self.auto_scale();
+                    self.set_scale(target);
+                }
+            }
             let on = self.smooth_allowed();
             self.set_smooth(on);
         }
@@ -595,6 +666,7 @@ impl Unx {
     /// a new scene says nothing of what the last one cost: smooth mode, if
     /// wanted and off, tries again now, and the backoff starts over
     fn scene_changed(&mut self, why: &str) {
+        self.smooth.scale_drop_failed = false;
         if self.battle_scale_drop != 0 {
             self.battle_scale_drop = 0;
             if self.fixed_resolution.is_none() {
@@ -614,6 +686,7 @@ impl Unx {
     fn set_smooth(&mut self, on: bool) {
         self.smooth.on = self.system.set_interpolation(on);
         self.smooth.wait = 0.0;
+        self.smooth.elapsed = 0.0;
         self.smooth.frames = 0;
         self.smooth.last = None;
         self.smooth.slow = 0;
@@ -629,6 +702,8 @@ impl Unx {
         let video = self.settings.mode_mut(docked).customize(docked);
         video.smooth = !self.smooth.wanted;
         self.smooth_forced = None;
+        self.battle_scale_drop = 0;
+        self.smooth.scale_drop_failed = false;
         self.apply_settings();
         self.settings_changed("smooth mode");
         self.notify_video();
@@ -676,23 +751,31 @@ impl Unx {
             return;
         }
         let now = Instant::now();
-        if let Some(last) = self.smooth.last.replace(now) {
-            self.smooth.slow += ((now - last).as_secs_f64() * 1000.0 > SMOOTH_REFRESH_MS) as u32;
-        }
+        let Some(last) = self.smooth.last.replace(now) else {
+            return;
+        };
+        let dt = (now - last).as_secs_f64() * 1000.0;
+        self.smooth.elapsed += dt;
+        self.smooth.slow += (dt > SMOOTH_REFRESH_MS) as u32;
         self.smooth.wait += waiting;
         self.smooth.frames += 1;
         if self.smooth.frames < SMOOTH_CHECK {
             return;
         }
         let average = self.smooth.wait / self.smooth.frames as f64;
+        let refresh_avg = std::mem::take(&mut self.smooth.elapsed) / self.smooth.frames as f64;
         let slow = std::mem::take(&mut self.smooth.slow);
         let frames = self.smooth.frames;
         self.smooth.wait = 0.0;
         self.smooth.frames = 0;
-        if average <= SMOOTH_WAIT_MS && slow * 2 <= frames {
+        // Odd/even interpolation splits a 33.33 ms pair into ~20.2 ms + ~13.1 ms at a
+        // locked 60 Hz, so require the 30-refresh mean interval to exceed 18.5 ms (<54 Hz)
+        // before treating individual >20 ms deltas as falling behind.
+        if average <= SMOOTH_WAIT_MS && (slow * 2 <= frames || refresh_avg <= 18.5) {
             self.smooth.kept_up += 1;
             if self.smooth.kept_up >= SMOOTH_SETTLED {
                 self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
+                self.smooth.scale_drop_failed = false;
             }
             return;
         }
@@ -701,7 +784,12 @@ impl Unx {
         let allow_drop = *ALLOW_SCALE_DROP.get_or_init(|| {
             std::env::var("UNX_SMOOTH_SCALE_DROP").map_or(true, |v| v.trim() != "0")
         });
-        if allow_drop && !self.title_boosted && self.fixed_resolution.is_none() && self.battle_scale_drop == 0 {
+        if allow_drop
+            && !self.smooth.scale_drop_failed
+            && !self.title_boosted
+            && self.fixed_resolution.is_none()
+            && self.battle_scale_drop == 0
+        {
             let before = self.system.gpu.scale();
             if before > 1 {
                 self.battle_scale_drop = 1;
@@ -709,25 +797,41 @@ impl Unx {
                 let scale = self.set_scale(target);
                 if scale < before {
                     self.smooth.wait = 0.0;
+                    self.smooth.elapsed = 0.0;
                     self.smooth.frames = 0;
                     self.smooth.last = None;
                     self.smooth.slow = 0;
                     self.smooth.kept_up = 0;
                     log::info!(
-                        "unx: smooth guard stepped battle resolution {before}x -> {scale}x to keep smooth mode on ({average:.1} ms waited a refresh, {slow} of {frames} refreshes slow, frame {})",
+                        "unx: smooth guard stepped battle resolution {before}x -> {scale}x to keep smooth mode on ({average:.1} ms waited a refresh, {refresh_avg:.1} ms/refresh, {slow} of {frames} refreshes slow, frame {})",
                         self.frame
                     );
                     return;
                 }
             }
         }
-        let backoff = self.smooth.backoff;
+        let dropped_failed = self.battle_scale_drop != 0;
+        let backoff = if dropped_failed { SMOOTH_BACKOFF_MOST } else { self.smooth.backoff };
         self.smooth.retry_at = self.frame + backoff;
         self.smooth.backoff = (backoff * 2).min(SMOOTH_BACKOFF_MOST);
         self.smooth.kept_up = 0;
         self.set_smooth(false);
+        if dropped_failed {
+            self.battle_scale_drop = 0;
+            self.smooth.scale_drop_failed = true;
+            if self.fixed_resolution.is_none() {
+                let target = self.auto_scale();
+                let restored = self.set_scale(target);
+                log::info!(
+                    "unx: smooth mode off ({average:.1} ms waited a refresh, {refresh_avg:.1} ms/refresh, {slow} of {frames} refreshes slow), restored battle resolution -> {restored}x, again in {} s (frame {})",
+                    backoff / 60,
+                    self.frame
+                );
+                return;
+            }
+        }
         log::info!(
-            "unx: smooth mode off, the GPU fell behind ({average:.1} ms waited a refresh, {slow} of {frames} refreshes slow), again in {} s (frame {})",
+            "unx: smooth mode off, the GPU fell behind ({average:.1} ms waited a refresh, {refresh_avg:.1} ms/refresh, {slow} of {frames} refreshes slow), again in {} s (frame {})",
             backoff / 60,
             self.frame
         );
@@ -755,6 +859,7 @@ impl Unx {
         };
         self.fixed_resolution = None;
         self.battle_scale_drop = 0;
+        self.smooth.scale_drop_failed = false;
         self.apply_settings();
         self.settings_changed(what);
         self.notify_video();
@@ -763,6 +868,7 @@ impl Unx {
     fn apply_docked(&mut self, docked: bool) {
         self.docked = docked;
         self.battle_scale_drop = 0;
+        self.smooth.scale_drop_failed = false;
         let (width, height) = if docked { (1920, 1080) } else { (1280, 720) };
         self.presenter.resize(width, height);
         if let Some(fixed) = self.fixed_resolution {
@@ -954,7 +1060,6 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         hardware: 0.0,
         shade_wait: 0.0,
         out_of_play: u32::MAX,
-        res_out_of_play: u32::MAX,
         bottom: Bottom::new(),
         bench: None,
         in_play: false,
@@ -976,10 +1081,12 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             retry_at: 0,
             backoff: SMOOTH_BACKOFF_FIRST,
             wait: 0.0,
+            elapsed: 0.0,
             frames: 0,
             last: None,
             slow: 0,
             kept_up: 0,
+            scale_drop_failed: false,
         },
         menu: menu::Menu::new(),
         aim: aim::Aim::from_env(),
@@ -1222,6 +1329,7 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
         Some(menu::Changed::Video) => {
             unx.fixed_resolution = None;
             unx.battle_scale_drop = 0;
+            unx.smooth.scale_drop_failed = false;
             unx.smooth_forced = None;
             unx.apply_settings();
             unx.settings_changed("menu");
@@ -1315,16 +1423,6 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let big_portrait = unx.system.gpu.flags().big_portrait.swap(false, std::sync::atomic::Ordering::Relaxed);
     unx.out_of_play = if said != 0 || big_portrait { 0 } else { unx.out_of_play.saturating_add(1) };
     let in_battle = unx.out_of_play <= 90;
-    // the resolution follows battles only: a conversation's portrait keeps
-    // one going, but out of one (How to Play's videos) it would flip the
-    // scale back and forth, each flip a hitch
-    let was_res_battle = unx.res_out_of_play <= 90;
-    unx.res_out_of_play = if said != 0 || (was_res_battle && big_portrait) {
-        0
-    } else {
-        unx.res_out_of_play.saturating_add(1)
-    };
-    let res_battle = unx.res_out_of_play <= 90;
     let host = input.as_ref().map_or(0, |input| input.host);
     let gpu_flags = unx.system.gpu.flags();
     let in_frontend_menu = gpu_flags.on_frontend_menu.swap(false, std::sync::atomic::Ordering::Relaxed) && !in_battle;
@@ -1346,6 +1444,9 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         || gpu_flags.on_weapon.load(std::sync::atomic::Ordering::Relaxed)
         || on_file_pre)
         && !in_battle;
+    // Resolution stays locked to battle_scale across quiet flight rails and
+    // cutscenes once play starts, until returning to a frontend menu.
+    let res_battle = said != 0 || (unx.bottom.played && !in_frontend_menu && !on_special_pre);
     let on_tutorial_movie = in_battle && !res_battle;
     let bottom_shown = unx.bottom.update(host, said, on_special_pre, on_tutorial_movie, in_frontend_menu);
     unx.system
@@ -1361,6 +1462,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let flags = unx.system.gpu.flags();
     flags.in_play.store(in_play, std::sync::atomic::Ordering::Relaxed);
     flags.in_battle.store(in_battle, std::sync::atomic::Ordering::Relaxed);
+    flags.active_battle.store(res_battle, std::sync::atomic::Ordering::Relaxed);
     if said != 0 && unx.frame % 120 == 0 {
         log::info!("unx: overrides say {said} (frame {})", unx.frame);
     }
@@ -1416,6 +1518,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 }),
                 "load" => {
                     let loaded = load_slot(&mut unx.system, slot);
+                    unx.out_of_play = u32::MAX;
                     unx.scene_changed("a state loaded");
                     loaded
                 }
@@ -1423,6 +1526,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                     "auto" => {
                         unx.fixed_resolution = None;
                         unx.battle_scale_drop = 0;
+                        unx.smooth.scale_drop_failed = false;
                         let target = unx.auto_scale();
                         let scale = unx.set_scale(target);
                         Ok(format!("auto resolution -> {scale}x"))
@@ -1947,4 +2051,5 @@ pub unsafe extern "C" fn unx_destroy(unx: *mut Unx) {
     if !unx.is_null() {
         drop(Box::from_raw(unx));
     }
+    stop_reporter();
 }
