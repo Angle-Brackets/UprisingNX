@@ -346,6 +346,8 @@ pub struct Unx {
     cauldron_cursor_x: f32,
     cauldron_opacity: f32,
     cauldron_hold: u8,
+    /// background watcher delivering commands read from `sdmc:/switch/uprisingnx/cmd.txt`
+    cmd_rx: std::sync::mpsc::Receiver<String>,
 }
 
 /// when the bottom screen is shown. Nothing guesses it from what the game
@@ -551,8 +553,11 @@ impl Unx {
         }
     }
 
-    /// the menu's overlay for this refresh (nothing but frees when closed)
+    /// the menu's overlay for this refresh (nothing when closed and no toast)
     fn menu_overlay(&mut self) -> Overlay {
+        if !self.menu.has_overlay() {
+            return Overlay::default();
+        }
         let (width, height) = self.presenter.extent();
         let now = (self.system.gpu.scale(), self.smooth.on);
         self.menu.overlay(&self.settings, self.docked, now, width, height)
@@ -884,8 +889,10 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     let system = match loader::load(&rom, config) {
         Ok(mut system) => {
             // what the recompiled code leaves to the interpreter, printed
-            // every 10 s (diagnostics)
-            system.interpreted_pcs = Some(Default::default());
+            // every 10 s (only when diagnostics or hints are requested)
+            if std::env::var_os("UNX_DIAG").is_some() || std::env::var_os("ZAKURO_HINTS").is_some() {
+                system.interpreted_pcs = Some(Default::default());
+            }
             // where the linked code still leaves the interpreter, for
             // 3dsrecomp to make functions of (Zakuro only sets this up where
             // it finds a library dir, which Horizon has none of)
@@ -906,6 +913,22 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             return std::ptr::null_mut();
         }
     };
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+    let _ = std::thread::Builder::new()
+        .name("cmd-watch".into())
+        .stack_size(64 << 10)
+        .spawn(move || {
+            let cmd_path = "sdmc:/switch/uprisingnx/cmd.txt";
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                if let Ok(text) = std::fs::read_to_string(cmd_path) {
+                    let _ = std::fs::remove_file(cmd_path);
+                    if cmd_tx.send(text).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
     log::info!("unx: loaded {rom} in {:?}", started.elapsed());
     Box::into_raw(Box::new(Unx {
         system,
@@ -964,7 +987,13 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         cauldron_cursor_x: 0.0,
         cauldron_opacity: 0.48,
         cauldron_hold: 0,
+        cmd_rx,
     }))
+}
+
+fn empty_pixels() -> std::sync::Arc<Vec<u8>> {
+    static EMPTY_PIXELS: std::sync::OnceLock<std::sync::Arc<Vec<u8>>> = std::sync::OnceLock::new();
+    EMPTY_PIXELS.get_or_init(|| std::sync::Arc::new(Vec::new())).clone()
 }
 
 /// a screen as the presenter takes it, straight from the GPU when the
@@ -972,7 +1001,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
 fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<zakuro_gpu::GpuScreen>) {
     if let Some(gpu) = system.gpu_screen(screen) {
         let scale = system.gpu.scale();
-        return ((std::sync::Arc::new(Vec::new()), screen.width() * scale, screen.height() * scale), Some(gpu));
+        return ((empty_pixels(), screen.width() * scale, screen.height() * scale), Some(gpu));
     }
     (system.read_screen_scaled(screen), None)
 }
@@ -995,7 +1024,7 @@ fn touch_on_bottom(layout: ScreenLayout, weapon_sub: u8, x: u16, y: u16) -> Opti
         }
         const KX: f32 = zakuro_gpu::raster::CHAPTER_BOT_KX;
         let sx_buf = u * 320.0;
-        let by = (6.0 + v * 232.5).clamp(0.0, 239.0);
+        let by = (4.0 + v * 234.5).clamp(0.0, 239.0);
         let bx = if by >= 194.0 {
             if sx_buf <= 34.0 {
                 (3.0 + (sx_buf - 3.0) / KX).clamp(0.0, 319.0)
@@ -1143,7 +1172,7 @@ pub extern "C" fn unx_minus_opens_menu() -> u32 {
 /// shows the screens as they are, with the overlay over them
 fn present_screens(unx: &mut Unx, overlay: &Overlay) {
     let top = shown(&mut unx.system, Screen::Top);
-    let blank = std::sync::Arc::new(Vec::new());
+    let blank = empty_pixels();
     let ((top_px, tw, th), top_gpu) = top;
     // the bottom screen is only fetched when the active layout places it
     let ((bottom_px, bw, bh), bottom_gpu) = if unx.layout == ScreenLayout::TopOnly {
@@ -1376,9 +1405,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     // can start from the same moment every time. the file is removed when read, and
     // the result is written to cmd.result
     if unx.frame % 15 == 0 {
-        let cmd_path = "sdmc:/switch/uprisingnx/cmd.txt";
-        if let Ok(text) = std::fs::read_to_string(cmd_path) {
-            let _ = std::fs::remove_file(cmd_path);
+        while let Ok(text) = unx.cmd_rx.try_recv() {
             let mut words = text.split_whitespace();
             let (verb, slot) = (words.next().unwrap_or(""), words.next().unwrap_or("slot0"));
             let file = format!("sdmc:/switch/uprisingnx/{slot}.zst");

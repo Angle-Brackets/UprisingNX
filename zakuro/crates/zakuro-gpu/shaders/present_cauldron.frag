@@ -39,7 +39,12 @@ vec3 sample_top(vec2 local_uv, vec2 local_duv) {
         }
         return textureLod(sampler2D(top_screen, screen_sampler), clamp(at, crop.top_bounds.xy, crop.top_bounds.zw), 0.0).rgb;
     }
-    ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
+    ivec2 taps = (crop.mode == 0)
+        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        : ivec2(clamp(ceil(covered), 1.0, 4.0));
+    if (taps == ivec2(1, 1)) {
+        return textureLod(sampler2D(top_screen, screen_sampler), clamp(at, crop.top_bounds.xy, crop.top_bounds.zw), 0.0).rgb;
+    }
     vec3 sum = vec3(0.0);
     for (int y = 0; y < taps.y; y++) {
         for (int x = 0; x < taps.x; x++) {
@@ -66,7 +71,12 @@ vec3 sample_bot(vec2 local_uv, vec2 local_duv) {
         }
         return textureLod(sampler2D(bot_screen, screen_sampler), clamp(at, crop.bot_bounds.xy, crop.bot_bounds.zw), 0.0).rgb;
     }
-    ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
+    ivec2 taps = (crop.mode == 0)
+        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        : ivec2(clamp(ceil(covered), 1.0, 4.0));
+    if (taps == ivec2(1, 1)) {
+        return textureLod(sampler2D(bot_screen, screen_sampler), clamp(at, crop.bot_bounds.xy, crop.bot_bounds.zw), 0.0).rgb;
+    }
     vec3 sum = vec3(0.0);
     for (int y = 0; y < taps.y; y++) {
         for (int x = 0; x < taps.x; x++) {
@@ -152,6 +162,14 @@ void main() {
     // 1. Dynamic obsidian-ember room stage (smoothly cross-dissolves slate-blue <-> crimson)
     uint uflags = uint(crop.hud_visible);
     bool hud_vis = (uflags & 1u) != 0u;
+    float mural_peak = max(
+        max3(sample_top_fast(vec2(42.0 / 400.0, 36.0 / 240.0))),
+        max(
+            max3(sample_top_fast(vec2(358.0 / 400.0, 36.0 / 240.0))),
+            max3(sample_top_fast(vec2(42.0 / 400.0, 152.0 / 240.0)))
+        )
+    );
+    float scene_fade = hud_vis ? clamp(mural_peak / 0.55, 0.0, 1.0) : 1.0;
     uint packed_rgb = uflags >> 8u;
     vec3 room_bg = (packed_rgb != 0u)
         ? vec3(
@@ -164,7 +182,7 @@ void main() {
     float edge = clamp(length(vec2(n.x * 0.9, n.y * 0.5)) - 0.62, 0.0, 1.0);
     float top_glow = clamp(1.0 - p.y / 53.0, 0.0, 1.0) * 0.55;
     float warmth = clamp(edge * 0.85 + top_glow * 0.42, 0.0, 1.0);
-    vec3 col = room_bg * warmth;
+    vec3 col = room_bg * warmth * scene_fade;
 
     // 2. Full Un-Occluded Parchment Mural (Winged Pit, Reapers & Treasure Chests 100% visible!)
     if (hud_vis) {
@@ -190,7 +208,7 @@ void main() {
         }
         float border_d = abs(d_mural);
         if (border_d < 0.36 + aa) {
-            float border_a = clamp(1.0 - (border_d - 0.33) * px_scale, 0.0, 1.0) * 0.84;
+            float border_a = clamp(1.0 - (border_d - 0.33) * px_scale, 0.0, 1.0) * 0.84 * scene_fade;
             col = mix(col, vec3(0.533, 0.345, 0.212), border_a);
         }
 
@@ -335,9 +353,9 @@ void main() {
 
             // Soft drop shadow + warm golden active halo while dragging
             float sh_soft = clamp(1.0 - max(d_sh, 0.0) / 2.6, 0.0, 1.0);
-            col = mix(col, vec3(0.0), sh_soft * sh_soft * mix(0.24, 0.68, active));
+            col = mix(col, vec3(0.0), sh_soft * sh_soft * mix(0.24, 0.68, active) * scene_fade);
             if (active > 0.01 && d_box > 0.0) {
-                float halo = exp(-d_box * 0.55) * active * 0.38;
+                float halo = exp(-d_box * 0.55) * active * 0.38 * scene_fade;
                 col = mix(col, vec3(1.0, 0.58, 0.22), halo);
             }
 
@@ -349,7 +367,7 @@ void main() {
                 vec3 up_fill = mix(vec3(0.42, 0.55, 1.0), vec3(0.52, 0.68, 1.0), active);
                 vec3 up_rim = mix(vec3(0.20, 0.28, 0.78), vec3(1.0, 0.85, 0.52), active * 0.85);
                 vec3 up_col = mix(up_fill, up_rim, up_edge_a * 0.85);
-                col = mix(col, up_col, up_fill_a * mix(0.75, 1.0, active));
+                col = mix(col, up_col, up_fill_a * opacity * scene_fade);
             }
 
             // Left & right draggable chevron ears (< and >)
@@ -362,7 +380,7 @@ void main() {
                 vec3 ear_fill = mix(vec3(0.80, 0.24, 0.17), vec3(0.92, 0.20, 0.14), active);
                 vec3 ear_rim = mix(vec3(0.75, 0.53, 0.37), vec3(1.0, 0.84, 0.55), active);
                 vec3 ear_col = mix(ear_fill, ear_rim, chev_edge_a * 0.85);
-                col = mix(col, ear_col, chev_fill_a * opacity);
+                col = mix(col, ear_col, chev_fill_a * opacity * scene_fade);
             }
 
             // Rounded Intensity badge sampled from our parked slot at x_center = 255 on top_screen
@@ -379,7 +397,7 @@ void main() {
                 badge_col = mix(badge_col, rim_col, border_band * mix(0.25, 0.95, active));
 
                 float box_a = clamp(0.5 - d_box * px_scale, 0.0, 1.0);
-                col = mix(col, badge_col, box_a * opacity);
+                col = mix(col, badge_col, box_a * opacity * scene_fade);
             }
         }
     }

@@ -1672,8 +1672,14 @@ pub(crate) struct Portraits {
     pub(crate) weapon_active: bool,
     /// whether Weapon Select's bottom `#FF00FF` chroma canvas has been painted this frame.
     pub(crate) weapon_bot_painted: bool,
+    /// whether Weapon List's bottom modal dimmer (`Try It! / Equip It! / Back`) has drawn this frame.
+    weapon_bot_modal: bool,
     /// whether `Try It! / Equip It! / Back` modal banner is active on Weapon List's top screen.
     weapon_modal_top: bool,
+    /// horizontal slide delta keeping `Ranged / Melee / Value` text aligned with the Stars Plaque.
+    weapon_plaque_dx: f32,
+    /// whether battle-entry field resets have already been applied during this battle.
+    battle_cleared: bool,
     /// whether the 3DS frontend-menu top-right battery icon was seen outside of battle.
     pub(crate) frontend_menu_seen: bool,
     /// whether the user toggled `R-Stick` to view raw `LargeTop` instead of custom menu UI.
@@ -2172,6 +2178,13 @@ fn needs_cauldron_top_adjust(registers: &[u32]) -> bool {
     registers[REG_TEXTURE_CONFIG] & 1 != 0
 }
 
+fn copy_regs(registers: &[u32]) -> [u32; 0x300] {
+    let mut out = [0u32; 0x300];
+    let n = registers.len().min(0x300);
+    out[..n].copy_from_slice(&registers[..n]);
+    out
+}
+
 fn rasterize_cauldron_faded<M: GpuMemory>(
     registers: &[u32],
     memory: &mut M,
@@ -2189,7 +2202,8 @@ fn rasterize_cauldron_faded<M: GpuMemory>(
         resources.portraits.adding = false;
         return res;
     }
-    let mut regs = registers.to_vec();
+    let mut regs_buf = copy_regs(registers);
+    let regs = &mut regs_buf[..registers.len()];
     let alpha_u8 = ((alpha * 255.0).round() as u32).min(255);
     if regs[REG_COLOR_OPERATION] & 0x100 == 0 {
         regs[REG_COLOR_OPERATION] = (regs[REG_COLOR_OPERATION] & !0xFF) | 0x00E4_0100;
@@ -2216,7 +2230,7 @@ fn rasterize_cauldron_faded<M: GpuMemory>(
         }
     }
     resources.portraits.adding = true;
-    let res = rasterize(&regs, memory, resources, Vertices::Shaded(&vertices));
+    let res = rasterize(regs, memory, resources, Vertices::Shaded(&vertices));
     resources.portraits.adding = false;
     res
 }
@@ -2430,7 +2444,8 @@ fn draw_cauldron_top<M: GpuMemory>(
                             (v0.color[c] - resources.portraits.cauldron_room_rgb[c]) * 0.11;
                     }
                 }
-                let mut regs = registers.to_vec();
+                let mut regs_buf = copy_regs(registers);
+                let regs = &mut regs_buf[..registers.len()];
                 regs[REG_FACE_CULLING] = 0;
                 regs[REG_ALPHA_TEST] &= !1;
                 regs[REG_DEPTH_COLOR_MASK] = (regs[REG_DEPTH_COLOR_MASK] & !0xFF) | 0x0F00;
@@ -2454,7 +2469,7 @@ fn draw_cauldron_top<M: GpuMemory>(
                     mk(-4.0, 161.0), mk(404.0, 242.0), mk(-4.0, 242.0),
                 ];
                 resources.portraits.adding = true;
-                let res = rasterize(&regs, memory, resources, Vertices::Shaded(&wipe));
+                let res = rasterize(regs, memory, resources, Vertices::Shaded(&wipe));
                 resources.portraits.adding = false;
                 return res;
             }
@@ -2462,10 +2477,10 @@ fn draw_cauldron_top<M: GpuMemory>(
         return Some(0);
     }
 
-    // 6. Park all 6 draws of the `[Intensity X.X]` card (`168 <= upper <= 242`) at
+    // 6. Park all 6 draws of the `[Intensity X.X]` card (`156 <= upper <= 242`) at
     //    `x_center = 255.0` (`[186.4..323.6, 165.9..239.5]`) below the mural.
-    if (168.0..=242.0).contains(&upper) && lower <= 252.0 && !(left < -20.0 && right > 420.0) {
-        if dims == (64 << 16 | 64) && fmt == TextureFormat::La4 && upper < 185.0 {
+    if (156.0..=242.0).contains(&upper) && lower <= 252.0 && !(left < -20.0 && right > 420.0) {
+        if dims == (64 << 16 | 64) && fmt == TextureFormat::La4 && (168.0..185.0).contains(&upper) {
             resources.portraits.cauldron_card_dx = 255.0 - (left + right) * 0.5;
         }
         let dx = resources.portraits.cauldron_card_dx;
@@ -2550,7 +2565,12 @@ fn adjust_cauldron_bot(
     //    ellipses (`v == 6`, `lower > 150`) so `bot_screen` is pure `#000000`
     //    outside the Cauldron, Pan, Flames, Hearts, and UI!
     if portraits.cauldron_hud_active {
-        if !textured && shaded.len() == 6 && (right - left) > 300.0 && (lower - upper) > 220.0 {
+        if !textured
+            && !portraits.cauldron_pot_seen
+            && shaded.len() == 6
+            && (right - left) > 300.0
+            && (lower - upper) > 220.0
+        {
             return None;
         }
         if textured
@@ -2920,10 +2940,13 @@ fn adjust_mode_top(
     // 3. Keep the bottom description blurb (`256x256 A4`) at exact 1:1 unstretched aspect!
     if dims == (256 << 16 | 256) && fmt == TextureFormat::A4 {
         const SX: f32 = 400.0 / 426.66666;
-        for v in &mut shaded {
-            let [sx, sy] = to_top_xy(v);
-            if sy >= 200.0 {
-                set_top_xy(v, 200.0 + (sx - 200.0) * SX, sy);
+        for tri in shaded.chunks_exact_mut(3) {
+            let pts = [to_top_xy(&tri[0]), to_top_xy(&tri[1]), to_top_xy(&tri[2])];
+            let cy = (pts[0][1] + pts[1][1] + pts[2][1]) / 3.0;
+            if cy >= 200.0 {
+                for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
+                    set_top_xy(v, 200.0 + (sx - 200.0) * SX, sy - 2.0);
+                }
             }
         }
     }
@@ -2965,7 +2988,8 @@ fn draw_mode_bot<M: GpuMemory>(
     // 1. Replace Mode Select's `128x256 L4` pastel backdrop with pure `#0000FF` (`0, 0, 1`)
     //    so the Top Screen's lined parchment, wings, and vines shine through behind the buttons!
     if dims == (128 << 16 | 256) && fmt == TextureFormat::L4 {
-        let mut chroma_regs = registers.to_vec();
+        let mut chroma_buf = copy_regs(registers);
+        let chroma_regs = &mut chroma_buf[..registers.len()];
         chroma_regs[REG_TEXTURE_CONFIG] &= !0x7;
         for (stage, &stage_base) in TEV_STAGES.iter().enumerate() {
             let vals = match stage {
@@ -2975,7 +2999,7 @@ fn draw_mode_bot<M: GpuMemory>(
             chroma_regs[stage_base..stage_base + 5].copy_from_slice(&vals);
         }
         resources.portraits.adding = true;
-        let res = rasterize(&chroma_regs, memory, resources, Vertices::Shaded(&shaded));
+        let res = rasterize(chroma_regs, memory, resources, Vertices::Shaded(&shaded));
         resources.portraits.adding = false;
         return res;
     }
@@ -3222,7 +3246,7 @@ fn draw_solo_bot<M: GpuMemory>(
     let cy = (upper + lower) * 0.5;
     let slot_idx = if cx < 70.0 && cy >= 195.0 {
         6 // Back
-    } else if cx < 70.0 {
+    } else if cx < 70.0 && cy >= 80.0 {
         2 // Practice Range
     } else if cx < 195.0 && cy >= 175.0 {
         4 // Idol Toss
@@ -3368,7 +3392,8 @@ fn draw_file_bot<M: GpuMemory>(
 ) -> Option<u32> {
     if !resources.portraits.file_bot_painted {
         resources.portraits.file_bot_painted = true;
-        let mut clear_regs = registers.to_vec();
+        let mut clear_buf = copy_regs(registers);
+        let clear_regs = &mut clear_buf[..registers.len()];
         clear_regs[REG_PRIMITIVE_CONFIG] &= !0x300;
         clear_regs[REG_FACE_CULLING] = 0;
         clear_regs[0x0065] = 0;
@@ -3393,7 +3418,7 @@ fn draw_file_bot<M: GpuMemory>(
             ..Default::default()
         });
         resources.portraits.adding = true;
-        let _ = rasterize(&clear_regs, memory, resources, Vertices::Shaded(&cover));
+        let _ = rasterize(clear_regs, memory, resources, Vertices::Shaded(&cover));
         resources.portraits.adding = false;
     }
 
@@ -3640,6 +3665,7 @@ fn draw_weapon_top<M: GpuMemory>(
             } else if shaded.len() == 18 && right < 180.0 {
                 // `Ranged / Melee / Value` cream Stars Plaque: mirror horizontally and right-align
                 // flush to `wx = 426.67` so its curved black border faces left!
+                resources.portraits.weapon_plaque_dx = (134.5 - right).max(0.0) * PLAQUE_S;
                 disable_cull = true;
                 for v in &mut shaded {
                     let [sx, sy] = to_top_xy(v);
@@ -3668,7 +3694,7 @@ fn draw_weapon_top<M: GpuMemory>(
                     let [sx, sy] = to_top_xy(v);
                     set_wide_top(
                         v,
-                        275.5 + (sx - 301.55) * MED_S,
+                        266.0 + (sx - 301.55) * MED_S,
                         51.5 + (sy - 204.6) * MED_S,
                     );
                 }
@@ -3738,10 +3764,11 @@ fn draw_weapon_top<M: GpuMemory>(
                     }
                 } else if cx < 168.0 {
                     // `Ranged / Melee / Value` + stars inside the mirrored right-aligned Stars Plaque:
+                    let plaque_dx = resources.portraits.weapon_plaque_dx;
                     for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
                         set_wide_top(
                             v,
-                            326.0 + (sx - 6.2) * PLAQUE_S,
+                            326.0 + plaque_dx + (sx - 6.2) * PLAQUE_S,
                             24.0 + (sy - 24.0) * PLAQUE_S,
                         );
                     }
@@ -3760,6 +3787,10 @@ fn draw_weapon_top<M: GpuMemory>(
     } else if sub == 2 {
         // Weapon Category Select (`"Select a weapon category."`):
         if dims == (128 << 16 | 128) && fmt == TextureFormat::L4 {
+            // Hovering `Back` renders a giant L4 arrow watermark across the right showcase: omit it.
+            if left > 20.0 {
+                return Some(0);
+            }
             // Category emblem card (`[-37.9..138.9, 92.7..213.1]`): mirror & right-align
             // at `wx = 426.67` so its flat edge docks right and its gradient fades left!
             disable_cull = true;
@@ -3837,6 +3868,10 @@ fn draw_weapon_top<M: GpuMemory>(
                 );
             }
         } else if dims == (128 << 16 | 128) && fmt == TextureFormat::La4 {
+            // Omit Back-button hover arrow watermark so it never overwrites `"WEAPONS"` / `"POWERS"`.
+            if left < 200.0 || upper > 110.0 {
+                return Some(0);
+            }
             // `"WEAPONS"` / `"POWERS"` serif display title at upper-right:
             for v in &mut shaded {
                 let [sx, sy] = to_top_xy(v);
@@ -3887,18 +3922,20 @@ fn draw_weapon_top<M: GpuMemory>(
         // Power Configurator (Option A: 0.80x Workbench Left | Power Inspector / Set Summary Right):
         const S_BOX: f32 = 0.58;
         const S_ROT: f32 = 0.78;
-        const S_DESC: f32 = 0.64;
+        const S_DESC_X: f32 = 0.44;
+        const S_DESC_Y: f32 = 0.58;
 
         if textured && dims == (256 << 16 | 256) && fmt == TextureFormat::Etc1 && shaded.len() >= 100 {
             // Start of Power Configurator's top pass: lined cream parchment + gold seal + header ribbon.
             resources.portraits.power_set_overlay = false;
+            resources.portraits.power_set_two_cols = false;
         } else if !textured && shaded.len() == 6 {
             // Translucent white description card (`[-18.8..418.8, 163.8..208.5]`):
             for v in &mut shaded {
                 let [sx, sy] = to_top_xy(v);
                 set_wide_top(
                     v,
-                    263.0 + (sx + 18.8) * (160.0 / 437.6),
+                    256.0 + (sx + 18.8) * (168.0 / 437.6),
                     144.0 + (sy - 163.8) * (40.0 / 44.7),
                 );
             }
@@ -3918,7 +3955,7 @@ fn draw_weapon_top<M: GpuMemory>(
                     let [sx, sy] = to_top_xy(v);
                     set_wide_top(
                         v,
-                        263.0 + x_slide + (sx - left) * (165.0 / span_x),
+                        255.0 + x_slide + (sx - left) * (170.0 / span_x),
                         36.0 + (sy - 9.9) * (200.0 / 223.9),
                     );
                 }
@@ -3937,7 +3974,7 @@ fn draw_weapon_top<M: GpuMemory>(
                     let [sx, sy] = to_top_xy(v);
                     set_wide_top(
                         v,
-                        265.0 + (sx + shift) * s_set + x_slide,
+                        257.0 + (sx + shift) * s_set + x_slide,
                         44.0 + (sy - 23.0) * s_set,
                     );
                 }
@@ -3967,7 +4004,7 @@ fn draw_weapon_top<M: GpuMemory>(
                         for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
                             set_wide_top(
                                 v,
-                                265.0 + (sx + shift) * s_set + x_slide,
+                                257.0 + (sx + shift) * s_set + x_slide,
                                 44.0 + (sy - 23.0) * s_set,
                             );
                         }
@@ -3978,7 +4015,7 @@ fn draw_weapon_top<M: GpuMemory>(
                     let [sx, sy] = to_top_xy(v);
                     set_wide_top(
                         v,
-                        265.0 + (sx + shift) * s_set + x_slide,
+                        257.0 + (sx + shift) * s_set + x_slide,
                         44.0 + (sy - 23.0) * s_set,
                     );
                 }
@@ -3987,7 +4024,7 @@ fn draw_weapon_top<M: GpuMemory>(
             // `6x6` Shape Preview outer frame (`cx < 175`); omit the oversized outer pink box (`cx >= 175`)
             // around the Power Icon since the Power Icon already carries its own bold rounded border:
             resources.portraits.power_set_two_cols = false;
-            if left > 500.0 {
+            if left > 500.0 || right < 10.0 {
                 return Some(0);
             }
             for tri in shaded.chunks_exact_mut(3) {
@@ -4012,7 +4049,7 @@ fn draw_weapon_top<M: GpuMemory>(
             && matches!(fmt, TextureFormat::Etc1 | TextureFormat::Etc1A4)
         {
             // Selected Power Icon (`[219.2..330.5, 44.1..155.4]`):
-            if left > 500.0 {
+            if left > 500.0 || right < 10.0 {
                 return Some(0);
             }
             for v in &mut shaded {
@@ -4024,7 +4061,7 @@ fn draw_weapon_top<M: GpuMemory>(
                 );
             }
         } else if textured && dims == (32 << 16 | 32) && fmt == TextureFormat::La4 {
-            if left > 500.0 {
+            if left > 500.0 || right < 10.0 {
                 return Some(0);
             }
             if upper >= 205.0 {
@@ -4060,7 +4097,7 @@ fn draw_weapon_top<M: GpuMemory>(
                 let pts = [to_top_xy(&tri[0]), to_top_xy(&tri[1]), to_top_xy(&tri[2])];
                 let cx = (pts[0][0] + pts[1][0] + pts[2][0]) / 3.0;
                 let cy = (pts[0][1] + pts[1][1] + pts[2][1]) / 3.0;
-                if cx < 0.0 || cx > 405.0 || cy > 240.0 {
+                if cx < -12.0 || cx > 412.0 || cy > 240.0 {
                     for v in tri.iter_mut() {
                         v.clip = [0.0; 4];
                     }
@@ -4089,8 +4126,8 @@ fn draw_weapon_top<M: GpuMemory>(
                     for (v, [sx, sy]) in tri.iter_mut().zip(pts) {
                         set_wide_top(
                             v,
-                            343.5 + (sx - 200.0) * S_DESC,
-                            164.0 + (sy - 187.4) * S_DESC,
+                            340.0 + (sx - 200.0) * S_DESC_X,
+                            164.0 + (sy - 187.4) * S_DESC_Y,
                         );
                     }
                 }
@@ -4100,12 +4137,48 @@ fn draw_weapon_top<M: GpuMemory>(
 
     resources.portraits.adding = true;
     let res = if disable_cull {
-        let mut regs = registers.to_vec();
+        let mut regs_buf = copy_regs(registers);
+        let regs = &mut regs_buf[..registers.len()];
         regs[REG_FACE_CULLING] = 0;
-        rasterize(&regs, memory, resources, Vertices::Shaded(&shaded))
+        rasterize(regs, memory, resources, Vertices::Shaded(&shaded))
     } else {
         rasterize(registers, memory, resources, Vertices::Shaded(&shaded))
     };
+    resources.portraits.adding = false;
+    res
+}
+
+/// Paints opaque `#FF00FF` exterior/scroll-clip mask geometry on bottom chroma menus.
+fn rasterize_magenta_mask<M: GpuMemory>(
+    registers: &[u32],
+    memory: &mut M,
+    resources: &mut Resources,
+    shaded: &mut [Vertex],
+) -> Option<u32> {
+    let mut mask_buf = copy_regs(registers);
+    let mask_regs = &mut mask_buf[..registers.len()];
+    mask_regs[REG_PRIMITIVE_CONFIG] &= !0x300;
+    mask_regs[REG_FACE_CULLING] = 0;
+    mask_regs[0x0065] = 0;
+    mask_regs[REG_TEXTURE_CONFIG] &= !0x7;
+    mask_regs[REG_ALPHA_TEST] = 0;
+    mask_regs[REG_STENCIL_TEST] = 0;
+    mask_regs[REG_COLOR_OPERATION] = 0x00E4_0100;
+    mask_regs[REG_BLEND_FUNC] = 0x0101_0000;
+    mask_regs[REG_COLOR_BUFFER_WRITE] = 0xF;
+    mask_regs[REG_DEPTH_COLOR_MASK] = 0xF << 8;
+    for (stage, &stage_base) in TEV_STAGES.iter().enumerate() {
+        let vals = match stage {
+            0 => [0x000E_000E, 0, 0, 0xFFFF_00FF, 0],
+            _ => [0x000F_000F, 0, 0, 0, 0],
+        };
+        mask_regs[stage_base..stage_base + 5].copy_from_slice(&vals);
+    }
+    for v in shaded.iter_mut() {
+        v.color = [1.0, 0.0, 1.0, 1.0];
+    }
+    resources.portraits.adding = true;
+    let res = rasterize(mask_regs, memory, resources, Vertices::Shaded(shaded));
     resources.portraits.adding = false;
     res
 }
@@ -4118,33 +4191,14 @@ fn draw_weapon_bot<M: GpuMemory>(
 ) -> Option<u32> {
     if !resources.portraits.weapon_bot_painted {
         resources.portraits.weapon_bot_painted = true;
-        let mut clear_regs = registers.to_vec();
-        clear_regs[REG_PRIMITIVE_CONFIG] &= !0x300;
-        clear_regs[REG_FACE_CULLING] = 0;
-        clear_regs[0x0065] = 0;
-        clear_regs[REG_TEXTURE_CONFIG] &= !0x7;
-        clear_regs[REG_ALPHA_TEST] = 0;
-        clear_regs[REG_STENCIL_TEST] = 0;
-        clear_regs[REG_COLOR_OPERATION] = 0x00E4_0100;
-        clear_regs[REG_BLEND_FUNC] = 0x0101_0000;
-        clear_regs[REG_COLOR_BUFFER_WRITE] = 0xF;
-        clear_regs[REG_DEPTH_COLOR_MASK] = 0xF << 8;
-        for (stage, &stage_base) in TEV_STAGES.iter().enumerate() {
-            let vals = match stage {
-                0 => [0x000E_000E, 0, 0, 0xFFFF_00FF, 0],
-                _ => [0x000F_000F, 0, 0, 0, 0],
-            };
-            clear_regs[stage_base..stage_base + 5].copy_from_slice(&vals);
-        }
-        let cover: [Vertex; 3] = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]].map(|[x, y]| Vertex {
+        resources.portraits.weapon_bot_modal = false;
+        let mut cover: [Vertex; 3] = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]].map(|[x, y]| Vertex {
             clip: [x, y, 0.0, 1.0],
             color: [1.0, 0.0, 1.0, 1.0],
             quaternion: [0.0, 0.0, 0.0, 1.0],
             ..Default::default()
         });
-        resources.portraits.adding = true;
-        let _ = rasterize(&clear_regs, memory, resources, Vertices::Shaded(&cover));
-        resources.portraits.adding = false;
+        let _ = rasterize_magenta_mask(registers, memory, resources, &mut cover);
     }
 
     if shaded.iter().any(|v| !v.clip[3].is_finite() || v.clip[3] <= 1e-4) {
@@ -4186,9 +4240,12 @@ fn draw_weapon_bot<M: GpuMemory>(
         return Some(0);
     }
 
-    // Omit the 3DS beige lined-paper wallpaper (`64x8 Rgb565` on List & GearHub;
-    // untextured `v>=18`, `128x128 L4`, and `8x16 L4` on Category Select).
+    // On Weapon List (`sub == 1`), `64x8 Rgb565` (`v == 12`) is KIU's top & bottom scroll-clip
+    // mask over scrolled weapon rows — paint as `#FF00FF`; omit `64x8 Rgb565` wallpaper otherwise.
     if textured && dims == (64 << 16 | 8) && fmt == TextureFormat::Rgb565 {
+        if sub == 1 && shaded.len() >= 12 {
+            return rasterize_magenta_mask(registers, memory, resources, &mut shaded);
+        }
         return Some(0);
     }
     if sub == 4 {
@@ -4206,36 +4263,17 @@ fn draw_weapon_bot<M: GpuMemory>(
                     set_bot_xy(v, sx.clamp(146.5, 307.5), sy.clamp(25.5, 200.0));
                 }
             } else {
-                let mut mask_regs = registers.to_vec();
-                mask_regs[REG_PRIMITIVE_CONFIG] &= !0x300;
-                mask_regs[REG_FACE_CULLING] = 0;
-                mask_regs[0x0065] = 0;
-                mask_regs[REG_TEXTURE_CONFIG] &= !0x7;
-                mask_regs[REG_ALPHA_TEST] = 0;
-                mask_regs[REG_STENCIL_TEST] = 0;
-                mask_regs[REG_COLOR_OPERATION] = 0x00E4_0100;
-                mask_regs[REG_BLEND_FUNC] = 0x0101_0000;
-                mask_regs[REG_COLOR_BUFFER_WRITE] = 0xF;
-                mask_regs[REG_DEPTH_COLOR_MASK] = 0xF << 8;
-                for (stage, &stage_base) in TEV_STAGES.iter().enumerate() {
-                    let vals = match stage {
-                        0 => [0x000E_000E, 0, 0, 0xFFFF_00FF, 0],
-                        _ => [0x000F_000F, 0, 0, 0, 0],
-                    };
-                    mask_regs[stage_base..stage_base + 5].copy_from_slice(&vals);
-                }
-                for v in &mut shaded {
-                    v.color = [1.0, 0.0, 1.0, 1.0];
-                }
-                resources.portraits.adding = true;
-                let res = rasterize(&mask_regs, memory, resources, Vertices::Shaded(&shaded));
-                resources.portraits.adding = false;
-                return res;
+                return rasterize_magenta_mask(registers, memory, resources, &mut shaded);
             }
         } else if !textured && (right - left) > 340.0 {
             for v in &mut shaded {
                 let [sx, sy] = to_bot_xy(v);
                 set_bot_xy(v, sx.clamp(0.0, 312.0), sy.clamp(0.0, 202.0));
+            }
+        } else if upper >= 200.5 && (right - left) < 300.0 {
+            for v in &mut shaded {
+                let [sx, sy] = to_bot_xy(v);
+                set_bot_xy(v, sx, sy - 3.5);
             }
         }
     } else if sub == 2 {
@@ -4256,16 +4294,19 @@ fn draw_weapon_bot<M: GpuMemory>(
                 let [sx, sy] = to_bot_xy(v);
                 set_bot_xy(v, 320.0 - sx, sy);
             }
-            let mut regs = registers.to_vec();
+            let mut regs_buf = copy_regs(registers);
+            let regs = &mut regs_buf[..registers.len()];
             regs[REG_FACE_CULLING] = 0;
             resources.portraits.adding = true;
-            let res = rasterize(&regs, memory, resources, Vertices::Shaded(&shaded));
+            let res = rasterize(regs, memory, resources, Vertices::Shaded(&shaded));
             resources.portraits.adding = false;
             return res;
         }
-        // Keep `Back` (`64x32 La4`) at `(sx + 4, sy)` in bottom-left; shift the 10 Category
-        // plaques, icons, names, & highlight left by `-48` so `[56..312]` centers in `[8..264]`.
-        let dx = if textured && dims == (64 << 16 | 32) && fmt == TextureFormat::La4 {
+        // Pass full-screen fade quads through unmodified; keep `Back` (`64x32 La4`) at `(sx + 4, sy)`
+        // in bottom-left; shift the 10 Category plaques, icons, names, & highlight left by `-48`.
+        let dx = if !textured && (right - left) >= 315.0 && (lower - upper) >= 235.0 {
+            0.0
+        } else if textured && dims == (64 << 16 | 32) && fmt == TextureFormat::La4 {
             4.0
         } else {
             -48.0
@@ -4274,12 +4315,43 @@ fn draw_weapon_bot<M: GpuMemory>(
             let [sx, sy] = to_bot_xy(v);
             set_bot_xy(v, sx + dx, sy);
         }
-    } else if sub == 1 && !textured && (right - left) > 340.0 {
-        // Clamp the `Try It! / Equip It! / Back` modal dimmer strictly to the Weapon List box
-        // (`[3..315, 0..198]`) so `#FF00FF` exterior around `Back` & `Page 1/32` stays clean!
-        for v in &mut shaded {
-            let [sx, sy] = to_bot_xy(v);
-            set_bot_xy(v, sx.clamp(3.0, 315.0), sy.clamp(0.0, 198.0));
+    } else if sub == 1 {
+        if textured && dims == (256 << 16 | 128) && fmt == TextureFormat::L4 {
+            // Clamp the dark well (`v == 24`) and header/side/bottom frame (`v == 39`) strictly
+            // to `[3.0..315.0, 0.0..194.5]` so `[Back]` and `[< ALL Page >]` float cleanly on `#FF00FF`.
+            let y_min = if shaded.len() <= 24 { 29.0 } else { 0.0 };
+            for v in &mut shaded {
+                let [sx, sy] = to_bot_xy(v);
+                set_bot_xy(v, sx.clamp(3.0, 315.0), sy.clamp(y_min, 194.5));
+            }
+        } else if !textured && (right - left) > 340.0 {
+            if shaded.len() == 6 {
+                resources.portraits.weapon_bot_modal = true;
+            }
+            for v in &mut shaded {
+                let [sx, sy] = to_bot_xy(v);
+                set_bot_xy(v, sx.clamp(3.0, 315.0), sy.clamp(0.0, 194.5));
+            }
+        } else if textured
+            && dims == (256 << 16 | 256)
+            && fmt == TextureFormat::A4
+            && (registers[REG_PRIMITIVE_CONFIG] >> 8 & 3) == 0
+            && !resources.portraits.weapon_bot_modal
+            && !(lower <= 24.0 || (upper >= 208.0 && lower <= 227.0))
+        {
+            // Clip partially scrolled weapon-row names & values (`"Viridi Palm 282"`) strictly inside
+            // `[30.0..192.5]` while preserving `"Equipped"`, `"Strength"`, `"1/33"`, and modal text.
+            let mut kept = Vec::with_capacity(shaded.len());
+            for tri in shaded.chunks_exact(3) {
+                let ys = [to_bot_xy(&tri[0])[1], to_bot_xy(&tri[1])[1], to_bot_xy(&tri[2])[1]];
+                if ys.into_iter().all(|y| (30.0..=192.5).contains(&y)) {
+                    kept.extend_from_slice(tri);
+                }
+            }
+            if kept.is_empty() {
+                return Some(0);
+            }
+            shaded = kept;
         }
     }
 
@@ -4293,6 +4365,10 @@ fn draw_weapon_bot<M: GpuMemory>(
 /// being drawn, as well as Fuse Weapons' A/B card headers.
 fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
     if portraits.in_battle {
+        if portraits.battle_cleared {
+            return;
+        }
+        portraits.battle_cleared = true;
         portraits.reset_title();
         portraits.fuse_first_header = 0;
         portraits.fuse_frame_seen = false;
@@ -4342,10 +4418,12 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
         portraits.weapon_sub_seen = 0;
         portraits.weapon_sub = 0;
         portraits.weapon_active = false;
+        portraits.weapon_bot_modal = false;
         portraits.weapon_missed = 0;
         portraits.weapon_modal_top = false;
         return;
     }
+    portraits.battle_cleared = false;
     if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
         && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0
     {
@@ -4357,6 +4435,8 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
             let fmt = TextureFormat::from_raw(registers[base + 13]);
             if dims == (64 << 16 | 64) && fmt == TextureFormat::Etc1 {
                 portraits.file_top_step = 1;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
             } else if portraits.file_top_step == 1
                 && dims == (8 << 16 | 16)
                 && fmt == TextureFormat::L4
@@ -4381,9 +4461,17 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                 portraits.file_active = true;
                 portraits.file_missed = 0;
                 portraits.reset_title();
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+                portraits.chapter_active = false;
                 portraits.mode_active = false;
                 portraits.mode_top_latched = false;
                 portraits.solo_active = false;
+                portraits.weapon_active = false;
+                portraits.weapon_modal_top = false;
+                portraits.power_set_overlay = false;
+                portraits.power_set_two_cols = false;
+                portraits.power_bot_latched = false;
                 portraits.frontend_menu_seen = true;
             } else {
                 portraits.file_top_step = 0;
@@ -4411,179 +4499,234 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                 portraits.cauldron_active = true;
                 portraits.cauldron_hud_active = true;
                 portraits.cauldron_missed = 0;
+                portraits.chapter_active = false;
+                portraits.mode_active = false;
+                portraits.mode_top_latched = false;
+                portraits.solo_active = false;
+                portraits.file_active = false;
+                portraits.weapon_active = false;
+                portraits.weapon_modal_top = false;
+                portraits.power_set_overlay = false;
+                portraits.power_set_two_cols = false;
             } else {
                 portraits.cauldron_mural_step = 0;
             }
 
-            if !portraits.cauldron_active {
-                if dims == (512 << 16 | 256) && fmt == TextureFormat::Etc1 {
-                    portraits.chapter_step = 1;
-                } else if portraits.chapter_step == 1
-                    && dims == (128 << 16 | 128)
-                    && fmt == TextureFormat::Etc1A4
-                {
-                    portraits.chapter_step = 2;
-                } else if portraits.chapter_step == 2
-                    && dims == (32 << 16 | 32)
-                    && fmt == TextureFormat::La4
-                {
-                    // Optional cleared-chapter laurel wreath before the 256x64 stage preview.
-                } else if portraits.chapter_step == 2
-                    && dims == (256 << 16 | 64)
-                    && fmt == TextureFormat::Etc1
-                {
-                    portraits.chapter_step = 3;
-                    portraits.chapter_top_seen = true;
-                    portraits.chapter_active = true;
-                    portraits.chapter_missed = 0;
-                } else {
-                    portraits.chapter_step = 0;
-                }
+            if dims == (512 << 16 | 256) && fmt == TextureFormat::Etc1 {
+                portraits.chapter_step = 1;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+            } else if portraits.chapter_step == 1
+                && dims == (128 << 16 | 128)
+                && fmt == TextureFormat::Etc1A4
+            {
+                portraits.chapter_step = 2;
+                portraits.chapter_top_seen = true;
+                portraits.chapter_active = true;
+                portraits.chapter_missed = 0;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+                portraits.solo_active = false;
+                portraits.weapon_active = false;
+                portraits.mode_active = false;
+                portraits.mode_top_latched = false;
+                portraits.file_active = false;
+            } else if portraits.chapter_step == 2
+                && dims == (32 << 16 | 32)
+                && fmt == TextureFormat::La4
+            {
+                // Optional cleared-chapter laurel wreath before the 256x64 stage preview.
+            } else if portraits.chapter_step == 2
+                && dims == (256 << 16 | 64)
+                && fmt == TextureFormat::Etc1
+            {
+                portraits.chapter_step = 3;
+                portraits.chapter_top_seen = true;
+                portraits.chapter_active = true;
+                portraits.chapter_missed = 0;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+                portraits.solo_active = false;
+                portraits.weapon_active = false;
+                portraits.mode_active = false;
+                portraits.mode_top_latched = false;
+                portraits.file_active = false;
             } else {
                 portraits.chapter_step = 0;
             }
 
-            if !portraits.cauldron_active && !portraits.chapter_active {
-                if dims == (256 << 16 | 128) && fmt == TextureFormat::Etc1 {
-                    portraits.mode_top_step = 1;
-                } else if portraits.mode_top_step == 1
-                    && dims == (256 << 16 | 256)
-                    && fmt == TextureFormat::L4
-                {
-                    portraits.mode_top_step = 2;
-                } else if portraits.mode_top_step == 2
-                    && dims == (256 << 16 | 256)
-                    && fmt == TextureFormat::L4
-                {
-                    // Multiple `256x256 L4` wing/vine flourish draws precede the header underline.
-                } else if portraits.mode_top_step == 2
-                    && dims == (32 << 16 | 8)
-                    && fmt == TextureFormat::Rgb565
-                {
-                    portraits.mode_top_step = 3;
-                    portraits.mode_top_seen = true;
-                    portraits.mode_top_latched = true;
-                    if !portraits.mode_rejected {
-                        portraits.mode_active = true;
-                        portraits.mode_missed = 0;
-                        portraits.solo_active = false;
-                        portraits.file_active = false;
-                    }
-                    portraits.frontend_menu_seen = true;
-                } else {
-                    portraits.mode_top_step = 0;
-                }
-
-                if dims == (16 << 16 | 32) && fmt == TextureFormat::Rgb565 {
-                    portraits.solo_top_step = 1;
-                } else if portraits.solo_top_step == 1
-                    && dims == (64 << 16 | 64)
-                    && fmt == TextureFormat::Rgba4
-                {
-                    portraits.solo_top_step = 2;
-                } else if portraits.solo_top_step == 2
-                    && dims == (128 << 16 | 128)
-                    && fmt == TextureFormat::L4
-                {
-                    portraits.solo_top_step = 3;
-                    portraits.solo_top_seen = true;
-                    portraits.solo_active = true;
-                    portraits.solo_missed = 0;
-                    portraits.mode_active = false;
+            if dims == (256 << 16 | 128) && fmt == TextureFormat::Etc1 {
+                portraits.mode_top_step = 1;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+            } else if portraits.mode_top_step == 1
+                && dims == (256 << 16 | 256)
+                && fmt == TextureFormat::L4
+            {
+                portraits.mode_top_step = 2;
+            } else if portraits.mode_top_step == 2
+                && dims == (256 << 16 | 256)
+                && fmt == TextureFormat::L4
+            {
+                // Multiple `256x256 L4` wing/vine flourish draws precede the header underline.
+            } else if portraits.mode_top_step == 2
+                && dims == (32 << 16 | 8)
+                && fmt == TextureFormat::Rgb565
+            {
+                portraits.mode_top_step = 3;
+                portraits.mode_top_seen = true;
+                portraits.mode_top_latched = true;
+                if !portraits.mode_rejected {
+                    portraits.mode_active = true;
+                    portraits.mode_missed = 0;
+                    portraits.cauldron_active = false;
+                    portraits.cauldron_hud_active = false;
+                    portraits.chapter_active = false;
+                    portraits.solo_active = false;
                     portraits.file_active = false;
                     portraits.weapon_active = false;
-                    portraits.frontend_menu_seen = true;
-                } else {
-                    portraits.solo_top_step = 0;
-                }
-
-                // Weapon List (`512x256 Etc1` -> `256x128 La4`) & Weapon Category (`512x256 Etc1` -> `128x128 L4`):
-                if dims == (512 << 16 | 256) && fmt == TextureFormat::Etc1 {
-                    portraits.weapon_step = 1;
-                } else if portraits.weapon_step == 1
-                    && dims == (256 << 16 | 128)
-                    && fmt == TextureFormat::La4
-                {
-                    portraits.weapon_step = 2;
-                    portraits.weapon_sub_seen = 1;
-                    portraits.weapon_sub = 1;
-                    portraits.weapon_active = true;
-                    portraits.weapon_missed = 0;
-                    portraits.mode_active = false;
-                    portraits.mode_top_latched = false;
-                    portraits.solo_active = false;
-                    portraits.file_active = false;
-                    portraits.frontend_menu_seen = true;
-                } else if portraits.weapon_step == 1
-                    && dims == (128 << 16 | 128)
-                    && fmt == TextureFormat::L4
-                {
-                    portraits.weapon_step = 2;
-                    portraits.weapon_sub_seen = 2;
-                    portraits.weapon_sub = 2;
-                    portraits.weapon_active = true;
-                    portraits.weapon_missed = 0;
                     portraits.weapon_modal_top = false;
-                    portraits.mode_active = false;
-                    portraits.mode_top_latched = false;
-                    portraits.solo_active = false;
-                    portraits.file_active = false;
-                    portraits.frontend_menu_seen = true;
-                } else {
-                    portraits.weapon_step = 0;
                 }
-
-                // Gear Hub (`256x256 L4` -> `256x256 Etc1` Pit rainbow silhouette):
-                if dims == (256 << 16 | 256) && fmt == TextureFormat::L4 {
-                    portraits.gear_step = 1;
-                } else if portraits.gear_step == 1
-                    && dims == (256 << 16 | 256)
-                    && fmt == TextureFormat::Etc1
-                {
-                    portraits.gear_step = 2;
-                    portraits.power_bot_latched = true;
-                    portraits.weapon_sub_seen = 3;
-                    portraits.weapon_sub = 3;
-                    portraits.weapon_active = true;
-                    portraits.weapon_missed = 0;
-                    portraits.weapon_modal_top = false;
-                    portraits.mode_active = false;
-                    portraits.mode_top_latched = false;
-                    portraits.solo_active = false;
-                    portraits.file_active = false;
-                    portraits.frontend_menu_seen = true;
-                } else {
-                    portraits.gear_step = 0;
-                }
-
-                // Power Configurator (`256x256 Etc1` -> `128x64 L4`, armed via Gear Hub or bottom `6x6` + Set Tabs):
-                if dims == (256 << 16 | 256) && fmt == TextureFormat::Etc1 {
-                    portraits.power_step = 1;
-                } else if portraits.power_step == 1
-                    && dims == (128 << 16 | 64)
-                    && fmt == TextureFormat::L4
-                {
-                    portraits.power_step = 2;
-                    if portraits.power_bot_latched {
-                        portraits.weapon_sub_seen = 4;
-                        portraits.weapon_sub = 4;
-                        portraits.weapon_active = true;
-                        portraits.weapon_missed = 0;
-                        portraits.weapon_modal_top = false;
-                        portraits.mode_active = false;
-                        portraits.mode_top_latched = false;
-                        portraits.solo_active = false;
-                        portraits.file_active = false;
-                        portraits.frontend_menu_seen = true;
-                    }
-                } else {
-                    portraits.power_step = 0;
-                }
+                portraits.frontend_menu_seen = true;
             } else {
                 portraits.mode_top_step = 0;
+            }
+
+            if dims == (16 << 16 | 32) && fmt == TextureFormat::Rgb565 {
+                portraits.solo_top_step = 1;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+            } else if portraits.solo_top_step == 1
+                && dims == (64 << 16 | 64)
+                && fmt == TextureFormat::Rgba4
+            {
+                portraits.solo_top_step = 2;
+            } else if portraits.solo_top_step == 2
+                && dims == (128 << 16 | 128)
+                && fmt == TextureFormat::L4
+            {
+                portraits.solo_top_step = 3;
+                portraits.solo_top_seen = true;
+                portraits.solo_active = true;
+                portraits.solo_missed = 0;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+                portraits.chapter_active = false;
+                portraits.mode_active = false;
+                portraits.mode_top_latched = false;
+                portraits.file_active = false;
+                portraits.weapon_active = false;
+                portraits.weapon_modal_top = false;
+                portraits.frontend_menu_seen = true;
+            } else {
                 portraits.solo_top_step = 0;
+            }
+
+            // Weapon List (`512x256 Etc1` -> `256x128 La4`) & Weapon Category (`512x256 Etc1` -> `128x128 L4`):
+            if dims == (512 << 16 | 256) && fmt == TextureFormat::Etc1 {
+                portraits.weapon_step = 1;
+                portraits.weapon_modal_top = false;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+            } else if portraits.weapon_step == 1
+                && dims == (256 << 16 | 128)
+                && fmt == TextureFormat::La4
+            {
+                portraits.weapon_step = 2;
+                portraits.weapon_sub_seen = 1;
+                portraits.weapon_sub = 1;
+                portraits.weapon_active = true;
+                portraits.weapon_missed = 0;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+                portraits.chapter_active = false;
+                portraits.mode_active = false;
+                portraits.mode_top_latched = false;
+                portraits.solo_active = false;
+                portraits.file_active = false;
+                portraits.power_set_overlay = false;
+                portraits.power_set_two_cols = false;
+                portraits.frontend_menu_seen = true;
+            } else if portraits.weapon_step == 1
+                && dims == (128 << 16 | 128)
+                && fmt == TextureFormat::L4
+            {
+                portraits.weapon_step = 2;
+                portraits.weapon_sub_seen = 2;
+                portraits.weapon_sub = 2;
+                portraits.weapon_active = true;
+                portraits.weapon_missed = 0;
+                portraits.weapon_modal_top = false;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+                portraits.chapter_active = false;
+                portraits.mode_active = false;
+                portraits.mode_top_latched = false;
+                portraits.solo_active = false;
+                portraits.file_active = false;
+                portraits.power_set_overlay = false;
+                portraits.power_set_two_cols = false;
+                portraits.frontend_menu_seen = true;
+            } else {
                 portraits.weapon_step = 0;
+            }
+
+            // Gear Hub (`256x256 L4` -> `256x256 Etc1` Pit rainbow silhouette):
+            if dims == (256 << 16 | 256) && fmt == TextureFormat::L4 {
+                portraits.gear_step = 1;
+            } else if portraits.gear_step == 1
+                && dims == (256 << 16 | 256)
+                && fmt == TextureFormat::Etc1
+            {
+                portraits.gear_step = 2;
+                portraits.power_bot_latched = true;
+                portraits.weapon_sub_seen = 3;
+                portraits.weapon_sub = 3;
+                portraits.weapon_active = true;
+                portraits.weapon_missed = 0;
+                portraits.weapon_modal_top = false;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+                portraits.chapter_active = false;
+                portraits.mode_active = false;
+                portraits.mode_top_latched = false;
+                portraits.solo_active = false;
+                portraits.file_active = false;
+                portraits.power_set_overlay = false;
+                portraits.power_set_two_cols = false;
+                portraits.frontend_menu_seen = true;
+            } else {
                 portraits.gear_step = 0;
+            }
+
+            // Power Configurator (`256x256 Etc1` -> `128x64 L4`, armed via Gear Hub or bottom `6x6` + Set Tabs):
+            if dims == (256 << 16 | 256) && fmt == TextureFormat::Etc1 {
+                portraits.power_step = 1;
+            } else if portraits.power_step == 1
+                && dims == (128 << 16 | 64)
+                && fmt == TextureFormat::L4
+            {
+                portraits.power_step = 2;
+                if portraits.power_bot_latched {
+                    if portraits.weapon_sub != 4 {
+                        portraits.power_set_overlay = false;
+                        portraits.power_set_two_cols = false;
+                    }
+                    portraits.weapon_sub_seen = 4;
+                    portraits.weapon_sub = 4;
+                    portraits.weapon_active = true;
+                    portraits.weapon_missed = 0;
+                    portraits.weapon_modal_top = false;
+                    portraits.cauldron_active = false;
+                    portraits.cauldron_hud_active = false;
+                    portraits.chapter_active = false;
+                    portraits.mode_active = false;
+                    portraits.mode_top_latched = false;
+                    portraits.solo_active = false;
+                    portraits.file_active = false;
+                    portraits.frontend_menu_seen = true;
+                }
+            } else {
                 portraits.power_step = 0;
             }
         } else {
@@ -4717,7 +4860,8 @@ fn is_subtitle(registers: &[u32]) -> bool {
 fn draw_subtitle_shadow<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) {
     /// how dark the shadow is, out of 255.
     const SHADOW_ALPHA: u32 = 0xC0;
-    let mut shadow = registers.to_vec();
+    let mut shadow_buf = copy_regs(registers);
+    let shadow = &mut shadow_buf[..registers.len()];
     // the first stage: constant black, with the text's alpha times the
     // constant's; the rest pass it on
     for (stage, &base) in TEV_STAGES.iter().enumerate() {
@@ -4732,7 +4876,7 @@ fn draw_subtitle_shadow<M: GpuMemory>(registers: &[u32], memory: &mut M, resourc
     let xy = registers[REG_VIEWPORT_XY];
     let shifted = |value: u32, by: i32| ((((value & 0x3FF) << 22) as i32 >> 22) + by) as u32 & 0x3FF;
     shadow[REG_VIEWPORT_XY] = shifted(xy, -1) | shifted(xy >> 16, 1) << 16;
-    rasterize(&shadow, memory, resources, vertices);
+    rasterize(shadow, memory, resources, vertices);
 }
 
 /// draws a crisp 4-way dark outline plus drop shadow under the bottom-centered
@@ -4747,7 +4891,8 @@ fn draw_power_label_outline<M: GpuMemory>(
     if fade <= 0.01 {
         return;
     }
-    let mut shadow = registers.to_vec();
+    let mut shadow_buf = copy_regs(registers);
+    let shadow = &mut shadow_buf[..registers.len()];
     let mut shifted = Vec::with_capacity(vertices.len());
     // Shift vertices in clip space rather than REG_VIEWPORT_XY: +1 on viewport_x
     // makes viewport_right = 241 > buffer_width (240) and changes target stride!
@@ -4767,7 +4912,7 @@ fn draw_power_label_outline<M: GpuMemory>(
             v.clip[1] += (dy / 200.0) * w;
             v
         }));
-        rasterize(&shadow, memory, resources, Vertices::Shaded(&shifted));
+        rasterize(shadow, memory, resources, Vertices::Shaded(&shifted));
     }
 }
 
@@ -4987,18 +5132,21 @@ fn faded_top(topology: u32, vertices: &[Vertex]) -> Vec<Vertex> {
         let triangle = [vertices[a], vertices[b], vertices[c]];
         // the part below the band's edge, then the part in it
         for side in [1.0, -1.0] {
-            let mut polygon = Vec::with_capacity(4);
+            let mut polygon = [triangle[0]; 4];
+            let mut poly_len = 0usize;
             for (i, current) in triangle.iter().enumerate() {
                 let next = &triangle[(i + 1) % 3];
                 let (d0, d1) = (side * below(current), side * below(next));
                 if d0 >= 0.0 {
-                    polygon.push(*current);
+                    polygon[poly_len] = *current;
+                    poly_len += 1;
                 }
                 if d0 * d1 < 0.0 {
-                    polygon.push(current.lerp(next, d0 / (d0 - d1)));
+                    polygon[poly_len] = current.lerp(next, d0 / (d0 - d1));
+                    poly_len += 1;
                 }
             }
-            for i in 1..polygon.len().saturating_sub(1) {
+            for i in 1..poly_len.saturating_sub(1) {
                 faded.extend([polygon[0], polygon[i], polygon[i + 1]]);
             }
         }
@@ -5016,19 +5164,22 @@ fn split_triangles(triangles: &[Vertex], plane: impl Fn(&Vertex) -> f32) -> Vec<
     let mut out = Vec::with_capacity(triangles.len() + 12);
     for tri in triangles.chunks_exact(3) {
         for side in [1.0, -1.0] {
-            let mut polygon = Vec::with_capacity(4);
+            let mut polygon = [tri[0]; 4];
+            let mut poly_len = 0usize;
             for i in 0..3 {
                 let current = &tri[i];
                 let next = &tri[(i + 1) % 3];
                 let (d0, d1) = (side * plane(current), side * plane(next));
                 if d0 >= 0.0 {
-                    polygon.push(*current);
+                    polygon[poly_len] = *current;
+                    poly_len += 1;
                 }
                 if d0 * d1 < 0.0 {
-                    polygon.push(current.lerp(next, d0 / (d0 - d1)));
+                    polygon[poly_len] = current.lerp(next, d0 / (d0 - d1));
+                    poly_len += 1;
                 }
             }
-            for i in 1..polygon.len().saturating_sub(1) {
+            for i in 1..poly_len.saturating_sub(1) {
                 out.extend([polygon[0], polygon[i], polygon[i + 1]]);
             }
         }
@@ -5978,7 +6129,8 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
 
 /// draws a portrait with only alpha of it showing over what is there.
 fn draw_faded<M: GpuMemory>(memory: &mut M, resources: &mut Resources, draw: &PortraitDraw, alpha: f32) {
-    let mut registers = draw.registers.clone();
+    let mut regs_buf = copy_regs(&draw.registers);
+    let registers = &mut regs_buf[..draw.registers.len()];
     if let Some([address, format, dimensions]) = resources.portraits.top {
         registers[REG_COLOR_BUFFER_ADDRESS] = address;
         registers[REG_COLOR_BUFFER_FORMAT] = format;
@@ -5986,7 +6138,7 @@ fn draw_faded<M: GpuMemory>(memory: &mut M, resources: &mut Resources, draw: &Po
     }
     if alpha >= 1.0 {
         resources.portraits.adding = true;
-        rasterize(&registers, memory, resources, Vertices::Shaded(&draw.vertices));
+        rasterize(registers, memory, resources, Vertices::Shaded(&draw.vertices));
         resources.portraits.adding = false;
         return;
     }
@@ -6004,7 +6156,7 @@ fn draw_faded<M: GpuMemory>(memory: &mut M, resources: &mut Resources, draw: &Po
         }
     }
     resources.portraits.adding = true;
-    rasterize(&registers, memory, resources, Vertices::Shaded(&vertices));
+    rasterize(registers, memory, resources, Vertices::Shaded(&vertices));
     resources.portraits.adding = false;
 }
 
@@ -6804,17 +6956,19 @@ fn bind_texture<M: GpuMemory>(
         width,
         height | (max_level << 16),
     );
-    let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
-        (Some(_), _) if !past => (Arc::default(), None),
-        (_, Some(found)) => found,
-        (_, None) => match memory.slice(addr, size) {
+    let (texels, replacement) = if drawn.is_some() && !past {
+        (Arc::default(), None)
+    } else if let Some(found) = cache.checked(key, size as u32) {
+        found
+    } else {
+        match memory.slice(addr, size) {
             Some(data) => cache.decoded(key, data),
             None => {
                 let mut data = vec![0u8; size];
                 memory.read(addr, &mut data);
                 cache.decoded(key, &data)
             }
-        },
+        }
     };
 
     // filter mode in bit 1 (magnification), 2 (minification), and 24 (mipmap),

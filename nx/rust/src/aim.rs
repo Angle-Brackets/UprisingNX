@@ -318,13 +318,20 @@ impl Aim {
                     self.msbt_offset = Some(0x0172_d300);
                     0x0172_d300
                 } else {
-                    if !frame.is_multiple_of(30) {
+                    if !frame.is_multiple_of(15) {
                         return;
                     }
+                    let start_min = 0x0100_0000usize;
                     let search_end = fcram.len().min(0x0280_0000).saturating_sub(MSBT_MENU_SIZE as usize);
+                    if search_end <= start_min {
+                        return;
+                    }
+                    let slice_idx = ((frame / 15) % 4) as usize;
+                    let span = (search_end - start_min).div_ceil(4);
+                    let mut off = (start_min + slice_idx * span) & !0xFF;
+                    let slice_end = (off + span).min(search_end);
                     let mut found = None;
-                    let mut off = 0x0100_0000.min(search_end);
-                    while off <= search_end {
+                    while off <= slice_end {
                         if fcram[off] == b'M' && is_menu_msbt(fcram, off) {
                             found = Some(off);
                             break;

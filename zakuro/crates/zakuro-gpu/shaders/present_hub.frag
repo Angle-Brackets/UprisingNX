@@ -56,7 +56,12 @@ vec3 sample_top(vec2 local_uv, vec2 local_duv) {
         }
         return textureLod(sampler2D(top_screen, screen_sampler), clamp(at, crop.top_bounds.xy, crop.top_bounds.zw), 0.0).rgb;
     }
-    ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
+    ivec2 taps = (crop.mode == 0)
+        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        : ivec2(clamp(ceil(covered), 1.0, 4.0));
+    if (taps == ivec2(1, 1)) {
+        return textureLod(sampler2D(top_screen, screen_sampler), clamp(at, crop.top_bounds.xy, crop.top_bounds.zw), 0.0).rgb;
+    }
     vec3 sum = vec3(0.0);
     for (int y = 0; y < taps.y; y++) {
         for (int x = 0; x < taps.x; x++) {
@@ -83,7 +88,12 @@ vec3 sample_bot(vec2 local_uv, vec2 local_duv) {
         }
         return textureLod(sampler2D(bot_screen, screen_sampler), clamp(at, crop.bot_bounds.xy, crop.bot_bounds.zw), 0.0).rgb;
     }
-    ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
+    ivec2 taps = (crop.mode == 0)
+        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        : ivec2(clamp(ceil(covered), 1.0, 4.0));
+    if (taps == ivec2(1, 1)) {
+        return textureLod(sampler2D(bot_screen, screen_sampler), clamp(at, crop.bot_bounds.xy, crop.bot_bounds.zw), 0.0).rgb;
+    }
     vec3 sum = vec3(0.0);
     for (int y = 0; y < taps.y; y++) {
         for (int x = 0; x < taps.x; x++) {
@@ -169,26 +179,42 @@ void main() {
         vec3 col = sample_top(uv, duv);
         float bot_x0 = crop.pad0;
         bool is_power = crop.pad1 < 0.0;
+        bool is_list = crop.pad1 > 0.0 && crop.pad1 < 0.775;
         float bot_s = max(abs(crop.pad1), 0.01);
         float bot_w = 320.0 * bot_s;
         float bot_h = 240.0 * bot_s;
         float bot_y0 = 240.0 - bot_h;
-        if (p.x >= bot_x0 && p.x <= bot_x0 + bot_w && p.y >= bot_y0 && p.y <= bot_y0 + bot_h) {
+        vec3 ref_bg = sample_bot_fast(vec2(318.5 / 320.0, 238.5 / 240.0));
+        float ref_mag = min(ref_bg.r, ref_bg.b) - ref_bg.g;
+        const vec2 probes[3] = vec2[3](
+            vec2(318.5 / 320.0, 2.0 / 240.0),
+            vec2(72.0 / 320.0, 234.0 / 240.0),
+            vec2(1.5 / 320.0, 2.0 / 240.0)
+        );
+        for (int i = 0; i < 3; i++) {
+            vec3 cand = sample_bot_fast(probes[i]);
+            float m = min(cand.r, cand.b) - cand.g;
+            if (m > ref_mag) {
+                ref_bg = cand;
+                ref_mag = m;
+            }
+        }
+        if (ref_mag > 0.04 && p.x >= bot_x0 && p.x <= bot_x0 + bot_w && p.y >= bot_y0 && p.y <= bot_y0 + bot_h) {
             vec2 local_uv = (p - vec2(bot_x0, bot_y0)) / vec2(bot_w, bot_h);
             vec2 local_duv = dp / vec2(bot_w, bot_h);
             vec3 b_col = sample_bot(local_uv, local_duv);
+            vec3 c_norm = clamp((b_col - ref_bg) / ref_mag + vec3(1.0, 0.0, 1.0), 0.0, 1.0);
             vec2 bp = local_uv * vec2(320.0, 240.0);
-            bool in_opaque_well = is_power && (
+            bool in_opaque_well = (is_power && (
                 (bp.x >= 1.0 && bp.x <= 148.0 && bp.y >= 50.0 && bp.y <= 200.0) ||
                 (bp.x >= 147.0 && bp.x <= 307.0 && bp.y >= 26.0 && bp.y <= 200.0)
-            );
-            float bg_amt = in_opaque_well ? 0.0 : clamp(
-                (min(b_col.r, b_col.b) - b_col.g - 3.2 * abs(b_col.r - b_col.b) - 0.03) / 0.97,
-                0.0,
-                1.0
-            );
+            )) || (is_list && bp.x >= 3.5 && bp.x <= 314.5 && bp.y >= 31.0 && bp.y <= 192.0);
+            float raw_mag = min(c_norm.r, c_norm.b) - c_norm.g - 3.2 * abs(c_norm.r - c_norm.b);
+            float bg_amt = in_opaque_well
+                ? smoothstep(0.90, 0.97, raw_mag)
+                : clamp((raw_mag - 0.03) / 0.97, 0.0, 1.0);
             float fg_a = 1.0 - bg_amt;
-            vec3 premul_fg = clamp(b_col - bg_amt * vec3(1.0, 0.0, 1.0), 0.0, 1.0);
+            vec3 premul_fg = clamp(b_col - bg_amt * ref_bg, 0.0, 1.0);
             col = clamp(col * (1.0 - fg_a) + premul_fg, 0.0, 1.0);
         }
         colour = vec4(clamp(col, 0.0, 1.0), 1.0);

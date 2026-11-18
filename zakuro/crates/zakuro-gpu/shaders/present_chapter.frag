@@ -42,7 +42,12 @@ vec3 sample_top(vec2 local_uv, vec2 local_duv) {
         }
         return textureLod(sampler2D(top_screen, screen_sampler), clamp(at, crop.top_bounds.xy, crop.top_bounds.zw), 0.0).rgb;
     }
-    ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
+    ivec2 taps = (crop.mode == 0)
+        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        : ivec2(clamp(ceil(covered), 1.0, 4.0));
+    if (taps == ivec2(1, 1)) {
+        return textureLod(sampler2D(top_screen, screen_sampler), clamp(at, crop.top_bounds.xy, crop.top_bounds.zw), 0.0).rgb;
+    }
     vec3 sum = vec3(0.0);
     for (int y = 0; y < taps.y; y++) {
         for (int x = 0; x < taps.x; x++) {
@@ -69,7 +74,12 @@ vec3 sample_bot(vec2 local_uv, vec2 local_duv) {
         }
         return textureLod(sampler2D(bot_screen, screen_sampler), clamp(at, crop.bot_bounds.xy, crop.bot_bounds.zw), 0.0).rgb;
     }
-    ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
+    ivec2 taps = (crop.mode == 0)
+        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        : ivec2(clamp(ceil(covered), 1.0, 4.0));
+    if (taps == ivec2(1, 1)) {
+        return textureLod(sampler2D(bot_screen, screen_sampler), clamp(at, crop.bot_bounds.xy, crop.bot_bounds.zw), 0.0).rgb;
+    }
     vec3 sum = vec3(0.0);
     for (int y = 0; y < taps.y; y++) {
         for (int x = 0; x < taps.x; x++) {
@@ -186,8 +196,8 @@ void main() {
         if (t_y >= 25.0 && t_y <= 59.5) {
             float rib_fy = smoothstep(25.0, 26.8, t_y) * smoothstep(59.5, 57.8, t_y);
             float sample_y = clamp(t_y, 26.0, 58.0);
-            vec3 v_prof = sample_top_fast(vec2(358.0 / 400.0, sample_y / 240.0))
-                / max(sample_top_fast(vec2(358.0 / 400.0, 26.6 / 240.0)), vec3(0.08));
+            vec3 v_prof = sample_top_fast(vec2(394.0 / 400.0, sample_y / 240.0))
+                / max(sample_top_fast(vec2(394.0 / 400.0, 26.6 / 240.0)), vec3(0.08));
             v_prof = clamp(v_prof, 0.88, 1.06);
 
             // Sample KIU's pure un-occluded rainbow gradient at t_y = 26.6 stretched smoothly across 0..W
@@ -278,8 +288,8 @@ void main() {
     if (p.x >= b_min.x && p.x <= b_max.x && p.y >= b_min.y && p.y <= b_max.y) {
         vec2 b_size = b_max - b_min;
         vec2 b_uv = (p - b_min) / b_size;
-        vec2 b_px = vec2(b_uv.x * 320.0, 6.0 + b_uv.y * 232.5);
-        vec2 b_duv = (dp / b_size) * vec2(1.0, 232.5 / 240.0);
+        vec2 b_px = vec2(b_uv.x * 320.0, 4.0 + b_uv.y * 234.5);
+        vec2 b_duv = (dp / b_size) * vec2(1.0, 234.5 / 240.0);
         vec3 b_col = sample_bot(b_px / vec2(320.0, 240.0), b_duv);
         vec3 bot_paper = sample_bot_fast(vec2(160.0 / 320.0, 102.0 / 240.0));
         // Guard against pink rose-thorn frame touching (160, 102): take max with (20, 104)
@@ -297,13 +307,14 @@ void main() {
         vec2 c_size = c_max - c_min;
         vec2 c_uv = (p - c_min) / c_size;
         vec2 t_px = vec2(326.0, 134.0) + c_uv * vec2(74.0, 106.0);
-        // Mask out top-left of crop where the stage-art right corner sat (x < 363, y < 169.5)
-        if (!(t_px.x < 363.5 && t_px.y < 169.5)) {
+        // Smooth feather out top-left corner of crop where the stage-art right corner sat
+        float corner_mask = max(smoothstep(361.0, 366.0, t_px.x), smoothstep(167.0, 172.0, t_px.y));
+        if (corner_mask > 0.001) {
             vec2 c_duv = (dp / c_size) * (vec2(74.0, 106.0) / vec2(400.0, 240.0));
             vec3 c_col = sample_top(t_px / vec2(400.0, 240.0), c_duv);
             float fx = smoothstep(0.0, 4.5, p.x - c_min.x);
             float fy = smoothstep(0.0, 3.5, p.y - c_min.y);
-            col = blend_parchment(col, c_col, top_paper * 0.98, fx * fy);
+            col = blend_parchment(col, c_col, top_paper * 0.98, fx * fy * corner_mask);
         }
     }
 
