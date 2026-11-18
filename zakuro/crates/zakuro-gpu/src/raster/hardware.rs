@@ -2182,6 +2182,7 @@ pub struct Hardware {
     upright_image: Option<Compute>,
     samples: Option<Local>,
     samplers: QuickMap<(u8, Wrap, Wrap, u32, i16), vk::Sampler>,
+    default_sampler: vk::Sampler,
     ring: Buffer,
     used: u64,
     readback: Option<Buffer>,
@@ -2472,6 +2473,7 @@ impl Hardware {
                 upright_image: None,
                 samples: None,
                 samplers: QuickMap::default(),
+                default_sampler: vk::Sampler::null(),
                 used: 0,
                 readback: None,
                 surfaces: Vec::new(),
@@ -2568,6 +2570,7 @@ impl Hardware {
                 vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
                 vk::ImageAspectFlags::COLOR,
             )?;
+            hardware.default_sampler = hardware.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0, 0)?;
             // the generic pipelines, while the title starts. a draw that
             // needs one before it is made makes it itself, as before
             if dynamic.blend && !hardware.waits {
@@ -4034,10 +4037,12 @@ impl Hardware {
         let mut bias = if smallest > 0 { lod_bias as f32 / 256.0 } else { 0.0 };
         // test switches: ZAKURO_MIP_BIAS=<float> overrides the bias,
         // ZAKURO_NO_MIPS=1 samples only the full picture
-        if let Some(value) = std::env::var("ZAKURO_MIP_BIAS").ok().and_then(|v| v.parse::<f32>().ok()) {
+        static MIP_BIAS: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        static NO_MIPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if let Some(value) = *MIP_BIAS.get_or_init(|| std::env::var("ZAKURO_MIP_BIAS").ok().and_then(|v| v.parse::<f32>().ok())) {
             bias = value;
         }
-        let smallest_lod = if std::env::var_os("ZAKURO_NO_MIPS").is_some() { 0 } else { smallest };
+        let smallest_lod = if *NO_MIPS.get_or_init(|| std::env::var_os("ZAKURO_NO_MIPS").is_some()) { 0 } else { smallest };
         let info = vk::SamplerCreateInfo::default()
             .mag_filter(filter(mag))
             .min_filter(filter(min))
@@ -5053,22 +5058,23 @@ impl Hardware {
             match bound {
                 Some(bound) => {
                     let smallest = match bound.drawn {
-                        Some(drawn) if self.direct_source(&drawn, color).is_some() => {
-                            let Some(source) = self.direct_source(&drawn, color) else { unreachable!("checked above") };
-                            views[unit] = self.surface_view(source, false);
-                            twin_views[unit] = self.surface_view(source, true);
-                            direct |= 1 << unit;
-                            0
-                        }
-                        Some(drawn) => {
-                            if real {
-                                views[unit] = self.copy_texture(&drawn, bound, false)?;
+                        Some(drawn) => match self.direct_source(&drawn, color) {
+                            Some(source) => {
+                                views[unit] = self.surface_view(source, false);
+                                twin_views[unit] = self.surface_view(source, true);
+                                direct |= 1 << unit;
+                                0
                             }
-                            if twin {
-                                twin_views[unit] = self.copy_texture(&drawn, bound, true)?;
+                            None => {
+                                if real {
+                                    views[unit] = self.copy_texture(&drawn, bound, false)?;
+                                }
+                                if twin {
+                                    twin_views[unit] = self.copy_texture(&drawn, bound, true)?;
+                                }
+                                0
                             }
-                            0
-                        }
+                        },
                         None => {
                             let (view, smallest) = self.texture(bound)?;
                             (views[unit], twin_views[unit]) = (view, view);
@@ -5105,9 +5111,8 @@ impl Hardware {
                     enabled |= 1 << unit;
                 }
                 None => {
-                    let s = self.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0, 0)?;
-                    samplers[unit] = s;
-                    twin_samplers[unit] = s;
+                    samplers[unit] = self.default_sampler;
+                    twin_samplers[unit] = self.default_sampler;
                 }
             }
         }
@@ -6838,9 +6843,8 @@ impl Hardware {
             let buffers = [self.commands];
             let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
             let started = std::time::Instant::now();
-            let waited = std::time::Instant::now();
             let _queue = self.queue_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            crate::stats::QUEUE_WAIT_NS.fetch_add(waited.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::QUEUE_WAIT_NS.fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             self.device.queue_submit(self.queue, &submit, self.fence).map_err(vk_error("submit"))?;
             let took = started.elapsed().as_secs_f64() * 1000.0;
             if took >= 20.0 {
@@ -6870,17 +6874,19 @@ impl Hardware {
         // textures nobody drew with for a while go, long after the GPU
         // last used them
         let batch = self.batch;
-        let stale: Vec<usize> = self.textures.iter().filter(|(_, t)| batch - t.used > 600).map(|(&k, _)| k).collect();
-        for key in stale {
-            if let Some(texture) = self.textures.remove(&key) {
-                self.destroy_image(&texture.image);
-            }
-        }
-        for twin in [false, true] {
-            let stale: Vec<(DrawnTexture, u32)> = self.copies(twin).iter().filter(|(_, c)| batch - c.used > 600).map(|(&k, _)| k).collect();
+        if batch % 64 == 0 {
+            let stale: Vec<usize> = self.textures.iter().filter(|(_, t)| batch - t.used > 600).map(|(&k, _)| k).collect();
             for key in stale {
-                if let Some(copy) = self.copies(twin).remove(&key) {
-                    self.destroy_image(&copy.image);
+                if let Some(texture) = self.textures.remove(&key) {
+                    self.destroy_image(&texture.image);
+                }
+            }
+            for twin in [false, true] {
+                let stale: Vec<(DrawnTexture, u32)> = self.copies(twin).iter().filter(|(_, c)| batch - c.used > 600).map(|(&k, _)| k).collect();
+                for key in stale {
+                    if let Some(copy) = self.copies(twin).remove(&key) {
+                        self.destroy_image(&copy.image);
+                    }
                 }
             }
         }

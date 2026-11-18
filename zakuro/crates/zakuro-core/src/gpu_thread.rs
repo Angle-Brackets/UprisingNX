@@ -19,7 +19,7 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use zakuro_gpu::{Gpu, GpuMemory, Renderer};
@@ -166,6 +166,8 @@ pub struct GpuCell {
     worker: Option<std::thread::JoinHandle<()>>,
     /// what the frontend and the Gpu tell each other, see zakuro_gpu::Flags.
     flags: Arc<zakuro_gpu::Flags>,
+    /// internal resolution scale kept here so readers can ask without waiting.
+    scale: AtomicU32,
     /// whether frame interpolation is on, kept here to ask without waiting.
     interpolating: AtomicBool,
     /// which kinds of job go to the thread, by Gx::bit, the others run at once
@@ -176,6 +178,7 @@ pub struct GpuCell {
 
 impl GpuCell {
     pub fn new(gpu: Gpu, threaded: bool) -> GpuCell {
+        let scale = AtomicU32::new(gpu.scale());
         let flags = gpu.flags.clone();
         let gpu = Box::new(UnsafeCell::new(gpu));
         let shared = Arc::new(Shared {
@@ -204,7 +207,36 @@ impl GpuCell {
             log::info!("the GPU runs on a thread of its own");
         }
         let asynchronous = std::env::var("ZAKURO_GPU_ASYNC").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(!0);
-        GpuCell { gpu, shared, worker, flags, interpolating: AtomicBool::new(false), asynchronous }
+        GpuCell { gpu, shared, worker, flags, scale, interpolating: AtomicBool::new(false), asynchronous }
+    }
+
+    /// how many times the console's resolution the GPU draws at, without waiting.
+    pub fn scale(&self) -> u32 {
+        self.scale.load(Ordering::Relaxed)
+    }
+
+    /// enables the hardware renderer and updates the cached scale.
+    pub fn enable_hardware_renderer(
+        &mut self,
+        scale: u32,
+        device: Option<std::sync::Arc<zakuro_gpu::SharedDevice>>,
+        title: Option<u64>,
+    ) -> Result<String, String> {
+        let res = (&mut **self).enable_hardware_renderer(scale, device, title);
+        self.scale.store((&**self).scale(), Ordering::Relaxed);
+        res
+    }
+
+    /// updates the internal resolution scale and refreshes the cached scale.
+    pub fn set_scale<M: zakuro_gpu::GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        scale: u32,
+        keep: &[(u32, u32)],
+    ) -> u32 {
+        let now = (&mut **self).set_scale(memory, scale, keep);
+        self.scale.store(now, Ordering::Relaxed);
+        now
     }
 
     /// whether the GPU has a thread.

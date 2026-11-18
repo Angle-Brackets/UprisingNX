@@ -513,12 +513,13 @@ impl System {
         let recompiled = if !enters {
             None
         } else {
-            let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::RECOMPILED);
             let started = std::time::Instant::now();
             let (instructions, cycles) = (self.recompiled_instructions, self.cpu.cycles);
             let ran = self.run_recompiled(deadline);
+            let elapsed = started.elapsed();
+            zakuro_gpu::stats::RECOMPILED.fetch_add(elapsed.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             // one call that long is a frame the player feels, and where
-            let took = started.elapsed().as_secs_f64() * 1000.0;
+            let took = elapsed.as_secs_f64() * 1000.0;
             if took >= 20.0 {
                 let thread = self.kernel.current().map_or_else(String::new, |t| format!("{} (priority {}, core {})", t.name, t.priority, t.processor_id));
                 let (instructions, cycles) = (self.recompiled_instructions - instructions, self.cpu.cycles - cycles);

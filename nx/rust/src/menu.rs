@@ -522,6 +522,14 @@ impl Menu {
         true
     }
 
+    /// whether the menu or a non-expired toast needs drawing this refresh.
+    pub fn has_overlay(&mut self) -> bool {
+        if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs_f32() > TOAST_SECONDS) {
+            self.toast = None;
+        }
+        self.open || self.toast.is_some()
+    }
+
     /// the menu, or a hotkey's notice, over the game, in a window `width` x
     /// `height` pixels
     pub fn overlay(&mut self, settings: &Settings, docked: bool, now: (u32, bool), width: u32, height: u32) -> Overlay {

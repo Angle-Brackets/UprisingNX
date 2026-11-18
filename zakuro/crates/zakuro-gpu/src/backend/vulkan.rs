@@ -869,11 +869,17 @@ impl VulkanPresenter {
             // read once what it wrote is there
             if sources.iter().any(|source| matches!(source, Source::Gpu(_))) {
                 let barrier = vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                    .src_access_mask(
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                            | vk::AccessFlags::TRANSFER_WRITE
+                            | vk::AccessFlags::SHADER_WRITE,
+                    )
                     .dst_access_mask(vk::AccessFlags::SHADER_READ);
                 device.cmd_pipeline_barrier(
                     command_buffer,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::TRANSFER
+                        | vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::DependencyFlags::empty(),
                     &[barrier],
@@ -969,19 +975,22 @@ impl VulkanPresenter {
                 }
             };
             if self.arrangement == ScreenLayout::FiendsCauldron {
-                if let (Some((_, top_area)), Some((_, bot_area)), ( Some(stage_vp), _ )) = (
+                if let (Some((_, top_area)), Some((_, bot_area)), (Some(stage_vp), _)) = (
                     crop(0, [0.0, 0.0, 1.0, 1.0]),
                     crop(1, [0.0, 0.0, 1.0, 1.0]),
                     super::layout(self.extent.width, self.extent.height, ScreenLayout::FiendsCauldron, self.top_width, self.integer),
                 ) {
                     let (cursor_x, opacity, hud_flags) = self.cauldron_state;
-                    let mut constants = Vec::with_capacity(CAULDRON_CONSTANTS as usize);
-                    constants.extend(top_area.iter().flat_map(|c| c.to_le_bytes()));
-                    constants.extend(bot_area.iter().flat_map(|c| c.to_le_bytes()));
-                    constants.extend_from_slice(&cursor_x.to_le_bytes());
-                    constants.extend_from_slice(&opacity.to_le_bytes());
-                    constants.extend_from_slice(&hud_flags.to_le_bytes());
-                    constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                    let mut constants = [0u8; CAULDRON_CONSTANTS as usize];
+                    let mut off = 0usize;
+                    for &c in top_area.iter().chain(bot_area.iter()) {
+                        constants[off..off + 4].copy_from_slice(&c.to_le_bytes());
+                        off += 4;
+                    }
+                    constants[off..off + 4].copy_from_slice(&cursor_x.to_le_bytes());
+                    constants[off + 4..off + 8].copy_from_slice(&opacity.to_le_bytes());
+                    constants[off + 8..off + 12].copy_from_slice(&hud_flags.to_le_bytes());
+                    constants[off + 12..off + 16].copy_from_slice(&self.filter.mode().to_le_bytes());
                     set_viewport(device, command_buffer, stage_vp, self.extent);
                     device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.cauldron_pipeline);
                     device.cmd_bind_descriptor_sets(
@@ -1007,13 +1016,14 @@ impl VulkanPresenter {
                     crop(1, [0.0, 0.0, 1.0, 1.0]),
                     super::layout(self.extent.width, self.extent.height, ScreenLayout::ChapterSelect, self.top_width, self.integer),
                 ) {
-                    let mut constants = Vec::with_capacity(CHAPTER_CONSTANTS as usize);
-                    constants.extend(top_area.iter().flat_map(|c| c.to_le_bytes()));
-                    constants.extend(bot_area.iter().flat_map(|c| c.to_le_bytes()));
-                    constants.extend_from_slice(&self.chapter_title_right.to_le_bytes());
-                    constants.extend_from_slice(&0.0f32.to_le_bytes());
-                    constants.extend_from_slice(&0u32.to_le_bytes());
-                    constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                    let mut constants = [0u8; CHAPTER_CONSTANTS as usize];
+                    let mut off = 0usize;
+                    for &c in top_area.iter().chain(bot_area.iter()) {
+                        constants[off..off + 4].copy_from_slice(&c.to_le_bytes());
+                        off += 4;
+                    }
+                    constants[off..off + 4].copy_from_slice(&self.chapter_title_right.to_le_bytes());
+                    constants[off + 12..off + 16].copy_from_slice(&self.filter.mode().to_le_bytes());
                     set_viewport(device, command_buffer, stage_vp, self.extent);
                     device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.chapter_pipeline);
                     device.cmd_bind_descriptor_sets(
@@ -1061,13 +1071,16 @@ impl VulkanPresenter {
                     } else {
                         (0.0, 0.0)
                     };
-                    let mut constants = Vec::with_capacity(HUB_CONSTANTS as usize);
-                    constants.extend(top_area.iter().flat_map(|c| c.to_le_bytes()));
-                    constants.extend(bot_area.iter().flat_map(|c| c.to_le_bytes()));
-                    constants.extend_from_slice(&pad0.to_le_bytes());
-                    constants.extend_from_slice(&pad1.to_le_bytes());
-                    constants.extend_from_slice(&kind.to_le_bytes());
-                    constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                    let mut constants = [0u8; HUB_CONSTANTS as usize];
+                    let mut off = 0usize;
+                    for &c in top_area.iter().chain(bot_area.iter()) {
+                        constants[off..off + 4].copy_from_slice(&c.to_le_bytes());
+                        off += 4;
+                    }
+                    constants[off..off + 4].copy_from_slice(&pad0.to_le_bytes());
+                    constants[off + 4..off + 8].copy_from_slice(&pad1.to_le_bytes());
+                    constants[off + 8..off + 12].copy_from_slice(&kind.to_le_bytes());
+                    constants[off + 12..off + 16].copy_from_slice(&self.filter.mode().to_le_bytes());
                     set_viewport(device, command_buffer, stage_vp, self.extent);
                     device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.hub_pipeline);
                     device.cmd_bind_descriptor_sets(
@@ -1097,16 +1110,26 @@ impl VulkanPresenter {
                         Shown::Right => 2,
                     };
                     let Some((descriptor, area)) = crop(index, uv) else { continue };
-                    let mut constants: Vec<u8> = area.iter().flat_map(|c| c.to_le_bytes()).collect();
-                    constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                    let mut constants = [0u8; STEREO_CONSTANTS as usize];
+                    let mut off = 0usize;
+                    for &c in &area {
+                        constants[off..off + 4].copy_from_slice(&c.to_le_bytes());
+                        off += 4;
+                    }
+                    constants[off..off + 4].copy_from_slice(&self.filter.mode().to_le_bytes());
+                    off += 4;
                     let (pipeline, layout, set) = if shown == Shown::Both {
                         // then how the eyes show, and the right eye's place
                         let Some((_, right)) = crop(2, uv) else { continue };
                         let stereo = if self.stereo.mode == StereoMode::Anaglyph { 1i32 } else { 2 };
                         for word in [stereo, self.stereo.swap as i32, 0] {
-                            constants.extend_from_slice(&word.to_le_bytes());
+                            constants[off..off + 4].copy_from_slice(&word.to_le_bytes());
+                            off += 4;
                         }
-                        constants.extend(right.iter().flat_map(|c| c.to_le_bytes()));
+                        for &c in &right {
+                            constants[off..off + 4].copy_from_slice(&c.to_le_bytes());
+                            off += 4;
+                        }
                         (self.stereo_pipeline, self.stereo_pipeline_layout, self.stereo_sets[self.frame])
                     } else {
                         (self.pipeline, self.pipeline_layout, descriptor)
@@ -1114,7 +1137,7 @@ impl VulkanPresenter {
                     set_viewport(device, command_buffer, viewport, self.extent);
                     device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
                     device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
-                    device.cmd_push_constants(command_buffer, layout, vk::ShaderStageFlags::FRAGMENT, 0, &constants);
+                    device.cmd_push_constants(command_buffer, layout, vk::ShaderStageFlags::FRAGMENT, 0, &constants[..off]);
                     device.cmd_draw(command_buffer, 3, 1, 0, 0);
                 }
             }

@@ -54,7 +54,12 @@ vec3 shown(sampler2D image, vec4 area, vec4 bounds) {
         return texture(image, clamp(at, bounds.xy, bounds.zw)).rgb;
     }
     // each sample is bilinear, so it already averages its four texels
-    ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
+    ivec2 taps = (crop.mode == 0)
+        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        : ivec2(clamp(ceil(covered), 1.0, 4.0));
+    if (taps == ivec2(1, 1)) {
+        return texture(image, clamp(at, bounds.xy, bounds.zw)).rgb;
+    }
     vec3 sum = vec3(0.0);
     for (int y = 0; y < taps.y; y++) {
         for (int x = 0; x < taps.x; x++) {

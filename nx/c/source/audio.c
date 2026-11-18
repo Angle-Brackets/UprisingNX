@@ -97,18 +97,23 @@ static bool wsola_step(void) {
     uint64_t natural = g_prev + HS;
     int best = SEARCH;
     if (g_grains > 0) {
-        float bestc = -1e30f;
+        float y_buf[HS / 4];
+        for (int k = 0; k < HS / 4; k++) {
+            uint64_t pos = natural + (uint64_t)(k * 4);
+            y_buf[k] = in_at(pos, 0) + in_at(pos, 1);
+        }
+        float best_score = -1e30f;
         for (int d = 0; d <= 2 * SEARCH; d += 2) {
             uint64_t a = (uint64_t)base + d;
             float c = 0, e = 1e-3f;
-            for (int i = 0; i < HS; i += 4) {
-                float x = in_at(a + i, 0) + in_at(a + i, 1);
-                float y = in_at(natural + i, 0) + in_at(natural + i, 1);
-                c += x * y;
+            for (int k = 0; k < HS / 4; k++) {
+                uint64_t pos = a + (uint64_t)(k * 4);
+                float x = in_at(pos, 0) + in_at(pos, 1);
+                c += x * y_buf[k];
                 e += x * x;
             }
-            c /= sqrtf(e);
-            if (c > bestc) { bestc = c; best = d; }
+            float score = (c >= 0.0f) ? (c * c) / e : -(c * c) / e;
+            if (score > best_score) { best_score = score; best = d; }
         }
     }
     uint64_t a = (uint64_t)base + best;
@@ -227,8 +232,8 @@ void nx_audio_init(void) {
     rc = audoutStartAudioOut();
     if (R_FAILED(rc)) { printf("nx_audio: audoutStartAudioOut failed: 0x%x\n", rc); audoutExit(); return; }
     g_running = true;
-    // above the game's priority, on core 0 next to the game's mostly waiting thread
-    rc = threadCreate(&g_thread, audio_thread, NULL, NULL, 0x8000, 0x2A, 0);
+    // above the game's priority, on core 1 away from core 0's main emulation thread
+    rc = threadCreate(&g_thread, audio_thread, NULL, NULL, 0x8000, 0x2A, 1);
     if (R_SUCCEEDED(rc)) rc = threadStart(&g_thread);
     if (R_FAILED(rc)) { printf("nx_audio: no audio thread: 0x%x\n", rc); g_running = false; return; }
     g_initialized = true;
