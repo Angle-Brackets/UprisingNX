@@ -102,10 +102,19 @@ fn install_panic_hook() {
             unx_write_crash(buf.bytes.as_ptr(), buf.len);
         }
         if let Ok(text) = std::str::from_utf8(&buf.bytes[..buf.len]) {
-            println!("{text}");
+            safe_println(text);
         }
         shown(info);
     }));
+}
+
+/// Print to stdout without panicking if stdout fails (e.g. nxlink disconnects or
+/// socket closes with EPIPE / os error 32).
+fn safe_println(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{text}");
+    let _ = out.flush();
 }
 
 /// lines to print, and the frame rate ones to keep in fps.log, handed to a
@@ -134,7 +143,7 @@ fn report_line(line: String) {
                         fps_log = match std::fs::OpenOptions::new().create(true).append(true).open("sdmc:/switch/uprisingnx/fps.log") {
                             Ok(file) => Some(file),
                             Err(error) => {
-                                println!("[ERROR] fps.log: {error}");
+                                safe_println(&format!("[ERROR] fps.log: {error}"));
                                 None
                             }
                         };
@@ -151,7 +160,7 @@ fn report_line(line: String) {
                 if quiet && !line.starts_with('[') {
                     continue;
                 }
-                println!("{line}");
+                safe_println(&line);
             }
         });
         spawned.ok().map(|_| send)
@@ -160,7 +169,7 @@ fn report_line(line: String) {
         Some(sender) => {
             let _ = sender.send(line);
         }
-        None => println!("{line}"),
+        None => safe_println(&line),
     }
 }
 
