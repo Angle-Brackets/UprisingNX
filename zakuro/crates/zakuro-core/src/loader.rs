@@ -63,12 +63,16 @@ fn load_dlc(title: &Title, paths: &[std::path::PathBuf]) -> Vec<zakuro_fs::Dlc> 
 const STACK_TOP: u32 = SHARED_MEMORY_VADDR;
 
 pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<System, LoadError> {
+    let t0 = std::time::Instant::now();
     let mut title = Title::load(path)?;
+    let t_title = t0.elapsed();
     log::info!("loaded {}", title.describe());
     if let Some(update) = &config.update {
         attach_update(&mut title, update);
     }
+    let t_mods_start = std::time::Instant::now();
     crate::mods::lay(&mut title, config.data_dir.as_deref());
+    let t_mods = t_mods_start.elapsed();
     let dlc = load_dlc(&title, &config.dlc);
 
     let exheader = &title.exheader;
@@ -194,6 +198,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     }
 
     let mut on_gpu = false;
+    let t_gpu_start = std::time::Instant::now();
     if system.config.hardware_renderer {
         match system.gpu.enable_hardware_renderer(system.config.resolution, system.config.device.clone(), Some(title.program_id())) {
             Ok(name) => {
@@ -203,6 +208,14 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
             Err(error) => log::warn!("{error}, drawing in software"),
         }
     }
+    let t_gpu = t_gpu_start.elapsed();
+    log::info!(
+        "load phases: title={:.0}ms mods={:.0}ms gpu={:.0}ms total={:.0}ms",
+        t_title.as_secs_f64() * 1000.0,
+        t_mods.as_secs_f64() * 1000.0,
+        t_gpu.as_secs_f64() * 1000.0,
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
     if system.config.interpolate {
         match system.set_interpolation(true) {
             true => log::info!("frame interpolation on"),

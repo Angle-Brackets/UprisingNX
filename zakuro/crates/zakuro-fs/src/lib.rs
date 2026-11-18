@@ -120,17 +120,26 @@ impl RomImage {
 
     #[cfg(target_os = "horizon")]
     pub fn open(path: impl AsRef<Path>) -> Result<RomImage, FsError> {
+        let started = std::time::Instant::now();
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
         let len = file.metadata()?.len();
         let cache = std::sync::Mutex::new(horizon::RomCache::new(file));
         let head_len = horizon::head_len(&cache, len)?;
         let mut head = vec![0u8; head_len as usize];
-        let got = horizon::read_at(&cache, 0, &mut head);
+        // Read head directly into RAM in one sequential pass instead of routing
+        // through RomCache, avoiding 61+ MiB of duplicate cached chunks and
+        // hundreds of redundant seek+read syscalls on boot.
+        let got = horizon::read_direct(&cache, 0, &mut head);
         if got != head.len() {
             return Err(FsError::Truncated { offset: got, len: head.len() });
         }
-        log::info!("rom: {} MiB, {} KiB of it kept in memory", len >> 20, head_len >> 10);
+        log::info!(
+            "rom: {} MiB, {} KiB of it kept in memory in {:.0} ms",
+            len >> 20,
+            head_len >> 10,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
         Ok(RomImage { path, head, cache, len })
     }
 
@@ -189,8 +198,8 @@ mod horizon {
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::Mutex;
 
-    const CHUNK_SIZE: usize = 65536;
-    const NUM_CHUNKS: usize = 8192; // 512 MiB cache
+    const CHUNK_SIZE: usize = 256 * 1024;
+    const NUM_CHUNKS: usize = 2048; // 512 MiB cache
 
     struct CacheEntry {
         offset: u64,
@@ -200,6 +209,7 @@ mod horizon {
 
     pub struct RomCache {
         file: File,
+        cursor: Option<u64>,
         chunks: Vec<Option<CacheEntry>>,
     }
 
@@ -207,13 +217,17 @@ mod horizon {
         pub fn new(file: File) -> Self {
             let mut chunks = Vec::with_capacity(NUM_CHUNKS);
             chunks.resize_with(NUM_CHUNKS, || None);
-            RomCache { file, chunks }
+            RomCache { file, cursor: Some(0), chunks }
         }
 
         fn read_direct(&mut self, offset: u64, buf: &mut [u8]) -> usize {
-            if let Err(e) = self.file.seek(SeekFrom::Start(offset)) {
-                log::warn!("rom: seek to 0x{offset:X} failed, {e}");
-                return 0;
+            if self.cursor != Some(offset) {
+                if let Err(e) = self.file.seek(SeekFrom::Start(offset)) {
+                    log::warn!("rom: seek to 0x{offset:X} failed, {e}");
+                    self.cursor = None;
+                    return 0;
+                }
+                self.cursor = Some(offset);
             }
             let mut done = 0;
             while done < buf.len() {
@@ -223,12 +237,23 @@ mod horizon {
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(e) => {
                         log::warn!("rom: read of {} bytes at 0x{:X} failed, {e}", buf.len(), offset + done as u64);
-                        break;
+                        self.cursor = None;
+                        return done;
                     }
                 }
             }
+            self.cursor = Some(offset + done as u64);
             done
         }
+    }
+
+    /// reads directly from the underlying file without populating the chunk cache.
+    pub fn read_direct(cache: &Mutex<RomCache>, offset: u64, buf: &mut [u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        let mut state = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.read_direct(offset, buf)
     }
 
     /// reads at offset until buf is full or the file ends, how much it read.

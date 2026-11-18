@@ -215,6 +215,9 @@ pub struct FsState {
     /// the tick each medium, the game's and the SD card, is busy until. a
     /// medium reads one request after another.
     pub busy_until: [u64; 2],
+    /// reusable scratch buffer for RomFS / host file reads to avoid
+    /// allocating and zeroing a fresh multi-MiB Vec on every File::Read.
+    pub read_buf: Vec<u8>,
 }
 
 impl Default for FsState {
@@ -229,6 +232,7 @@ impl Default for FsState {
             next_directory: 0,
             busy_until: [0; 2],
             priority: 0,
+            read_buf: Vec::new(),
         }
     }
 }
@@ -1167,18 +1171,41 @@ fn open_sd_title(system: &mut System, title_id: u64, content_index: u16, kind: u
     }))
 }
 
-/// how long a read of length bytes takes on the console, in nanoseconds,
-/// the numbers Citra measured reading a game card on an Old 3DS. titles
-/// that load on a worker thread count on their other threads getting
-/// ahead meanwhile, Animal Crossing runs out of memory when a load is
-/// done before it asks.
+/// how long a read of length bytes takes on the console, in nanoseconds.
+/// titles that load on a worker thread count on their other threads getting
+/// ahead meanwhile (Animal Crossing runs out of memory when a load is done
+/// before it asks), so we always keep a small non-zero yield. On Horizon we
+/// run ~10x faster than the 2011 Old 3DS game card unless ZAKURO_FAST_FS=0.
 fn read_delay(length: u32) -> u64 {
-    (u64::from(length) * 94 + 582_778).max(663_124)
+    static FAST_FS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast = *FAST_FS.get_or_init(|| {
+        std::env::var("ZAKURO_FAST_FS")
+            .map(|v| v != "0")
+            .unwrap_or(cfg!(target_os = "horizon"))
+    });
+    if fast {
+        (u64::from(length) * 8 + 50_000).max(50_000)
+    } else {
+        (u64::from(length) * 94 + 582_778).max(663_124)
+    }
 }
 
 fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u32) -> u32 {
     let Some(backing) = system.services.fs.files.get(&file_id).map(|f| f.backing.clone()) else {
         return 0;
+    };
+
+    const MAX_KEPT_READ_BUF: usize = 4 * 1024 * 1024;
+    let take_buf = |system: &mut System, len: usize| -> Vec<u8> {
+        let mut buf = std::mem::take(&mut system.services.fs.read_buf);
+        buf.resize(len, 0);
+        buf
+    };
+    let put_buf = |system: &mut System, mut buf: Vec<u8>| {
+        if buf.capacity() <= MAX_KEPT_READ_BUF {
+            buf.clear();
+            system.services.fs.read_buf = buf;
+        }
     };
 
     match backing {
@@ -1191,21 +1218,21 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
                 return 0;
             }
             let count = (size as u64).min(total - offset) as usize;
-            // read into a temporary, the image may not hold the bytes in
-            // memory (Horizon), and it keeps the borrow of title from
-            // overlapping the mutable borrow of memory.
-            let mut data = vec![0u8; count];
+            let mut data = take_buf(system, count);
             if image.read_at(base + offset, &mut data) != count {
+                put_buf(system, data);
                 log::warn!("fs: read past the end of the ROM image");
                 return 0;
             }
             system.write_from_service(dest, &data);
+            put_buf(system, data);
             count as u32
         }
         FileBacking::Host(path) => {
-            let mut data = vec![0u8; size as usize];
+            let mut data = take_buf(system, size as usize);
             let count = host_archive::read_at(&path, offset, &mut data);
             system.write_from_service(dest, &data[..count]);
+            put_buf(system, data);
             count as u32
         }
         FileBacking::Memory(data) => {
@@ -1218,9 +1245,11 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             count as u32
         }
         FileBacking::Layered(layered, image) => {
-            let mut data = vec![0u8; (size as u64).min(layered.len().saturating_sub(offset)) as usize];
+            let len = (size as u64).min(layered.len().saturating_sub(offset)) as usize;
+            let mut data = take_buf(system, len);
             let count = layered.read_image(&image, offset, &mut data);
             system.write_from_service(dest, &data[..count]);
+            put_buf(system, data);
             count as u32
         }
     }

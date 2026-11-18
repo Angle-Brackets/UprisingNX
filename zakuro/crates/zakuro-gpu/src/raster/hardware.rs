@@ -728,21 +728,57 @@ pub(crate) fn pipeline_cache(title: u64) -> Option<std::path::PathBuf> {
     Some(dir.join("pipelines").join(format!("{title:016X}.bin")))
 }
 
+/// magic header identifying an LZ4-compressed pipeline cache file.
+const PIPELINE_CACHE_LZ4_MAGIC: &[u8; 8] = b"ZKRPLZ4\0";
+
 /// the pipelines kept for a game, none when there are none or they grew past
-/// MOST_PIPELINE_BYTES, which then go.
-fn read_pipeline_cache(path: &std::path::Path) -> Option<Vec<u8>> {
+/// MOST_PIPELINE_BYTES, which then go. Returns `(bytes, needs_migration)` where
+/// `needs_migration` is true if the on-disk file was uncompressed legacy format.
+fn read_pipeline_cache(path: &std::path::Path) -> Option<(Vec<u8>, bool)> {
+    let started = std::time::Instant::now();
     let size = std::fs::metadata(path).ok()?.len();
     if size > MOST_PIPELINE_BYTES {
         log::info!("the {} MB of pipelines in {} are compiled again", size >> 20, path.display());
         let _ = std::fs::remove_file(path);
         return None;
     }
-    std::fs::read(path).ok()
+    let raw = std::fs::read(path).ok()?;
+    if let Some(payload) = raw.strip_prefix(PIPELINE_CACHE_LZ4_MAGIC) {
+        match lz4_flex::decompress_size_prepended(payload) {
+            Ok(data) => {
+                if data.len() as u64 > MOST_PIPELINE_BYTES {
+                    log::info!("the {} MB of pipelines in {} are compiled again", data.len() >> 20, path.display());
+                    let _ = std::fs::remove_file(path);
+                    return None;
+                }
+                log::info!(
+                    "pipelines: read {} KB ({} KB raw) in {:.0} ms",
+                    raw.len() / 1024,
+                    data.len() / 1024,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+                Some((data, false))
+            }
+            Err(error) => {
+                log::warn!("corrupt compressed pipeline cache {}, {error}", path.display());
+                let _ = std::fs::remove_file(path);
+                None
+            }
+        }
+    } else {
+        log::info!(
+            "pipelines: read {} KB uncompressed in {:.0} ms (will compress on save)",
+            raw.len() / 1024,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        Some((raw, true))
+    }
 }
 
 /// keeps the pipelines compiled so far for the next run, by way of a file
 /// of its own, so a run killed halfway leaves the last one whole.
 fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache, path: &std::path::Path) {
+    let started = std::time::Instant::now();
     // SAFETY: the cache is the device's, and taking its data needs no one
     // else to keep off it
     let data = match unsafe { device.get_pipeline_cache_data(cache) } {
@@ -752,12 +788,21 @@ fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache, path: &st
             return;
         }
     };
+    let raw_size = data.len();
+    let compressed = lz4_flex::compress_prepend_size(&data);
+    drop(data);
+    let disk_size = PIPELINE_CACHE_LZ4_MAGIC.len() + compressed.len();
     let partial = path.with_extension(format!("{}.partial", std::process::id()));
-    let size = data.len();
     let written = path
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| std::fs::write(&partial, data))
+        .and_then(|()| {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&partial)?;
+            file.write_all(PIPELINE_CACHE_LZ4_MAGIC)?;
+            file.write_all(&compressed)?;
+            Ok(())
+        })
         .and_then(|()| {
             if cfg!(target_os = "horizon") {
                 let _ = std::fs::remove_file(path);
@@ -765,7 +810,13 @@ fn save_pipeline_cache(device: &ash::Device, cache: vk::PipelineCache, path: &st
             std::fs::rename(&partial, path)
         });
     match written {
-        Ok(()) => log::debug!(target: "zakuro_gpu::pipelines", "kept {} KB of pipelines in {}", size / 1024, path.display()),
+        Ok(()) => log::info!(
+            "pipelines: saved {} KB ({} KB raw) to {} in {:.0} ms",
+            disk_size / 1024,
+            raw_size / 1024,
+            path.display(),
+            started.elapsed().as_secs_f64() * 1000.0,
+        ),
         Err(error) => {
             log::warn!("could not save the pipeline cache to {}, {error}", path.display());
             let _ = std::fs::remove_file(&partial);
@@ -1483,6 +1534,20 @@ impl Compiler {
         self.outstanding += 1;
     }
 
+    /// queues a batch of already-deduplicated compile jobs in one lock.
+    fn send_batch(&mut self, jobs: Vec<Job>) -> Vec<Job> {
+        if self.threads.is_empty() || jobs.is_empty() {
+            return jobs;
+        }
+        let (queue, ready) = &*self.queue;
+        let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
+        self.outstanding += jobs.len();
+        waiting.compiles.extend(jobs);
+        drop(waiting);
+        ready.notify_all();
+        Vec::new()
+    }
+
     /// queues a job for the threads, or gives it back when there are none.
     fn send(&mut self, job: Job) -> Option<Job> {
         if self.threads.is_empty() {
@@ -1518,8 +1583,9 @@ impl Compiler {
     }
 
     /// waits for the jobs the threads are on and drops the rest, giving
-    /// back the pipelines they made that no one took.
-    fn finish(&mut self, kept: Option<&std::path::Path>) -> Vec<vk::Pipeline> {
+    /// back the pipelines they made that no one took, and whether any new
+    /// pipelines were compiled since the last cache save.
+    fn finish(&mut self, kept: Option<&std::path::Path>) -> (Vec<vk::Pipeline>, bool) {
         let (queue, ready) = &*self.queue;
         let mut waiting = queue.lock().unwrap_or_else(PoisonError::into_inner);
         waiting.stopped = true;
@@ -1533,6 +1599,7 @@ impl Compiler {
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
+        let dirty = queue.lock().unwrap_or_else(PoisonError::into_inner).compiled > 0;
         if let Some(path) = kept {
             flush_keys(path, &bytes, &translated);
         }
@@ -1540,7 +1607,7 @@ impl Compiler {
             Made::Compiled(_, Ok(pipeline)) => Some(pipeline),
             _ => None,
         });
-        made.collect()
+        (made.collect(), dirty)
     }
 }
 
@@ -1617,9 +1684,10 @@ fn compile(
             }
         };
         drop(waiting);
-        let compiles = matches!(job, Job::Compile(..));
-        let made = work(job, device, cache, layout, fragments, dynamic, depth_format, libraries);
-        lock().compiled += compiles as usize;
+        let (made, compiled_new) = work(job, device, cache, layout, fragments, dynamic, depth_format, libraries);
+        if compiled_new {
+            lock().compiled += 1;
+        }
         if sent.send(made).is_err() {
             return;
         }
@@ -1627,7 +1695,8 @@ fn compile(
 }
 
 /// a job done, on the compiler thread or, when waiting for it, on the
-/// caller's.
+/// caller's. Returns `(made, compiled_new)` where `compiled_new` is true only
+/// when a pipeline missed the driver's pipeline cache and had to be compiled.
 fn work(
     job: Job,
     device: &ash::Device,
@@ -1637,7 +1706,7 @@ fn work(
     dynamic: Dynamic,
     depth_format: vk::Format,
     libraries: Option<&Libraries>,
-) -> Made {
+) -> (Made, bool) {
     let started = std::time::Instant::now();
     match job {
         Job::Translate(key, program, keep) => {
@@ -1680,7 +1749,7 @@ fn work(
                     key.1
                 ),
             }
-            Made::Translated(key, made)
+            (Made::Translated(key, made), false)
         }
         Job::TranslateGeometry(key, vertex, geometry, geometry_entry, layout, keep) => {
             let source = std::panic::catch_unwind(|| glsl::translate_geometry(&vertex, key.1, &geometry, geometry_entry, &layout, &key.2))
@@ -1702,12 +1771,27 @@ fn work(
                 }
                 Err(error) => log::info!(target: "zakuro_gpu::programs", "geometry program from {geometry_entry} stays on the CPU, {error}"),
             }
-            Made::Translated(key, made)
+            (Made::Translated(key, made), false)
         }
         Job::Compile(key, module) => {
             let modules = [module, fragment_module(fragments, &key)];
-            let flags = vk::PipelineCreateFlags::empty();
-            let made = build_pipeline(device, cache, layout, modules, &key, flags, dynamic, depth_format, libraries);
+            let (made, compiled_new) = match build_pipeline(
+                device,
+                cache,
+                layout,
+                modules,
+                &key,
+                vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED,
+                dynamic,
+                depth_format,
+                libraries,
+            ) {
+                Ok(pipeline) => (Ok(pipeline), false),
+                Err(_) => (
+                    build_pipeline(device, cache, layout, modules, &key, vk::PipelineCreateFlags::empty(), dynamic, depth_format, libraries),
+                    true,
+                ),
+            };
             let took = started.elapsed();
             if took.as_millis() > 250 {
                 log::info!(
@@ -1725,7 +1809,7 @@ fn work(
                 );
             }
             note_compile(took, matches!(key.vertex, VertexStage::Translated(_)));
-            Made::Compiled(key, made)
+            (Made::Compiled(key, made), compiled_new)
         }
     }
 }
@@ -2279,6 +2363,9 @@ pub struct Hardware {
     libraries: Option<Arc<Libraries>>,
     /// the file they are kept in, none for nowhere.
     kept_pipelines: Option<Arc<std::path::Path>>,
+    /// whether the pipeline cache needs saving on drop (legacy migration or
+    /// synchronous compilation on the main thread).
+    pipeline_cache_dirty: bool,
     /// the keys of the pipelines the title used, kept beside them so the
     /// next run makes them all while it starts rather than as it plays.
     known_keys: std::collections::HashSet<PipelineKey>,
@@ -2398,11 +2485,13 @@ impl Hardware {
             }
             let timestamps = instance.get_physical_device_queue_family_properties(physical)[family as usize].timestamp_valid_bits > 0;
             // the driver checks the data is for this GPU and ignores it if not
-            let saved = kept_pipelines.as_deref().and_then(read_pipeline_cache).unwrap_or_default();
+            let (saved, pipeline_cache_dirty) = kept_pipelines.as_deref().and_then(read_pipeline_cache).unwrap_or_default();
+            let t_cache = std::time::Instant::now();
             let pipeline_cache = device
                 .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
                 .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
                 .map_err(vk_error("create a pipeline cache"))?;
+            log::info!("pipelines: vkCreatePipelineCache in {:.0} ms", t_cache.elapsed().as_secs_f64() * 1000.0);
             let libraries = dynamic.libraries.then(|| Arc::new(Libraries::default()));
             let fragments = [fragment_shader, depth_fragment_shader];
             let compiler = Compiler::start(device.clone(), pipeline_cache, kept_pipelines.clone(), layout, fragments, dynamic, depth_format, libraries.clone());
@@ -2551,6 +2640,7 @@ impl Hardware {
                 pipeline_cache,
                 libraries,
                 kept_pipelines,
+                pipeline_cache_dirty,
                 known_keys: std::collections::HashSet::new(),
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
@@ -2636,15 +2726,15 @@ impl Hardware {
             }
             if !hardware.waits && !used.is_empty() {
                 log::info!(target: "zakuro_gpu::pipelines", "making the {} pipelines the title used before", used.len());
-            }
-            for key in used {
-                if hardware.waits || !hardware.known_keys.insert(key) {
-                    continue;
+                let mut batch = Vec::with_capacity(used.len());
+                for key in used {
+                    if !hardware.known_keys.insert(key) {
+                        continue;
+                    }
+                    let module = hardware.vertex_module(key.vertex);
+                    batch.push(Job::Compile(key, module));
                 }
-                let module = hardware.vertex_module(key.vertex);
-                if hardware.compiler.send(Job::Compile(key, module)).is_some() {
-                    break;
-                }
+                let _ = hardware.compiler.send_batch(batch);
             }
             Ok(hardware)
         }
@@ -4742,7 +4832,10 @@ impl Hardware {
                 None => return,
             },
         };
-        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_modules(), self.dynamic, self.depth_format, self.libraries.as_deref());
+        let (made, compiled_new) = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_modules(), self.dynamic, self.depth_format, self.libraries.as_deref());
+        if compiled_new {
+            self.pipeline_cache_dirty = true;
+        }
         self.take(made);
     }
 
@@ -7344,12 +7437,14 @@ pub(crate) fn format_index(format: ColorFormat) -> i32 {
 impl Drop for Hardware {
     fn drop(&mut self) {
         // the compiler first, it uses the cache, the layout and the modules
-        let unclaimed = self.compiler.finish(self.kept_pipelines.as_deref());
+        let (unclaimed, compiler_dirty) = self.compiler.finish(self.kept_pipelines.as_deref());
         // SAFETY: waits for the GPU before anything it uses goes
         unsafe {
             let _ = self.device.device_wait_idle();
-            if let Some(path) = &self.kept_pipelines {
-                save_pipeline_cache(&self.device, self.pipeline_cache, path);
+            if self.pipeline_cache_dirty || compiler_dirty {
+                if let Some(path) = &self.kept_pipelines {
+                    save_pipeline_cache(&self.device, self.pipeline_cache, path);
+                }
             }
             self.device.destroy_pipeline_cache(self.pipeline_cache, None);
             for texture in self.textures.values() {
