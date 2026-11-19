@@ -1469,7 +1469,114 @@ struct Compiler {
     threads: Vec<thread::JoinHandle<()>>,
 }
 
+/// pipeline cache and pre-translated shader modules loaded asynchronously on a
+/// background thread during cold boot so the game can start immediately while
+/// Mesa NVK deserializes the cache.
+struct LoadedCache {
+    cache: vk::PipelineCache,
+    needs_migration: bool,
+    used: Vec<PipelineKey>,
+    modules: Vec<(ProgramKey, String, vk::ShaderModule)>,
+    translated_keys: Vec<(PipelineKey, ProgramKey)>,
+}
+
+struct PendingCache {
+    rx: mpsc::Receiver<LoadedCache>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+fn spawn_cache_loader(
+    device: ash::Device,
+    path: Arc<std::path::Path>,
+    load_translations: bool,
+) -> PendingCache {
+    let (tx, rx) = mpsc::channel();
+    let thread = thread::Builder::new()
+        .name("pipeline cache".to_owned())
+        .spawn(move || {
+            let (saved, needs_migration) = read_pipeline_cache(&path).unwrap_or_default();
+            let t_cache = std::time::Instant::now();
+            // SAFETY: vkCreatePipelineCache only needs a valid device, which
+            // outlives this thread (Hardware::drop joins it first).
+            let cache = unsafe {
+                device
+                    .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
+                    .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
+            };
+            drop(saved);
+            let Ok(cache) = cache else {
+                return;
+            };
+            log::info!("pipelines: vkCreatePipelineCache in {:.0} ms (async)", t_cache.elapsed().as_secs_f64() * 1000.0);
+            let used = read_keys(&path);
+            let mut modules = Vec::new();
+            let mut translated_keys = Vec::new();
+            if load_translations {
+                let started = std::time::Instant::now();
+                let programs = read_translations(&programs_dir(&path));
+                let count = programs.len();
+                let mut by_source: HashMap<String, vk::ShaderModule> = HashMap::new();
+                for (key, source, words) in programs {
+                    if (!super::gpu_geometry() || source.contains("vec4 slot_position[3];"))
+                        && source.contains("void run_geometry()")
+                    {
+                        continue;
+                    }
+                    let module = match by_source.get(&source) {
+                        Some(&module) => module,
+                        None => {
+                            let info = vk::ShaderModuleCreateInfo::default().code(&words);
+                            // SAFETY: words are SPIR-V naga validated in an earlier run.
+                            match unsafe { device.create_shader_module(&info, None) } {
+                                Ok(module) => {
+                                    by_source.insert(source.clone(), module);
+                                    module
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                    };
+                    modules.push((key, source, module));
+                }
+                translated_keys = read_translated_keys(&path);
+                log::info!(
+                    target: "zakuro_gpu::pipelines",
+                    "read back {count} translated programs and {} translated keys in {:.0} ms (async)",
+                    translated_keys.len(),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            let _ = tx.send(LoadedCache {
+                cache,
+                needs_migration,
+                used,
+                modules,
+                translated_keys,
+            });
+        })
+        .ok();
+    PendingCache { rx, thread }
+}
+
 impl Compiler {
+    /// an inert compiler with no background threads yet, used while the
+    /// on-disk pipeline cache is still loading asynchronously.
+    fn deferred() -> Compiler {
+        let waiting = Queue {
+            translations: VecDeque::new(),
+            generic: VecDeque::new(),
+            compiles: Vec::new(),
+            new_keys: Vec::new(),
+            new_translated_keys: Vec::new(),
+            stopped: false,
+            compiled: 0,
+            saved: std::time::Instant::now(),
+        };
+        let queue = Arc::new((Mutex::new(waiting), Condvar::new()));
+        let (_sent, made) = mpsc::channel();
+        Compiler { queue, made, outstanding: 0, asked: QuickSet::default(), threads: Vec::new() }
+    }
+
     /// the threads, compiling with a cache, a layout and a fragment shader
     /// that outlive them. a slow driver takes a long while over a scene's
     /// pipelines, which are drawn through the slower generic shader until
@@ -2366,6 +2473,9 @@ pub struct Hardware {
     /// whether the pipeline cache needs saving on drop (legacy migration or
     /// synchronous compilation on the main thread).
     pipeline_cache_dirty: bool,
+    /// background loader for the on-disk pipeline cache and pre-translated
+    /// shaders during cold boot.
+    pending_cache: Option<PendingCache>,
     /// the keys of the pipelines the title used, kept beside them so the
     /// next run makes them all while it starts rather than as it plays.
     known_keys: std::collections::HashSet<PipelineKey>,
@@ -2484,17 +2594,43 @@ impl Hardware {
                 log::info!("the GPU can't blit depth buffers, they are scaled on the CPU on their way to and from memory");
             }
             let timestamps = instance.get_physical_device_queue_family_properties(physical)[family as usize].timestamp_valid_bits > 0;
-            // the driver checks the data is for this GPU and ignores it if not
-            let (saved, pipeline_cache_dirty) = kept_pipelines.as_deref().and_then(read_pipeline_cache).unwrap_or_default();
-            let t_cache = std::time::Instant::now();
-            let pipeline_cache = device
-                .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
-                .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
-                .map_err(vk_error("create a pipeline cache"))?;
-            log::info!("pipelines: vkCreatePipelineCache in {:.0} ms", t_cache.elapsed().as_secs_f64() * 1000.0);
+            let shades = match (std::env::var_os("ZAKURO_CPU_SHADERS"), std::env::var_os("ZAKURO_GPU_SHADERS")) {
+                (Some(_), _) => false,
+                (None, Some(_)) => true,
+                (None, None) => properties.device_type != vk::PhysicalDeviceType::INTEGRATED_GPU,
+            };
+            let translates = std::env::var_os("ZAKURO_INTERPRET_SHADERS").is_none();
+            let waits = cfg!(test) || std::env::var_os("ZAKURO_WAIT_FOR_SHADERS").is_some();
+            let async_cache = !waits
+                && kept_pipelines.as_deref().is_some_and(|p| p.exists())
+                && std::env::var_os("ZAKURO_SYNC_CACHE").is_none();
             let libraries = dynamic.libraries.then(|| Arc::new(Libraries::default()));
             let fragments = [fragment_shader, depth_fragment_shader];
-            let compiler = Compiler::start(device.clone(), pipeline_cache, kept_pipelines.clone(), layout, fragments, dynamic, depth_format, libraries.clone());
+            let (pipeline_cache, pipeline_cache_dirty, compiler, pending_cache) = if async_cache {
+                // Start with an empty boot cache so the game begins booting
+                // immediately while the full on-disk cache deserializes in the
+                // background.
+                let boot_cache = device
+                    .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+                    .map_err(vk_error("create a pipeline cache"))?;
+                let pending = spawn_cache_loader(
+                    device.clone(),
+                    kept_pipelines.clone().unwrap(),
+                    shades && translates,
+                );
+                (boot_cache, false, Compiler::deferred(), Some(pending))
+            } else {
+                // the driver checks the data is for this GPU and ignores it if not
+                let (saved, pipeline_cache_dirty) = kept_pipelines.as_deref().and_then(read_pipeline_cache).unwrap_or_default();
+                let t_cache = std::time::Instant::now();
+                let pipeline_cache = device
+                    .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
+                    .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
+                    .map_err(vk_error("create a pipeline cache"))?;
+                log::info!("pipelines: vkCreatePipelineCache in {:.0} ms", t_cache.elapsed().as_secs_f64() * 1000.0);
+                let compiler = Compiler::start(device.clone(), pipeline_cache, kept_pipelines.clone(), layout, fragments, dynamic, depth_format, libraries.clone());
+                (pipeline_cache, pipeline_cache_dirty, compiler, None)
+            };
             let blend_state = dynamic.blend.then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device));
             let logic_op_state = dynamic.logic_op.then(|| ash::ext::extended_dynamic_state2::Device::new(&instance, &device));
             let mut hardware = Hardware {
@@ -2520,18 +2656,8 @@ impl Hardware {
                 fragment_shader,
                 depth_fragment_shader,
                 shade_shader,
-                // shading on the CPU instead, to tell the two apart. an
-                // integrated GPU does worse at it than the CPU, its draws
-                // read each vertex's inputs and uniforms out of storage
-                // buffers, a load after another. ZAKURO_GPU_SHADERS=1 has
-                // it shade all the same
-                shades: match (std::env::var_os("ZAKURO_CPU_SHADERS"), std::env::var_os("ZAKURO_GPU_SHADERS")) {
-                    (Some(_), _) => false,
-                    (None, Some(_)) => true,
-                    (None, None) => properties.device_type != vk::PhysicalDeviceType::INTEGRATED_GPU,
-                },
-                // interpreting them all instead, to tell the two apart
-                translates: std::env::var_os("ZAKURO_INTERPRET_SHADERS").is_none(),
+                shades,
+                translates,
                 scratch: Vec::new(),
                 translated: QuickMap::default(),
                 reached: QuickMap::default(),
@@ -2541,9 +2667,7 @@ impl Hardware {
                 stand_ins: Default::default(),
                 modules: HashMap::new(),
                 program_of: HashMap::new(),
-                // to draw through the pipeline made for each draw from the
-                // first on, as the tests do
-                waits: cfg!(test) || std::env::var_os("ZAKURO_WAIT_FOR_SHADERS").is_some(),
+                waits,
                 generic: std::env::var_os("ZAKURO_GENERIC_SHADERS").is_some(),
                 compiler,
                 logic_ops,
@@ -2641,6 +2765,7 @@ impl Hardware {
                 libraries,
                 kept_pipelines,
                 pipeline_cache_dirty,
+                pending_cache,
                 known_keys: std::collections::HashSet::new(),
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
@@ -2661,80 +2786,82 @@ impl Hardware {
                 vk::ImageAspectFlags::COLOR,
             )?;
             hardware.default_sampler = hardware.sampler(0, Wrap::ClampToEdge, Wrap::ClampToEdge, 0, 0)?;
-            // the generic pipelines, while the title starts. a draw that
-            // needs one before it is made makes it itself, as before
-            if dynamic.blend && !hardware.waits {
-                for key in generic_keys(hardware.shades) {
-                    let module = hardware.vertex_module(key.vertex);
-                    hardware.compiler.send_generic(Job::Compile(key, module));
-                }
-            }
-            // then every pipeline the title used before, so that one first
-            // seen in an earlier run is ready before it is drawn again
-            let mut used = hardware.kept_pipelines.as_deref().map(read_keys).unwrap_or_default();
-            // the programs translated before, ready from the first draw,
-            // and the pipelines made with them
-            if let (Some(cache), true) = (hardware.kept_pipelines.clone(), hardware.shades && hardware.translates && !hardware.waits) {
-                let started = std::time::Instant::now();
-                let programs = read_translations(&programs_dir(&cache));
-                let count = programs.len();
-                for (key, source, words) in programs {
-                    // a geometry draw's slots, made only when that path is on
-                    if (!super::gpu_geometry() || source.contains("vec4 slot_position[3];"))
-                        && source.contains("void run_geometry()")
-                    {
-                        continue;
+            if hardware.pending_cache.is_none() {
+                // the generic pipelines, while the title starts. a draw that
+                // needs one before it is made makes it itself, as before
+                if dynamic.blend && !hardware.waits {
+                    for key in generic_keys(hardware.shades) {
+                        let module = hardware.vertex_module(key.vertex);
+                        hardware.compiler.send_generic(Job::Compile(key, module));
                     }
-                    let module = match hardware.modules.get(&source) {
-                        Some(&module) => module,
-                        None => {
-                            let info = vk::ShaderModuleCreateInfo::default().code(&words);
-                            // the words are SPIR-V naga made and validated in an earlier run
-                            match hardware.device.create_shader_module(&info, None) {
-                                Ok(module) => {
-                                    hardware.modules.insert(source, module);
-                                    module
-                                }
-                                Err(_) => continue,
-                            }
+                }
+                // then every pipeline the title used before, so that one first
+                // seen in an earlier run is ready before it is drawn again
+                let mut used = hardware.kept_pipelines.as_deref().map(read_keys).unwrap_or_default();
+                // the programs translated before, ready from the first draw,
+                // and the pipelines made with them
+                if let (Some(cache), true) = (hardware.kept_pipelines.clone(), hardware.shades && hardware.translates && !hardware.waits) {
+                    let started = std::time::Instant::now();
+                    let programs = read_translations(&programs_dir(&cache));
+                    let count = programs.len();
+                    for (key, source, words) in programs {
+                        // a geometry draw's slots, made only when that path is on
+                        if (!super::gpu_geometry() || source.contains("vec4 slot_position[3];"))
+                            && source.contains("void run_geometry()")
+                        {
+                            continue;
                         }
-                    };
-                    hardware.program_of.entry(module).or_insert(key);
-                    hardware.translated.insert(key, Translation::Done(module));
-                }
-                let mut translated = 0;
-                for (key, program) in read_translated_keys(&cache) {
-                    let matched = hardware.translated.get(&program).copied().or_else(|| {
-                        (program.2[21] == MISSING).then(|| {
-                            hardware
-                                .translated
-                                .iter()
-                                .find(|((fp, ep, sems), _)| *fp == program.0 && *ep == program.1 && sems[..21] == program.2[..21])
-                                .map(|(_, &translation)| translation)
-                        })?
-                    });
-                    if let Some(Translation::Done(module)) = matched {
-                        used.push(PipelineKey { vertex: VertexStage::Translated(module), ..key });
-                        translated += 1;
+                        let module = match hardware.modules.get(&source) {
+                            Some(&module) => module,
+                            None => {
+                                let info = vk::ShaderModuleCreateInfo::default().code(&words);
+                                // the words are SPIR-V naga made and validated in an earlier run
+                                match hardware.device.create_shader_module(&info, None) {
+                                    Ok(module) => {
+                                        hardware.modules.insert(source, module);
+                                        module
+                                    }
+                                    Err(_) => continue,
+                                }
+                            }
+                        };
+                        hardware.program_of.entry(module).or_insert(key);
+                        hardware.translated.insert(key, Translation::Done(module));
                     }
-                }
-                log::info!(
-                    target: "zakuro_gpu::pipelines",
-                    "read back {count} translated programs and {translated} pipelines made with them in {:.0} ms",
-                    started.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            if !hardware.waits && !used.is_empty() {
-                log::info!(target: "zakuro_gpu::pipelines", "making the {} pipelines the title used before", used.len());
-                let mut batch = Vec::with_capacity(used.len());
-                for key in used {
-                    if !hardware.known_keys.insert(key) {
-                        continue;
+                    let mut translated = 0;
+                    for (key, program) in read_translated_keys(&cache) {
+                        let matched = hardware.translated.get(&program).copied().or_else(|| {
+                            (program.2[21] == MISSING).then(|| {
+                                hardware
+                                    .translated
+                                    .iter()
+                                    .find(|((fp, ep, sems), _)| *fp == program.0 && *ep == program.1 && sems[..21] == program.2[..21])
+                                    .map(|(_, &translation)| translation)
+                            })?
+                        });
+                        if let Some(Translation::Done(module)) = matched {
+                            used.push(PipelineKey { vertex: VertexStage::Translated(module), ..key });
+                            translated += 1;
+                        }
                     }
-                    let module = hardware.vertex_module(key.vertex);
-                    batch.push(Job::Compile(key, module));
+                    log::info!(
+                        target: "zakuro_gpu::pipelines",
+                        "read back {count} translated programs and {translated} pipelines made with them in {:.0} ms",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
-                let _ = hardware.compiler.send_batch(batch);
+                if !hardware.waits && !used.is_empty() {
+                    log::info!(target: "zakuro_gpu::pipelines", "making the {} pipelines the title used before", used.len());
+                    let mut batch = Vec::with_capacity(used.len());
+                    for key in used {
+                        if !hardware.known_keys.insert(key) {
+                            continue;
+                        }
+                        let module = hardware.vertex_module(key.vertex);
+                        batch.push(Job::Compile(key, module));
+                    }
+                    let _ = hardware.compiler.send_batch(batch);
+                }
             }
             Ok(hardware)
         }
@@ -4208,6 +4335,9 @@ impl Hardware {
     /// notes a pipeline the title used for the list kept beside the cache,
     /// handing its bytes to the compiler threads to write out when idle.
     fn remember(&mut self, key: PipelineKey) {
+        if self.pending_cache.is_some() {
+            return;
+        }
         let keepable = match key.vertex {
             VertexStage::Translated(module) => self.program_of.contains_key(&module),
             _ => true,
@@ -4839,8 +4969,118 @@ impl Hardware {
         self.take(made);
     }
 
+    /// attaches the asynchronously loaded pipeline cache and pre-translated
+    /// shader modules once the background loader finishes.
+    fn poll_pending_cache(&mut self) {
+        let state = match self.pending_cache.as_ref() {
+            Some(pending) => pending.rx.try_recv(),
+            None => return,
+        };
+        match state {
+            Ok(mut loaded) => {
+                if let Some(mut pending) = self.pending_cache.take() {
+                    if let Some(thread) = pending.thread.take() {
+                        let _ = thread.join();
+                    }
+                }
+                // Merge the small boot cache (0-5 pipelines) into the full
+                // on-disk cache (<0.1 ms) and swap it in.
+                let boot_cache = self.pipeline_cache;
+                // SAFETY: both caches belong to self.device, and the compiler
+                // has no background threads running yet.
+                unsafe {
+                    let _ = self.device.merge_pipeline_caches(loaded.cache, &[boot_cache]);
+                    self.device.destroy_pipeline_cache(boot_cache, None);
+                }
+                self.pipeline_cache = loaded.cache;
+                if loaded.needs_migration {
+                    self.pipeline_cache_dirty = true;
+                }
+                // Attach pre-translated shader modules, deduplicating against
+                // any module already compiled during early boot.
+                let mut seen_dups: std::collections::HashSet<vk::ShaderModule> = std::collections::HashSet::new();
+                for (key, source, module) in loaded.modules {
+                    let actual = match self.modules.get(&source) {
+                        Some(&existing) => {
+                            if existing != module && seen_dups.insert(module) {
+                                // SAFETY: unused duplicate shader module.
+                                unsafe { self.device.destroy_shader_module(module, None) };
+                            }
+                            existing
+                        }
+                        None => {
+                            self.modules.insert(source, module);
+                            module
+                        }
+                    };
+                    self.program_of.entry(actual).or_insert(key);
+                    self.translated.entry(key).or_insert(Translation::Done(actual));
+                }
+                for (key, program) in loaded.translated_keys {
+                    let matched = self.translated.get(&program).copied().or_else(|| {
+                        (program.2[21] == MISSING).then(|| {
+                            self.translated
+                                .iter()
+                                .find(|((fp, ep, sems), _)| *fp == program.0 && *ep == program.1 && sems[..21] == program.2[..21])
+                                .map(|(_, &translation)| translation)
+                        })?
+                    });
+                    if let Some(Translation::Done(module)) = matched {
+                        loaded.used.push(PipelineKey { vertex: VertexStage::Translated(module), ..key });
+                    }
+                }
+                self.compiler = Compiler::start(
+                    self.device.clone(),
+                    self.pipeline_cache,
+                    self.kept_pipelines.clone(),
+                    self.layout,
+                    self.fragment_modules(),
+                    self.dynamic,
+                    self.depth_format,
+                    self.libraries.clone(),
+                );
+                if self.dynamic.blend && !self.waits {
+                    for key in generic_keys(self.shades) {
+                        let module = self.vertex_module(key.vertex);
+                        self.compiler.send_generic(Job::Compile(key, module));
+                    }
+                }
+                let mut batch = Vec::with_capacity(loaded.used.len());
+                for key in loaded.used {
+                    if !self.known_keys.insert(key) {
+                        continue;
+                    }
+                    let module = self.vertex_module(key.vertex);
+                    batch.push(Job::Compile(key, module));
+                }
+                let count = batch.len();
+                let _ = self.compiler.send_batch(batch);
+                log::info!(target: "zakuro_gpu::pipelines", "async pipeline cache attached ({count} warmup pipelines queued)");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if let Some(mut pending) = self.pending_cache.take() {
+                    if let Some(thread) = pending.thread.take() {
+                        let _ = thread.join();
+                    }
+                }
+                self.compiler = Compiler::start(
+                    self.device.clone(),
+                    self.pipeline_cache,
+                    self.kept_pipelines.clone(),
+                    self.layout,
+                    self.fragment_modules(),
+                    self.dynamic,
+                    self.depth_format,
+                    self.libraries.clone(),
+                );
+            }
+        }
+    }
+
     /// takes in what the compiler made since last time.
     fn collect(&mut self) {
+        self.poll_pending_cache();
         while self.compiler.outstanding > 0 {
             let Ok(made) = self.compiler.made.try_recv() else {
                 break;
@@ -7436,12 +7676,32 @@ pub(crate) fn format_index(format: ColorFormat) -> i32 {
 
 impl Drop for Hardware {
     fn drop(&mut self) {
+        // Join any in-flight async cache loader before touching device objects,
+        // and never overwrite the on-disk cache with the tiny boot cache.
+        let had_pending = self.pending_cache.is_some();
+        if let Some(mut pending) = self.pending_cache.take() {
+            if let Some(thread) = pending.thread.take() {
+                let _ = thread.join();
+            }
+            if let Ok(loaded) = pending.rx.try_recv() {
+                let mut destroyed: std::collections::HashSet<vk::ShaderModule> = std::collections::HashSet::new();
+                // SAFETY: these objects were never handed to the GPU or compiler.
+                unsafe {
+                    self.device.destroy_pipeline_cache(loaded.cache, None);
+                    for (_, _, module) in loaded.modules {
+                        if destroyed.insert(module) {
+                            self.device.destroy_shader_module(module, None);
+                        }
+                    }
+                }
+            }
+        }
         // the compiler first, it uses the cache, the layout and the modules
         let (unclaimed, compiler_dirty) = self.compiler.finish(self.kept_pipelines.as_deref());
         // SAFETY: waits for the GPU before anything it uses goes
         unsafe {
             let _ = self.device.device_wait_idle();
-            if self.pipeline_cache_dirty || compiler_dirty {
+            if !had_pending && (self.pipeline_cache_dirty || compiler_dirty) {
                 if let Some(path) = &self.kept_pipelines {
                     save_pipeline_cache(&self.device, self.pipeline_cache, path);
                 }
