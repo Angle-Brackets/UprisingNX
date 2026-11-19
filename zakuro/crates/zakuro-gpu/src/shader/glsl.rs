@@ -1102,7 +1102,7 @@ impl Translator<'_> {
             Min => "vec4(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y, a.z < b.z ? a.z : b.z, a.w < b.w ? a.w : b.w)"
                 .to_owned(),
             Rcp => "vec4(1.0 / a.x)".to_owned(),
-            Rsq => "vec4(1.0 / sqrt(a.x))".to_owned(),
+            Rsq => "vec4(inversesqrt(a.x))".to_owned(),
             Mov => "a".to_owned(),
             Mad | MadI => "multiply4(a, b) + c".to_owned(),
             Mova => {

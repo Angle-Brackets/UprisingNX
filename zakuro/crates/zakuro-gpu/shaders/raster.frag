@@ -171,7 +171,10 @@ vec4 sample_unit(uint unit, vec2 uv) {
     }
     bool border_s = (wrap_s & 3u) == 1u && (st.x < 0.0 || st.x >= 1.0);
     bool border_t = (wrap_t & 3u) == 1u && (st.y < 0.0 || st.y >= 1.0);
-    return border_s || border_t ? unpack_color(units[unit].y) : sampled;
+    if (border_s || border_t) {
+        return unpack_color(units[unit].y);
+    }
+    return sampled;
 }
 
 precise float lookup(uint table, uint entry, float delta) {
@@ -234,7 +237,6 @@ precise float proctex_clamp(float c, uint mode) {
 }
 
 precise float proctex_combine(float u, float v, uint function) {
-    float len = sqrt(u * u + v * v);
     switch (function) {
         case 0u: return u;
         case 1u: return u * u;
@@ -242,10 +244,10 @@ precise float proctex_combine(float u, float v, uint function) {
         case 3u: return v * v;
         case 4u: return (u + v) * 0.5;
         case 5u: return (u * u + v * v) * 0.5;
-        case 6u: return min(len, 1.0);
+        case 6u: return min(sqrt(u * u + v * v), 1.0);
         case 7u: return min(u, v);
         case 8u: return max(u, v);
-        case 9u: return min(((u + v) * 0.5 + len) * 0.5, 1.0);
+        case 9u: return min(((u + v) * 0.5 + sqrt(u * u + v * v)) * 0.5, 1.0);
         default: return 0.0;
     }
 }
@@ -333,7 +335,7 @@ bool light_bit(uint bit, uint dynamic_value) {
 // one lighting table's value for a light, 1 for a table not read
 float table_value(
     uint i, uint flags, uint number, uint config, bool two_sided,
-    vec3 normal, vec3 half_unit, vec3 norm_view, vec3 light_vector, vec3 spot_direction, vec3 tangent
+    vec3 normal, vec3 half_unit, vec3 norm_view, vec3 light_vector, float ln, vec3 spot_direction, vec3 tangent
 ) {
     if (!table_read(i) || (i == 6u && (flags & 32u) == 0u)) {
         return 1.0;
@@ -343,7 +345,7 @@ float table_value(
         case 0u: result = dot(normal, half_unit); break;
         case 1u: result = dot(norm_view, half_unit); break;
         case 2u: result = dot(normal, norm_view); break;
-        case 3u: result = dot(light_vector, normal); break;
+        case 3u: result = ln; break;
         case 4u: result = dot(light_vector, spot_direction); break;
         case 5u:
             if (config == 8u) {
@@ -379,8 +381,8 @@ float table_value(
 // what fragment lighting leaves in the primary and secondary colors
 void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     uint config = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 19) & 0xFu : light_config.x;
-    float length_q = length(in_quaternion);
-    vec4 q = length_q > 0.0 ? in_quaternion / length_q : vec4(0.0, 0.0, 0.0, 1.0);
+    float q_len2 = dot(in_quaternion, in_quaternion);
+    vec4 q = q_len2 > 0.0 ? in_quaternion * inversesqrt(q_len2) : vec4(0.0, 0.0, 0.0, 1.0);
 
     uint shadow_word = light_config.w;
     vec4 shadow = vec4(1.0);
@@ -392,19 +394,27 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
         }
     }
 
-    vec3 surface_normal = vec3(0.0, 0.0, 1.0);
     vec3 surface_tangent = vec3(1.0, 0.0, 0.0);
     uint bump = light_config.z;
     uint bump_mode = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 25) & 3u : bump & 3u;
+    vec3 normal;
     if (bump_mode == 1u) {
-        surface_normal = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
+        vec3 surface_normal = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
         if ((bump & 0x100u) != 0u) {
             surface_normal.z = sqrt(max(1.0 - dot(surface_normal.xy, surface_normal.xy), 0.0));
         }
-    } else if (bump_mode == 2u) {
-        surface_tangent = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
+        normal = rotate(q, surface_normal);
+    } else {
+        if (bump_mode == 2u) {
+            surface_tangent = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
+        }
+        // exact algebraic form of rotate(q, vec3(0.0, 0.0, 1.0))
+        normal = vec3(
+            2.0 * (q.y * q.w + q.z * q.x),
+            2.0 * (q.z * q.y - q.x * q.w),
+            1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+        );
     }
-    vec3 normal = rotate(q, surface_normal);
     vec3 tangent = config == 8u ? rotate(q, surface_tangent) : surface_tangent;
     bool needs_half = light_bit(23u, light_flags.w & 1u);
     bool needs_view = light_bit(24u, light_flags.w & 2u);
@@ -422,7 +432,17 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
         uint flags = light.flags.x;
         uint number = light.flags.y;
         bool two_sided = (flags & 2u) != 0u;
-        vec3 light_vector = (flags & 1u) != 0u ? light.direction.xyz : normalize(light.position.xyz + view);
+        vec3 light_vector;
+        float dist_len = 0.0;
+        if ((flags & 1u) != 0u) {
+            light_vector = light.direction.xyz;
+        } else {
+            vec3 to_light = light.position.xyz + view;
+            float d2 = dot(to_light, to_light);
+            float inv_d = inversesqrt(d2);
+            light_vector = to_light * inv_d;
+            dist_len = d2 * inv_d;
+        }
         vec3 half_vector = vec3(0.0);
         vec3 half_unit = vec3(0.0);
         if (needs_half) {
@@ -432,42 +452,40 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
 
         float distance = 1.0;
         if ((flags & 16u) != 0u) {
-            vec3 offset = -view - light.position.xyz;
-            float place = clamp(light.distance.y * length(offset) + light.distance.x, 0.0, 1.0);
+            float d = (flags & 1u) != 0u ? length(-view - light.position.xyz) : dist_len;
+            float place = clamp(light.distance.y * d + light.distance.x, 0.0, 1.0);
             float entry = clamp(floor(place * 256.0), 0.0, 255.0);
             distance = lookup(DISTANCE + number, uint(entry), place * 256.0 - entry);
         }
 
+        float ln = dot(light_vector, normal);
+
         // each table by its own number, so a pipeline with the lighting's
         // constants drops the ones it does not read, and no array of the
         // values is indexed as the loop goes, which put it in memory
-        float values[7];
-        values[0] = table_value(0u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
-        values[1] = table_value(1u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
-        values[2] = table_value(2u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
-        values[3] = table_value(3u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
-        values[4] = table_value(4u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
-        values[5] = table_value(5u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
-        values[6] = table_value(6u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        float v0 = table_value(0u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
+        float v1 = table_value(1u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
+        float v3 = table_value(3u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
+        float v4 = table_value(4u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
+        float v5 = table_value(5u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
+        float spot = table_value(6u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
 
-        float spot = values[6];
-        float red = values[3];
-        vec3 reflect_color = vec3(red, table_read(4u) ? values[4] : red, table_read(5u) ? values[5] : red);
-        vec3 specular0 = light.specular0.rgb * values[0];
-        vec3 specular1 = values[1] * reflect_color * light.specular1.rgb;
+        vec3 reflect_color = vec3(v3, table_read(4u) ? v4 : v3, table_read(5u) ? v5 : v3);
+        vec3 specular0 = light.specular0.rgb * v0;
+        vec3 specular1 = v1 * reflect_color * light.specular1.rgb;
 
         // only the last light applies fresnel
-        if (slot == count - 1u && table_read(2u)) {
+        if (slot == count - 1u && table_read(2u) && (fresnel_primary || fresnel_secondary)) {
+            float fresnel = table_value(2u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
             if (fresnel_primary) {
-                diffuse_sum.a = values[2];
+                diffuse_sum.a = fresnel;
             }
             if (fresnel_secondary) {
-                specular_sum.a = values[2];
+                specular_sum.a = fresnel;
             }
         }
 
-        float facing = dot(light_vector, normal);
-        facing = two_sided ? abs(facing) : max(facing, 0.0);
+        float facing = two_sided ? abs(ln) : max(ln, 0.0);
         float highlights = clamp_highlights && facing == 0.0 ? 0.0 : 1.0;
         if ((flags & 12u) != 0u) {
             float length2 = dot(half_vector, half_vector);
