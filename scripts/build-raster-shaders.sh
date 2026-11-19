@@ -14,6 +14,8 @@ else
 fi
 run -O -fshader-stage=frag raster.frag -o raster.frag.spv
 run -O -fshader-stage=frag -DWRITES_DEPTH raster.frag -o raster_depth.frag.spv
+run -O -fshader-stage=frag -DFAST_MATH raster.frag -o raster_fast.frag.spv
+run -O -fshader-stage=frag -DWRITES_DEPTH -DFAST_MATH raster.frag -o raster_depth_fast.frag.spv
 run -O -fshader-stage=vert raster.vert -o raster.vert.spv
 run -O -fshader-stage=vert shade.vert -o shade.vert.spv
-echo "built raster.frag.spv, raster_depth.frag.spv, raster.vert.spv, and shade.vert.spv"
+echo "built raster*.frag.spv, raster.vert.spv, and shade.vert.spv"

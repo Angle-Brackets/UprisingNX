@@ -1,5 +1,13 @@
 #version 450
 
+// FAST_MATH drops `precise` (NoContraction) so Maxwell GM20B can fuse a*b+c
+// into single-cycle FFMA instructions across lighting, TEV combiners, and fog.
+#ifdef FAST_MATH
+#define PRECISE
+#else
+#define PRECISE precise
+#endif
+
 // the PICA200's fragment stages for one draw, the texture units, fragment
 // lighting and the six combiners, then the alpha test. they follow the
 // software rasterizer, which follows the hardware.
@@ -157,7 +165,7 @@ vec4 sample_unit(uint unit, vec2 uv) {
     // still interpolate a hair apart from one shader to another
     // a unit reading a surface's own image (units[unit].z) has its rows
     // bottom first already, as the PICA's
-    precise vec2 st = vec2(uv.x, units[unit].z != 0u ? uv.y : 1.0 - uv.y);
+    PRECISE vec2 st = vec2(uv.x, units[unit].z != 0u ? uv.y : 1.0 - uv.y);
     // sampled before the border is decided on for each fragment, so that a
     // texture pack's picture picks which of its sizes to draw with from all
     // of a fragment's neighbours
@@ -177,13 +185,13 @@ vec4 sample_unit(uint unit, vec2 uv) {
     return sampled;
 }
 
-precise float lookup(uint table, uint entry, float delta) {
+PRECISE float lookup(uint table, uint entry, float delta) {
     vec2 value = tables[table * 256u + entry];
     return value.x + value.y * delta;
 }
 
 // a procedural texture map read at a coordinate from 0 to 1
-precise float proctex_lookup(uint map, float coordinate) {
+PRECISE float proctex_lookup(uint map, float coordinate) {
     float at = coordinate * 128.0;
     uint entry = min(uint(max(at, 0.0)), 127u);
     vec2 value = tables[PROCTEX_MAPS + map * 128u + entry];
@@ -221,7 +229,7 @@ float proctex_shift(float other, uint mode, uint clamping) {
     return 0.0;
 }
 
-precise float proctex_clamp(float c, uint mode) {
+PRECISE float proctex_clamp(float c, uint mode) {
     switch (mode) {
         case 0u: return c > 1.0 ? 0.0 : c;
         case 1u: return min(c, 1.0);
@@ -236,7 +244,7 @@ precise float proctex_clamp(float c, uint mode) {
     }
 }
 
-precise float proctex_combine(float u, float v, uint function) {
+PRECISE float proctex_combine(float u, float v, uint function) {
     switch (function) {
         case 0u: return u;
         case 1u: return u * u;
@@ -254,7 +262,7 @@ precise float proctex_combine(float u, float v, uint function) {
 
 // texture 3, made up from its coordinates, as the software rasterizer has
 // it. precise as the combiners are, as is lighting
-precise vec4 procedural(vec2 uv) {
+PRECISE vec4 procedural(vec2 uv) {
     uint config = proctex[0].x;
     uvec2 clamps = uvec2(config & 7u, (config >> 3) & 7u);
     float u = abs(uv.x);
@@ -303,12 +311,12 @@ precise vec4 procedural(vec2 uv) {
     return color;
 }
 
-precise vec3 rotate(vec4 q, vec3 v) {
+PRECISE vec3 rotate(vec4 q, vec3 v) {
     vec3 inner = cross(q.xyz, v);
     return v + 2.0 * cross(q.xyz, inner + v * q.w);
 }
 
-precise float quantize(float c) {
+PRECISE float quantize(float c) {
     return floor(clamp(c, 0.0, 1.0) * 255.0) / 255.0;
 }
 
@@ -424,8 +432,8 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     vec3 view = in_view;
     vec3 norm_view = needs_view ? normalize(view) : vec3(0.0);
 
-    precise vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
-    precise vec4 specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
+    PRECISE vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
+    PRECISE vec4 specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
     uint count = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 1) & 0xFu : light_config.y;
     for (uint slot = 0u; slot < count; slot++) {
         Light light = lights[slot];
@@ -520,7 +528,7 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     specular_out = vec4(quantize(specular_sum.r), quantize(specular_sum.g), quantize(specular_sum.b), quantize(specular_sum.a));
 }
 
-precise vec3 color_operand(vec4 s, uint operand) {
+PRECISE vec3 color_operand(vec4 s, uint operand) {
     switch (operand) {
         case 0x1u: return vec3(1.0) - s.rgb;
         case 0x2u: return vec3(s.a);
@@ -535,7 +543,7 @@ precise vec3 color_operand(vec4 s, uint operand) {
     }
 }
 
-precise float alpha_operand(vec4 s, uint operand) {
+PRECISE float alpha_operand(vec4 s, uint operand) {
     switch (operand) {
         case 0x0u: return s.a;
         case 0x1u: return 1.0 - s.a;
@@ -552,7 +560,7 @@ precise float alpha_operand(vec4 s, uint operand) {
 // into an add, which it would do one way where it knows the operation and
 // another where the generic shader does not, rounding differently
 vec3 combine_rgb(uint op, vec3 a, vec3 b, vec3 c) {
-    precise vec3 result;
+    PRECISE vec3 result;
     switch (op) {
         case 0u: result = a; break;
         case 1u: result = a * b; break;
@@ -574,7 +582,7 @@ vec3 combine_rgb(uint op, vec3 a, vec3 b, vec3 c) {
 }
 
 float combine_alpha(uint op, float a, float b, float c) {
-    precise float result;
+    PRECISE float result;
     switch (op) {
         case 0u: result = a; break;
         case 1u: result = a * b; break;
@@ -670,7 +678,7 @@ void combine_stage(
                 alpha_operand(alpha_in[1], (operand >> 16) & 0x7u),
                 alpha_operand(alpha_in[2], (operand >> 20) & 0x7u)
             );
-        precise vec4 scaled = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
+        PRECISE vec4 scaled = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
         previous = scaled;
     }
 
@@ -695,7 +703,7 @@ float fragment_depth() {
         return gl_FragCoord.z;
     }
 #endif
-    precise float depth = in_depth;
+    PRECISE float depth = in_depth;
     if ((depth_mode & 2u) != 0u) {
         depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);
     }
@@ -755,7 +763,7 @@ void main() {
     // precise, as everything from the operands on is, or where the driver
     // knows the operands it works 1 - a times 255 out as 255 - 255a, which
     // rounds to the other side of a byte
-    precise vec4 color = floor(previous * 255.0);
+    PRECISE vec4 color = floor(previous * 255.0);
     uint alpha_test = DYNAMIC != 0u ? misc.z & 0x71u : ALPHA_TEST;
     if ((alpha_test & 1u) != 0u && !compare((alpha_test >> 4) & 7u, color.a, float((misc.z >> 8) & 0xFFu))) {
         discard;
@@ -765,14 +773,14 @@ void main() {
     // before. 5 turns it on, 7 is gas
     if ((misc.x & 7u) == 5u) {
         float depth = fragment_depth();
-        precise float index = ((misc.x & 0x10000u) != 0u ? 1.0 - depth : depth) * 128.0;
-        precise float entry = clamp(floor(index), 0.0, 127.0);
+        PRECISE float index = ((misc.x & 0x10000u) != 0u ? 1.0 - depth : depth) * 128.0;
+        PRECISE float entry = clamp(floor(index), 0.0, 127.0);
         vec2 lookup = tables[FOG_TABLE + uint(entry)];
-        precise float factor = clamp(lookup.x + lookup.y * (index - entry), 0.0, 1.0);
+        PRECISE float factor = clamp(lookup.x + lookup.y * (index - entry), 0.0, 1.0);
         vec3 fog_color = vec3(fog.x & 0xFFu, (fog.x >> 8) & 0xFFu, (fog.x >> 16) & 0xFFu);
         color.rgb = floor(factor * color.rgb + (1.0 - factor) * fog_color);
     }
-    precise vec4 written = color / 255.0;
+    PRECISE vec4 written = color / 255.0;
     out_color = written;
 
 #ifdef WRITES_DEPTH
