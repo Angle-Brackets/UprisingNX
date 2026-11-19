@@ -101,7 +101,7 @@ void unx_thread_role(const char *role, int index) {
     // shader all along. UNX_COMPILER_PRIO (hex) overrides the priority.
     if (!strcmp(role, "compiler")) {
         const char *p = getenv("UNX_COMPILER_PRIO");
-        int priority = (p && p[0]) ? (int)strtol(p, NULL, 16) : 0x2D;
+        int priority = (p && p[0]) ? (int)strtol(p, NULL, 16) : 0x32;
         svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
         svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 0x7);
         printf("place: compiler %d at priority 0x%X, core 0 first, any core\n", index, priority);

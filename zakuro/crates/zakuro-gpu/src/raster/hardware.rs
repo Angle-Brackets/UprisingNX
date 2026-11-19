@@ -1720,6 +1720,10 @@ impl Compiler {
 
 /// appends newly noted pipeline keys to the lists beside the cache on disk.
 fn flush_keys(cache: &std::path::Path, bytes: &[u8], translated: &[u8]) {
+    // Serialize appends across compiler threads: Horizon's FAT32 fs:USER rejects
+    // concurrent writable opens of the same file with EIO (os error 5).
+    static KEYS_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     for (path, slice) in [(keys_path(cache), bytes), (translated_keys_path(cache), translated)] {
         if slice.is_empty() {
             continue;
@@ -2479,6 +2483,10 @@ pub struct Hardware {
     /// the keys of the pipelines the title used, kept beside them so the
     /// next run makes them all while it starts rather than as it plays.
     known_keys: std::collections::HashSet<PipelineKey>,
+    /// keys already known to miss the driver's pipeline cache, so fallback
+    /// draws don't hammer `vkCreateGraphicsPipelines(FAIL_ON_COMPILE_REQUIRED)`
+    /// every frame while the compiler thread builds them.
+    cache_misses: QuickSet<PipelineKey>,
 }
 
 impl Hardware {
@@ -2767,6 +2775,7 @@ impl Hardware {
                 pipeline_cache_dirty,
                 pending_cache,
                 known_keys: std::collections::HashSet::new(),
+                cache_misses: QuickSet::default(),
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
@@ -4369,12 +4378,16 @@ impl Hardware {
     /// the pipeline for a key when the cache on disk has it, made without
     /// compiling anything.
     fn cached(&mut self, key: PipelineKey) -> Option<vk::Pipeline> {
+        if self.cache_misses.contains(&key) {
+            return None;
+        }
         let modules = [self.vertex_module(key.vertex), fragment_module(self.fragment_modules(), &key)];
         let started = std::time::Instant::now();
         let flags = vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
         let libraries = self.libraries.as_deref();
         let pipeline = build_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, flags, self.dynamic, self.depth_format, libraries);
         let Ok(pipeline) = pipeline else {
+            self.cache_misses.insert(key);
             // a driver should turn it down at once, one that takes long holds the frame up
             let took = started.elapsed().as_secs_f64() * 1000.0;
             if took >= 2.0 {
@@ -4993,6 +5006,7 @@ impl Hardware {
                     self.device.destroy_pipeline_cache(boot_cache, None);
                 }
                 self.pipeline_cache = loaded.cache;
+                self.cache_misses.clear();
                 if loaded.needs_migration {
                     self.pipeline_cache_dirty = true;
                 }
@@ -5121,18 +5135,21 @@ impl Hardware {
             Made::Translated(key, Err(_)) => {
                 self.translated.insert(key, Translation::Failed);
             }
-            Made::Compiled(key, Ok(pipeline)) => match self.pipelines.entry(key) {
-                Entry::Vacant(entry) => {
-                    if let Some((since, _)) = self.stand_ins.remove(&key) {
-                        log::info!(target: "zakuro_gpu::pipelines", "generic stand-in ends: its pipeline came after {:.0} ms", since.elapsed().as_secs_f64() * 1000.0);
+            Made::Compiled(key, Ok(pipeline)) => {
+                self.cache_misses.remove(&key);
+                match self.pipelines.entry(key) {
+                    Entry::Vacant(entry) => {
+                        if let Some((since, _)) = self.stand_ins.remove(&key) {
+                            log::info!(target: "zakuro_gpu::pipelines", "generic stand-in ends: its pipeline came after {:.0} ms", since.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        entry.insert(pipeline);
+                        self.remember(key);
                     }
-                    entry.insert(pipeline);
-                    self.remember(key);
+                    // a draw made it meanwhile
+                    // SAFETY: nothing recorded uses the one just made
+                    Entry::Occupied(_) => unsafe { self.device.destroy_pipeline(pipeline, None) },
                 }
-                // a draw made it meanwhile
-                // SAFETY: nothing recorded uses the one just made
-                Entry::Occupied(_) => unsafe { self.device.destroy_pipeline(pipeline, None) },
-            },
+            }
             Made::Compiled(key, Err(error)) => match key.vertex {
                 // a translated program the driver turns down goes back to
                 // the interpreter

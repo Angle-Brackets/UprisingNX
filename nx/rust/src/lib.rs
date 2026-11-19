@@ -303,8 +303,11 @@ const SMOOTH_REFRESH_MS: f64 = 20.0;
 /// SMOOTH_SETTLED checks or the scene changes (into or out of a battle, a
 /// load). the most is short so a heavy moment doesn't keep it off for long
 const SMOOTH_BACKOFF_FIRST: u64 = 5 * 60;
-const SMOOTH_BACKOFF_MOST: u64 = 30 * 60;
+const SMOOTH_BACKOFF_MOST: u64 = 10 * 60;
 const SMOOTH_SETTLED: u32 = 60;
+/// refreshes ignored after toggling smooth mode or stepping battle resolution,
+/// so surface rebuild / swapchain recovery frames don't immediately trip the guard
+const SMOOTH_GRACE_FRAMES: u32 = 20;
 
 /// frame interpolation, smooth mode: a picture in between each two of the
 /// game's, which draws every other refresh. it doubles what the GPU draws,
@@ -331,6 +334,8 @@ struct Smooth {
     kept_up: u32,
     /// whether dropping battle resolution 1 step already failed to keep smooth mode on in this scene
     scale_drop_failed: bool,
+    /// remaining refreshes to ignore before measuring again (after a resize or mode toggle)
+    grace: u32,
 }
 /// the highest scale the controller asks for, 1600x960 a screen
 const MAX_SCALE: u32 = 4;
@@ -690,6 +695,7 @@ impl Unx {
         self.smooth.frames = 0;
         self.smooth.last = None;
         self.smooth.slow = 0;
+        self.smooth.grace = if self.smooth.on { SMOOTH_GRACE_FRAMES } else { 0 };
     }
 
     /// right stick + Right turns smooth mode on or off: this mode's preset
@@ -750,6 +756,11 @@ impl Unx {
             }
             return;
         }
+        if self.smooth.grace > 0 {
+            self.smooth.grace -= 1;
+            self.smooth.last = None;
+            return;
+        }
         let now = Instant::now();
         let Some(last) = self.smooth.last.replace(now) else {
             return;
@@ -802,6 +813,7 @@ impl Unx {
                     self.smooth.last = None;
                     self.smooth.slow = 0;
                     self.smooth.kept_up = 0;
+                    self.smooth.grace = SMOOTH_GRACE_FRAMES;
                     log::info!(
                         "unx: smooth guard stepped battle resolution {before}x -> {scale}x to keep smooth mode on ({average:.1} ms waited a refresh, {refresh_avg:.1} ms/refresh, {slow} of {frames} refreshes slow, frame {})",
                         self.frame
@@ -1087,6 +1099,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             slow: 0,
             kept_up: 0,
             scale_drop_failed: false,
+            grace: 0,
         },
         menu: menu::Menu::new(),
         aim: aim::Aim::from_env(),
