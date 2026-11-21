@@ -91,16 +91,32 @@ void unx_memory(unsigned long long *out) {
     out[3] = (unsigned long long)info.arena;
 }
 
-/* Switch TV / panel output resolution, updated via display-resolution change
- * event (or forced when docking/undocking) so per-frame polls avoid IPC. */
+static int s_disp_dirty = 1;
+
+static void on_display_applet_hook(AppletHookType hook, void *param) {
+    (void)param;
+    if (hook == AppletHookType_OnFocusState
+        || hook == AppletHookType_OnOperationMode
+        || hook == AppletHookType_OnResume) {
+        __atomic_store_n(&s_disp_dirty, 1, __ATOMIC_RELAXED);
+    }
+}
+
+/* Switch TV / panel active pixel dimensions: queries default display resolution
+ * plus docked TV screen-size underscan (System Settings -> TV Settings -> Adjust
+ * Screen Size) so the Vulkan swapchain matches the ViLayer 1:1 without a second
+ * vi hardware resample. Refreshed via appletHook + display-resolution event so
+ * per-frame polls avoid IPC. */
 void unx_display_resolution(unsigned int *out_w, unsigned int *out_h, int force) {
     static int s_init = 0;
     static int s_has_event = 0;
     static Event s_event;
+    static AppletHookCookie s_hook;
     static unsigned int s_w = 1280, s_h = 720;
-    bool refresh = !s_init || force != 0;
+    bool refresh = !s_init || force != 0 || __atomic_exchange_n(&s_disp_dirty, 0, __ATOMIC_RELAXED) != 0;
     if (!s_init) {
         s_init = 1;
+        appletHook(&s_hook, on_display_applet_hook, NULL);
         if (R_SUCCEEDED(appletGetDefaultDisplayResolutionChangeEvent(&s_event))) {
             s_has_event = 1;
         }
@@ -109,16 +125,34 @@ void unx_display_resolution(unsigned int *out_w, unsigned int *out_h, int force)
     }
     if (refresh) {
         s32 w = 0, h = 0;
-        if (R_SUCCEEDED(appletGetDefaultDisplayResolution(&w, &h)) && w > 0 && h > 0) {
-            s_w = (unsigned int)w;
-            s_h = (unsigned int)h;
-        } else if (appletGetOperationMode() == AppletOperationMode_Console) {
-            s_w = 1920;
-            s_h = 1080;
-        } else {
-            s_w = 1280;
-            s_h = 720;
+        bool docked = appletGetOperationMode() == AppletOperationMode_Console;
+        if (!R_SUCCEEDED(appletGetDefaultDisplayResolution(&w, &h)) || w <= 0 || h <= 0) {
+            w = docked ? 1920 : 1280;
+            h = docked ? 1080 : 720;
         }
+        unsigned int pct = 100;
+        if (docked && R_SUCCEEDED(setsysInitialize())) {
+            SetSysTvSettings tv;
+            if (R_SUCCEEDED(setsysGetTvSettings(&tv))) {
+                if (tv.underscan >= 1 && tv.underscan <= 20) {
+                    pct = 100u - tv.underscan;
+                } else if (tv.underscan >= 80 && tv.underscan <= 99) {
+                    pct = tv.underscan;
+                }
+            }
+            setsysExit();
+        }
+        unsigned int nw = (unsigned int)w;
+        unsigned int nh = (unsigned int)h;
+        if (pct < 100) {
+            nw = ((nw * pct + 50u) / 100u) & ~1u;
+            nh = ((nh * pct + 50u) / 100u) & ~1u;
+        }
+        if (nw != s_w || nh != s_h) {
+            printf("display: %dx%d at %u%% TV screen area -> swapchain %ux%u\n", (int)w, (int)h, pct, nw, nh);
+        }
+        s_w = nw;
+        s_h = nh;
     }
     *out_w = s_w;
     *out_h = s_h;

@@ -170,7 +170,6 @@ enum Row {
     BattleScale,
     MenuScale,
     Smooth,
-    ScreenArea,
     PowerLabel,
     RightStick,
     Gyro,
@@ -184,13 +183,12 @@ enum Row {
     Quit,
 }
 
-const ROWS: [Row; 17] = [
+const ROWS: [Row; 16] = [
     Row::Editing,
     Row::Preset,
     Row::BattleScale,
     Row::MenuScale,
     Row::Smooth,
-    Row::ScreenArea,
     Row::PowerLabel,
     Row::RightStick,
     Row::Gyro,
@@ -215,7 +213,6 @@ impl Row {
             Row::BattleScale => "Battle resolution",
             Row::MenuScale => "Menu resolution",
             Row::Smooth => "Smooth mode (60 fps)",
-            Row::ScreenArea => "TV screen area",
             Row::PowerLabel => "Power label",
             Row::RightStick => "Right stick aim",
             Row::Gyro => "Gyro aim",
@@ -243,7 +240,6 @@ impl Row {
             Row::BattleScale => "How sharp battles are drawn, in multiples of the 3DS screen. Higher looks better but can drop below 30 fps or turn smooth mode off. Changing it makes the preset Custom.",
             Row::MenuScale => "How sharp everything outside battles is drawn: menus, the hub and cutscenes. Changing it makes the preset Custom.",
             Row::Smooth => "Draws a picture between each two of the game's for 60 fps. It turns itself off for a while when the GPU can't keep up. Changing it makes the preset Custom.",
-            Row::ScreenArea => "Shrinks the docked picture inside clean black borders (80%-100%) when a TV cuts off the edges or isn't set to Just Scan / Fit to Screen, without blurring text.",
             Row::PowerLabel => "Where the selected power's name appears on foot. Bottom: centered at the bottom in crisp white text. Above bar: in a bubble over the power icons. Off: icons only.",
             Row::RightStick => "Aims the reticle in the air and turns the camera on foot with the right stick, in place of the touch screen.",
             Row::Gyro => "Fine aiming by tilting the console or controller.",
@@ -449,21 +445,6 @@ impl Menu {
                 video.smooth = !video.smooth;
                 Changed::Video
             }
-            Row::ScreenArea => {
-                if a {
-                    settings.screen_area = match settings.screen_area {
-                        100 => 96,
-                        96 => 92,
-                        92 => 88,
-                        _ => 100,
-                    };
-                } else if delta < 0 {
-                    settings.screen_area = settings.screen_area.saturating_sub(2).max(80);
-                } else {
-                    settings.screen_area = (settings.screen_area + 2).min(100);
-                }
-                Changed::Video
-            }
             Row::PowerLabel => {
                 let index = (power_label_index(settings) as i32 + delta).rem_euclid(POWER_LABELS.len() as i32) as usize;
                 set_control(settings, "power_label", POWER_LABELS[index].into());
@@ -523,7 +504,7 @@ impl Menu {
     /// the atlas for this window height, made (and the old one freed) when
     /// the size changes; false without a font
     fn ready(&mut self, height: u32, overlay: &mut Overlay) -> bool {
-        let px = (height as f32 / 720.0 * 21.0).round().max(14.0);
+        let px = (height as f32 / 720.0 * 22.0).round().max(14.0);
         if self.atlas.as_ref().is_none_or(|atlas| atlas.px != px) {
             if let Some(old) = self.atlas.take() {
                 overlay.free.push(old.id);
@@ -606,7 +587,6 @@ impl Menu {
                 Row::BattleScale => scale(video.battle_scale),
                 Row::MenuScale => scale(video.menu_scale),
                 Row::Smooth => flag(video.smooth),
-                Row::ScreenArea => format!("{}%", settings.screen_area),
                 Row::PowerLabel => match settings.power_label_mode() {
                     zakuro_gpu::PowerLabelMode::Bottom => "Bottom".into(),
                     zakuro_gpu::PowerLabelMode::AboveBar => "Above bar".into(),
@@ -629,7 +609,7 @@ impl Menu {
         };
 
         let k = height as f32 / 720.0;
-        let line = (atlas.px * 1.32).round();
+        let line = (atlas.px * 1.4).round();
         let small = 0.78;
         let small_line = line * 0.8;
         let panel_w = 760.0 * k;

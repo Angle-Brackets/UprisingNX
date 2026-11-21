@@ -623,10 +623,9 @@ impl Unx {
             && self.layout == ScreenLayout::TopOnly
     }
 
-    /// puts the settings for this mode in place: resolution (unless fixed),
-    /// smooth mode (unless env.txt decides it), and docked TV safe area
+    /// puts the settings for this mode in place: resolution (unless fixed)
+    /// and smooth mode (unless env.txt decides it)
     fn apply_settings(&mut self) {
-        self.presenter.set_safe_area(if self.docked { self.settings.screen_area as f32 / 100.0 } else { 1.0 });
         if self.fixed_resolution.is_none() {
             let target = self.auto_scale();
             self.set_scale(target);
@@ -655,19 +654,9 @@ impl Unx {
         if !self.menu.has_overlay() {
             return Overlay::default();
         }
-        let (ox, oy, width, height) = self.presenter.safe_rect();
+        let (width, height) = self.presenter.extent();
         let now = (self.system.gpu.scale(), self.smooth.on);
-        let mut overlay = self.menu.overlay(&self.settings, self.docked, now, width, height);
-        if ox != 0 || oy != 0 {
-            for mesh in &mut overlay.meshes {
-                for v in &mut mesh.vertices {
-                    v.position[0] += ox as f32;
-                    v.position[1] += oy as f32;
-                }
-                mesh.clip = [mesh.clip[0] + ox, mesh.clip[1] + oy, mesh.clip[2] + ox, mesh.clip[3] + oy];
-            }
-        }
-        overlay
+        self.menu.overlay(&self.settings, self.docked, now, width, height)
     }
 
     /// writes the settings back and says what this mode runs at now
@@ -1003,7 +992,6 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             return std::ptr::null_mut();
         }
     };
-    presenter.set_safe_area(if docked { settings.screen_area as f32 / 100.0 } else { 1.0 });
     log::info!(
         "unx: presenter {} up in {:?} ({} {}x{}, internal {}x)",
         presenter.name(),
