@@ -6410,12 +6410,12 @@ impl TextureCache {
         } else if title_sprite {
             let cache = title_cache();
             let cache_key = (width, height, hash);
-            if let Some(cached) = cache
+            let cached = cache
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .get(&cache_key)
-                .cloned()
-            {
+                .cloned();
+            if let Some(cached) = cached {
                 cached
             } else {
                 let upscaled: Arc<[[u8; 4]]> =
@@ -12804,5 +12804,17 @@ mod tests {
         resources.portraits.bottom_seen = true;
         assert!(!flush_portraits(&mut memory, &mut resources), "the last step leaves nothing to draw");
         assert_eq!(alphas(&resources), (None, None));
+    }
+
+    #[test]
+    fn title_sprite_cache_miss_does_not_deadlock() {
+        let mut cache = TextureCache::default();
+        let data = vec![0xAAu8; 8 * 8 * 4];
+        let key = (0x1002, TextureFormat::Rgba8, 8, 8);
+        let (first, _) = cache.decoded(key, &data);
+        assert!(first.len() >= 16 * 16);
+        let mut cache2 = TextureCache::default();
+        let (second, _) = cache2.decoded(key, &data);
+        assert!(Arc::ptr_eq(&first, &second), "second miss in TextureCache reuses TITLE_CACHE entry");
     }
 }
