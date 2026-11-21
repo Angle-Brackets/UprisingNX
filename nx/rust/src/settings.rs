@@ -83,7 +83,7 @@ impl Mode {
 }
 
 /// the aim and HUD keys, each the env var the runtime reads
-const CONTROLS: [(&str, &str); 9] = [
+const CONTROLS: [(&str, &str); 10] = [
     ("right_stick_aim", "UNX_RIGHT_STICK_AIM"),
     ("gyro_aim", "UNX_GYRO_AIM"),
     ("gyro_speed", "UNX_GYRO_SPEED"),
@@ -93,6 +93,7 @@ const CONTROLS: [(&str, &str); 9] = [
     ("aim_speed", "UNX_AIM_SPEED"),
     ("power_label", "ZAKURO_POWER_LABEL"),
     ("minus_button", "UNX_MINUS_BUTTON"),
+    ("smooth_scale_drop", "UNX_SMOOTH_SCALE_DROP"),
 ];
 
 #[derive(Clone, PartialEq, Debug)]
@@ -119,6 +120,7 @@ impl Default for Settings {
                 ("aim_speed".into(), "1.0".into()),
                 ("power_label".into(), "bottom".into()),
                 ("minus_button".into(), "menu".into()),
+                ("smooth_scale_drop".into(), "0".into()),
             ],
         }
     }
@@ -226,6 +228,7 @@ impl Settings {
              # aim_modifier ZL, ZR, L, R, X, Y or A, aim_invert_y 1 or 0, speeds 1.0 = normal\n\
              # power_label: bottom (centered at bottom), bar (above power icons) or off\n\
              # minus_button: menu (Minus alone opens the settings menu) or select (the 3DS's Select)\n\
+             # smooth_scale_drop: 0 (keep battle resolution fixed; default) or 1 (drop 1x before pausing smooth mode)\n\
              [controls]\n",
         );
         for (key, value) in &self.controls {
@@ -248,6 +251,16 @@ impl Settings {
     /// Minus alone opens the settings menu, rather than being the 3DS's Select
     pub fn minus_opens_menu(&self) -> bool {
         self.controls.iter().find(|(k, _)| k == "minus_button").map_or(true, |(_, v)| v.trim() != "select")
+    }
+
+    /// Whether smooth_guard may dynamically step real battle resolution down 1x
+    /// to keep 60 fps (default: false — keeps battle resolution fixed and only
+    /// renders intermediate frames 1 step lower)
+    pub fn smooth_scale_drop(&self) -> bool {
+        self.controls
+            .iter()
+            .find(|(k, _)| k == "smooth_scale_drop")
+            .is_some_and(|(_, v)| on_off(&v.trim().to_ascii_lowercase()).unwrap_or(false))
     }
 
     /// Where the selected land-battle power's name is drawn on the top screen

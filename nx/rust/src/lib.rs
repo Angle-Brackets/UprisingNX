@@ -298,13 +298,17 @@ const SMOOTH_WAIT_MS: f64 = 4.0;
 /// host GPU (at 2x handheld in a battle the game fell to ~21 frames/s with
 /// no wait the first test sees). most, so a load's one long stall is not it
 const SMOOTH_REFRESH_MS: f64 = 20.0;
+/// how many consecutive slow checks (~0.5 s each) before smooth_guard steps
+/// in, so a single heavy explosion or shader compile hitch does not trip it
+const SMOOTH_STRIKES: u32 = 2;
 /// how long smooth mode stays off before it tries again, doubling each
 /// time it fails up to the most, back to the first once it kept up for
 /// SMOOTH_SETTLED checks or the scene changes (into or out of a battle, a
-/// load). the most is short so a heavy moment doesn't keep it off for long
-const SMOOTH_BACKOFF_FIRST: u64 = 5 * 60;
-const SMOOTH_BACKOFF_MOST: u64 = 10 * 60;
-const SMOOTH_SETTLED: u32 = 60;
+/// load). kept short so heavy moments recover automatically without waiting
+/// for a load screen
+const SMOOTH_BACKOFF_FIRST: u64 = 3 * 60;
+const SMOOTH_BACKOFF_MOST: u64 = 6 * 60;
+const SMOOTH_SETTLED: u32 = 20;
 /// refreshes ignored after toggling smooth mode or stepping battle resolution,
 /// so surface rebuild / swapchain recovery frames don't immediately trip the guard
 const SMOOTH_GRACE_FRAMES: u32 = 20;
@@ -330,6 +334,8 @@ struct Smooth {
     /// longer than SMOOTH_REFRESH_MS
     last: Option<Instant>,
     slow: u32,
+    /// consecutive slow checks seen so far
+    strikes: u32,
     /// checks in a row that kept up
     kept_up: u32,
     /// whether dropping battle resolution 1 step already failed to keep smooth mode on in this scene
@@ -703,6 +709,7 @@ impl Unx {
             }
         }
         self.system.reset_interpolation();
+        self.smooth.strikes = 0;
         self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
         if self.smooth.wanted && !self.smooth.on && self.smooth.retry_at > self.frame {
             self.smooth.retry_at = self.frame;
@@ -717,6 +724,7 @@ impl Unx {
         self.smooth.frames = 0;
         self.smooth.last = None;
         self.smooth.slow = 0;
+        self.smooth.strikes = 0;
         self.smooth.grace = if self.smooth.on { SMOOTH_GRACE_FRAMES } else { 0 };
     }
 
@@ -805,6 +813,7 @@ impl Unx {
         // locked 60 Hz, so require the 30-refresh mean interval to exceed 18.5 ms (<54 Hz)
         // before treating individual >20 ms deltas as falling behind.
         if average <= SMOOTH_WAIT_MS && (slow * 2 <= frames || refresh_avg <= 18.5) {
+            self.smooth.strikes = 0;
             self.smooth.kept_up += 1;
             if self.smooth.kept_up >= SMOOTH_SETTLED {
                 self.smooth.backoff = SMOOTH_BACKOFF_FIRST;
@@ -812,11 +821,13 @@ impl Unx {
             }
             return;
         }
-        // UNX_SMOOTH_SCALE_DROP=0 skips stepping battle resolution down first
-        static ALLOW_SCALE_DROP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let allow_drop = *ALLOW_SCALE_DROP.get_or_init(|| {
-            std::env::var("UNX_SMOOTH_SCALE_DROP").map_or(true, |v| v.trim() != "0")
-        });
+        self.smooth.kept_up = 0;
+        self.smooth.strikes += 1;
+        if self.smooth.strikes < SMOOTH_STRIKES {
+            return;
+        }
+        self.smooth.strikes = 0;
+        let allow_drop = self.settings.smooth_scale_drop();
         if allow_drop
             && !self.smooth.scale_drop_failed
             && !self.title_boosted
@@ -834,6 +845,7 @@ impl Unx {
                     self.smooth.frames = 0;
                     self.smooth.last = None;
                     self.smooth.slow = 0;
+                    self.smooth.strikes = 0;
                     self.smooth.kept_up = 0;
                     self.smooth.grace = SMOOTH_GRACE_FRAMES;
                     log::info!(
@@ -1124,6 +1136,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             frames: 0,
             last: None,
             slow: 0,
+            strikes: 0,
             kept_up: 0,
             scale_drop_failed: false,
             grace: 0,

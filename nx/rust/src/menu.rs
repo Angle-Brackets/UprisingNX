@@ -173,6 +173,7 @@ enum Row {
     BattleScale,
     MenuScale,
     Smooth,
+    DynamicRes,
     PowerLabel,
     RightStick,
     Gyro,
@@ -186,12 +187,13 @@ enum Row {
     Quit,
 }
 
-const ROWS: [Row; 16] = [
+const ROWS: [Row; 17] = [
     Row::Editing,
     Row::Preset,
     Row::BattleScale,
     Row::MenuScale,
     Row::Smooth,
+    Row::DynamicRes,
     Row::PowerLabel,
     Row::RightStick,
     Row::Gyro,
@@ -216,6 +218,7 @@ impl Row {
             Row::BattleScale => "Battle resolution",
             Row::MenuScale => "Menu resolution",
             Row::Smooth => "Smooth mode (60 fps)",
+            Row::DynamicRes => "Dynamic resolution",
             Row::PowerLabel => "Power label",
             Row::RightStick => "Right stick aim",
             Row::Gyro => "Gyro aim",
@@ -242,7 +245,8 @@ impl Row {
             }
             Row::BattleScale => "How sharp battles are drawn, in multiples of the 3DS screen. Higher looks better but can drop below 30 fps or turn smooth mode off. Changing it makes the preset Custom.",
             Row::MenuScale => "How sharp everything outside battles is drawn: menus, the hub and cutscenes. Changing it makes the preset Custom.",
-            Row::Smooth => "Draws a picture between each two of the game's for 60 fps. It turns itself off for a while when the GPU can't keep up. Changing it makes the preset Custom.",
+            Row::Smooth => "Draws an in-between frame at 1 step lower resolution for 60 fps. Briefly pauses and resumes automatically if the GPU falls behind. Changing it makes the preset Custom.",
+            Row::DynamicRes => "Off (default): keeps your chosen battle resolution fixed; only in-between 60 fps frames render lower. On: tries dropping real battle resolution 1 step before pausing smooth mode.",
             Row::PowerLabel => "Where the selected power's name appears on foot. Bottom: centered at the bottom in crisp white text. Above bar: in a bubble over the power icons. Off: icons only.",
             Row::RightStick => "Aims the reticle in the air and turns the camera on foot with the right stick, in place of the touch screen.",
             Row::Gyro => "Fine aiming by tilting the console or controller.",
@@ -448,6 +452,11 @@ impl Menu {
                 video.smooth = !video.smooth;
                 Changed::Video
             }
+            Row::DynamicRes => {
+                let value = if settings.smooth_scale_drop() { "0" } else { "1" };
+                set_control(settings, "smooth_scale_drop", value.into());
+                Changed::Video
+            }
             Row::PowerLabel => {
                 let index = (power_label_index(settings) as i32 + delta).rem_euclid(POWER_LABELS.len() as i32) as usize;
                 set_control(settings, "power_label", POWER_LABELS[index].into());
@@ -603,6 +612,7 @@ impl Menu {
                 Row::BattleScale => scale(video.battle_scale),
                 Row::MenuScale => scale(video.menu_scale),
                 Row::Smooth => flag(video.smooth),
+                Row::DynamicRes => flag(settings.smooth_scale_drop()),
                 Row::PowerLabel => match settings.power_label_mode() {
                     zakuro_gpu::PowerLabelMode::Bottom => "Bottom".into(),
                     zakuro_gpu::PowerLabelMode::AboveBar => "Above bar".into(),
@@ -625,7 +635,7 @@ impl Menu {
         };
 
         let k = height as f32 / 720.0;
-        let line = (atlas.px * 1.4).round();
+        let line = (atlas.px * 1.32).round();
         let small = 0.78;
         let small_line = line * 0.8;
         let panel_w = 760.0 * k;
