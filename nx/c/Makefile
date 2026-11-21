@@ -38,6 +38,11 @@ include $(DEVKITPRO)/libnx/switch_rules
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
 TARGET		:=	uprising_nx
+APP_TITLE	:=	UprisingNX
+APP_AUTHOR	:=	Angle-Brackets
+UNX_VER		:=	$(shell tr -d ' \r\n' < $(TOPDIR)/../../VERSION 2>/dev/null || echo 0.1.0)
+UNX_SHA		:=	$(shell git -C $(TOPDIR)/../.. rev-parse --short HEAD 2>/dev/null || echo unknown)
+APP_VERSION	:=	$(shell printf '%s-%s' '$(UNX_VER)' '$(UNX_SHA)' | cut -c1-15)
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
@@ -206,6 +211,9 @@ ifeq ($(strip $(APP_JSON)),)
 all	:	$(OUTPUT).nro
 
 ifeq ($(strip $(NO_NACP)),)
+VERSION_STAMP := $(CURDIR)/version.stamp
+_STAMP := $(shell printf '%s\n' '$(APP_VERSION)' | cmp -s - '$(VERSION_STAMP)' || printf '%s\n' '$(APP_VERSION)' > '$(VERSION_STAMP)')
+$(OUTPUT).nacp	:	$(VERSION_STAMP)
 $(OUTPUT).nro	:	$(OUTPUT).elf $(OUTPUT).nacp
 else
 $(OUTPUT).nro	:	$(OUTPUT).elf

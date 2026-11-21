@@ -397,6 +397,8 @@ pub struct Unx {
     smooth_forced: Option<bool>,
     /// frames since the GPU last reported drawing the title screen
     title_quiet: u32,
+    /// whether the game is currently showing the title screen (for version watermark)
+    on_title: bool,
     /// whether internal resolution is currently boosted to 2x for the title screen
     title_boosted: bool,
     /// last seen sub-screen (`1..=3`) for `ScreenLayout::WeaponSelect`
@@ -649,14 +651,14 @@ impl Unx {
         }
     }
 
-    /// the menu's overlay for this refresh (nothing when closed and no toast)
+    /// the menu's overlay for this refresh (or the title-screen version watermark)
     fn menu_overlay(&mut self) -> Overlay {
-        if !self.menu.has_overlay() {
+        if !self.menu.has_overlay(self.on_title) {
             return Overlay::default();
         }
         let (width, height) = self.presenter.extent();
         let now = (self.system.gpu.scale(), self.smooth.on);
-        self.menu.overlay(&self.settings, self.docked, now, width, height)
+        self.menu.overlay(&self.settings, self.docked, now, width, height, self.on_title)
     }
 
     /// writes the settings back and says what this mode runs at now
@@ -966,6 +968,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     let _ = log::set_logger(&LOGGER);
     let _ = zakuro_gpu::THREAD_ROLE.set(place_thread);
     log::set_max_level(log::LevelFilter::Info);
+    log::info!("unx: UprisingNX {}", menu::VERSION_LABEL);
     let (Some(rom), Some(data_dir)) = (cstr(rom), cstr(data_dir)) else {
         log::error!("unx: no ROM or data directory");
         return std::ptr::null_mut();
@@ -1106,6 +1109,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         settings,
         smooth_forced,
         title_quiet: u32::MAX,
+        on_title: false,
         title_boosted: true,
         weapon_sub: 1,
         battle_scale_drop: 0,
@@ -1714,6 +1718,7 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
         unx.title_quiet = u32::MAX;
     }
     let on_title_active = unx.title_quiet <= 15 && !in_battle && !on_file_post;
+    unx.on_title = on_title_active;
     let on_fuse_post = unx.system.gpu.flags().on_fuse.load(std::sync::atomic::Ordering::Relaxed)
         && !in_battle
         && !on_title_active;

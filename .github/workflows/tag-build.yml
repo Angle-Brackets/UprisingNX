@@ -1,0 +1,61 @@
+name: Test and Tag Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Desktop Unit Tests
+    runs-on: ubuntu-latest
+    env:
+      RUST_MIN_STACK: "16777216"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: zakuro -> target
+
+      - name: Run zakuro release unit tests
+        working-directory: zakuro
+        run: cargo test --release -p zakuro-fs -p zakuro-gpu -p zakuro-core
+
+  tag:
+    name: Tag Commit Build
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create and push build tag
+        run: |
+          VER="$(tr -d ' \r\n' < VERSION)"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          TAG="v${VER}-${SHORT_SHA}"
+          echo "Computed build tag: ${TAG}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists; skipping."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "UprisingNX v${VER} (${SHORT_SHA})"
+            git push origin "${TAG}"
+          fi
+          {
+            echo "### Build Tagged"
+            echo "- **Version:** \`v${VER} (${SHORT_SHA})\`"
+            echo "- **Tag:** \`${TAG}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -16,6 +16,9 @@ use crate::settings::{Preset, Settings};
 /// the system font, kept by unx_set_font
 pub static FONT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
+/// build version + short git hash stamped at compile time by build.rs
+pub const VERSION_LABEL: &str = env!("UNX_VERSION_LABEL");
+
 const FIRST: u8 = b' ';
 /// '~' is the last glyph; the cell after it is the white block
 const COUNT: usize = (b'~' - FIRST + 1) as usize;
@@ -522,23 +525,24 @@ impl Menu {
         true
     }
 
-    /// whether the menu or a non-expired toast needs drawing this refresh.
-    pub fn has_overlay(&mut self) -> bool {
+    /// whether the menu, a non-expired toast, or the title-screen version
+    /// watermark needs drawing this refresh.
+    pub fn has_overlay(&mut self, show_version: bool) -> bool {
         if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed().as_secs_f32() > TOAST_SECONDS) {
             self.toast = None;
         }
-        self.open || self.toast.is_some()
+        self.open || self.toast.is_some() || show_version
     }
 
-    /// the menu, or a hotkey's notice, over the game, in a window `width` x
-    /// `height` pixels
-    pub fn overlay(&mut self, settings: &Settings, docked: bool, now: (u32, bool), width: u32, height: u32) -> Overlay {
+    /// the menu, a hotkey's notice, or the title-screen version watermark over
+    /// the game, in a window `width` x `height` pixels
+    pub fn overlay(&mut self, settings: &Settings, docked: bool, now: (u32, bool), width: u32, height: u32, show_version: bool) -> Overlay {
         let mut overlay = Overlay::default();
         let toast = self.toast.as_ref().map(|(text, at)| (text.clone(), at.elapsed().as_secs_f32()));
         if toast.as_ref().is_some_and(|(_, age)| *age > TOAST_SECONDS) {
             self.toast = None;
         }
-        if !self.open && self.toast.is_none() {
+        if !self.open && self.toast.is_none() && !show_version {
             return overlay;
         }
         if !self.ready(height, &mut overlay) {
@@ -557,6 +561,18 @@ impl Menu {
                 painter.rect([x, y, x + w, y + h], color(16, 20, 40, a(225)));
                 painter.rect([x, y + h - 3.0 * k, x + w, y + h], color(250, 200, 80, a(255)));
                 painter.text(x + 18.0 * k, y + (h - atlas.px * size * 1.2) / 2.0, &text, size, color(235, 238, 245, a(255)));
+            }
+            if show_version {
+                let size = 0.78;
+                let tw = atlas.width(VERSION_LABEL) * size;
+                let th = atlas.px * size;
+                let pad_x = 18.0 * k;
+                let pad_y = 14.0 * k;
+                let x = (width as f32 - tw - pad_x).max(0.0);
+                let y = (height as f32 - th - pad_y).max(0.0);
+                let sh = (1.5 * k).max(1.0);
+                painter.text(x + sh, y + sh, VERSION_LABEL, size, color(0, 0, 0, 175));
+                painter.text(x, y, VERSION_LABEL, size, color(245, 248, 255, 220));
             }
         } else {
             self.paint_menu(&mut painter, settings, docked, now, width, height);
@@ -625,7 +641,7 @@ impl Menu {
         painter.rect([0.0, 0.0, width as f32, height as f32], color(0, 0, 0, 120));
         painter.rect([left, top, left + panel_w, top + panel_h], color(16, 20, 40, 238));
         painter.rect([left, top, left + panel_w, top + 3.0 * k], color(250, 200, 80, 255));
-        let title = format!("UprisingNX settings - playing {}", if docked_now { "docked" } else { "handheld" });
+        let title = format!("UprisingNX {} - playing {}", VERSION_LABEL, if docked_now { "docked" } else { "handheld" });
         painter.text(left + margin, top + line * 0.4, &title, 1.0, color(250, 200, 80, 255));
         for (index, row) in ROWS.iter().enumerate() {
             let y = top + line * (1.5 + index as f32);
