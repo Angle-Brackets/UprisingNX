@@ -91,17 +91,47 @@ void unx_memory(unsigned long long *out) {
     out[3] = (unsigned long long)info.arena;
 }
 
+/* Switch TV / panel output resolution, updated via display-resolution change
+ * event (or forced when docking/undocking) so per-frame polls avoid IPC. */
+void unx_display_resolution(unsigned int *out_w, unsigned int *out_h, int force) {
+    static int s_init = 0;
+    static int s_has_event = 0;
+    static Event s_event;
+    static unsigned int s_w = 1280, s_h = 720;
+    bool refresh = !s_init || force != 0;
+    if (!s_init) {
+        s_init = 1;
+        if (R_SUCCEEDED(appletGetDefaultDisplayResolutionChangeEvent(&s_event))) {
+            s_has_event = 1;
+        }
+    } else if (s_has_event && R_SUCCEEDED(eventWait(&s_event, 0))) {
+        refresh = true;
+    }
+    if (refresh) {
+        s32 w = 0, h = 0;
+        if (R_SUCCEEDED(appletGetDefaultDisplayResolution(&w, &h)) && w > 0 && h > 0) {
+            s_w = (unsigned int)w;
+            s_h = (unsigned int)h;
+        } else if (appletGetOperationMode() == AppletOperationMode_Console) {
+            s_w = 1920;
+            s_h = 1080;
+        } else {
+            s_w = 1280;
+            s_h = 720;
+        }
+    }
+    *out_w = s_w;
+    *out_h = s_h;
+}
+
 void unx_thread_role(const char *role, int index) {
-    // the pipeline compilers: a step below every other thread's priority, so
-    // they never take a core from the game or the GPU, free to run on any
-    // core and on core 0 first, which the game's thread leaves idle most of
-    // each frame. at the drawing threads' priority on cores 1 and 2 they
-    // waited seconds for a turn (Horizon does not share a core between
-    // threads of one priority), the scene drawing through the generic
-    // shader all along. UNX_COMPILER_PRIO (hex) overrides the priority.
+    // the pipeline compilers: one step below the drawing/game threads' 0x2C
+    // priority (not 0x32, which lets background workers starve shader compiles
+    // on Horizon's strict fixed-priority scheduler), free to run on any core
+    // and on core 0 first. UNX_COMPILER_PRIO (hex) overrides the priority.
     if (!strcmp(role, "compiler")) {
         const char *p = getenv("UNX_COMPILER_PRIO");
-        int priority = (p && p[0]) ? (int)strtol(p, NULL, 16) : 0x32;
+        int priority = (p && p[0]) ? (int)strtol(p, NULL, 16) : 0x2D;
         svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
         svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 0x7);
         printf("place: compiler %d at priority 0x%X, core 0 first, any core\n", index, priority);

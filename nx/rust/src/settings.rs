@@ -99,6 +99,8 @@ const CONTROLS: [(&str, &str); 9] = [
 pub struct Settings {
     pub handheld: Mode,
     pub docked: Mode,
+    /// active screen area percentage (80..=100) when docked on a TV with overscan
+    pub screen_area: u32,
     /// [controls], as written (key, value)
     pub controls: Vec<(String, String)>,
 }
@@ -109,6 +111,7 @@ impl Default for Settings {
         Settings {
             handheld: Mode { preset: Preset::Performance, custom: custom(false) },
             docked: Mode { preset: Preset::Performance, custom: custom(true) },
+            screen_area: 100,
             controls: vec![
                 ("right_stick_aim".into(), "1".into()),
                 ("gyro_aim".into(), "1".into()),
@@ -164,6 +167,9 @@ impl Settings {
                         "battle_scale" => scale(value).map(|s| mode.custom.battle_scale = s).is_some(),
                         "menu_scale" => scale(value).map(|s| mode.custom.menu_scale = s).is_some(),
                         "smooth" => on_off(&value.to_ascii_lowercase()).map(|s| mode.custom.smooth = s).is_some(),
+                        "screen_area" if section == "docked" => {
+                            value.parse::<u32>().ok().filter(|s| (80..=100).contains(s)).map(|s| settings.screen_area = s).is_some()
+                        }
                         _ => false,
                     }
                 }
@@ -209,7 +215,9 @@ impl Settings {
              #         or custom (the three values below).\n\
              # battle_scale / menu_scale: internal resolution 1-4 in and out of battles.\n\
              # smooth: on or off. On, it still turns itself off for a while when\n\
-             #         the GPU can't keep up.\n",
+             #         the GPU can't keep up.\n\
+             # screen_area: 80-100 (%) in [docked], shrinks the picture inside black\n\
+             #              borders for TVs with overscan.\n",
         );
         for (name, mode) in [("handheld", &self.handheld), ("docked", &self.docked)] {
             let _ = write!(
@@ -220,6 +228,9 @@ impl Settings {
                 mode.custom.menu_scale,
                 if mode.custom.smooth { "on" } else { "off" },
             );
+            if name == "docked" {
+                let _ = writeln!(text, "screen_area = {}", self.screen_area.clamp(80, 100));
+            }
         }
         text.push_str(
             "\n# aim: right_stick_aim / gyro_aim 1 or 0, left_stick_aim 0 (off) / 1 / 2,\n\
@@ -287,15 +298,17 @@ mod tests {
         let mut settings = Settings::default();
         settings.docked.preset = Preset::Custom;
         settings.docked.custom = Video { battle_scale: 2, menu_scale: 3, smooth: false };
+        settings.screen_area = 92;
         settings.controls[1].1 = "0".into();
         assert_eq!(Settings::parse(&settings.to_text()), settings);
     }
 
     #[test]
     fn bad_lines_keep_defaults() {
-        let settings = Settings::parse("[handheld]\npreset = fast\nbattle_scale = 9\n[docked]\npreset = quality # sharp\n");
+        let settings = Settings::parse("[handheld]\npreset = fast\nbattle_scale = 9\n[docked]\npreset = quality # sharp\nscreen_area = 40\n");
         assert_eq!(settings.handheld, Settings::default().handheld);
         assert_eq!(settings.docked.preset, Preset::Quality);
         assert!(!settings.docked.video(true).smooth);
+        assert_eq!(settings.screen_area, 100);
     }
 }

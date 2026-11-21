@@ -382,6 +382,8 @@ pub struct Unx {
     layout: ScreenLayout,
     /// whether the presenter and resolution are currently in docked mode
     docked: bool,
+    /// the presenter swapchain dimensions matching the current docked/display state
+    display_size: (u32, u32),
     /// the hardware's last reported docked state from appletGetOperationMode
     hw_docked: bool,
     /// a docked state forced by cmd.txt `dock 0|1`, cleared when hardware state changes
@@ -577,7 +579,25 @@ extern "C" {
     fn nx_audio_exit();
     fn unx_thread_role(role: *const c_char, index: i32);
     fn unx_memory(out: *mut u64);
+    fn unx_display_resolution(out_w: *mut u32, out_h: *mut u32, force: i32);
     fn appletGetOperationMode() -> u32;
+}
+
+fn query_window_size(docked: bool, hw_docked: bool, force: bool) -> (u32, u32) {
+    if !docked {
+        return (1280, 720);
+    }
+    if !hw_docked {
+        return (1920, 1080);
+    }
+    let (mut w, mut h) = (0u32, 0u32);
+    // SAFETY: valid out-pointers to stack u32s.
+    unsafe { unx_display_resolution(&mut w, &mut h, force as i32) };
+    if w == 0 || h == 0 {
+        (1920, 1080)
+    } else {
+        (w.clamp(640, 1920), h.clamp(360, 1080))
+    }
 }
 
 impl Unx {
@@ -603,9 +623,10 @@ impl Unx {
             && self.layout == ScreenLayout::TopOnly
     }
 
-    /// puts the settings for this mode in place: resolution (unless fixed)
-    /// and smooth mode (unless env.txt decides it)
+    /// puts the settings for this mode in place: resolution (unless fixed),
+    /// smooth mode (unless env.txt decides it), and docked TV safe area
     fn apply_settings(&mut self) {
+        self.presenter.set_safe_area(if self.docked { self.settings.screen_area as f32 / 100.0 } else { 1.0 });
         if self.fixed_resolution.is_none() {
             let target = self.auto_scale();
             self.set_scale(target);
@@ -634,9 +655,19 @@ impl Unx {
         if !self.menu.has_overlay() {
             return Overlay::default();
         }
-        let (width, height) = self.presenter.extent();
+        let (ox, oy, width, height) = self.presenter.safe_rect();
         let now = (self.system.gpu.scale(), self.smooth.on);
-        self.menu.overlay(&self.settings, self.docked, now, width, height)
+        let mut overlay = self.menu.overlay(&self.settings, self.docked, now, width, height);
+        if ox != 0 || oy != 0 {
+            for mesh in &mut overlay.meshes {
+                for v in &mut mesh.vertices {
+                    v.position[0] += ox as f32;
+                    v.position[1] += oy as f32;
+                }
+                mesh.clip = [mesh.clip[0] + ox, mesh.clip[1] + oy, mesh.clip[2] + ox, mesh.clip[3] + oy];
+            }
+        }
+        overlay
     }
 
     /// writes the settings back and says what this mode runs at now
@@ -881,7 +912,9 @@ impl Unx {
         self.docked = docked;
         self.battle_scale_drop = 0;
         self.smooth.scale_drop_failed = false;
-        let (width, height) = if docked { (1920, 1080) } else { (1280, 720) };
+        self.smooth.grace = SMOOTH_GRACE_FRAMES;
+        let (width, height) = query_window_size(docked, self.hw_docked, true);
+        self.display_size = (width, height);
         self.presenter.resize(width, height);
         if let Some(fixed) = self.fixed_resolution {
             self.set_scale(fixed);
@@ -950,7 +983,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     };
 
     let docked = appletGetOperationMode() == 1;
-    let window = if docked { (1920, 1080) } else { (1280, 720) };
+    let window = query_window_size(docked, docked, true);
     let fixed_resolution = std::env::var("ZAKURO_RESOLUTION")
         .ok()
         .and_then(|v| v.parse::<u32>().ok());
@@ -970,6 +1003,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             return std::ptr::null_mut();
         }
     };
+    presenter.set_safe_area(if docked { settings.screen_area as f32 / 100.0 } else { 1.0 });
     log::info!(
         "unx: presenter {} up in {:?} ({} {}x{}, internal {}x)",
         presenter.name(),
@@ -1077,6 +1111,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         in_play: false,
         layout: ScreenLayout::TopOnly,
         docked,
+        display_size: window,
         hw_docked: docked,
         dock_override: None,
         fixed_resolution,
@@ -1496,6 +1531,19 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     let docked = unx.dock_override.unwrap_or(hw_docked);
     if docked != unx.docked {
         unx.apply_docked(docked);
+    } else {
+        let next_size = query_window_size(docked, unx.hw_docked, false);
+        if next_size != unx.display_size {
+            unx.display_size = next_size;
+            unx.presenter.resize(next_size.0, next_size.1);
+            unx.smooth.grace = SMOOTH_GRACE_FRAMES;
+            log::info!(
+                "unx: display resolution changed -> {}x{} (frame {})",
+                next_size.0,
+                next_size.1,
+                unx.frame,
+            );
+        }
     }
 
     let title_boost = !res_battle;
@@ -1557,19 +1605,21 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                     "1" | "docked" | "console" => {
                         unx.dock_override = Some(true);
                         unx.apply_docked(true);
-                        Ok(format!("docked 1920x1080 at {}x", unx.system.gpu.scale()))
+                        Ok(format!("docked {}x{} at {}x", unx.display_size.0, unx.display_size.1, unx.system.gpu.scale()))
                     }
                     "0" | "handheld" => {
                         unx.dock_override = Some(false);
                         unx.apply_docked(false);
-                        Ok(format!("handheld 1280x720 at {}x", unx.system.gpu.scale()))
+                        Ok(format!("handheld {}x{} at {}x", unx.display_size.0, unx.display_size.1, unx.system.gpu.scale()))
                     }
                     "auto" => {
                         unx.dock_override = None;
                         unx.apply_docked(unx.hw_docked);
                         Ok(format!(
-                            "auto ({}) at {}x",
-                            if unx.docked { "docked 1920x1080" } else { "handheld 1280x720" },
+                            "auto ({} {}x{}) at {}x",
+                            if unx.docked { "docked" } else { "handheld" },
+                            unx.display_size.0,
+                            unx.display_size.1,
                             unx.system.gpu.scale(),
                         ))
                     }

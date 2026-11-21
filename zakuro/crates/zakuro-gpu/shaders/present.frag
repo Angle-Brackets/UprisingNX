@@ -53,9 +53,15 @@ vec3 shown(sampler2D image, vec4 area, vec4 bounds) {
         }
         return texture(image, clamp(at, bounds.xy, bounds.zw)).rgb;
     }
-    // each sample is bilinear, so it already averages its four texels
+    // each sample is bilinear, so it already averages its four texels.
+    // a downscale in (1.001, 2.0] must still take at least 2 taps per
+    // downscaled axis, or single bilinear taps miss texel rows and crunch text.
+    vec2 smooth_taps = vec2(
+        covered.x > 1.001 ? clamp(ceil(covered.x * 0.5), 2.0, 4.0) : 1.0,
+        covered.y > 1.001 ? clamp(ceil(covered.y * 0.5), 2.0, 4.0) : 1.0
+    );
     ivec2 taps = (crop.mode == 0)
-        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        ? ivec2(smooth_taps)
         : ivec2(clamp(ceil(covered), 1.0, 4.0));
     if (taps == ivec2(1, 1)) {
         return texture(image, clamp(at, bounds.xy, bounds.zw)).rgb;

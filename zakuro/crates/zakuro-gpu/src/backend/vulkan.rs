@@ -152,6 +152,7 @@ pub struct VulkanPresenter {
     filter: ScreenFilter,
     integer: bool,
     stereo: Stereo,
+    safe_area: f32,
     /// set when the swapchain no longer matches the window.
     stale: bool,
 }
@@ -498,6 +499,7 @@ impl VulkanPresenter {
             filter: ScreenFilter::default(),
             integer: false,
             stereo: Stereo::default(),
+            safe_area: 1.0,
             stale: false,
         };
 
@@ -700,6 +702,20 @@ impl VulkanPresenter {
     /// positions are in
     pub fn extent(&self) -> (u32, u32) {
         (self.extent.width, self.extent.height)
+    }
+
+    /// active safe-area rectangle `(x, y, width, height)` inside `self.extent`,
+    /// centered inside black borders when `safe_area < 1.0` for TVs with overscan.
+    pub fn safe_rect(&self) -> (u32, u32, u32, u32) {
+        let f = self.safe_area.clamp(0.80, 1.0);
+        if (f - 1.0).abs() < 1e-4 || self.extent.width == 0 || self.extent.height == 0 {
+            return (0, 0, self.extent.width, self.extent.height);
+        }
+        let w = (((self.extent.width as f32 * f).round() as u32) & !1).clamp(1, self.extent.width);
+        let h = (((self.extent.height as f32 * f).round() as u32) & !1).clamp(1, self.extent.height);
+        let ox = (self.extent.width - w) / 2;
+        let oy = (self.extent.height - h) / 2;
+        (ox, oy, w, h)
     }
 
     /// whether a present waits for the display, rather than handing the
@@ -905,6 +921,12 @@ impl VulkanPresenter {
                     .clear_values(&clear),
                 vk::SubpassContents::INLINE,
             );
+            let (ox, oy, safe_w, safe_h) = self.safe_rect();
+            let shift = |vp: Viewport| Viewport {
+                x: vp.x + ox as f32,
+                y: vp.y + oy as f32,
+                ..vp
+            };
             if self.arrangement == ScreenLayout::FuseSplitDeck {
                 let srgb = matches!(self.surface_format.format, vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB);
                 let to_clear = |c: f32| {
@@ -916,7 +938,8 @@ impl VulkanPresenter {
                         ((c + 0.055) / 1.055).powf(2.4)
                     }
                 };
-                for (vp, [r, g, b, a]) in fuse_backdrops(self.extent.width, self.extent.height, self.integer) {
+                for (vp, [r, g, b, a]) in fuse_backdrops(safe_w, safe_h, self.integer) {
+                    let vp = shift(vp);
                     let x0 = vp.x.max(0.0) as u32;
                     let y0 = vp.y.max(0.0) as u32;
                     let x1 = (vp.x + vp.width).max(0.0).min(self.extent.width as f32) as u32;
@@ -978,7 +1001,7 @@ impl VulkanPresenter {
                 if let (Some((_, top_area)), Some((_, bot_area)), (Some(stage_vp), _)) = (
                     crop(0, [0.0, 0.0, 1.0, 1.0]),
                     crop(1, [0.0, 0.0, 1.0, 1.0]),
-                    super::layout(self.extent.width, self.extent.height, ScreenLayout::FiendsCauldron, self.top_width, self.integer),
+                    super::layout(safe_w, safe_h, ScreenLayout::FiendsCauldron, self.top_width, self.integer),
                 ) {
                     let (cursor_x, opacity, hud_flags) = self.cauldron_state;
                     let mut constants = [0u8; CAULDRON_CONSTANTS as usize];
@@ -991,7 +1014,7 @@ impl VulkanPresenter {
                     constants[off + 4..off + 8].copy_from_slice(&opacity.to_le_bytes());
                     constants[off + 8..off + 12].copy_from_slice(&hud_flags.to_le_bytes());
                     constants[off + 12..off + 16].copy_from_slice(&self.filter.mode().to_le_bytes());
-                    set_viewport(device, command_buffer, stage_vp, self.extent);
+                    set_viewport(device, command_buffer, shift(stage_vp), self.extent);
                     device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.cauldron_pipeline);
                     device.cmd_bind_descriptor_sets(
                         command_buffer,
@@ -1014,7 +1037,7 @@ impl VulkanPresenter {
                 if let (Some((_, top_area)), Some((_, bot_area)), (Some(stage_vp), _)) = (
                     crop(0, [0.0, 0.0, 1.0, 1.0]),
                     crop(1, [0.0, 0.0, 1.0, 1.0]),
-                    super::layout(self.extent.width, self.extent.height, ScreenLayout::ChapterSelect, self.top_width, self.integer),
+                    super::layout(safe_w, safe_h, ScreenLayout::ChapterSelect, self.top_width, self.integer),
                 ) {
                     let mut constants = [0u8; CHAPTER_CONSTANTS as usize];
                     let mut off = 0usize;
@@ -1024,7 +1047,7 @@ impl VulkanPresenter {
                     }
                     constants[off..off + 4].copy_from_slice(&self.chapter_title_right.to_le_bytes());
                     constants[off + 12..off + 16].copy_from_slice(&self.filter.mode().to_le_bytes());
-                    set_viewport(device, command_buffer, stage_vp, self.extent);
+                    set_viewport(device, command_buffer, shift(stage_vp), self.extent);
                     device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.chapter_pipeline);
                     device.cmd_bind_descriptor_sets(
                         command_buffer,
@@ -1053,7 +1076,7 @@ impl VulkanPresenter {
                 if let (Some((_, top_area)), Some((_, bot_area)), (Some(stage_vp), _)) = (
                     crop(0, [0.0, 0.0, 1.0, 1.0]),
                     crop(1, [0.0, 0.0, 1.0, 1.0]),
-                    super::layout(self.extent.width, self.extent.height, self.arrangement, self.top_width, self.integer),
+                    super::layout(safe_w, safe_h, self.arrangement, self.top_width, self.integer),
                 ) {
                     let kind: i32 = match self.arrangement {
                         ScreenLayout::SoloHub => 1,
@@ -1081,7 +1104,7 @@ impl VulkanPresenter {
                     constants[off + 4..off + 8].copy_from_slice(&pad1.to_le_bytes());
                     constants[off + 8..off + 12].copy_from_slice(&kind.to_le_bytes());
                     constants[off + 12..off + 16].copy_from_slice(&self.filter.mode().to_le_bytes());
-                    set_viewport(device, command_buffer, stage_vp, self.extent);
+                    set_viewport(device, command_buffer, shift(stage_vp), self.extent);
                     device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.hub_pipeline);
                     device.cmd_bind_descriptor_sets(
                         command_buffer,
@@ -1101,7 +1124,7 @@ impl VulkanPresenter {
                     device.cmd_draw(command_buffer, 3, 1, 0, 0);
                 }
             } else {
-                let places = place_slices(self.extent.width, self.extent.height, self.arrangement, self.top_width, self.integer, self.stereo, right);
+                let places = place_slices(safe_w, safe_h, self.arrangement, self.top_width, self.integer, self.stereo, right);
                 for slice in places {
                     let (viewport, shown, uv) = (slice.viewport, slice.shown, slice.uv);
                     let index = match shown {
@@ -1134,7 +1157,7 @@ impl VulkanPresenter {
                     } else {
                         (self.pipeline, self.pipeline_layout, descriptor)
                     };
-                    set_viewport(device, command_buffer, viewport, self.extent);
+                    set_viewport(device, command_buffer, shift(viewport), self.extent);
                     device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
                     device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
                     device.cmd_push_constants(command_buffer, layout, vk::ShaderStageFlags::FRAGMENT, 0, &constants[..off]);
@@ -1342,6 +1365,10 @@ impl Presenter for VulkanPresenter {
 
     fn set_weapon_state(&mut self, sub: u8) {
         self.weapon_sub = sub;
+    }
+
+    fn set_safe_area(&mut self, factor: f32) {
+        self.safe_area = factor.clamp(0.80, 1.0);
     }
 }
 

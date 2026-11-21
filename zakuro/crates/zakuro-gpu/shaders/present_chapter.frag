@@ -42,8 +42,12 @@ vec3 sample_top(vec2 local_uv, vec2 local_duv) {
         }
         return textureLod(sampler2D(top_screen, screen_sampler), clamp(at, crop.top_bounds.xy, crop.top_bounds.zw), 0.0).rgb;
     }
+    vec2 smooth_taps = vec2(
+        covered.x > 1.001 ? clamp(ceil(covered.x * 0.5), 2.0, 4.0) : 1.0,
+        covered.y > 1.001 ? clamp(ceil(covered.y * 0.5), 2.0, 4.0) : 1.0
+    );
     ivec2 taps = (crop.mode == 0)
-        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        ? ivec2(smooth_taps)
         : ivec2(clamp(ceil(covered), 1.0, 4.0));
     if (taps == ivec2(1, 1)) {
         return textureLod(sampler2D(top_screen, screen_sampler), clamp(at, crop.top_bounds.xy, crop.top_bounds.zw), 0.0).rgb;
@@ -74,8 +78,12 @@ vec3 sample_bot(vec2 local_uv, vec2 local_duv) {
         }
         return textureLod(sampler2D(bot_screen, screen_sampler), clamp(at, crop.bot_bounds.xy, crop.bot_bounds.zw), 0.0).rgb;
     }
+    vec2 smooth_taps = vec2(
+        covered.x > 1.001 ? clamp(ceil(covered.x * 0.5), 2.0, 4.0) : 1.0,
+        covered.y > 1.001 ? clamp(ceil(covered.y * 0.5), 2.0, 4.0) : 1.0
+    );
     ivec2 taps = (crop.mode == 0)
-        ? ivec2(clamp(ceil(covered * 0.5), 1.0, 4.0))
+        ? ivec2(smooth_taps)
         : ivec2(clamp(ceil(covered), 1.0, 4.0));
     if (taps == ivec2(1, 1)) {
         return textureLod(sampler2D(bot_screen, screen_sampler), clamp(at, crop.bot_bounds.xy, crop.bot_bounds.zw), 0.0).rgb;

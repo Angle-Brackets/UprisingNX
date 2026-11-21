@@ -658,6 +658,10 @@ pub trait Presenter {
     /// live sub-state for `ScreenLayout::WeaponSelect` (`1` = Weapon List,
     /// `2` = Weapon Category Select, `3` = Gear Hub).
     fn set_weapon_state(&mut self, _sub: u8) {}
+
+    /// fraction (`0.80..=1.0`) of the window/swapchain used for the active
+    /// display area, centering it inside black overscan borders on TVs.
+    fn set_safe_area(&mut self, _factor: f32) {}
 }
 
 #[cfg(test)]
