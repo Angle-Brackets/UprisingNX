@@ -92,12 +92,15 @@ pub fn init() {
         );
         // where it came from, for the file only
         let backtrace = std::backtrace::Backtrace::force_capture().to_string();
-        let mut sink = SINK.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(file) = &mut sink.file {
-            let _ = writeln!(file, "{line}\n{backtrace}");
+        if let Ok(mut sink) = SINK.try_lock().or_else(|e| match e {
+            std::sync::TryLockError::Poisoned(p) => Ok(p.into_inner()),
+            std::sync::TryLockError::WouldBlock => Err(()),
+        }) {
+            if let Some(file) = &mut sink.file {
+                let _ = writeln!(file, "{line}\n{backtrace}");
+            }
+            sink.keep(line);
         }
-        sink.keep(line);
-        drop(sink);
         shown(info);
     }));
 }

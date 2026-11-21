@@ -2111,14 +2111,30 @@ impl Libraries {
             }
             parts = self.made.wait(parts).unwrap_or_else(PoisonError::into_inner);
         }
+        struct InProgress<'a> {
+            libraries: &'a Libraries,
+            part: Part,
+            done: bool,
+        }
+        impl Drop for InProgress<'_> {
+            fn drop(&mut self) {
+                if !self.done {
+                    let mut parts = self.libraries.parts.lock().unwrap_or_else(PoisonError::into_inner);
+                    parts.1.remove(&self.part);
+                    self.libraries.made.notify_all();
+                }
+            }
+        }
         parts.1.insert(part);
         drop(parts);
+        let mut guard = InProgress { libraries: self, part, done: false };
         let made = make();
         let mut parts = lock();
         parts.1.remove(&part);
         if let Ok(library) = made {
             parts.0.insert(part, library);
         }
+        guard.done = true;
         self.made.notify_all();
         made
     }
@@ -7440,9 +7456,14 @@ impl Drop for Hardware {
     fn drop(&mut self) {
         // the compiler first, it uses the cache, the layout and the modules
         let (unclaimed, compiler_dirty) = self.compiler.finish(self.kept_pipelines.as_deref());
-        // SAFETY: waits for the GPU before anything it uses goes
+        let _queue = self.queue_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: queue_lock is held so no other thread submits while waiting for idle
         unsafe {
             let _ = self.device.device_wait_idle();
+        }
+        drop(_queue);
+        // SAFETY: the GPU is idle before anything it uses goes
+        unsafe {
             if self.pipeline_cache_dirty || compiler_dirty {
                 if let Some(path) = &self.kept_pipelines {
                     save_pipeline_cache(&self.device, self.pipeline_cache, path);
@@ -8148,6 +8169,25 @@ mod tests {
             let depth = f32::from_bits(bits);
             assert_eq!(shader(depth), d24_from_float(depth), "{depth:e}");
         }
+    }
+
+    #[test]
+    fn libraries_part_panic_wakes_waiters() {
+        let libraries = Arc::new(Libraries::default());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let libs = libraries.clone();
+        let gate = entered.clone();
+        let panicker = std::thread::spawn(move || {
+            let _ = libs.part(Part::Input(false), true, || {
+                gate.wait();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                panic!("simulated compile panic");
+            });
+        });
+        entered.wait();
+        let got = libraries.part(Part::Input(false), true, || Ok(vk::Pipeline::null()));
+        assert_eq!(got, Ok(vk::Pipeline::null()));
+        assert!(panicker.join().is_err());
     }
 }
 

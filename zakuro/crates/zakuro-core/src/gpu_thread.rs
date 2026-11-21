@@ -378,8 +378,12 @@ impl Drop for GpuCell {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
             self.wait_idle();
+            // Hold `queue` while setting `quit` and notifying so `work()` cannot
+            // observe `quit == false` and then enter `wake.wait()` after our notify.
+            let _queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
             self.shared.quit.store(true, Ordering::Release);
             self.shared.wake.notify_all();
+            drop(_queue);
             let _ = worker.join();
         }
     }
@@ -421,5 +425,18 @@ fn work(shared: &Shared) {
             shared.pending.fetch_sub(1, Ordering::AcqRel);
         }
         shared.idle_changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_does_not_lose_wakeup() {
+        for _ in 0..64 {
+            let cell = GpuCell::new(Gpu::new(), true);
+            drop(cell);
+        }
     }
 }

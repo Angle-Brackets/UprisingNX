@@ -78,12 +78,36 @@ pub struct Server {
     seats: Arc<Mutex<Seats>>,
 }
 
+struct Peer {
+    stream: TcpStream,
+    write: Mutex<()>,
+}
+
+impl Peer {
+    fn send(&self, message: &FromRoom) -> std::io::Result<()> {
+        let Ok(_guard) = self.write.lock() else {
+            return Err(std::io::Error::other("room peer write lock poisoned"));
+        };
+        write(&mut &self.stream, message)
+    }
+
+    fn shutdown(&self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
+fn send_all(peers: &[Arc<Peer>], message: &FromRoom) {
+    for peer in peers {
+        let _ = peer.send(message);
+    }
+}
+
 struct Seats {
     name: String,
     password: String,
     most: usize,
-    /// the members, and the stream each is written to through.
-    taken: Vec<(Member, Arc<Mutex<TcpStream>>)>,
+    /// the members, and the peer socket each is written to through.
+    taken: Vec<(Member, Arc<Peer>)>,
     /// the last part of the next MAC address handed out.
     next: u32,
 }
@@ -93,14 +117,17 @@ impl Seats {
         self.taken.iter().map(|(member, _)| member.clone()).collect()
     }
 
-    /// tells everyone who is in the room.
-    fn announce(&self) {
+    /// snapshots the current member list and peer handles so network writes happen
+    /// outside the `seats` mutex.
+    fn announcement(&self, exclude: Option<Mac>) -> (FromRoom, Vec<Arc<Peer>>) {
         let members = FromRoom::Members(self.members());
-        for (_, stream) in &self.taken {
-            if let Ok(mut stream) = stream.lock() {
-                let _ = write(&mut *stream, &members);
-            }
-        }
+        let peers = self
+            .taken
+            .iter()
+            .filter(|(member, _)| exclude.is_none_or(|mac| member.mac != mac))
+            .map(|(_, peer)| peer.clone())
+            .collect();
+        (members, peers)
     }
 }
 
@@ -152,12 +179,13 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Ok(seats) = self.seats.lock() {
-            for (_, stream) in &seats.taken {
-                if let Ok(stream) = stream.lock() {
-                    let _ = stream.shutdown(Shutdown::Both);
-                }
-            }
+        let peers: Vec<Arc<Peer>> = self
+            .seats
+            .lock()
+            .map(|seats| seats.taken.iter().map(|(_, peer)| peer.clone()).collect())
+            .unwrap_or_default();
+        for peer in peers {
+            peer.shutdown();
         }
     }
 }
@@ -169,66 +197,101 @@ fn seat(mut stream: TcpStream, address: String, seats: &Mutex<Seats>, stop: &Ato
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(PATIENCE));
+    let _ = stream.set_write_timeout(Some(PATIENCE));
     let Ok(ToRoom::Hello { version, nickname, password }) = read(&mut stream) else { return };
     let _ = stream.set_read_timeout(None);
     let Ok(writer) = stream.try_clone() else { return };
-    let writer = Arc::new(Mutex::new(writer));
+    let peer = Arc::new(Peer { stream: writer, write: Mutex::new(()) });
     let mac = {
-        let Ok(mut room) = seats.lock() else { return };
-        let refusal = if version != VERSION {
-            Some("the room is for another version of Zakuro".to_owned())
-        } else if !room.password.is_empty() && password != room.password {
-            Some("the password is wrong".to_owned())
-        } else if room.taken.len() >= room.most {
-            Some("the room is full".to_owned())
-        } else if room.taken.iter().any(|(member, _)| member.nickname == nickname) {
-            Some("someone in the room has that nickname".to_owned())
-        } else {
-            None
+        // Hold this brand-new peer's write lock before adding it to `seats` so
+        // `Welcome` and the initial `Members` list always arrive before any
+        // relayed packet, without ever performing socket I/O under `seats`.
+        let Ok(first_write) = peer.write.lock() else { return };
+        let joined = {
+            let Ok(mut room) = seats.lock() else { return };
+            let refusal = if version != VERSION {
+                Some("the room is for another version of Zakuro".to_owned())
+            } else if !room.password.is_empty() && password != room.password {
+                Some("the password is wrong".to_owned())
+            } else if room.taken.len() >= room.most {
+                Some("the room is full".to_owned())
+            } else if room.taken.iter().any(|(member, _)| member.nickname == nickname) {
+                Some("someone in the room has that nickname".to_owned())
+            } else {
+                None
+            };
+            if let Some(reason) = refusal {
+                Err(reason)
+            } else {
+                // locally administered addresses, Z and K, then the member's number
+                let number = room.next;
+                room.next += 1;
+                let mac = [0x02, 0x5A, 0x4B, (number >> 16) as u8, (number >> 8) as u8, number as u8];
+                let welcome = FromRoom::Welcome { mac, name: room.name.clone() };
+                room.taken.push((Member { nickname: nickname.clone(), mac, game: String::new() }, peer.clone()));
+                let (members_msg, other_peers) = room.announcement(Some(mac));
+                Ok((mac, welcome, members_msg, other_peers))
+            }
         };
-        if let Some(reason) = refusal {
-            let _ = write(&mut stream, &FromRoom::Refused(reason));
+        let (mac, welcome, members_msg, other_peers) = match joined {
+            Ok(joined) => joined,
+            Err(reason) => {
+                drop(first_write);
+                let _ = write(&mut stream, &FromRoom::Refused(reason));
+                return;
+            }
+        };
+        if write(&mut &peer.stream, &welcome).is_err() {
+            drop(first_write);
+            let removed = seats.lock().ok().map(|mut room| {
+                room.taken.retain(|(member, _)| member.mac != mac);
+                room.announcement(None)
+            });
+            if let Some((members_msg, peers)) = removed {
+                send_all(&peers, &members_msg);
+            }
             return;
         }
-        // locally administered addresses, Z and K, then the member's number
-        let number = room.next;
-        room.next += 1;
-        let mac = [0x02, 0x5A, 0x4B, (number >> 16) as u8, (number >> 8) as u8, number as u8];
-        let welcome = FromRoom::Welcome { mac, name: room.name.clone() };
-        if write(&mut stream, &welcome).is_err() {
-            return;
-        }
-        room.taken.push((Member { nickname: nickname.clone(), mac, game: String::new() }, writer));
-        room.announce();
+        let _ = write(&mut &peer.stream, &members_msg);
+        drop(first_write);
+        send_all(&other_peers, &members_msg);
         mac
     };
     log::info!("{nickname} joined the room from {address}");
     while !stop.load(Ordering::Relaxed) {
         let Ok(message) = read::<ToRoom>(&mut stream) else { break };
-        let Ok(mut room) = seats.lock() else { break };
-        match message {
-            ToRoom::Packet { to, body } => {
-                let packet = FromRoom::Packet { from: mac, body };
-                for (member, stream) in &room.taken {
-                    if member.mac != mac && (to == BROADCAST || member.mac == to) {
-                        if let Ok(mut stream) = stream.lock() {
-                            let _ = write(&mut *stream, &packet);
-                        }
+        let outgoing = {
+            let Ok(mut room) = seats.lock() else { break };
+            match message {
+                ToRoom::Packet { to, body } => {
+                    let packet = FromRoom::Packet { from: mac, body };
+                    let targets: Vec<Arc<Peer>> = room
+                        .taken
+                        .iter()
+                        .filter(|(member, _)| member.mac != mac && (to == BROADCAST || member.mac == to))
+                        .map(|(_, peer)| peer.clone())
+                        .collect();
+                    Some((packet, targets))
+                }
+                ToRoom::Playing(game) => {
+                    if let Some((member, _)) = room.taken.iter_mut().find(|(member, _)| member.mac == mac) {
+                        member.game = game;
                     }
+                    Some(room.announcement(None))
                 }
+                ToRoom::Hello { .. } => None,
             }
-            ToRoom::Playing(game) => {
-                if let Some((member, _)) = room.taken.iter_mut().find(|(member, _)| member.mac == mac) {
-                    member.game = game;
-                }
-                room.announce();
-            }
-            ToRoom::Hello { .. } => {}
+        };
+        if let Some((message, targets)) = outgoing {
+            send_all(&targets, &message);
         }
     }
-    if let Ok(mut room) = seats.lock() {
+    let left = seats.lock().ok().map(|mut room| {
         room.taken.retain(|(member, _)| member.mac != mac);
-        room.announce();
+        room.announcement(None)
+    });
+    if let Some((members_msg, peers)) = left {
+        send_all(&peers, &members_msg);
     }
     log::info!("{nickname} left the room");
 }

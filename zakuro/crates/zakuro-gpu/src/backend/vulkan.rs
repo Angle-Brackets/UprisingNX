@@ -1374,8 +1374,13 @@ impl Presenter for VulkanPresenter {
 
 impl Drop for VulkanPresenter {
     fn drop(&mut self) {
+        let queue_lock = self.shared.as_ref().map(|shared| shared.queue_lock.clone());
+        let _queue = queue_lock.as_ref().map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         unsafe {
             let _ = self.device.device_wait_idle();
+        }
+        drop(_queue);
+        unsafe {
             for screen in std::mem::replace(&mut self.screens, [Screen::null(), Screen::null(), Screen::null()]) {
                 screen.destroy(&self.device, self.descriptor_pool);
             }

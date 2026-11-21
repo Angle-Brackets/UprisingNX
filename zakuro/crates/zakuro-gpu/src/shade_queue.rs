@@ -17,7 +17,7 @@ fn queue() -> &'static Queue {
     static QUEUE: OnceLock<&'static Queue> = OnceLock::new();
     QUEUE.get_or_init(|| {
         let queue: &'static Queue = Box::leak(Box::new(Queue { jobs: Mutex::new(VecDeque::new()), wake: Condvar::new() }));
-        let helpers = std::env::var("ZAKURO_SHADE_HELPERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+        let helpers = std::env::var("ZAKURO_SHADE_HELPERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
         for index in 0..helpers {
             std::thread::Builder::new()
                 .name(format!("shade helper {index}"))

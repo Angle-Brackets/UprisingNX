@@ -828,11 +828,16 @@ impl<T> Spin<T> {
         use std::sync::atomic::Ordering::{Acquire, Relaxed};
         let mut spins = 0u32;
         while self.locked.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
-            spins += 1;
+            spins = spins.saturating_add(1);
             if spins < 2000 {
                 std::hint::spin_loop();
-            } else {
+            } else if spins < 2016 {
                 std::thread::yield_now();
+            } else {
+                // On fixed-priority schedulers (Horizon), yield_now() / svcSleepThread(0)
+                // never yields to a lower-priority holder on the same core; a short timed
+                // sleep deschedules the waiter so the holder can run and unlock.
+                std::thread::sleep(std::time::Duration::from_micros(50));
             }
         }
         SpinGuard(self)
