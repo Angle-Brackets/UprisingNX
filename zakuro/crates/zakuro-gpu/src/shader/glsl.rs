@@ -60,27 +60,6 @@ impl ShaderUnit {
     }
 }
 
-/// whether translated shaders and fragment shaders use fast native GPU math
-/// (native `dot`/`*`/`+`/`min`/`max` + FFMA fusion) instead of strict per-lane
-/// `0 * Inf = 0` / `NoContraction` emulation. Default on for Horizon (Switch)
-/// unless `ZAKURO_STRICT_SHADERS=1`; default off on desktop/tests unless
-/// `ZAKURO_FAST_SHADERS=1`.
-pub(crate) fn fast_math() -> bool {
-    if cfg!(test) {
-        return false;
-    }
-    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FAST.get_or_init(|| {
-        if std::env::var_os("ZAKURO_STRICT_SHADERS").is_some() {
-            false
-        } else if std::env::var_os("ZAKURO_FAST_SHADERS").is_some() {
-            true
-        } else {
-            cfg!(target_os = "horizon")
-        }
-    })
-}
-
 /// a program from an entry point as a GLSL vertex shader with shade.vert's
 /// interface, its outputs going where semantics says, the output register
 /// times four plus the component for each, or MISSING or ZERO as
@@ -1099,44 +1078,33 @@ impl Translator<'_> {
             let value = self.operand(source);
             let _ = writeln!(out, "{indent}    vec4 {name} = {value};");
         }
-        let fast = fast_math();
         let result = match op.opcode {
             Add => "a + b".to_owned(),
-            Dp3 => if fast { "vec4(dot(a.xyz, b.xyz))" } else { "vec4(dot3(a, b))" }.to_owned(),
-            Dp4 => if fast { "vec4(dot(a, b))" } else { "vec4(dot4(a, b))" }.to_owned(),
+            Dp3 => "vec4(dot3(a, b))".to_owned(),
+            Dp4 => "vec4(dot4(a, b))".to_owned(),
             // the first source's w taken as one
-            Dph | DphI => if fast { "vec4(dot(a.xyz, b.xyz) + b.w)" } else { "vec4(dot3(a, b) + b.w)" }.to_owned(),
-            Dst | DstI => if fast { "vec4(1.0, a.y * b.y, a.z, b.w)" } else { "vec4(1.0, multiply(a.y, b.y), a.z, b.w)" }.to_owned(),
+            Dph | DphI => "vec4(dot3(a, b) + b.w)".to_owned(),
+            Dst | DstI => "vec4(1.0, multiply(a.y, b.y), a.z, b.w)".to_owned(),
             Ex2 => "vec4(exp2(a.x))".to_owned(),
             Lg2 => "vec4(log2(a.x))".to_owned(),
             LitP => {
                 let _ = writeln!(out, "{indent}    condition = bvec2(a.x >= 0.0, a.w >= 0.0);");
                 "vec4(max(a.x, 0.0), clamp(a.y, -127.9961, 127.9961), 0.0, max(a.w, 0.0))".to_owned()
             }
-            Mul => if fast { "a * b" } else { "multiply4(a, b)" }.to_owned(),
+            Mul => "multiply4(a, b)".to_owned(),
             Sge | SgeI => "vec4(greaterThanEqual(a, b))".to_owned(),
             Slt | SltI => "vec4(lessThan(a, b))".to_owned(),
             Flr => "floor(a)".to_owned(),
             // NaN behaving as on hardware, max(0, NaN) is NaN but
             // max(NaN, 0) is 0
-            Max => if fast {
-                "max(a, b)"
-            } else {
-                "vec4(a.x > b.x ? a.x : b.x, a.y > b.y ? a.y : b.y, a.z > b.z ? a.z : b.z, a.w > b.w ? a.w : b.w)"
-            }
-            .to_owned(),
-            Min => if fast {
-                "min(a, b)"
-            } else {
-                "vec4(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y, a.z < b.z ? a.z : b.z, a.w < b.w ? a.w : b.w)"
-            }
-            .to_owned(),
+            Max => "vec4(a.x > b.x ? a.x : b.x, a.y > b.y ? a.y : b.y, a.z > b.z ? a.z : b.z, a.w > b.w ? a.w : b.w)"
+                .to_owned(),
+            Min => "vec4(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y, a.z < b.z ? a.z : b.z, a.w < b.w ? a.w : b.w)"
+                .to_owned(),
             Rcp => "vec4(1.0 / a.x)".to_owned(),
-            // In fast mode, guard rsq(0) -> 0 so zero-length normal normalization
-            // doesn't produce Inf * 0 = NaN without per-mul isnan checks.
-            Rsq => if fast { "vec4(a.x > 0.0 ? inversesqrt(a.x) : 0.0)" } else { "vec4(inversesqrt(a.x))" }.to_owned(),
+            Rsq => "vec4(1.0 / sqrt(a.x))".to_owned(),
             Mov => "a".to_owned(),
-            Mad | MadI => if fast { "a * b + c" } else { "multiply4(a, b) + c" }.to_owned(),
+            Mad | MadI => "multiply4(a, b) + c".to_owned(),
             Mova => {
                 if op.mask & 0b1000 != 0 {
                     let _ = writeln!(out, "{indent}    address.x = to_int(a.x);");

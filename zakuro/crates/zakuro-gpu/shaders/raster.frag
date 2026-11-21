@@ -1,13 +1,5 @@
 #version 450
 
-// FAST_MATH drops `precise` (NoContraction) so Maxwell GM20B can fuse a*b+c
-// into single-cycle FFMA instructions across lighting, TEV combiners, and fog.
-#ifdef FAST_MATH
-#define PRECISE
-#else
-#define PRECISE precise
-#endif
-
 // the PICA200's fragment stages for one draw, the texture units, fragment
 // lighting and the six combiners, then the alpha test. they follow the
 // software rasterizer, which follows the hardware.
@@ -165,7 +157,7 @@ vec4 sample_unit(uint unit, vec2 uv) {
     // still interpolate a hair apart from one shader to another
     // a unit reading a surface's own image (units[unit].z) has its rows
     // bottom first already, as the PICA's
-    PRECISE vec2 st = vec2(uv.x, units[unit].z != 0u ? uv.y : 1.0 - uv.y);
+    precise vec2 st = vec2(uv.x, units[unit].z != 0u ? uv.y : 1.0 - uv.y);
     // sampled before the border is decided on for each fragment, so that a
     // texture pack's picture picks which of its sizes to draw with from all
     // of a fragment's neighbours
@@ -179,19 +171,16 @@ vec4 sample_unit(uint unit, vec2 uv) {
     }
     bool border_s = (wrap_s & 3u) == 1u && (st.x < 0.0 || st.x >= 1.0);
     bool border_t = (wrap_t & 3u) == 1u && (st.y < 0.0 || st.y >= 1.0);
-    if (border_s || border_t) {
-        return unpack_color(units[unit].y);
-    }
-    return sampled;
+    return border_s || border_t ? unpack_color(units[unit].y) : sampled;
 }
 
-PRECISE float lookup(uint table, uint entry, float delta) {
+precise float lookup(uint table, uint entry, float delta) {
     vec2 value = tables[table * 256u + entry];
     return value.x + value.y * delta;
 }
 
 // a procedural texture map read at a coordinate from 0 to 1
-PRECISE float proctex_lookup(uint map, float coordinate) {
+precise float proctex_lookup(uint map, float coordinate) {
     float at = coordinate * 128.0;
     uint entry = min(uint(max(at, 0.0)), 127u);
     vec2 value = tables[PROCTEX_MAPS + map * 128u + entry];
@@ -229,7 +218,7 @@ float proctex_shift(float other, uint mode, uint clamping) {
     return 0.0;
 }
 
-PRECISE float proctex_clamp(float c, uint mode) {
+precise float proctex_clamp(float c, uint mode) {
     switch (mode) {
         case 0u: return c > 1.0 ? 0.0 : c;
         case 1u: return min(c, 1.0);
@@ -244,7 +233,8 @@ PRECISE float proctex_clamp(float c, uint mode) {
     }
 }
 
-PRECISE float proctex_combine(float u, float v, uint function) {
+precise float proctex_combine(float u, float v, uint function) {
+    float len = sqrt(u * u + v * v);
     switch (function) {
         case 0u: return u;
         case 1u: return u * u;
@@ -252,17 +242,17 @@ PRECISE float proctex_combine(float u, float v, uint function) {
         case 3u: return v * v;
         case 4u: return (u + v) * 0.5;
         case 5u: return (u * u + v * v) * 0.5;
-        case 6u: return min(sqrt(u * u + v * v), 1.0);
+        case 6u: return min(len, 1.0);
         case 7u: return min(u, v);
         case 8u: return max(u, v);
-        case 9u: return min(((u + v) * 0.5 + sqrt(u * u + v * v)) * 0.5, 1.0);
+        case 9u: return min(((u + v) * 0.5 + len) * 0.5, 1.0);
         default: return 0.0;
     }
 }
 
 // texture 3, made up from its coordinates, as the software rasterizer has
 // it. precise as the combiners are, as is lighting
-PRECISE vec4 procedural(vec2 uv) {
+precise vec4 procedural(vec2 uv) {
     uint config = proctex[0].x;
     uvec2 clamps = uvec2(config & 7u, (config >> 3) & 7u);
     float u = abs(uv.x);
@@ -311,12 +301,12 @@ PRECISE vec4 procedural(vec2 uv) {
     return color;
 }
 
-PRECISE vec3 rotate(vec4 q, vec3 v) {
+precise vec3 rotate(vec4 q, vec3 v) {
     vec3 inner = cross(q.xyz, v);
     return v + 2.0 * cross(q.xyz, inner + v * q.w);
 }
 
-PRECISE float quantize(float c) {
+precise float quantize(float c) {
     return floor(clamp(c, 0.0, 1.0) * 255.0) / 255.0;
 }
 
@@ -343,7 +333,7 @@ bool light_bit(uint bit, uint dynamic_value) {
 // one lighting table's value for a light, 1 for a table not read
 float table_value(
     uint i, uint flags, uint number, uint config, bool two_sided,
-    vec3 normal, vec3 half_unit, vec3 norm_view, vec3 light_vector, float ln, vec3 spot_direction, vec3 tangent
+    vec3 normal, vec3 half_unit, vec3 norm_view, vec3 light_vector, vec3 spot_direction, vec3 tangent
 ) {
     if (!table_read(i) || (i == 6u && (flags & 32u) == 0u)) {
         return 1.0;
@@ -353,7 +343,7 @@ float table_value(
         case 0u: result = dot(normal, half_unit); break;
         case 1u: result = dot(norm_view, half_unit); break;
         case 2u: result = dot(normal, norm_view); break;
-        case 3u: result = ln; break;
+        case 3u: result = dot(light_vector, normal); break;
         case 4u: result = dot(light_vector, spot_direction); break;
         case 5u:
             if (config == 8u) {
@@ -389,8 +379,8 @@ float table_value(
 // what fragment lighting leaves in the primary and secondary colors
 void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     uint config = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 19) & 0xFu : light_config.x;
-    float q_len2 = dot(in_quaternion, in_quaternion);
-    vec4 q = q_len2 > 0.0 ? in_quaternion * inversesqrt(q_len2) : vec4(0.0, 0.0, 0.0, 1.0);
+    float length_q = length(in_quaternion);
+    vec4 q = length_q > 0.0 ? in_quaternion / length_q : vec4(0.0, 0.0, 0.0, 1.0);
 
     uint shadow_word = light_config.w;
     vec4 shadow = vec4(1.0);
@@ -402,27 +392,19 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
         }
     }
 
+    vec3 surface_normal = vec3(0.0, 0.0, 1.0);
     vec3 surface_tangent = vec3(1.0, 0.0, 0.0);
     uint bump = light_config.z;
     uint bump_mode = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 25) & 3u : bump & 3u;
-    vec3 normal;
     if (bump_mode == 1u) {
-        vec3 surface_normal = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
+        surface_normal = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
         if ((bump & 0x100u) != 0u) {
             surface_normal.z = sqrt(max(1.0 - dot(surface_normal.xy, surface_normal.xy), 0.0));
         }
-        normal = rotate(q, surface_normal);
-    } else {
-        if (bump_mode == 2u) {
-            surface_tangent = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
-        }
-        // exact algebraic form of rotate(q, vec3(0.0, 0.0, 1.0))
-        normal = vec3(
-            2.0 * (q.y * q.w + q.z * q.x),
-            2.0 * (q.z * q.y - q.x * q.w),
-            1.0 - 2.0 * (q.x * q.x + q.y * q.y)
-        );
+    } else if (bump_mode == 2u) {
+        surface_tangent = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
     }
+    vec3 normal = rotate(q, surface_normal);
     vec3 tangent = config == 8u ? rotate(q, surface_tangent) : surface_tangent;
     bool needs_half = light_bit(23u, light_flags.w & 1u);
     bool needs_view = light_bit(24u, light_flags.w & 2u);
@@ -432,25 +414,15 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     vec3 view = in_view;
     vec3 norm_view = needs_view ? normalize(view) : vec3(0.0);
 
-    PRECISE vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
-    PRECISE vec4 specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
+    precise vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
+    precise vec4 specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
     uint count = LIGHT_CONSTANT ? (LIGHT_SHAPE >> 1) & 0xFu : light_config.y;
     for (uint slot = 0u; slot < count; slot++) {
         Light light = lights[slot];
         uint flags = light.flags.x;
         uint number = light.flags.y;
         bool two_sided = (flags & 2u) != 0u;
-        vec3 light_vector;
-        float dist_len = 0.0;
-        if ((flags & 1u) != 0u) {
-            light_vector = light.direction.xyz;
-        } else {
-            vec3 to_light = light.position.xyz + view;
-            float d2 = dot(to_light, to_light);
-            float inv_d = inversesqrt(d2);
-            light_vector = to_light * inv_d;
-            dist_len = d2 * inv_d;
-        }
+        vec3 light_vector = (flags & 1u) != 0u ? light.direction.xyz : normalize(light.position.xyz + view);
         vec3 half_vector = vec3(0.0);
         vec3 half_unit = vec3(0.0);
         if (needs_half) {
@@ -460,40 +432,42 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
 
         float distance = 1.0;
         if ((flags & 16u) != 0u) {
-            float d = (flags & 1u) != 0u ? length(-view - light.position.xyz) : dist_len;
-            float place = clamp(light.distance.y * d + light.distance.x, 0.0, 1.0);
+            vec3 offset = -view - light.position.xyz;
+            float place = clamp(light.distance.y * length(offset) + light.distance.x, 0.0, 1.0);
             float entry = clamp(floor(place * 256.0), 0.0, 255.0);
             distance = lookup(DISTANCE + number, uint(entry), place * 256.0 - entry);
         }
 
-        float ln = dot(light_vector, normal);
-
         // each table by its own number, so a pipeline with the lighting's
         // constants drops the ones it does not read, and no array of the
         // values is indexed as the loop goes, which put it in memory
-        float v0 = table_value(0u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
-        float v1 = table_value(1u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
-        float v3 = table_value(3u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
-        float v4 = table_value(4u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
-        float v5 = table_value(5u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
-        float spot = table_value(6u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
+        float values[7];
+        values[0] = table_value(0u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[1] = table_value(1u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[2] = table_value(2u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[3] = table_value(3u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[4] = table_value(4u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[5] = table_value(5u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
+        values[6] = table_value(6u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, light.spot.xyz, tangent);
 
-        vec3 reflect_color = vec3(v3, table_read(4u) ? v4 : v3, table_read(5u) ? v5 : v3);
-        vec3 specular0 = light.specular0.rgb * v0;
-        vec3 specular1 = v1 * reflect_color * light.specular1.rgb;
+        float spot = values[6];
+        float red = values[3];
+        vec3 reflect_color = vec3(red, table_read(4u) ? values[4] : red, table_read(5u) ? values[5] : red);
+        vec3 specular0 = light.specular0.rgb * values[0];
+        vec3 specular1 = values[1] * reflect_color * light.specular1.rgb;
 
         // only the last light applies fresnel
-        if (slot == count - 1u && table_read(2u) && (fresnel_primary || fresnel_secondary)) {
-            float fresnel = table_value(2u, flags, number, config, two_sided, normal, half_unit, norm_view, light_vector, ln, light.spot.xyz, tangent);
+        if (slot == count - 1u && table_read(2u)) {
             if (fresnel_primary) {
-                diffuse_sum.a = fresnel;
+                diffuse_sum.a = values[2];
             }
             if (fresnel_secondary) {
-                specular_sum.a = fresnel;
+                specular_sum.a = values[2];
             }
         }
 
-        float facing = two_sided ? abs(ln) : max(ln, 0.0);
+        float facing = dot(light_vector, normal);
+        facing = two_sided ? abs(facing) : max(facing, 0.0);
         float highlights = clamp_highlights && facing == 0.0 ? 0.0 : 1.0;
         if ((flags & 12u) != 0u) {
             float length2 = dot(half_vector, half_vector);
@@ -528,7 +502,7 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     specular_out = vec4(quantize(specular_sum.r), quantize(specular_sum.g), quantize(specular_sum.b), quantize(specular_sum.a));
 }
 
-PRECISE vec3 color_operand(vec4 s, uint operand) {
+precise vec3 color_operand(vec4 s, uint operand) {
     switch (operand) {
         case 0x1u: return vec3(1.0) - s.rgb;
         case 0x2u: return vec3(s.a);
@@ -543,7 +517,7 @@ PRECISE vec3 color_operand(vec4 s, uint operand) {
     }
 }
 
-PRECISE float alpha_operand(vec4 s, uint operand) {
+precise float alpha_operand(vec4 s, uint operand) {
     switch (operand) {
         case 0x0u: return s.a;
         case 0x1u: return 1.0 - s.a;
@@ -560,7 +534,7 @@ PRECISE float alpha_operand(vec4 s, uint operand) {
 // into an add, which it would do one way where it knows the operation and
 // another where the generic shader does not, rounding differently
 vec3 combine_rgb(uint op, vec3 a, vec3 b, vec3 c) {
-    PRECISE vec3 result;
+    precise vec3 result;
     switch (op) {
         case 0u: result = a; break;
         case 1u: result = a * b; break;
@@ -582,7 +556,7 @@ vec3 combine_rgb(uint op, vec3 a, vec3 b, vec3 c) {
 }
 
 float combine_alpha(uint op, float a, float b, float c) {
-    PRECISE float result;
+    precise float result;
     switch (op) {
         case 0u: result = a; break;
         case 1u: result = a * b; break;
@@ -678,7 +652,7 @@ void combine_stage(
                 alpha_operand(alpha_in[1], (operand >> 16) & 0x7u),
                 alpha_operand(alpha_in[2], (operand >> 20) & 0x7u)
             );
-        PRECISE vec4 scaled = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
+        precise vec4 scaled = clamp(vec4(rgb * scale_factor(scale), alpha * scale_factor(scale >> 16)), 0.0, 1.0);
         previous = scaled;
     }
 
@@ -703,7 +677,7 @@ float fragment_depth() {
         return gl_FragCoord.z;
     }
 #endif
-    PRECISE float depth = in_depth;
+    precise float depth = in_depth;
     if ((depth_mode & 2u) != 0u) {
         depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);
     }
@@ -763,7 +737,7 @@ void main() {
     // precise, as everything from the operands on is, or where the driver
     // knows the operands it works 1 - a times 255 out as 255 - 255a, which
     // rounds to the other side of a byte
-    PRECISE vec4 color = floor(previous * 255.0);
+    precise vec4 color = floor(previous * 255.0);
     uint alpha_test = DYNAMIC != 0u ? misc.z & 0x71u : ALPHA_TEST;
     if ((alpha_test & 1u) != 0u && !compare((alpha_test >> 4) & 7u, color.a, float((misc.z >> 8) & 0xFFu))) {
         discard;
@@ -773,14 +747,14 @@ void main() {
     // before. 5 turns it on, 7 is gas
     if ((misc.x & 7u) == 5u) {
         float depth = fragment_depth();
-        PRECISE float index = ((misc.x & 0x10000u) != 0u ? 1.0 - depth : depth) * 128.0;
-        PRECISE float entry = clamp(floor(index), 0.0, 127.0);
+        precise float index = ((misc.x & 0x10000u) != 0u ? 1.0 - depth : depth) * 128.0;
+        precise float entry = clamp(floor(index), 0.0, 127.0);
         vec2 lookup = tables[FOG_TABLE + uint(entry)];
-        PRECISE float factor = clamp(lookup.x + lookup.y * (index - entry), 0.0, 1.0);
+        precise float factor = clamp(lookup.x + lookup.y * (index - entry), 0.0, 1.0);
         vec3 fog_color = vec3(fog.x & 0xFFu, (fog.x >> 8) & 0xFFu, (fog.x >> 16) & 0xFFu);
         color.rgb = floor(factor * color.rgb + (1.0 - factor) * fog_color);
     }
-    PRECISE vec4 written = color / 255.0;
+    precise vec4 written = color / 255.0;
     out_color = written;
 
 #ifdef WRITES_DEPTH

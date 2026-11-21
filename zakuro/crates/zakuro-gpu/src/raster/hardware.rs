@@ -45,10 +45,6 @@ const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/raster.frag.spv");
 /// raster.frag built with WRITES_DEPTH, for the draws whose depth the
 /// rasterizer can't work out.
 const FRAGMENT_DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/raster_depth.frag.spv");
-/// FAST_MATH builds of raster.frag (no `precise` / NoContraction) so Maxwell
-/// GM20B can fuse a*b+c into single-cycle FFMA instructions on Switch.
-const FRAGMENT_FAST_SPIRV: &[u8] = include_bytes!("../../shaders/raster_fast.frag.spv");
-const FRAGMENT_DEPTH_FAST_SPIRV: &[u8] = include_bytes!("../../shaders/raster_depth_fast.frag.spv");
 const TRANSFER_SPIRV: &[u8] = include_bytes!("../../shaders/transfer.comp.spv");
 const DEPTH_SPIRV: &[u8] = include_bytes!("../../shaders/depth.comp.spv");
 const UPRIGHT_SPIRV: &[u8] = include_bytes!("../../shaders/upright.comp.spv");
@@ -2578,10 +2574,9 @@ impl Hardware {
                     .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
                     .map_err(vk_error("create a shader module"))
             };
-            let fast_shaders = glsl::fast_math();
             let vertex_shader = module(VERTEX_SPIRV)?;
-            let fragment_shader = module(if fast_shaders { FRAGMENT_FAST_SPIRV } else { FRAGMENT_SPIRV })?;
-            let depth_fragment_shader = module(if fast_shaders { FRAGMENT_DEPTH_FAST_SPIRV } else { FRAGMENT_DEPTH_SPIRV })?;
+            let fragment_shader = module(FRAGMENT_SPIRV)?;
+            let depth_fragment_shader = module(FRAGMENT_DEPTH_SPIRV)?;
             let shade_shader = module(SHADE_SPIRV)?;
 
             let unmade = || Buffer {
