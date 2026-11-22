@@ -7105,10 +7105,48 @@ impl Hardware {
     /// waits for the oldest batch in flight and frees what it used.
     fn retire_oldest(&mut self) -> Result<(), String> {
         let Some(mut frame) = self.in_flight.pop_front() else { return Ok(()) };
+        // On Horizon, wait in 500 ms slices rather than u64::MAX so a stalled
+        // NVK fence logs diagnostics and bails out after 10 s instead of
+        // freezing the console permanently.
+        #[cfg(target_os = "horizon")]
+        {
+            const SLICE_NS: u64 = 500_000_000;
+            const MAX_SLICES: u32 = 20;
+            let mut slices = 0u32;
+            loop {
+                match unsafe { self.device.wait_for_fences(&[frame.fence], true, SLICE_NS) } {
+                    Ok(()) => break,
+                    Err(vk::Result::TIMEOUT) => {
+                        slices += 1;
+                        if slices % 4 == 0 {
+                            log::warn!(
+                                "GPU batch fence still waiting after {:.1}s ({} other batches in flight)",
+                                slices as f64 * 0.5,
+                                self.in_flight.len()
+                            );
+                        }
+                        if slices >= MAX_SLICES {
+                            // Keep the still-active frame in_flight so its command buffer
+                            // and staging buffers are not reset while the GPU may use them.
+                            self.in_flight.push_front(frame);
+                            return Err("GPU batch fence timed out after 10s".to_owned());
+                        }
+                    }
+                    Err(error) => {
+                        self.in_flight.push_front(frame);
+                        return Err(vk_error("wait for the GPU")(error));
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "horizon"))]
         // SAFETY: the fence belongs to the batch, and the command buffer is
         // reset only once the GPU is done with it
+        if let Err(error) = unsafe { self.device.wait_for_fences(&[frame.fence], true, u64::MAX) } {
+            self.in_flight.push_front(frame);
+            return Err(vk_error("wait for the GPU")(error));
+        }
         unsafe {
-            self.device.wait_for_fences(&[frame.fence], true, u64::MAX).map_err(vk_error("wait for the GPU"))?;
             self.device.reset_fences(&[frame.fence]).map_err(vk_error("reset a fence"))?;
             self.device
                 .reset_command_buffer(frame.commands, vk::CommandBufferResetFlags::empty())

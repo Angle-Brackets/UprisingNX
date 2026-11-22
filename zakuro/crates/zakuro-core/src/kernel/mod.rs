@@ -254,7 +254,18 @@ impl Kernel {
     /// highest-priority runnable thread.
     pub fn schedule(&mut self, cpu: &mut Cpu, tick: u64) -> bool {
         self.fire_timers(tick);
-        for id in 0..self.threads.len() as ThreadId {
+        // Satisfy blocked threads in priority order (lowest priority value first)
+        // so higher-priority waiters acquire Mutexes, Semaphores, and OneShot
+        // Events ahead of lower-priority threads, matching the 3DS kernel.
+        let mut blocked: Vec<(u32, ThreadId)> = self
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.status.is_blocked())
+            .map(|(id, t)| (t.priority, id as ThreadId))
+            .collect();
+        blocked.sort_unstable();
+        for (_, id) in blocked {
             self.try_satisfy_wait(id, tick);
         }
         for id in std::mem::take(&mut self.pulsed) {
@@ -801,5 +812,44 @@ mod tests {
         // the new thread's own object, not the one the ended thread had
         let object = kernel.thread_object(third);
         assert_eq!(kernel.objects.refcount(object), 1);
+    }
+
+    #[test]
+    fn schedule_wakes_higher_priority_waiter_first() {
+        let mut kernel = Kernel::new(0, MemoryRegion::Application, 0x1400_0000);
+        // Low-priority thread has the lower ThreadId (0), high-priority thread has id 1.
+        let low = kernel.create_thread("low", 0x0010_0000, 0x1000_0000, 0, 0x30, 0);
+        let high = kernel.create_thread("high", 0x0010_0000, 0x0FF0_0000, 0, 0x18, 0);
+        let object = kernel.objects.insert(KObject::Mutex(sync::Mutex::new("Mutex")));
+        kernel.objects.add_ref(object);
+        for waiter in [low, high] {
+            kernel.objects.add_ref(object);
+            let thread = &mut kernel.threads[waiter as usize];
+            thread.wait_objects = vec![object];
+            thread.status = ThreadStatus::WaitSync;
+        }
+        let mut cpu = Cpu::new();
+        kernel.schedule(&mut cpu, 1);
+
+        let Some(KObject::Mutex(mutex)) = kernel.objects.get(object) else { panic!("mutex missing") };
+        assert_eq!(mutex.owner, Some(high), "higher-priority waiter must acquire the mutex first");
+        assert_eq!(kernel.thread(low).status, ThreadStatus::WaitSync);
+    }
+
+    #[test]
+    fn negative_sleep_yields_instead_of_sleeping_forever() {
+        let mut system = crate::System::new(crate::Config::default());
+        let main = system.kernel.create_thread("main", 0x0010_0000, 0x1000_0000, 0, 0x30, 0);
+        let other = system.kernel.create_thread("other", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        system.kernel.schedule(&mut system.cpu, 0);
+        assert_eq!(system.kernel.current_thread, Some(main));
+        assert_eq!(system.kernel.thread(other).status, ThreadStatus::Ready);
+
+        // svcSleepThread(-1): must yield briefly (YIELD_TICKS), never overflow or sleep for centuries.
+        system.cpu.regs[0] = u32::MAX;
+        system.cpu.regs[1] = u32::MAX;
+        svc::dispatch(&mut system, 0x0A);
+        let wakeup = system.kernel.thread(main).wakeup_at.expect("yielding thread sleeps for YIELD_TICKS");
+        assert!(wakeup < crate::CYCLES_PER_FRAME, "negative sleep must not wrap into a long sleep: {wakeup}");
     }
 }

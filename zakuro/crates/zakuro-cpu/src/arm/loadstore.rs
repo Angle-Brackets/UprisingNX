@@ -328,6 +328,8 @@ pub fn exclusive<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
         // with a single emulated core the reservation can only be lost to a
         // context switch, which the kernel signals by clearing it.
         let succeeded = cpu.exclusive_addr == Some(addr);
+        // ARMv6K: executing STREX always clears the local exclusive monitor.
+        cpu.exclusive_addr = None;
         if succeeded {
             match size {
                 0b00 => bus.write32(addr, value),
@@ -338,7 +340,6 @@ pub fn exclusive<B: Bus>(cpu: &mut Cpu, bus: &mut B, op: u32) -> Option<Exit> {
                 0b10 => bus.write8(addr, value as u8),
                 _ => bus.write16(addr, value as u16),
             }
-            cpu.exclusive_addr = None;
         }
         cpu.set_reg(rd, !succeeded as u32);
     }

@@ -470,8 +470,14 @@ pub fn signal_interrupt(system: &mut System, interrupt: InterruptId) {
     let count = system.memory.read8(queue + 1) as u32;
 
     if count >= 0x34 {
-        // the queue is full, hardware sets the error byte and drops it.
+        // the queue is full, hardware sets the error byte and drops it; still
+        // clear the exclusive monitor and signal the relay event so the GSP
+        // thread wakes to drain the queue.
         system.memory.write8(queue + 2, 1);
+        system.cpu.exclusive_addr = None;
+        if let Some(object) = system.services.gsp.interrupt_event_object {
+            system.kernel.signal_event(object);
+        }
         return;
     }
 

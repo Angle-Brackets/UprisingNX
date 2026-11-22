@@ -14,7 +14,9 @@ pub const CPU_CLOCK_HZ: u64 = 268_111_856;
 pub const fn nanos_to_ticks(nanos: u64) -> u64 {
     // done in two steps to keep the intermediate inside 64 bits for the
     // multi-second timeouts games use when waiting on network operations.
-    (nanos / 1_000_000_000) * CPU_CLOCK_HZ + (nanos % 1_000_000_000) * CPU_CLOCK_HZ / 1_000_000_000
+    (nanos / 1_000_000_000)
+        .saturating_mul(CPU_CLOCK_HZ)
+        .saturating_add((nanos % 1_000_000_000) * CPU_CLOCK_HZ / 1_000_000_000)
 }
 
 pub const fn ticks_to_nanos(ticks: u64) -> u64 {

@@ -444,13 +444,14 @@ const YIELD_TICKS: u64 = 20_000;
 
 /// svcSleepThread, r0:r1 = nanoseconds as a signed 64-bit value.
 fn sleep_thread(system: &mut System) {
-    let nanos = (system.cpu.regs[0] as u64) | ((system.cpu.regs[1] as u64) << 32);
+    let nanos = ((system.cpu.regs[0] as u64) | ((system.cpu.regs[1] as u64) << 32)) as i64;
     let tick = system.cpu.cycles;
-    // a zero sleep is a yield, and while other threads are ready the
-    // kernel runs them for a while even when their priority is lower,
-    // titles polling a worker thread that way would spin forever otherwise
-    let ticks = if nanos != 0 {
-        nanos_to_ticks(nanos)
+    // a non-positive sleep (0, -1, -2) is a yield on 3DS, and while other
+    // threads are ready the kernel runs them for a while even when their
+    // priority is lower, titles polling a worker thread that way would spin
+    // forever otherwise
+    let ticks = if nanos > 0 {
+        nanos_to_ticks(nanos as u64)
     } else if system.kernel.others_ready() {
         YIELD_TICKS
     } else if system.kernel.next_event().is_some_and(|at| at <= tick) {
@@ -662,6 +663,9 @@ fn set_timer(system: &mut System) {
         timer.fire_at = Some(now.saturating_add(nanos_to_ticks(initial)));
         timer.interval = nanos_to_ticks(interval);
         timer.signaled = false;
+        if initial == 0 {
+            system.kernel.reschedule_pending = true;
+        }
         system.cpu.regs[0] = 0;
     } else {
         system.cpu.regs[0] = invalid_handle(system, handle, "svcSetTimer");
@@ -728,33 +732,39 @@ fn arbitrate_address(system: &mut System) {
     );
 
     if kind == ArbitrationType::Signal {
-        // wake up to value threads parked on this address, a negative value
-        // means all of them.
-        let mut woken = 0;
+        // wake up to value highest-priority threads parked on this address,
+        // a negative value means all of them.
         let unlimited = value < 0;
+        let limit = if unlimited { usize::MAX } else { value as usize };
         let mut to_wake = Vec::new();
         let kernel = &mut system.kernel;
         let threads = &kernel.threads;
         if let Some(KObject::AddressArbiter(arbiter)) = kernel.objects.get_mut(object) {
+            // drop stale entries (timed-out or dead threads) on this address first,
+            // then pick the highest-priority live waiters (FIFO tiebreak).
+            let mut candidates: Vec<(u32, usize, super::thread::ThreadId)> = Vec::new();
+            let mut seen = Vec::new();
+            let mut index = 0usize;
             arbiter.waiters.retain(|&(thread, addr)| {
                 if addr != address {
                     return true;
                 }
-                // a thread whose wait timed out, or that ended since, left its
-                // entry behind, it goes without counting, a dead thread must
-                // never run again
                 let parked = &threads[thread as usize];
-                if parked.status != ThreadStatus::WaitArbiter || parked.wait_address != Some(address) || to_wake.contains(&thread) {
+                if parked.status != ThreadStatus::WaitArbiter || parked.wait_address != Some(address) || seen.contains(&thread) {
                     return false;
                 }
-                if unlimited || woken < value {
-                    woken += 1;
-                    to_wake.push(thread);
-                    false
-                } else {
-                    true
-                }
+                seen.push(thread);
+                candidates.push((parked.priority, index, thread));
+                index += 1;
+                true
             });
+            candidates.sort_unstable_by_key(|&(prio, order, _)| (prio, order));
+            for (_, _, thread) in candidates.into_iter().take(limit) {
+                to_wake.push(thread);
+            }
+            if !to_wake.is_empty() {
+                arbiter.waiters.retain(|&(thread, addr)| addr != address || !to_wake.contains(&thread));
+            }
         }
         for thread in to_wake {
             let thread = system.kernel.thread_mut(thread);

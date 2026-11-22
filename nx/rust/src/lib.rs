@@ -33,6 +33,68 @@ impl log::Log for Logger {
 static LOGGER: Logger = Logger;
 
 static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAME_HEARTBEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAME_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static WATCHDOG_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const PHASE_IDLE: u8 = 0;
+const PHASE_EMULATING: u8 = 1;
+const PHASE_PRESENTING: u8 = 2;
+const PHASE_EXITING: u8 = 3;
+
+extern "C" {
+    fn unx_write_crash(buf: *const u8, len: usize);
+    fn unx_kernel_memory_mib(used: *mut u64, total: *mut u64);
+}
+
+/// Starts a lightweight lock-free stall watchdog thread: if the main loop stays
+/// inside `emulating` or `presenting` for 5+ awake seconds without advancing a
+/// frame, appends a diagnostic snapshot directly to `crash.txt` on the stack.
+fn start_watchdog() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    WATCHDOG_STOP.store(false, std::sync::atomic::Ordering::Release);
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("watchdog".into())
+            .stack_size(32 << 10)
+            .spawn(|| {
+                use std::fmt::Write as _;
+                use std::sync::atomic::Ordering::Acquire;
+                let mut last_beat = FRAME_HEARTBEAT.load(Acquire);
+                let mut stalled_secs = 0u32;
+                while !WATCHDOG_STOP.load(Acquire) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if WATCHDOG_STOP.load(Acquire) {
+                        break;
+                    }
+                    let beat = FRAME_HEARTBEAT.load(Acquire);
+                    let phase = FRAME_PHASE.load(Acquire);
+                    if beat == last_beat && (phase == PHASE_EMULATING || phase == PHASE_PRESENTING) {
+                        stalled_secs = stalled_secs.saturating_add(1);
+                        if stalled_secs >= 5 && (stalled_secs - 5).is_multiple_of(15) {
+                            let frame = CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+                            let phase_name = if phase == PHASE_EMULATING { "emulating" } else { "presenting" };
+                            let (mut used_mib, mut total_mib) = (0u64, 0u64);
+                            unsafe { unx_kernel_memory_mib(&mut used_mib, &mut total_mib) };
+                            let mut buf = CrashBuf { bytes: [0; 2048], len: 0 };
+                            let _ = writeln!(
+                                buf,
+                                "WATCHDOG STALL ({stalled_secs}s) {} frame {frame} phase '{phase_name}' (mem {used_mib}/{total_mib} MiB)",
+                                menu::VERSION_LABEL,
+                            );
+                            unsafe { unx_write_crash(buf.bytes.as_ptr(), buf.len) };
+                            if let Ok(text) = std::str::from_utf8(&buf.bytes[..buf.len]) {
+                                safe_println(text.trim_end());
+                            }
+                        }
+                    } else {
+                        last_beat = beat;
+                        stalled_secs = 0;
+                    }
+                }
+            });
+    });
+}
 
 struct CrashBuf {
     bytes: [u8; 2048],
@@ -58,9 +120,7 @@ impl std::fmt::Write for CrashBuf {
 fn install_panic_hook() {
     extern "C" {
         fn _start();
-        fn unx_write_crash(buf: *const u8, len: usize);
         fn unx_note_panic_logged();
-        fn unx_kernel_memory_mib(used: *mut u64, total: *mut u64);
     }
     let shown = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1084,6 +1144,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
                 }
             }
         });
+    start_watchdog();
     log::info!("unx: loaded {rom} in {:?}", started.elapsed());
     Box::into_raw(Box::new(Unx {
         system,
@@ -1401,7 +1462,9 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
         None => {}
     }
     let overlay = unx.menu_overlay();
+    FRAME_PHASE.store(PHASE_PRESENTING, std::sync::atomic::Ordering::Release);
     present_screens(unx, &overlay);
+    FRAME_PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
     if !unx.menu.open {
         audio_pause(false);
     }
@@ -1424,6 +1487,8 @@ static REPORT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32 {
     let unx = &mut *unx;
     CURRENT_FRAME.store(unx.frame, std::sync::atomic::Ordering::Relaxed);
+    FRAME_HEARTBEAT.fetch_add(1, std::sync::atomic::Ordering::Release);
+    FRAME_PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
     if let Some(done) = unx_menu(unx, input.as_ref()) {
         return done;
     }
@@ -1674,7 +1739,9 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     }
 
     let started = Instant::now();
+    FRAME_PHASE.store(PHASE_EMULATING, std::sync::atomic::Ordering::Release);
     let outcome = unx.system.run_frame();
+    FRAME_PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
     let took = started.elapsed();
     unx.frame += 1;
     let audio = unx.system.take_audio();
@@ -1891,7 +1958,9 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
     }
 
     let overlay = unx.menu_overlay();
+    FRAME_PHASE.store(PHASE_PRESENTING, std::sync::atomic::Ordering::Release);
     present_screens(unx, &overlay);
+    FRAME_PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
 
     let presented = presenting.elapsed();
     unx.window_presenting += presented;
@@ -2121,6 +2190,8 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
 /// `unx` came from unx_create and isn't used again.
 #[no_mangle]
 pub unsafe extern "C" fn unx_destroy(unx: *mut Unx) {
+    FRAME_PHASE.store(PHASE_EXITING, std::sync::atomic::Ordering::Release);
+    WATCHDOG_STOP.store(true, std::sync::atomic::Ordering::Release);
     nx_audio_exit();
     if !unx.is_null() {
         drop(Box::from_raw(unx));
