@@ -155,6 +155,8 @@ pub struct VulkanPresenter {
     safe_area: f32,
     /// set when the swapchain no longer matches the window.
     stale: bool,
+    /// consecutive Horizon swapchain acquire timeouts before rebuilding.
+    acquire_timeouts: u32,
 }
 
 impl VulkanPresenter {
@@ -501,6 +503,7 @@ impl VulkanPresenter {
             stereo: Stereo::default(),
             safe_area: 1.0,
             stale: false,
+            acquire_timeouts: 0,
         };
 
         presenter.build_swapchain()?;
@@ -641,6 +644,7 @@ impl VulkanPresenter {
         }
 
         self.stale = false;
+        self.acquire_timeouts = 0;
         Ok(())
     }
 
@@ -1207,25 +1211,57 @@ impl Presenter for VulkanPresenter {
             return Ok(());
         }
 
+        // Finite wait on Horizon so `present()` returns to `appletMainLoop()` on
+        // focus loss, sleep/wake, or a missed `NWindow` buffer-queue wakeup
+        // instead of blocking forever inside `wsi_hos_acquire_next_image`.
+        #[cfg(target_os = "horizon")]
+        const PRESENT_WAIT_NS: u64 = 250_000_000;
+        #[cfg(not(target_os = "horizon"))]
+        const PRESENT_WAIT_NS: u64 = u64::MAX;
+
         let frame = self.frame;
         let fence = self.in_flight[frame];
-        unsafe {
-            self.device
-                .wait_for_fences(&[fence], true, u64::MAX)
-                .map_err(vk_fail("waiting for a fence"))?;
+        match unsafe { self.device.wait_for_fences(&[fence], true, PRESENT_WAIT_NS) } {
+            Ok(()) => {}
+            Err(vk::Result::TIMEOUT) => {
+                self.defer(overlay);
+                return Ok(());
+            }
+            Err(error) => {
+                self.defer(overlay);
+                return Err(vk_fail("waiting for a fence")(error));
+            }
         }
 
         let acquired = unsafe {
             self.swapchain_device.acquire_next_image(
                 self.swapchain,
-                u64::MAX,
+                PRESENT_WAIT_NS,
                 self.image_available[frame],
                 vk::Fence::null(),
             )
         };
         let (image_index, suboptimal) = match acquired {
-            Ok(result) => result,
+            Ok(result) => {
+                self.acquire_timeouts = 0;
+                result
+            }
+            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => {
+                self.defer(overlay);
+                self.acquire_timeouts = self.acquire_timeouts.saturating_add(1);
+                if self.acquire_timeouts >= 4 {
+                    log::warn!(
+                        "swapchain acquire timed out {} times, rebuilding swapchain",
+                        self.acquire_timeouts
+                    );
+                    self.acquire_timeouts = 0;
+                    self.stale = true;
+                    return Err(PresentError::OutOfDate);
+                }
+                return Ok(());
+            }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.acquire_timeouts = 0;
                 self.stale = true;
                 self.defer(overlay);
                 return Err(PresentError::OutOfDate);

@@ -360,6 +360,7 @@ pub fn apply_framebuffer_updates(system: &mut System) {
         // title that polls it to know its previous frame was consumed keeps
         // moving instead of assuming GSP is stuck.
         system.memory.write32(record, index);
+        system.cpu.exclusive_addr = None;
     }
 }
 
@@ -477,6 +478,10 @@ pub fn signal_interrupt(system: &mut System, interrupt: InterruptId) {
     let slot = (index + count) % 0x34;
     system.memory.write8(queue + 0xC + slot, interrupt as u8);
     system.memory.write8(queue + 1, (count + 1) as u8);
+    // GSP writes the shared interrupt queue from outside the app core, which
+    // clears any in-progress LDREX reservation so the guest's STREX retries
+    // instead of overwriting the updated count and dropping this interrupt.
+    system.cpu.exclusive_addr = None;
 
     if let Some(object) = system.services.gsp.interrupt_event_object {
         system.kernel.signal_event(object);
@@ -538,6 +543,7 @@ fn process_command_queue(system: &mut System) {
         system
             .memory
             .write32(ring, next_index | ((count - 1) << 8));
+        system.cpu.exclusive_addr = None;
 
         execute_command(system, command);
     }
@@ -770,5 +776,32 @@ mod tests {
 
         assert_eq!(system.gpu.framebuffers[0].address_left(), 0x1234_0000);
         let _ = vaddr;
+    }
+
+    /// GSP shared-memory updates happen asynchronously from SysCore on real
+    /// hardware and invalidate the CPU's exclusive monitor. If `exclusive_addr`
+    /// survived a budget stop between the guest interrupt thread's LDREX and
+    /// STREX on the interrupt queue header, its STREX would succeed with a
+    /// stale count and silently drop the newly posted interrupt (e.g. P3D).
+    #[test]
+    fn shared_memory_writes_clear_cpu_exclusive_monitor() {
+        let (mut system, vaddr) = system_with_mapped_gsp_shm();
+
+        system.cpu.exclusive_addr = Some(vaddr);
+        signal_interrupt(&mut system, InterruptId::P3d);
+        assert_eq!(system.cpu.exclusive_addr, None);
+
+        let record = vaddr + FRAMEBUFFER_INFO_BASE;
+        system.memory.write32(record, 0x0000_0100);
+        system.cpu.exclusive_addr = Some(record);
+        apply_framebuffer_updates(&mut system);
+        assert_eq!(system.cpu.exclusive_addr, None);
+
+        let ring = vaddr + COMMAND_BUFFER_BASE;
+        system.memory.write32(ring + 0x20, 0x05); // CacheFlush
+        system.memory.write32(ring, 1 << 8);
+        system.cpu.exclusive_addr = Some(ring);
+        process_command_queue(&mut system);
+        assert_eq!(system.cpu.exclusive_addr, None);
     }
 }

@@ -344,6 +344,11 @@ impl GpuCell {
         )
     }
 
+    /// whether finished GPU interrupts are waiting to be raised.
+    pub fn has_done(&self) -> bool {
+        self.shared.done_any.load(Ordering::Acquire)
+    }
+
     /// the interrupts of the jobs done since this was last asked, in order.
     pub fn take_done(&self) -> Vec<InterruptId> {
         if !self.shared.done_any.load(Ordering::Acquire) {
@@ -417,7 +422,8 @@ fn work(shared: &Shared) {
         // SAFETY: while jobs are pending the CPU's side does not touch it
         let interrupt = execute(unsafe { &mut *shared.gpu }, job);
         if let Some(interrupt) = interrupt {
-            shared.done.lock().unwrap_or_else(|p| p.into_inner()).push(interrupt);
+            let mut done = shared.done.lock().unwrap_or_else(|p| p.into_inner());
+            done.push(interrupt);
             shared.done_any.store(true, Ordering::Release);
         }
         {

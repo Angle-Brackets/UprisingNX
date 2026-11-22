@@ -428,7 +428,7 @@ impl System {
         if self.kernel.current_thread.is_none() {
             // everything is blocked. when it waits for the GPU, which has
             // an interrupt to give, time does not go on while it draws
-            if self.gpu.busy() {
+            if self.gpu.busy() || self.gpu.has_done() {
                 self.gpu.wait_done();
                 self.raise_gpu_interrupts();
                 self.kernel.reschedule_pending = true;
@@ -579,6 +579,8 @@ impl System {
             None => {}
             Some(Exit::Supervisor(number)) => {
                 let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::SERVICES);
+                // ARM11 clears the local exclusive monitor on exception entry/return.
+                self.cpu.exclusive_addr = None;
                 kernel::svc::dispatch(self, number)
             }
             Some(Exit::Undefined { pc, opcode }) => {
@@ -801,6 +803,7 @@ impl System {
     /// everything that happens between frames, vertical blank, input, clock.
     fn end_frame(&mut self) {
         let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::FRAME_END);
+        self.cpu.exclusive_addr = None;
         self.idle_interrupted(false);
         self.frames += 1;
         if self.frames.is_multiple_of(hints::SAVE_EVERY) {
@@ -909,6 +912,7 @@ impl System {
     /// interrupts the title, whose sound library does one update per interrupt.
     fn audio_frame(&mut self) {
         let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::AUDIO);
+        self.cpu.exclusive_addr = None;
         self.idle_interrupted(false);
         // the whole opening froze until this ran every 4.9 ms. goddamn audio timing
         if self.services.dsp.running {
@@ -983,6 +987,9 @@ impl System {
             linear_base: self.kernel.linear_base,
         };
         if let Some(interrupt) = self.gpu.submit(job) {
+            // flush any interrupts finished on the GPU thread while waiting
+            // for idle so synchronous jobs never overtake earlier P3D/PPF ones.
+            self.raise_gpu_interrupts();
             services::gsp::signal_interrupt(self, interrupt);
         }
     }
