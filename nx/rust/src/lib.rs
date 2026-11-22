@@ -1460,6 +1460,11 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
                 *g += t;
             }
         }
+        let motion_active = unx.system.services.hid.accelerometer_users > 0
+            || unx.system.services.hid.gyroscope_users > 0;
+        unx.aim.apply_motion_tilt(&mut state, gyro, input.host, motion_active);
+        let fallback_ok = unx.in_play && !unx.title_boosted && (input.host & HOST_BOTTOM) == 0;
+        unx.aim.set_in_battle_play(fallback_ok);
         look = unx.aim.apply(&mut state, gyro, input.host);
         if on_title && (!state.buttons.is_empty() || game_touch) {
             state.buttons |= PadState::A;

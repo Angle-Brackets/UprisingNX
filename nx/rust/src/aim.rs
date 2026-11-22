@@ -99,6 +99,25 @@ const RECENTER_GRACE_FRAMES: u8 = 6;
 /// left-stick touch mode.
 const REACH_X: f32 = 150.0;
 const REACH_Y: f32 = 112.0;
+/// Virtual bottom-screen stylus dimensions (`320x240`) for in-battle fallback
+/// aiming when neither `kiu_air_aim` nor `kiu_mouse_look` runs (`said == 0`,
+/// e.g. Chapter 17/21/25 falling/aiming reticle sequences).
+const FALLBACK_TOUCH_CENTER: (f32, f32) = (160.0, 120.0);
+const FALLBACK_TOUCH_MAX_X: f32 = 319.0;
+const FALLBACK_TOUCH_MAX_Y: f32 = 239.0;
+/// Deliberate gyro angular rate (`0.025` turns/s = `9 deg/s`) required to
+/// initially engage fallback touch aiming from idle, so resting hand tremor
+/// during cutscenes or pause menus never injects a stray bottom-screen touch.
+const FALLBACK_GYRO_ENGAGE_THRESHOLD: f32 = 0.025;
+/// 60 Hz frames to keep the fallback virtual stylus lifted when `R`/`L3`
+/// recenters it, so relative-drag modes re-anchor cleanly at `(160, 120)`.
+const FALLBACK_RECENTER_LIFT_FRAMES: u8 = 2;
+/// 3DS `hid:USER` motion tilt limit (`±90 deg`, matching desktop `zakuro`).
+const MOTION_TILT_LIMIT: f32 = std::f32::consts::FRAC_PI_2;
+/// Radians per 60 Hz frame of virtual console tilt at full right-stick deflection.
+const MOTION_TILT_STICK_RAD_PER_FRAME: f32 = 0.05;
+/// Radians per 60 Hz frame per `1.0` turn/sec (`2π / 60`).
+const MOTION_TILT_GYRO_RAD_PER_TURN_RATE: f32 = std::f32::consts::TAU / 60.0;
 
 /// Live snapshot of the in-game Options -> Controls menu sliders and invert toggles.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -215,6 +234,17 @@ pub struct Aim {
     vehicle_b_held: bool,
     /// Active synthetic touchscreen tap pulse `((x, y), frames_remaining)` for vehicle HUD buttons.
     vehicle_tap: Option<((u16, u16), u8)>,
+    /// Whether the game is in active battle play with the bottom screen hidden
+    /// (`in_play && !title_boosted`), enabling fallback virtual-stylus aiming
+    /// when `self.game == 0` (Chapter 17/21/25 falling reticle sequences, etc.).
+    in_battle_play: bool,
+    /// Virtual bottom-screen stylus `(x, y)` while fallback touch aiming is active.
+    fallback_touch: Option<(f32, f32)>,
+    /// Remaining 60 Hz frames to keep the fallback stylus lifted after `R`/`L3` recenter.
+    fallback_lift: u8,
+    /// Integrated 3DS `hid:USER` motion tilt `[x, y]` in radians when a title
+    /// enables `EnableAccelerometer` or `EnableGyroscopeLow`.
+    motion_tilt: [f32; 2],
 }
 
 /// Relative byte offsets and maximum UTF-16 character counts inside the Options/Menu
@@ -300,6 +330,10 @@ impl Aim {
             vehicle_a_held: false,
             vehicle_b_held: false,
             vehicle_tap: None,
+            in_battle_play: false,
+            fallback_touch: None,
+            fallback_lift: 0,
+            motion_tilt: [0.0, 0.0],
         };
         log::info!(
             "unx: aim right_stick {} gyro {} (gyro_speed {}) left_stick_mode {} (modifier {:?}, invert y {}, speed {})",
@@ -452,6 +486,142 @@ impl Aim {
         (yaw_right * scale, pitch_up * scale)
     }
 
+    /// Updates whether the game is in an active battle with the bottom screen hidden.
+    pub fn set_in_battle_play(&mut self, in_battle_play: bool) {
+        self.in_battle_play = in_battle_play;
+        if !in_battle_play {
+            self.fallback_touch = None;
+            self.fallback_lift = 0;
+        }
+    }
+
+    /// Feeds Switch SixAxis gyro and right stick into 3DS `hid:USER` `InputState::tilt`
+    /// whenever a title has enabled the 3DS accelerometer or gyroscope.
+    pub fn apply_motion_tilt(&mut self, input: &mut InputState, gyro: [f32; 3], host: u32, motion_active: bool) {
+        if !motion_active {
+            self.motion_tilt = [0.0, 0.0];
+            input.tilt = [0.0, 0.0];
+            return;
+        }
+        let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
+        if recenter_now {
+            self.motion_tilt = [0.0, 0.0];
+            input.tilt = [0.0, 0.0];
+            return;
+        }
+        let mut dx = 0.0f32;
+        let mut dy = 0.0f32;
+        if self.right_stick {
+            let (sx, sy) = Aim::stick(input.c_stick_x, input.c_stick_y);
+            dx += sx * MOTION_TILT_STICK_RAD_PER_FRAME * self.speed;
+            dy += -sy * MOTION_TILT_STICK_RAD_PER_FRAME * self.speed;
+        }
+        if self.gyro {
+            let (gx, gy) = Aim::gyro_rate(gyro);
+            dx += gx * MOTION_TILT_GYRO_RAD_PER_TURN_RATE * self.gyro_speed * self.speed;
+            dy += -gy * MOTION_TILT_GYRO_RAD_PER_TURN_RATE * self.gyro_speed * self.speed;
+        }
+        self.motion_tilt[0] = (self.motion_tilt[0] + dx).clamp(-MOTION_TILT_LIMIT, MOTION_TILT_LIMIT);
+        self.motion_tilt[1] = (self.motion_tilt[1] + dy).clamp(-MOTION_TILT_LIMIT, MOTION_TILT_LIMIT);
+        input.tilt = self.motion_tilt;
+    }
+
+    /// Fallback virtual-stylus aiming when `self.game == 0` during an active battle
+    /// (`in_battle_play == true`), such as Chapter 17/21/25 falling reticle QTEs
+    /// where neither `kiu_air_aim` nor `kiu_mouse_look` runs.
+    fn apply_fallback_touch(&mut self, input: &mut InputState, gyro: [f32; 3], host: u32) {
+        self.aiming = false;
+        self.vehicle_a_held = false;
+        self.vehicle_b_held = false;
+        self.vehicle_tap = None;
+
+        if !self.in_battle_play
+            || self.touching
+            || input.buttons.intersects(PadState::START | PadState::SELECT)
+        {
+            self.fallback_touch = None;
+            self.fallback_lift = 0;
+            self.recenter_held = false;
+            self.recenter_grace = 0;
+            return;
+        }
+
+        let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
+        input.buttons.remove(PadState::R);
+        if recenter_now && !self.recenter_held && self.fallback_touch.is_some() {
+            self.fallback_touch = None;
+            self.fallback_lift = FALLBACK_RECENTER_LIFT_FRAMES;
+        }
+        if recenter_now {
+            self.recenter_grace = RECENTER_GRACE_FRAMES;
+        } else {
+            self.recenter_grace = self.recenter_grace.saturating_sub(1);
+        }
+        self.recenter_held = recenter_now;
+
+        if self.mode == 0 && input.buttons.intersects(PadState::ZL | PadState::ZR) {
+            input.buttons.remove(PadState::ZL | PadState::ZR);
+            input.buttons.insert(PadState::L);
+        }
+
+        let menu_invert_y = self.controls.air_invert_y();
+        let invert_y = self.invert_y != menu_invert_y;
+        let menu_scale = GuestControls::slider_scale(self.controls.air_speed);
+        let menu_gyro_scale = GuestControls::gyro_scale(self.controls.air_stop);
+
+        let mut across = 0.0f32;
+        let mut down = 0.0f32;
+        let mut stick_t = 0.0f32;
+        let mut stick_active = false;
+
+        if self.right_stick {
+            let (rx, ry) = (input.c_stick_x, input.c_stick_y);
+            let stick_len = (rx * rx + ry * ry).sqrt();
+            if stick_len >= DEAD_ZONE {
+                stick_t = ((stick_len - DEAD_ZONE) / (1.0 - DEAD_ZONE)).min(1.0);
+            }
+            let (sx, sy) = Aim::stick(rx, ry);
+            stick_active = sx != 0.0 || sy != 0.0;
+            if stick_active || self.fallback_touch.is_some() {
+                input.c_stick_x = 0.0;
+                input.c_stick_y = 0.0;
+            }
+            let dy = if !invert_y { -sy } else { sy };
+            across += sx * AIR_PIXELS_PER_FRAME * menu_scale * self.speed;
+            down += dy * AIR_PIXELS_PER_FRAME * menu_scale * self.speed;
+        }
+
+        let mut gyro_active = false;
+        let gyro_paused = recenter_now || self.recenter_grace > 0;
+        let stick_damp = 1.0 - stick_t;
+        if self.gyro && !gyro_paused && menu_gyro_scale > 0.0 && stick_damp > 0.0 {
+            let (gx, gy) = Aim::gyro_rate(gyro);
+            let gyro_mag = (gx * gx + gy * gy).sqrt();
+            if self.fallback_touch.is_some() || gyro_mag >= FALLBACK_GYRO_ENGAGE_THRESHOLD {
+                gyro_active = gyro_mag > 0.0;
+                let dy = if !invert_y { -gy } else { gy };
+                let g_mult = self.gyro_speed * menu_gyro_scale * self.speed * stick_damp;
+                across += gx * AIR_GYRO_PIXELS_PER_TURN_RATE * menu_scale * g_mult;
+                down += dy * AIR_GYRO_PIXELS_PER_TURN_RATE * menu_scale * g_mult;
+            }
+        }
+
+        if self.fallback_lift > 0 {
+            self.fallback_lift -= 1;
+            return;
+        }
+
+        if let Some((vx, vy)) = &mut self.fallback_touch {
+            *vx = (*vx + across).clamp(0.0, FALLBACK_TOUCH_MAX_X);
+            *vy = (*vy + down).clamp(0.0, FALLBACK_TOUCH_MAX_Y);
+            input.touch = Some((vx.round() as u16, vy.round() as u16));
+        } else if stick_active || gyro_active {
+            self.fallback_touch = Some(FALLBACK_TOUCH_CENTER);
+            input.touch = Some((FALLBACK_TOUCH_CENTER.0 as u16, FALLBACK_TOUCH_CENTER.1 as u16));
+            log::info!("unx: fallback touch aim engaged (said 0 in battle)");
+        }
+    }
+
     /// Processes stick and gyro inputs for the current frame and returns the
     /// `(across, down)` delta in bottom-screen pixels to feed into the host
     /// mailbox (`MOUSE_AIM` while flying, `MOUSE_LOOK` on foot).
@@ -460,14 +630,14 @@ impl Aim {
         (input.circle_x, input.circle_y) = Aim::left_stick(input.circle_x, input.circle_y);
 
         if self.game == 0 {
-            self.aiming = false;
-            self.recenter_held = false;
-            self.recenter_grace = 0;
-            self.vehicle_a_held = false;
-            self.vehicle_b_held = false;
-            self.vehicle_tap = None;
+            self.apply_fallback_touch(input, gyro, host);
             return (0.0, 0.0);
         }
+
+        if self.fallback_touch.take().is_some() {
+            log::info!("unx: fallback touch aim released (game mode {})", self.game);
+        }
+        self.fallback_lift = 0;
 
         // In battle:
         // - R (Right Bumper) or Left Stick Click (`UNX_HOST_RECENTER`, bit 1) snaps
@@ -693,6 +863,10 @@ mod tests {
             vehicle_a_held: false,
             vehicle_b_held: false,
             vehicle_tap: None,
+            in_battle_play: false,
+            fallback_touch: None,
+            fallback_lift: 0,
+            motion_tilt: [0.0, 0.0],
         }
     }
 
@@ -872,5 +1046,85 @@ mod tests {
         let mut input = InputState { c_stick_x: 1.0, c_stick_y: 0.0, ..InputState::default() };
         let (across, down) = aim.apply(&mut input, [0.2, 0.0, 0.0], 0);
         assert_eq!((across, down), (LAND_X_PIXELS_PER_FRAME, 0.0));
+    }
+
+    #[test]
+    fn fallback_touch_engages_in_battle_when_overrides_quiet_and_respects_pause_and_recenter() {
+        let mut aim = test_aim();
+        aim.set_in_battle_play(true);
+
+        // Idle and subtle resting gyro noise must not inject a phantom touch on cutscenes/pause
+        let mut idle = InputState::default();
+        assert_eq!(aim.apply(&mut idle, [0.005, -0.005, 0.0], 0), (0.0, 0.0));
+        assert_eq!(idle.touch, None);
+
+        // Right stick engages fallback stylus at screen center, consumes c-stick, and maps ZR -> L
+        let mut engage = InputState {
+            buttons: PadState::ZR,
+            c_stick_x: 1.0,
+            c_stick_y: 0.0,
+            ..InputState::default()
+        };
+        assert_eq!(aim.apply(&mut engage, [0.0; 3], 0), (0.0, 0.0));
+        assert_eq!(engage.touch, Some((160, 120)));
+        assert_eq!((engage.c_stick_x, engage.c_stick_y), (0.0, 0.0));
+        assert!(engage.buttons.contains(PadState::L));
+        assert!(!engage.buttons.contains(PadState::ZR));
+
+        // Subsequent frames move the virtual stylus right and up via right stick + fine gyro
+        let mut move_stick = InputState { c_stick_x: 1.0, c_stick_y: 1.0, ..InputState::default() };
+        aim.apply(&mut move_stick, [0.0; 3], 0);
+        let (x1, y1) = move_stick.touch.expect("virtual stylus stays down");
+        assert!(x1 > 160 && y1 < 120, "right + up moves virtual stylus toward top-right: ({x1}, {y1})");
+
+        let mut move_gyro = InputState::default();
+        aim.apply(&mut move_gyro, [0.02, -0.02, 0.0], 0);
+        let (x2, y2) = move_gyro.touch.expect("fine gyro tracks once engaged");
+        assert!(x2 > x1 && y2 < y1, "fine gyro moves stylus right/up: ({x2}, {y2}) vs ({x1}, {y1})");
+
+        // Pressing R lifts the virtual stylus for FALLBACK_RECENTER_LIFT_FRAMES
+        let mut recenter = InputState { buttons: PadState::R, c_stick_x: 1.0, ..InputState::default() };
+        aim.apply(&mut recenter, [0.0; 3], 0);
+        assert_eq!(recenter.touch, None);
+        assert!(!recenter.buttons.contains(PadState::R));
+
+        // Remaining lift frame keeps touch up, then next stick move re-anchors at center
+        for _ in 1..FALLBACK_RECENTER_LIFT_FRAMES {
+            let mut lifting = InputState { c_stick_x: 1.0, ..InputState::default() };
+            aim.apply(&mut lifting, [0.0; 3], 0);
+            assert_eq!(lifting.touch, None);
+        }
+        let mut reanchor = InputState { c_stick_x: 1.0, ..InputState::default() };
+        aim.apply(&mut reanchor, [0.0; 3], 0);
+        assert_eq!(reanchor.touch, Some((160, 120)));
+
+        // Pressing START immediately lifts the virtual stylus so pause menus stay clean
+        let mut pause = InputState { buttons: PadState::START, ..InputState::default() };
+        aim.apply(&mut pause, [0.0; 3], 0);
+        assert_eq!(pause.touch, None);
+
+        // Resuming normal GAME_FLYING releases fallback touch cleanly
+        let mut engage2 = InputState { c_stick_x: 1.0, ..InputState::default() };
+        aim.apply(&mut engage2, [0.0; 3], 0);
+        assert_eq!(engage2.touch, Some((160, 120)));
+        aim.said(GAME_FLYING);
+        let mut flying = InputState::default();
+        aim.apply(&mut flying, [0.0; 3], 0);
+        assert_eq!(flying.touch, None);
+    }
+
+    #[test]
+    fn motion_tilt_integrates_stick_and_gyro_and_recenters() {
+        let mut aim = test_aim();
+        let mut input = InputState { c_stick_x: 1.0, c_stick_y: 0.5, ..InputState::default() };
+        aim.apply_motion_tilt(&mut input, [0.1, -0.1, 0.0], 0, false);
+        assert_eq!(input.tilt, [0.0, 0.0]);
+
+        aim.apply_motion_tilt(&mut input, [0.1, -0.1, 0.0], 0, true);
+        assert!(input.tilt[0] > 0.0 && input.tilt[1] < 0.0, "right + up tilts right and up: {:?}", input.tilt);
+
+        let mut recenter = InputState { buttons: PadState::R, ..InputState::default() };
+        aim.apply_motion_tilt(&mut recenter, [0.1, -0.1, 0.0], 0, true);
+        assert_eq!(recenter.tilt, [0.0, 0.0]);
     }
 }

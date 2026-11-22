@@ -126,9 +126,15 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         0x0011..=0x0014 => {
             let hid = &mut system.services.hid;
             match header.command_id() {
-                0x0011 => hid.accelerometer_users += 1,
+                0x0011 => {
+                    hid.accelerometer_users += 1;
+                    log::info!("hid:USER EnableAccelerometer (users={})", hid.accelerometer_users);
+                }
                 0x0012 => hid.accelerometer_users = hid.accelerometer_users.saturating_sub(1),
-                0x0013 => hid.gyroscope_users += 1,
+                0x0013 => {
+                    hid.gyroscope_users += 1;
+                    log::info!("hid:USER EnableGyroscopeLow (users={})", hid.gyroscope_users);
+                }
                 _ => hid.gyroscope_users = hid.gyroscope_users.saturating_sub(1),
             }
             buffer.reply(&mut system.memory, header.command_id(), &[]);
