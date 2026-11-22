@@ -92,6 +92,9 @@ const LAND_GYRO_Y_PIXELS_PER_TURN_RATE: f32 = 52.0;
 const STALE_FRAMES: u8 = 4;
 /// Frames without a word from the game's overrides before it is out of play.
 const QUIET_FRAMES: u8 = 10;
+/// 60 Hz frames after releasing R / L3 during which gyro stays muted so the
+/// physical button-release jolt does not pull the reticle/camera off center.
+const RECENTER_GRACE_FRAMES: u8 = 6;
 /// Stylus reach from the center of the 320x240 bottom screen for legacy
 /// left-stick touch mode.
 const REACH_X: f32 = 150.0;
@@ -204,6 +207,8 @@ pub struct Aim {
     recenter_held: bool,
     /// Set when a gyro/reticle recenter has been requested for the next guest tick.
     recenter_pending: bool,
+    /// Remaining 60 Hz frames to mute gyro after releasing recenter (gyro ratchet settle).
+    recenter_grace: u8,
     /// Rising-edge tracker for `A` in `GAME_VEHICLE` (tap-and-release Special Action).
     vehicle_a_held: bool,
     /// Rising-edge tracker for `B` in `GAME_VEHICLE` (tap-and-release Dismount).
@@ -291,6 +296,7 @@ impl Aim {
             msbt_offset: None,
             recenter_held: false,
             recenter_pending: false,
+            recenter_grace: 0,
             vehicle_a_held: false,
             vehicle_b_held: false,
             vehicle_tap: None,
@@ -456,6 +462,7 @@ impl Aim {
         if self.game == 0 {
             self.aiming = false;
             self.recenter_held = false;
+            self.recenter_grace = 0;
             self.vehicle_a_held = false;
             self.vehicle_b_held = false;
             self.vehicle_tap = None;
@@ -463,13 +470,20 @@ impl Aim {
         }
 
         // In battle:
-        // - R (Right Bumper) or Left Stick Click (`UNX_HOST_RECENTER`, bit 1) recenters
-        //   the Air Battle reticle to the rail center or levels the Land Battle camera pitch.
+        // - R (Right Bumper) or Left Stick Click (`UNX_HOST_RECENTER`, bit 1) snaps
+        //   the Air Battle reticle to the rail center or levels Land Battle pitch on
+        //   press, and pauses gyro while held (+ brief settle grace on release) so
+        //   players can ratchet/reposition their hands comfortably back to neutral.
         // - ZL (Nunchuk Z trigger) and ZR (Wii Remote B trigger) act as Fire (`PadState::L`).
         let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
         input.buttons.remove(PadState::R);
         if recenter_now && !self.recenter_held {
             self.recenter_pending = true;
+        }
+        if recenter_now {
+            self.recenter_grace = RECENTER_GRACE_FRAMES;
+        } else {
+            self.recenter_grace = self.recenter_grace.saturating_sub(1);
         }
         self.recenter_held = recenter_now;
 
@@ -528,12 +542,17 @@ impl Aim {
             )
         };
 
+        let mut stick_t = 0.0f32;
         if self.right_stick {
             let (rx, ry) = (input.c_stick_x, input.c_stick_y);
             // Consume c_stick so 3DS ir:USER C-stick emulation does not fight
             // the direct mailbox overrides or add sluggish coasting inertia.
             input.c_stick_x = 0.0;
             input.c_stick_y = 0.0;
+            let stick_len = (rx * rx + ry * ry).sqrt();
+            if stick_len >= DEAD_ZONE {
+                stick_t = ((stick_len - DEAD_ZONE) / (1.0 - DEAD_ZONE)).min(1.0);
+            }
             let (sx, sy) = Aim::stick(rx, ry);
             // In GAME_FLYING, top-screen y=0 is at the top (so stick up -> down < 0).
             // In GAME_ON_FOOT, kiu_mouse_look adds `down * PITCH_PER_PIXEL` where
@@ -548,7 +567,12 @@ impl Aim {
             down += dy * px_y * menu_scale_y * self.speed;
         }
 
-        if self.gyro && menu_gyro_scale > 0.0 {
+        // Pause gyro while R / L3 is held (and briefly after release) for hand ratcheting,
+        // and smoothly damp gyro during large right-stick sweeps so wrist wobble does not
+        // fight stick-heavy aiming.
+        let gyro_paused = recenter_now || self.recenter_grace > 0;
+        let stick_damp = 1.0 - stick_t;
+        if self.gyro && !gyro_paused && menu_gyro_scale > 0.0 && stick_damp > 0.0 {
             let (gx, gy) = Aim::gyro_rate(gyro);
             let dy = if (self.game == GAME_FLYING) != invert_y { -gy } else { gy };
             let (g_px_x, g_px_y) = if self.game == GAME_FLYING {
@@ -556,7 +580,7 @@ impl Aim {
             } else {
                 (LAND_GYRO_X_PIXELS_PER_TURN_RATE, LAND_GYRO_Y_PIXELS_PER_TURN_RATE)
             };
-            let g_mult = self.gyro_speed * menu_gyro_scale * self.speed;
+            let g_mult = self.gyro_speed * menu_gyro_scale * self.speed * stick_damp;
             across += gx * g_px_x * menu_scale_x * g_mult;
             down += dy * g_px_y * menu_scale_y * g_mult;
         }
@@ -665,6 +689,7 @@ mod tests {
             msbt_offset: None,
             recenter_held: false,
             recenter_pending: false,
+            recenter_grace: 0,
             vehicle_a_held: false,
             vehicle_b_held: false,
             vehicle_tap: None,
@@ -810,5 +835,42 @@ mod tests {
                 assert_eq!(input.touch, None, "dismount touch automatically releases while B remains held");
             }
         }
+    }
+
+    #[test]
+    fn holding_recenter_pauses_gyro_and_settles_after_release() {
+        let mut aim = test_aim();
+        aim.said(GAME_FLYING);
+        let motion = [0.1, -0.1, 0.0];
+
+        // While R is held, recenter fires once and gyro stays muted
+        let mut input = InputState { buttons: PadState::R, ..InputState::default() };
+        assert_eq!(aim.apply(&mut input, motion, 0), (0.0, 0.0));
+        let mut mailbox = [0u32; 4];
+        aim.feed(&mut mailbox, (0.0, 0.0));
+        assert_eq!(mailbox[0], MOUSE_AIM_RECENTER);
+
+        // Continuing to hold R still mutes gyro without re-triggering recenter
+        let mut input_held = InputState { buttons: PadState::R, ..InputState::default() };
+        assert_eq!(aim.apply(&mut input_held, motion, 0), (0.0, 0.0));
+
+        // Release R: muted for RECENTER_GRACE_FRAMES - 1 settle frames, then resumes
+        for _ in 0..(RECENTER_GRACE_FRAMES - 1) {
+            let mut released = InputState::default();
+            assert_eq!(aim.apply(&mut released, motion, 0), (0.0, 0.0));
+        }
+        let mut resumed = InputState::default();
+        let (across, down) = aim.apply(&mut resumed, motion, 0);
+        assert!(across > 0.0 && down < 0.0, "gyro resumes smoothly after settle grace");
+    }
+
+    #[test]
+    fn right_stick_sweep_damps_gyro_wobble() {
+        let mut aim = test_aim();
+        aim.said(GAME_ON_FOOT);
+        // Full right-stick horizontal sweep with vertical gyro wobble should not add pitch wobble
+        let mut input = InputState { c_stick_x: 1.0, c_stick_y: 0.0, ..InputState::default() };
+        let (across, down) = aim.apply(&mut input, [0.2, 0.0, 0.0], 0);
+        assert_eq!((across, down), (LAND_X_PIXELS_PER_FRAME, 0.0));
     }
 }
