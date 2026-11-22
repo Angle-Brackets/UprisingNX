@@ -47,8 +47,10 @@ pub const GUEST_CONTROLS_VADDR: u32 = 0x00EF9638;
 /// Host mailbox mark for on-foot camera look (`"MLK1"`), followed by `across`
 /// and `down` as `f32` bottom-screen pixels (`zakuro::input::MOUSE_LOOK`).
 const MOUSE_LOOK: u32 = u32::from_le_bytes(*b"MLK1");
-/// Host mailbox mark to level on-foot camera pitch (`"MLKR"`).
+/// Host mailbox mark for on-foot Z-target / behind-Pit camera recenter press (`"MLKR"`).
 const MOUSE_LOOK_RECENTER: u32 = u32::from_le_bytes(*b"MLKR");
+/// Host mailbox mark while on-foot Z-target / recenter button remains held (`"MLKH"`).
+const MOUSE_LOOK_HOLD: u32 = u32::from_le_bytes(*b"MLKH");
 /// Host mailbox mark for flying reticle aim (`"MAM1"`), followed by `across`
 /// and `down` as `f32` bottom-screen pixels (`zakuro::input::MOUSE_AIM`).
 const MOUSE_AIM: u32 = u32::from_le_bytes(*b"MAM1");
@@ -257,14 +259,14 @@ const MSBT_CONTROLS_PATCHES: &[(usize, usize, &str)] = &[
     (0x1170E, 29, "Reticle: Right Stick & Gyro"),
     (0x11904, 13, "\u{2190}Gyro Off"),
     (0x11920, 12, "Gyro Fast\u{2192}"),
-    (0x119B6, 26, "R-Stick & Gyro (R:Center)"),
+    (0x119B6, 26, "R-Stick & Gyro (R:Target)"),
     (0x11A3A, 36, "Adjusts vertical Stick & Gyro speed."),
     (0x11A84, 38, "Adjusts horizontal Stick & Gyro speed."),
     (0x11AD2, 51, "Adjusts Right-Stick and Gyro Aiming reticle speed."),
     (
         0x11B3A,
         77,
-        "This adjusts Gyro Aiming sensitivity.\nSlide left for Off. Press R to center.",
+        "This adjusts Gyro Aiming sensitivity.\nSlide left for Off. R: Z-Target/Center",
     ),
     (0x11BD6, 51, "Adjust Air Battle Stick, Gyro & Invert Y controls."),
     (0x11C3E, 28, "Adjust Land Stick & Gyro."),
@@ -641,9 +643,10 @@ impl Aim {
 
         // In battle:
         // - R (Right Bumper) or Left Stick Click (`UNX_HOST_RECENTER`, bit 1) snaps
-        //   the Air Battle reticle to the rail center or levels Land Battle pitch on
-        //   press, and pauses gyro while held (+ brief settle grace on release) so
-        //   players can ratchet/reposition their hands comfortably back to neutral.
+        //   the Air Battle reticle to the rail center, or in Land Battle / Vehicles
+        //   Z-targets the nearest enemy (or centers yaw+pitch behind Pit if none is
+        //   in range). Holding keeps tracking the locked target while pausing gyro
+        //   (+ brief settle grace on release) so players can ratchet their hands.
         // - ZL (Nunchuk Z trigger) and ZR (Wii Remote B trigger) act as Fire (`PadState::L`).
         let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
         input.buttons.remove(PadState::R);
@@ -804,15 +807,16 @@ impl Aim {
     ///   `MOUSE_AIM` set even at zero stick velocity so `0x006D269C` locks the
     ///   reticle against left-stick movement drift), or `MOUSE_AIM_RECENTER` (`"MAMR"`)
     ///   when a recenter is requested.
-    /// - `MOUSE_LOOK` (`"MLK1"`) while on foot, or `MOUSE_LOOK_RECENTER` (`"MLKR"`)
-    ///   when a recenter is requested.
+    /// - `MOUSE_LOOK` (`"MLK1"`) on foot / in vehicles, `MOUSE_LOOK_RECENTER` (`"MLKR"`)
+    ///   on the rising edge of `R`/`L3` to acquire a Z-target (or center behind Pit),
+    ///   and `MOUSE_LOOK_HOLD` (`"MLKH"`) while `R`/`L3` stays held to keep tracking.
     pub fn feed(&mut self, mailbox: &mut [u32], (across, down): (f32, f32)) {
-        let (mark, recenter_mark) = match self.game {
+        let (mark, recenter_mark, hold_mark) = match self.game {
             GAME_ON_FOOT | GAME_VEHICLE if self.right_stick || self.gyro || self.mode != 0 => {
-                (MOUSE_LOOK, MOUSE_LOOK_RECENTER)
+                (MOUSE_LOOK, MOUSE_LOOK_RECENTER, MOUSE_LOOK_HOLD)
             }
             GAME_FLYING if (self.right_stick || self.gyro) && !self.touching => {
-                (MOUSE_AIM, MOUSE_AIM_RECENTER)
+                (MOUSE_AIM, MOUSE_AIM_RECENTER, MOUSE_AIM)
             }
             _ => {
                 self.recenter_pending = false;
@@ -821,7 +825,9 @@ impl Aim {
             }
         };
         let waiting_recenter = mailbox[0] == recenter_mark;
-        let waiting = waiting_recenter || (mailbox[0] == mark && (mailbox[1] != 0 || mailbox[2] != 0));
+        let waiting = waiting_recenter
+            || ((mailbox[0] == mark || mailbox[0] == hold_mark)
+                && (mailbox[1] != 0 || mailbox[2] != 0));
         self.untaken = if waiting { self.untaken.saturating_add(1) } else { 0 };
         let keep = waiting && self.untaken <= STALE_FRAMES;
         if self.recenter_pending {
@@ -830,7 +836,13 @@ impl Aim {
             mailbox[..3].copy_from_slice(&[recenter_mark, 0, 0]);
             return;
         }
-        let active_mark = if waiting_recenter && keep { recenter_mark } else { mark };
+        let active_mark = if waiting_recenter && keep {
+            recenter_mark
+        } else if self.recenter_held {
+            hold_mark
+        } else {
+            mark
+        };
         let carried = |word: u32| if keep { f32::from_bits(word) } else { 0.0 };
         let (across, down) = (carried(mailbox[1]) + across, carried(mailbox[2]) + down);
         mailbox[..3].copy_from_slice(&[active_mark, across.to_bits(), down.to_bits()]);
@@ -1126,5 +1138,72 @@ mod tests {
         let mut recenter = InputState { buttons: PadState::R, ..InputState::default() };
         aim.apply_motion_tilt(&mut recenter, [0.1, -0.1, 0.0], 0, true);
         assert_eq!(recenter.tilt, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn on_foot_recenter_sends_mlkr_then_mlkh_while_held_then_mlk1_on_release() {
+        let mut aim = test_aim();
+        aim.said(GAME_ON_FOOT);
+        let mut mailbox = [0u32; 4];
+
+        // Rising edge of R writes MOUSE_LOOK_RECENTER ("MLKR")
+        let mut press = InputState { buttons: PadState::R, ..InputState::default() };
+        let delta = aim.apply(&mut press, [0.1, -0.1, 0.0], 0);
+        assert_eq!(delta, (0.0, 0.0), "gyro is paused while R is held");
+        aim.feed(&mut mailbox, delta);
+        assert_eq!(mailbox[0], MOUSE_LOOK_RECENTER);
+
+        // Next 60 Hz host frame before 30 Hz guest consumes MLKR: preserve MLKR
+        let mut held = InputState { buttons: PadState::R, ..InputState::default() };
+        let delta = aim.apply(&mut held, [0.1, -0.1, 0.0], 0);
+        aim.feed(&mut mailbox, delta);
+        assert_eq!(mailbox[0], MOUSE_LOOK_RECENTER);
+
+        // Guest consumes MLKR by writing MLKH into mailbox[0]
+        mailbox[0] = MOUSE_LOOK_HOLD;
+        mailbox[1] = 0;
+        mailbox[2] = 0;
+
+        // While R remains held, host sends MOUSE_LOOK_HOLD ("MLKH")
+        let mut held2 = InputState { buttons: PadState::R, ..InputState::default() };
+        let delta = aim.apply(&mut held2, [0.1, -0.1, 0.0], 0);
+        aim.feed(&mut mailbox, delta);
+        assert_eq!(mailbox[0], MOUSE_LOOK_HOLD);
+
+        // Releasing R returns mailbox mark to MOUSE_LOOK ("MLK1")
+        let mut release = InputState::default();
+        let delta = aim.apply(&mut release, [0.0; 3], 0);
+        aim.feed(&mut mailbox, delta);
+        assert_eq!(mailbox[0], MOUSE_LOOK);
+    }
+
+    #[test]
+    fn flying_recenter_never_uses_mouse_look_hold() {
+        let mut aim = test_aim();
+        aim.said(GAME_FLYING);
+        let mut mailbox = [0u32; 4];
+
+        let mut press = InputState { buttons: PadState::R, ..InputState::default() };
+        let delta = aim.apply(&mut press, [0.0; 3], 0);
+        aim.feed(&mut mailbox, delta);
+        assert_eq!(mailbox[0], MOUSE_AIM_RECENTER);
+
+        // Guest acknowledges recenter
+        mailbox[0] = MOUSE_AIM;
+        let mut held = InputState { buttons: PadState::R, ..InputState::default() };
+        let delta = aim.apply(&mut held, [0.0; 3], 0);
+        aim.feed(&mut mailbox, delta);
+        assert_eq!(mailbox[0], MOUSE_AIM);
+    }
+
+    #[test]
+    fn msbt_controls_patches_fit_max_chars() {
+        for &(offset, max_chars, text) in MSBT_CONTROLS_PATCHES {
+            let utf16_len = text.encode_utf16().count();
+            assert!(
+                utf16_len <= max_chars,
+                "MSBT patch at {offset:#x} ({text:?}) has {utf16_len} UTF-16 units > max {max_chars}"
+            );
+        }
     }
 }
