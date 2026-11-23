@@ -277,6 +277,171 @@ const QUIET_AFTER_CLOSE: u32 = 6;
 const TOAST_SECONDS: f32 = 2.5;
 const TOAST_FADE: f32 = 0.5;
 
+struct WingSprite {
+    id: u64,
+    fresh: Option<Vec<u8>>,
+}
+
+const WING_W: u32 = 640;
+const WING_H: u32 = 440;
+
+type CubicSeg = ([f32; 2], [f32; 2], [f32; 2], [f32; 2]);
+
+const WING_BLADES: &[&[CubicSeg]] = &[
+    // 1) Main leading shoulder crest + Primary Feather #1 + continuous sweeping wing root
+    &[
+        ([134.0, 404.0], [66.0, 356.0], [48.0, 250.0], [112.0, 162.0]),
+        ([112.0, 162.0], [192.0, 62.0], [382.0, 18.0], [610.0, 36.0]),
+        ([610.0, 36.0], [528.0, 86.0], [424.0, 114.0], [314.0, 130.0]),
+        ([314.0, 130.0], [206.0, 146.0], [138.0, 212.0], [126.0, 304.0]),
+        ([126.0, 304.0], [120.0, 350.0], [144.0, 384.0], [176.0, 398.0]),
+        ([176.0, 398.0], [160.0, 408.0], [146.0, 412.0], [134.0, 404.0]),
+    ],
+    // 2) Primary Feather #2
+    &[
+        ([152.0, 248.0], [212.0, 160.0], [350.0, 126.0], [576.0, 102.0]),
+        ([576.0, 102.0], [492.0, 154.0], [386.0, 178.0], [274.0, 192.0]),
+        ([274.0, 192.0], [210.0, 200.0], [172.0, 224.0], [152.0, 248.0]),
+    ],
+    // 3) Primary Feather #3
+    &[
+        ([146.0, 288.0], [208.0, 214.0], [336.0, 188.0], [524.0, 172.0]),
+        ([524.0, 172.0], [446.0, 218.0], [350.0, 240.0], [250.0, 250.0]),
+        ([250.0, 250.0], [194.0, 256.0], [164.0, 272.0], [146.0, 288.0]),
+    ],
+    // 4) Primary Feather #4
+    &[
+        ([146.0, 326.0], [202.0, 266.0], [314.0, 246.0], [464.0, 238.0]),
+        ([464.0, 238.0], [394.0, 280.0], [310.0, 298.0], [222.0, 304.0]),
+        ([222.0, 304.0], [178.0, 308.0], [158.0, 316.0], [146.0, 326.0]),
+    ],
+    // 5) Primary Feather #5
+    &[
+        ([152.0, 358.0], [204.0, 312.0], [294.0, 298.0], [402.0, 298.0]),
+        ([402.0, 298.0], [342.0, 336.0], [268.0, 350.0], [196.0, 352.0]),
+        ([196.0, 352.0], [170.0, 354.0], [160.0, 356.0], [152.0, 358.0]),
+    ],
+    // 6) Primary Feather #6 (lower tail plume)
+    &[
+        ([164.0, 386.0], [212.0, 356.0], [278.0, 350.0], [344.0, 354.0]),
+        ([344.0, 354.0], [292.0, 386.0], [226.0, 398.0], [164.0, 386.0]),
+    ],
+    // 7) Delicate upper-left crest accent plume
+    &[
+        ([38.0, 234.0], [36.0, 166.0], [82.0, 102.0], [166.0, 62.0]),
+        ([166.0, 62.0], [114.0, 110.0], [76.0, 166.0], [58.0, 230.0]),
+        ([58.0, 230.0], [50.0, 238.0], [42.0, 238.0], [38.0, 234.0]),
+    ],
+];
+
+/// Rasterizes the cubic-Bezier angelic wing SVG paths into a crisp 4x-supersampled
+/// premultiplied white-alpha RGBA texture (`WING_W` x `WING_H`).
+fn rasterize_wing_svg() -> Vec<u8> {
+    let w = WING_W as usize;
+    let h = WING_H as usize;
+    let mut coverage = vec![0u16; w * h];
+    const STEPS: usize = 32;
+    const SUB_Y: usize = 4;
+
+    let mut edges: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(256);
+    let mut xs: Vec<f32> = Vec::with_capacity(32);
+
+    for &blade in WING_BLADES {
+        edges.clear();
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for &(p0, p1, p2, p3) in blade {
+            let mut prev = p0;
+            for step in 1..=STEPS {
+                let t = step as f32 / STEPS as f32;
+                let u = 1.0 - t;
+                let cur = [
+                    u * u * u * p0[0] + 3.0 * u * u * t * p1[0] + 3.0 * u * t * t * p2[0] + t * t * t * p3[0],
+                    u * u * u * p0[1] + 3.0 * u * u * t * p1[1] + 3.0 * u * t * t * p2[1] + t * t * t * p3[1],
+                ];
+                if (cur[1] - prev[1]).abs() > 1e-5 {
+                    let (y0, x0, y1, x1) = if prev[1] < cur[1] {
+                        (prev[1], prev[0], cur[1], cur[0])
+                    } else {
+                        (cur[1], cur[0], prev[1], prev[0])
+                    };
+                    min_y = min_y.min(y0);
+                    max_y = max_y.max(y1);
+                    edges.push((y0, x0, y1, x1));
+                }
+                prev = cur;
+            }
+        }
+        let py_start = (min_y.floor() as isize).clamp(0, h as isize) as usize;
+        let py_end = (max_y.ceil() as isize).clamp(0, h as isize) as usize;
+        for py in py_start..py_end {
+            let row = py * w;
+            for sy in 0..SUB_Y {
+                let y = py as f32 + (sy as f32 + 0.5) / SUB_Y as f32;
+                xs.clear();
+                for &(y0, x0, y1, x1) in &edges {
+                    if y >= y0 && y < y1 {
+                        let frac = (y - y0) / (y1 - y0);
+                        xs.push(x0 + (x1 - x0) * frac);
+                    }
+                }
+                if xs.len() < 2 {
+                    continue;
+                }
+                xs.sort_unstable_by(|a, b| a.total_cmp(b));
+                for pair in xs.chunks_exact(2) {
+                    let x0 = pair[0].clamp(0.0, w as f32);
+                    let x1 = pair[1].clamp(0.0, w as f32);
+                    if x1 <= x0 {
+                        continue;
+                    }
+                    let ix0 = x0.floor() as usize;
+                    let ix1 = (x1.ceil() as usize).min(w);
+                    for px in ix0..ix1 {
+                        let cov = ((px as f32 + 1.0).min(x1) - (px as f32).max(x0)).clamp(0.0, 1.0);
+                        let add = (cov * 255.0 + 0.5) as u16;
+                        coverage[row + px] = (coverage[row + px] + add).min(255 * SUB_Y as u16);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pixels = vec![0u8; w * h * 4];
+    for (i, &c) in coverage.iter().enumerate() {
+        let a = ((c as u32 + (SUB_Y as u32 / 2)) / SUB_Y as u32).min(255) as u8;
+        let at = i * 4;
+        pixels[at..at + 4].copy_from_slice(&[a, a, a, a]);
+    }
+    pixels
+}
+
+fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn wing_grad_color(u: f32, v: f32, phase: f32, is_error: bool) -> [u8; 4] {
+    let d = 0.68 * u + 0.32 * (1.0 - v);
+    let tau = std::f32::consts::TAU;
+    let wave = 0.5 + 0.5 * ((d * 0.85 - phase) * tau).sin();
+    let s = ((d * 1.10 - phase) * tau).sin().max(0.0);
+    let sheen = s * s * s * s;
+    let (r, g, b, alpha) = if !is_error {
+        let r = lerp_f32(lerp_f32(64.0, 250.0, wave), 255.0, sheen * 0.65);
+        let g = lerp_f32(lerp_f32(148.0, 206.0, wave), 246.0, sheen * 0.65);
+        let b = lerp_f32(lerp_f32(242.0, 94.0, wave), 214.0, sheen * 0.65);
+        let a = (lerp_f32(0.18, 0.36, wave) + sheen * 0.16).min(1.0);
+        (r, g, b, a)
+    } else {
+        let r = lerp_f32(lerp_f32(175.0, 245.0, wave), 255.0, sheen * 0.50);
+        let g = lerp_f32(lerp_f32(48.0, 128.0, wave), 204.0, sheen * 0.50);
+        let b = lerp_f32(lerp_f32(82.0, 92.0, wave), 178.0, sheen * 0.50);
+        let a = (lerp_f32(0.16, 0.32, wave) + sheen * 0.14).min(1.0);
+        (r, g, b, a)
+    };
+    color(r as u8, g as u8, b as u8, (alpha * 255.0) as u8)
+}
+
 pub struct Menu {
     pub open: bool,
     cursor: usize,
@@ -293,6 +458,8 @@ pub struct Menu {
     /// the direction held and for how many frames, for repeats
     held: (u32, u32),
     atlas: Option<Atlas>,
+    wing: Option<WingSprite>,
+    anim_start: std::time::Instant,
     next_id: u64,
     /// a hotkey's notice, while the menu is closed
     toast: Option<(String, std::time::Instant)>,
@@ -346,6 +513,8 @@ impl Menu {
             last_buttons: 0,
             held: (0, 0),
             atlas: None,
+            wing: None,
+            anim_start: std::time::Instant::now(),
             next_id: 0x4D45_4E55_0000,
             toast: None,
         }
@@ -547,6 +716,10 @@ impl Menu {
     /// the game, in a window `width` x `height` pixels
     pub fn overlay(&mut self, settings: &Settings, docked: bool, now: (u32, bool), width: u32, height: u32, show_version: bool) -> Overlay {
         let mut overlay = Overlay::default();
+        // Release the bootstrap wing texture once normal gameplay takes over.
+        if let Some(wing) = self.wing.take() {
+            overlay.free.push(wing.id);
+        }
         let toast = self.toast.as_ref().map(|(text, at)| (text.clone(), at.elapsed().as_secs_f32()));
         if toast.as_ref().is_some_and(|(_, age)| *age > TOAST_SECONDS) {
             self.toast = None;
@@ -688,7 +861,8 @@ impl Menu {
         painter.text(left + margin, y, &help, small, color(130, 140, 165, 255));
     }
 
-    /// Full-screen bootstrap / setup / progress card drawn before gameplay starts.
+    /// Full-screen bootstrap / setup / progress card drawn before gameplay starts,
+    /// layered over a soaring angelic wing SVG backdrop with an animated gradient fill.
     pub fn status_overlay(
         &mut self,
         heading: &str,
@@ -703,14 +877,97 @@ impl Menu {
         if !self.ready(height, &mut overlay) {
             return overlay;
         }
+        if self.wing.is_none() {
+            self.next_id += 1;
+            self.wing = Some(WingSprite { id: self.next_id, fresh: Some(rasterize_wing_svg()) });
+        }
+        let wing_id = {
+            let wing = self.wing.as_mut().unwrap();
+            if let Some(pixels) = wing.fresh.take() {
+                overlay.textures.push(OverlayTexture {
+                    id: wing.id,
+                    offset: None,
+                    size: [WING_W, WING_H],
+                    pixels,
+                    linear: true,
+                });
+            }
+            wing.id
+        };
+
+        let phase = (self.anim_start.elapsed().as_secs_f32() * 0.22).fract();
         let atlas = self.atlas.as_ref().unwrap();
+        let w_f = width as f32;
+        let h_f = height as f32;
+        let k = h_f / 720.0;
+
+        // Mesh 1: Smooth vertical twilight sky gradient backdrop
+        {
+            let uv = atlas.uv(COUNT, atlas.cell[0] / 2.0 - 0.5);
+            let top_c = color(7, 11, 26, 255);
+            let bot_c = color(15, 22, 48, 255);
+            let vertices = vec![
+                OverlayVertex { position: [0.0, 0.0], uv: [uv[0], uv[1]], color: top_c },
+                OverlayVertex { position: [w_f, 0.0], uv: [uv[2], uv[1]], color: top_c },
+                OverlayVertex { position: [w_f, h_f], uv: [uv[2], uv[3]], color: bot_c },
+                OverlayVertex { position: [0.0, h_f], uv: [uv[0], uv[3]], color: bot_c },
+            ];
+            overlay.meshes.push(OverlayMesh {
+                texture: atlas.id,
+                clip: [0, 0, width, height],
+                vertices,
+                indices: vec![0, 1, 2, 0, 2, 3],
+            });
+        }
+
+        // Mesh 2: Soaring angelic wing SVG with animated diagonal celestial gradient fill
+        {
+            const COLS: usize = 20;
+            const ROWS: usize = 14;
+            let ww = 1040.0 * k;
+            let wh = 715.0 * k;
+            let wx0 = w_f * 0.52 - ww * 0.48;
+            let wy0 = h_f * 0.50 - wh * 0.50;
+            let mut vertices = Vec::with_capacity((COLS + 1) * (ROWS + 1));
+            for ry in 0..=ROWS {
+                let v = ry as f32 / ROWS as f32;
+                let y = wy0 + wh * v;
+                for rx in 0..=COLS {
+                    let u = rx as f32 / COLS as f32;
+                    let x = wx0 + ww * u;
+                    vertices.push(OverlayVertex {
+                        position: [x, y],
+                        uv: [u, v],
+                        color: wing_grad_color(u, v, phase, is_error),
+                    });
+                }
+            }
+            let stride = (COLS + 1) as u32;
+            let mut indices = Vec::with_capacity(COLS * ROWS * 6);
+            for ry in 0..ROWS as u32 {
+                for rx in 0..COLS as u32 {
+                    let i0 = ry * stride + rx;
+                    let i1 = i0 + 1;
+                    let i2 = i0 + stride + 1;
+                    let i3 = i0 + stride;
+                    indices.extend_from_slice(&[i0, i1, i2, i0, i2, i3]);
+                }
+            }
+            overlay.meshes.push(OverlayMesh {
+                texture: wing_id,
+                clip: [0, 0, width, height],
+                vertices,
+                indices,
+            });
+        }
+
+        // Mesh 3: Frosted glass card, hairline border, animated progress bar, and crisp typography
         let mut painter = Painter { atlas, vertices: Vec::new(), indices: Vec::new() };
-        let k = height as f32 / 720.0;
         let line = (atlas.px * 1.38).round();
         let body_scale = 0.88;
         let body_line = line * 0.90;
         let panel_w = 820.0 * k;
-        let margin = 32.0 * k;
+        let margin = 34.0 * k;
         let max_text_w = panel_w - margin * 2.0;
 
         let mut wrapped_blocks: Vec<Vec<String>> = Vec::with_capacity(paragraphs.len());
@@ -728,15 +985,25 @@ impl Menu {
 
         let progress_h = if progress.is_some() { line * 2.4 } else { 0.0 };
         let footer_h = if footer.is_some() { line * 1.5 } else { 0.0 };
-        let panel_h = line * 2.2 + body_line * (total_body_lines as f32) + progress_h + footer_h + margin * 0.9;
-        let left = (width as f32 - panel_w) * 0.5;
-        let top = ((height as f32 - panel_h) * 0.5).max(20.0 * k);
+        let panel_h = line * 2.2 + body_line * (total_body_lines as f32) + progress_h + footer_h + margin * 0.95;
+        let left = (w_f - panel_w) * 0.5;
+        let top = ((h_f - panel_h) * 0.5).max(20.0 * k);
 
-        // Deep midnight background + card + accent bar
-        painter.rect([0.0, 0.0, width as f32, height as f32], color(8, 11, 24, 255));
-        painter.rect([left, top, left + panel_w, top + panel_h], color(18, 23, 46, 248));
-        let accent = if is_error { color(240, 95, 95, 255) } else { color(250, 200, 80, 255) };
-        painter.rect([left, top, left + panel_w, top + 4.0 * k], accent);
+        // Multi-layer soft drop shadow + translucent frosted celestial card
+        for &(pad_s, alpha_s) in &[(18.0 * k, 22u8), (10.0 * k, 36), (4.0 * k, 52)] {
+            painter.rect(
+                [left - pad_s, top - pad_s * 0.5, left + panel_w + pad_s, top + panel_h + pad_s],
+                color(3, 5, 14, alpha_s),
+            );
+        }
+        painter.rect([left, top, left + panel_w, top + panel_h], color(12, 17, 36, 192));
+        let accent = if is_error { color(242, 102, 102, 255) } else { color(250, 206, 88, 255) };
+        let border = if is_error { color(242, 102, 102, 92) } else { color(250, 206, 88, 92) };
+        let bw = (1.0 * k).max(1.0);
+        painter.rect([left, top, left + panel_w, top + (3.0 * k).max(2.0)], accent);
+        painter.rect([left, top + panel_h - bw, left + panel_w, top + panel_h], border);
+        painter.rect([left, top, left + bw, top + panel_h], border);
+        painter.rect([left + panel_w - bw, top, left + panel_w, top + panel_h], border);
 
         let title = format!("UprisingNX {} - {heading}", VERSION_LABEL);
         painter.text(left + margin, top + line * 0.55, &title, 1.05, accent);
@@ -749,9 +1016,9 @@ impl Menu {
             }
             for text in block {
                 let c = if text.starts_with("sdmc:/") || text.starts_with("switch/") {
-                    color(145, 220, 255, 255)
+                    color(145, 226, 255, 255)
                 } else {
-                    color(225, 230, 242, 255)
+                    color(234, 238, 248, 255)
                 };
                 painter.text(left + margin, y, text, body_scale, c);
                 y += body_line;
@@ -764,20 +1031,46 @@ impl Menu {
             let bar_x0 = left + margin;
             let bar_x1 = left + panel_w - margin;
             let bar_h = 22.0 * k;
-            painter.rect([bar_x0, y, bar_x1, y + bar_h], color(36, 44, 78, 255));
+            painter.rect([bar_x0, y, bar_x1, y + bar_h], color(26, 34, 66, 225));
             let fill_w = (bar_x1 - bar_x0) * pct.clamp(0.0, 1.0);
             if fill_w > 1.0 {
-                painter.rect([bar_x0, y, bar_x0 + fill_w, y + bar_h], color(250, 200, 80, 255));
+                // Smooth GPU-interpolated animated gold shimmer bar
+                const SEGS: usize = 16;
+                let white_uv = atlas.uv(COUNT, atlas.cell[0] / 2.0 - 0.5);
+                let u_mid = (white_uv[0] + white_uv[2]) * 0.5;
+                let v_mid = (white_uv[1] + white_uv[3]) * 0.5;
+                let bar_color = |t: f32| -> [u8; 4] {
+                    let s = ((t * 1.2 - phase * 1.5) * std::f32::consts::TAU).sin().max(0.0);
+                    let sh = s * s * s;
+                    let cr = lerp_f32(222.0, 255.0, (t * 0.55 + sh * 0.45).min(1.0)) as u8;
+                    let cg = lerp_f32(168.0, 238.0, (t * 0.45 + sh * 0.55).min(1.0)) as u8;
+                    let cb = lerp_f32(56.0, 166.0, (sh * 0.75).min(1.0)) as u8;
+                    color(cr, cg, cb, 255)
+                };
+                for i in 0..SEGS {
+                    let t0 = i as f32 / SEGS as f32;
+                    let t1 = (i + 1) as f32 / SEGS as f32;
+                    let x0 = bar_x0 + fill_w * t0;
+                    let x1 = bar_x0 + fill_w * t1;
+                    let c0 = bar_color(t0);
+                    let c1 = bar_color(t1);
+                    let base = painter.vertices.len() as u32;
+                    painter.vertices.push(OverlayVertex { position: [x0, y], uv: [u_mid, v_mid], color: c0 });
+                    painter.vertices.push(OverlayVertex { position: [x1, y], uv: [u_mid, v_mid], color: c1 });
+                    painter.vertices.push(OverlayVertex { position: [x1, y + bar_h], uv: [u_mid, v_mid], color: c1 });
+                    painter.vertices.push(OverlayVertex { position: [x0, y + bar_h], uv: [u_mid, v_mid], color: c0 });
+                    painter.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                }
             }
             let pct_label = format!("{:.0}%", (pct.clamp(0.0, 1.0) * 100.0));
             let px_x = bar_x1 - atlas.width(&pct_label) * 0.85;
-            painter.text(bar_x0, y + bar_h + 8.0 * k, status, 0.82, color(190, 200, 225, 255));
-            painter.text(px_x, y + bar_h + 8.0 * k, &pct_label, 0.85, color(250, 200, 80, 255));
+            painter.text(bar_x0, y + bar_h + 8.0 * k, status, 0.82, color(198, 210, 236, 255));
+            painter.text(px_x, y + bar_h + 8.0 * k, &pct_label, 0.85, accent);
         }
 
         if let Some(foot) = footer {
             let fy = top + panel_h - line * 1.15;
-            painter.text(left + margin, fy, foot, 0.80, color(145, 155, 185, 255));
+            painter.text(left + margin, fy, foot, 0.80, color(154, 166, 198, 255));
         }
 
         let (vertices, indices) = (painter.vertices, painter.indices);
