@@ -2916,7 +2916,7 @@ fn adjust_mode_top(
         if (right - left) <= 85.0
             && (lower - upper) <= 85.0
             && left >= 210.0
-            && right <= 335.0
+            && right <= 355.0
             && lower <= 105.0
         {
             return None;
@@ -4557,15 +4557,26 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                 portraits.chapter_step = 0;
             }
 
-            if dims == (256 << 16 | 128) && fmt == TextureFormat::Etc1 {
+            // Mode Select's top screen draws:
+            //   1. `256x32 Etc1` lined rainbow parchment (shared across all 8 mode tiles)
+            //   2. 0..=2 per-mode background silhouette draws (`256x128 Etc1` on Solo,
+            //      `128x128 Etc1` on Vault, `128x64 Etc1` on Options, `32x32 Rgb565` on
+            //      StreetPass, `128x128 L4` / `256x128 La4` on Together / AR / Manual)
+            //   3. One or more `256x256 L4` wing/vine flourishes
+            //   4. `32x8 Rgb565` header underline
+            if dims == (256 << 16 | 32) && fmt == TextureFormat::Etc1 {
                 portraits.mode_top_step = 1;
                 portraits.cauldron_active = false;
                 portraits.cauldron_hud_active = false;
-            } else if portraits.mode_top_step == 1
+            } else if matches!(portraits.mode_top_step, 1 | 4 | 5)
                 && dims == (256 << 16 | 256)
                 && fmt == TextureFormat::L4
             {
                 portraits.mode_top_step = 2;
+            } else if portraits.mode_top_step == 1 {
+                portraits.mode_top_step = 4;
+            } else if portraits.mode_top_step == 4 {
+                portraits.mode_top_step = 5;
             } else if portraits.mode_top_step == 2
                 && dims == (256 << 16 | 256)
                 && fmt == TextureFormat::L4
@@ -4594,6 +4605,13 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                 portraits.mode_top_step = 0;
             }
 
+            // Solo Hub's top screen (both Palutena's Temple and Viridi's Sanctuary) draws:
+            //   - Viridi's Sanctuary: `16x32 Rgb565` -> `64x64 Rgba4` (bottom vignette)
+            //     -> `128x128 L4` (lower-right black swirl) -> `64x64 Rgba4` (Total Hearts pouch)
+            //   - Palutena's Temple: `64x64 Rgba4` (bottom vignette) -> `64x64 Rgba4` (Total Hearts pouch)
+            // Matching the 2D HUD pair (`64x64 Rgba4 -> [128x128 L4] -> 64x64 Rgba4`) handles
+            // both domains independently of 3D room meshes and camera frustum culling, while
+            // keeping the Viridi `16x32 Rgb565` fast path so its swirl is hidden on frame 1.
             if dims == (16 << 16 | 32) && fmt == TextureFormat::Rgb565 {
                 portraits.solo_top_step = 1;
                 portraits.cauldron_active = false;
@@ -4620,6 +4638,34 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                 portraits.weapon_active = false;
                 portraits.weapon_modal_top = false;
                 portraits.frontend_menu_seen = true;
+            } else if matches!(portraits.solo_top_step, 2 | 4 | 5)
+                && dims == (64 << 16 | 64)
+                && fmt == TextureFormat::Rgba4
+            {
+                portraits.solo_top_step = 3;
+                portraits.solo_top_seen = true;
+                portraits.solo_active = true;
+                portraits.solo_missed = 0;
+                portraits.cauldron_active = false;
+                portraits.cauldron_hud_active = false;
+                portraits.chapter_active = false;
+                portraits.mode_active = false;
+                portraits.mode_top_latched = false;
+                portraits.file_active = false;
+                portraits.weapon_active = false;
+                portraits.weapon_modal_top = false;
+                portraits.frontend_menu_seen = true;
+            } else if portraits.solo_top_step == 4
+                && dims == (128 << 16 | 128)
+                && fmt == TextureFormat::L4
+            {
+                portraits.solo_top_step = 5;
+            } else if dims == (64 << 16 | 64)
+                && fmt == TextureFormat::Rgba4
+                && !portraits.file_top_seen
+                && !portraits.cauldron_top_seen
+            {
+                portraits.solo_top_step = 4;
             } else {
                 portraits.solo_top_step = 0;
             }
@@ -12816,5 +12862,81 @@ mod tests {
         let mut cache2 = TextureCache::default();
         let (second, _) = cache2.decoded(key, &data);
         assert!(Arc::ptr_eq(&first, &second), "second miss in TextureCache reuses TITLE_CACHE entry");
+    }
+
+    fn top_tex_regs(width: u32, height: u32, fmt: TextureFormat) -> Vec<u32> {
+        let mut regs = vec![0u32; 0x300];
+        regs[REG_FRAMEBUFFER_DIMENSIONS] = 240 | (399 << 12);
+        regs[REG_VIEWPORT_WIDTH] = float24(120.0);
+        regs[REG_VIEWPORT_HEIGHT] = float24(200.0);
+        regs[REG_TEXTURE_CONFIG] = 1;
+        let base = TEXTURE_UNIT_BASES[0];
+        regs[base + 1] = (width << 16) | height;
+        regs[base + 13] = match fmt {
+            TextureFormat::Rgb565 => 3,
+            TextureFormat::Rgba4 => 4,
+            TextureFormat::L4 => 10,
+            TextureFormat::Etc1 => 12,
+            _ => unreachable!("unused test format {fmt:?}"),
+        };
+        regs
+    }
+
+    #[test]
+    fn mode_select_detects_all_hovered_modes_including_after_vault() {
+        // Every Mode Select item shares `256x32 Etc1 -> [0..=2 mode silhouettes] -> 256x256 L4 -> 32x8 Rgb565`.
+        let cases: &[(&str, &[(u32, u32, TextureFormat)])] = &[
+            ("Solo", &[(256, 128, TextureFormat::Etc1)]),
+            ("Vault", &[(128, 128, TextureFormat::Etc1)]),
+            ("Options", &[(128, 64, TextureFormat::Etc1)]),
+            ("StreetPass", &[(32, 32, TextureFormat::Rgb565)]),
+            ("NoSilhouette", &[]),
+        ];
+        for &(name, silhouettes) in cases {
+            let mut portraits = Portraits::default();
+            note_title_draw(&top_tex_regs(256, 32, TextureFormat::Etc1), &mut portraits);
+            for &(w, h, fmt) in silhouettes {
+                note_title_draw(&top_tex_regs(w, h, fmt), &mut portraits);
+            }
+            note_title_draw(&top_tex_regs(256, 256, TextureFormat::L4), &mut portraits);
+            note_title_draw(&top_tex_regs(256, 256, TextureFormat::L4), &mut portraits);
+            note_title_draw(&top_tex_regs(32, 8, TextureFormat::Rgb565), &mut portraits);
+            assert!(
+                portraits.mode_active && portraits.mode_top_seen && portraits.mode_top_latched,
+                "Mode Select should activate immediately when hovering {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn solo_hub_detects_both_viridi_and_palutena_domains() {
+        // Viridi's Sanctuary: `16x32 Rgb565 -> 64x64 Rgba4 -> 128x128 L4`
+        let mut viridi = Portraits::default();
+        note_title_draw(&top_tex_regs(16, 32, TextureFormat::Rgb565), &mut viridi);
+        note_title_draw(&top_tex_regs(64, 64, TextureFormat::Rgba4), &mut viridi);
+        note_title_draw(&top_tex_regs(128, 128, TextureFormat::L4), &mut viridi);
+        assert!(viridi.solo_active && viridi.solo_top_seen, "Viridi Solo Hub detected");
+
+        // Palutena's Temple: `16x16 Etc1 -> 64x64 Rgba4 (vignette) -> 64x64 Rgba4 (hearts pouch)`
+        let mut palutena = Portraits::default();
+        note_title_draw(&top_tex_regs(16, 16, TextureFormat::Etc1), &mut palutena);
+        note_title_draw(&top_tex_regs(64, 64, TextureFormat::Rgba4), &mut palutena);
+        assert!(!palutena.solo_active, "single 64x64 Rgba4 must not trigger Solo Hub");
+        note_title_draw(&top_tex_regs(64, 64, TextureFormat::Rgba4), &mut palutena);
+        assert!(palutena.solo_active && palutena.solo_top_seen, "Palutena Solo Hub detected");
+
+        // Viridi fallback if `16x32 Rgb565` is frustum-culled: `64x64 Rgba4 -> 128x128 L4 -> 64x64 Rgba4`
+        let mut viridi_culled = Portraits::default();
+        note_title_draw(&top_tex_regs(64, 64, TextureFormat::Rgba4), &mut viridi_culled);
+        note_title_draw(&top_tex_regs(128, 128, TextureFormat::L4), &mut viridi_culled);
+        note_title_draw(&top_tex_regs(64, 64, TextureFormat::Rgba4), &mut viridi_culled);
+        assert!(viridi_culled.solo_active && viridi_culled.solo_top_seen, "Viridi fallback detected");
+
+        // File Select must not false-trigger Solo Hub
+        let mut file_select = Portraits::default();
+        file_select.file_top_seen = true;
+        note_title_draw(&top_tex_regs(64, 64, TextureFormat::Rgba4), &mut file_select);
+        note_title_draw(&top_tex_regs(64, 64, TextureFormat::Rgba4), &mut file_select);
+        assert!(!file_select.solo_active, "File Select must not trigger Solo Hub");
     }
 }
