@@ -99,6 +99,9 @@ pub fn ensure_sd_layout() {
         PRIMARY_ROM_DIR,
         CACHE_DIR,
         "sdmc:/switch/uprisingnx/data",
+        crate::saves::SAVE_ROOT,
+        crate::saves::SAVE_IMPORT_DIR,
+        crate::saves::SAVE_EXPORT_DIR,
     ] {
         let _ = fs::create_dir_all(dir);
     }

@@ -1,8 +1,9 @@
 //! the in-game settings menu: Minus (or right stick click + Minus) opens it, the game
-//! pauses while it is open. D-pad Up/Down picks a row, Left/Right (or A)
-//! changes it, B or right stick click + Minus again closes it. every change
-//! is applied at once and written to settings.ini; the chosen row's
-//! description shows under the rows. it also draws the hotkeys' notices.
+//! pauses while it is open. L/R switches tabs (Video, Controls, Save & System),
+//! D-pad Up/Down picks a row, Left/Right (or A) changes it, and B or Minus closes it.
+//! Every setting change is applied at once and written to settings.ini; the chosen
+//! row's description shows under the rows. It also draws hotkey notices and the
+//! pre-boot animated wing setup/progress screen.
 //!
 //! drawn with the presenter's overlay: one texture holds the printable ASCII
 //! glyphs of the Switch's system font (handed over by unx_set_font) and a
@@ -34,6 +35,10 @@ const PAD_RIGHT: u32 = 1 << 4;
 const PAD_LEFT: u32 = 1 << 5;
 const PAD_UP: u32 = 1 << 6;
 const PAD_DOWN: u32 = 1 << 7;
+const PAD_R: u32 = 1 << 8;
+const PAD_L: u32 = 1 << 9;
+const PAD_ZL: u32 = 1 << 14;
+const PAD_ZR: u32 = 1 << 15;
 /// frames a held direction waits before it repeats, then between repeats
 const REPEAT_FIRST: u32 = 20;
 const REPEAT_EVERY: u32 = 6;
@@ -167,6 +172,39 @@ fn wrap(atlas: &Atlas, text: &str, size: f32, width: f32) -> Vec<String> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tab {
+    Video,
+    Controls,
+    System,
+}
+
+const TABS: [Tab; 3] = [Tab::Video, Tab::Controls, Tab::System];
+const MAX_TAB_ROWS: usize = 8;
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Video => "Video",
+            Tab::Controls => "Controls",
+            Tab::System => "Save & System",
+        }
+    }
+
+    fn rows(self) -> &'static [Row] {
+        match self {
+            Tab::Video => VIDEO_ROWS,
+            Tab::Controls => CONTROLS_ROWS,
+            Tab::System => SYSTEM_ROWS,
+        }
+    }
+
+    fn step(self, delta: i32) -> Tab {
+        let idx = TABS.iter().position(|&t| t == self).unwrap_or(0) as i32;
+        TABS[(idx + delta).rem_euclid(TABS.len() as i32) as usize]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Row {
     Editing,
     Preset,
@@ -183,11 +221,41 @@ enum Row {
     LeftStick,
     Modifier,
     Minus,
+    ImportSave,
+    ExportSave,
     Resume,
     Quit,
 }
 
-const ROWS: [Row; 17] = [
+const VIDEO_ROWS: &[Row] = &[
+    Row::Editing,
+    Row::Preset,
+    Row::BattleScale,
+    Row::MenuScale,
+    Row::Smooth,
+    Row::DynamicRes,
+    Row::PowerLabel,
+];
+
+const CONTROLS_ROWS: &[Row] = &[
+    Row::RightStick,
+    Row::Gyro,
+    Row::GyroSpeed,
+    Row::AimSpeed,
+    Row::InvertY,
+    Row::LeftStick,
+    Row::Modifier,
+    Row::Minus,
+];
+
+const SYSTEM_ROWS: &[Row] = &[
+    Row::ImportSave,
+    Row::ExportSave,
+    Row::Resume,
+    Row::Quit,
+];
+
+const ALL_ROWS: [Row; 19] = [
     Row::Editing,
     Row::Preset,
     Row::BattleScale,
@@ -203,6 +271,8 @@ const ROWS: [Row; 17] = [
     Row::LeftStick,
     Row::Modifier,
     Row::Minus,
+    Row::ImportSave,
+    Row::ExportSave,
     Row::Resume,
     Row::Quit,
 ];
@@ -228,14 +298,16 @@ impl Row {
             Row::LeftStick => "Left stick aim",
             Row::Modifier => "Aim button",
             Row::Minus => "Minus button",
-            Row::Resume => "Resume",
-            Row::Quit => "Quit game",
+            Row::ImportSave => "Import 3DS save",
+            Row::ExportSave => "Export save backup",
+            Row::Resume => "Resume game",
+            Row::Quit => "Quit UprisingNX",
         }
     }
 
     fn description(self, docked: bool) -> &'static str {
         match self {
-            Row::Editing => "Which video settings the rows below change: handheld or docked. Each has its own preset and resolutions, and the other one takes over when you dock or undock. The aim settings are shared.",
+            Row::Editing => "Which video settings the rows below change: handheld or docked. Each has its own preset and resolutions, and the other one takes over when you dock or undock. Aim settings are shared.",
             Row::Preset => {
                 if docked {
                     "Performance: 3x in battles, 4x elsewhere, smooth mode on. Quality: 4x everywhere at the game's own 30 fps. Custom: the values below."
@@ -256,6 +328,8 @@ impl Row {
             Row::LeftStick => "Off: the left stick only moves Pit. 1: in the air it also aims, and on foot holding the aim button turns the camera with it. 2: as 1, but in the air it aims only while the aim button is held.",
             Row::Modifier => "The button held with the left stick to aim or turn the camera (Left stick aim 1 or 2). Fire stays on L/ZL.",
             Row::Minus => "Settings menu: Minus alone opens and closes this menu (Plus still pauses; the game's Select only pauses in battles, like Plus). 3DS Select: Minus goes to the game, and right stick click + Minus opens this menu.",
+            Row::ImportSave => "Imports decrypted 3DS saves (00.SAV, 01.SAV...) from sdmc:/switch/uprisingnx/save/import/. Automatically backs up your current Switch save first. Restart or return to Title Screen to load.",
+            Row::ExportSave => "Copies your current Switch save files to sdmc:/switch/uprisingnx/save/export/ for use with Checkpoint, JKSM, Citra, or Azahar.",
             Row::Resume => "Back to the game. B or Minus (or right stick click + Minus) also closes this menu.",
             Row::Quit => "Closes UprisingNX. Progress since the game last saved is lost.",
         }
@@ -267,6 +341,8 @@ impl Row {
 pub enum Changed {
     Video,
     Controls,
+    ImportSave,
+    ExportSave,
     Quit,
 }
 
@@ -428,9 +504,17 @@ fn wing_grad_color(u: f32, v: f32, phase: f32, is_error: bool) -> [u8; 4] {
 
 pub struct Menu {
     pub open: bool,
+    tab: Tab,
     cursor: usize,
     /// Quit was pressed once; a second press quits
     quit_armed: bool,
+    /// Import save was pressed once; a second press overwrites (after backup)
+    import_armed: bool,
+    /// Cached save counts refreshed on menu open and after import/export
+    pending_saves: usize,
+    live_saves: usize,
+    /// Inline status message shown on the Save & System tab (`(text, is_error)`)
+    status: Option<(String, bool)>,
     /// whose video settings the menu shows and changes, docked or handheld;
     /// the mode the console is in when it opens
     editing_docked: bool,
@@ -489,8 +573,13 @@ impl Menu {
     pub fn new() -> Menu {
         Menu {
             open: false,
+            tab: Tab::Video,
             cursor: 0,
             quit_armed: false,
+            import_armed: false,
+            pending_saves: 0,
+            live_saves: 0,
+            status: None,
             editing_docked: false,
             blocking: false,
             quiet: 0,
@@ -504,12 +593,24 @@ impl Menu {
         }
     }
 
+    pub fn set_save_counts(&mut self, pending: usize, live: usize) {
+        self.pending_saves = pending;
+        self.live_saves = live;
+    }
+
+    pub fn set_status(&mut self, text: String, is_error: bool) {
+        self.status = Some((text, is_error));
+    }
+
     pub fn toggle(&mut self, buttons: u32, docked: bool) {
         self.open = !self.open;
         // what is held as it opens or closes is not a press
         self.last_buttons = buttons;
         self.held = (0, 0);
         self.quit_armed = false;
+        self.import_armed = false;
+        self.status = None;
+        self.cursor = self.cursor.min(self.tab.rows().len().saturating_sub(1));
         self.editing_docked = docked;
         // the button that closed it, or any other, must not reach the game
         self.blocking = !self.open;
@@ -560,14 +661,39 @@ impl Menu {
             self.toggle(buttons, docked_now);
             return None;
         }
+        if pressed & (PAD_L | PAD_ZL) != 0 {
+            self.tab = self.tab.step(-1);
+            self.cursor = 0;
+            self.quit_armed = false;
+            self.import_armed = false;
+            if self.tab != Tab::System {
+                self.status = None;
+            }
+            return None;
+        }
+        if pressed & (PAD_R | PAD_ZR) != 0 {
+            self.tab = self.tab.step(1);
+            self.cursor = 0;
+            self.quit_armed = false;
+            self.import_armed = false;
+            if self.tab != Tab::System {
+                self.status = None;
+            }
+            return None;
+        }
+        let rows = self.tab.rows();
+        if self.cursor >= rows.len() {
+            self.cursor = 0;
+        }
         if step & (PAD_UP | PAD_DOWN) != 0 {
             self.quit_armed = false;
+            self.import_armed = false;
         }
         if step & PAD_UP != 0 {
-            self.cursor = (self.cursor + ROWS.len() - 1) % ROWS.len();
+            self.cursor = (self.cursor + rows.len() - 1) % rows.len();
         }
         if step & PAD_DOWN != 0 {
-            self.cursor = (self.cursor + 1) % ROWS.len();
+            self.cursor = (self.cursor + 1) % rows.len();
         }
         let a = pressed & PAD_A != 0;
         let delta: i32 = if step & PAD_RIGHT != 0 || a {
@@ -577,7 +703,7 @@ impl Menu {
         } else {
             return None;
         };
-        let row = ROWS[self.cursor];
+        let row = rows[self.cursor];
         let docked = self.editing_docked;
         let mode = settings.mode_mut(docked);
         let changed = match row {
@@ -645,6 +771,23 @@ impl Menu {
                 let index = (modifier_index(settings) as i32 + delta).rem_euclid(MODIFIERS.len() as i32) as usize;
                 set_control(settings, "aim_modifier", MODIFIERS[index].into());
                 Changed::Controls
+            }
+            Row::ImportSave => {
+                if !a {
+                    return None;
+                }
+                if self.pending_saves > 0 && !self.import_armed {
+                    self.import_armed = true;
+                    return None;
+                }
+                self.import_armed = false;
+                Changed::ImportSave
+            }
+            Row::ExportSave => {
+                if !a {
+                    return None;
+                }
+                Changed::ExportSave
             }
             Row::Resume => {
                 if a {
@@ -786,63 +929,212 @@ impl Menu {
                 },
                 Row::Modifier => MODIFIERS[modifier_index(settings)].into(),
                 Row::Minus => if settings.minus_opens_menu() { "Settings menu".into() } else { "3DS Select".into() },
+                Row::ImportSave => {
+                    if self.import_armed {
+                        "Press A again".into()
+                    } else if self.pending_saves > 0 {
+                        let s = if self.pending_saves == 1 { "" } else { "s" };
+                        format!("{} file{s} ready", self.pending_saves)
+                    } else {
+                        "No files in import/".into()
+                    }
+                }
+                Row::ExportSave => {
+                    if self.live_saves > 0 {
+                        let s = if self.live_saves == 1 { "" } else { "s" };
+                        format!("{} file{s}", self.live_saves)
+                    } else {
+                        "No save yet".into()
+                    }
+                }
                 Row::Resume => String::new(),
                 Row::Quit => if self.quit_armed { "Press A again".into() } else { String::new() },
             }
         };
 
         let k = height as f32 / 720.0;
-        let line = (atlas.px * 1.32).round();
+        let line = (atlas.px * 1.40).round();
         let small = 0.78;
-        let small_line = line * 0.8;
-        let panel_w = 760.0 * k;
-        let margin = 26.0 * k;
-        let row = ROWS[self.cursor];
-        let description = wrap(atlas, row.description(docked), small, panel_w - margin * 2.0);
-        // room for the longest description, so the panel doesn't jump
-        let described = ROWS.iter().map(|r| wrap(atlas, r.description(docked), small, panel_w - margin * 2.0).len()).max().unwrap_or(1);
-        let panel_h = line * (1.5 + ROWS.len() as f32 + 0.5) + small_line * described as f32 + line * 1.4;
+        let small_line = (line * 0.80).round();
+        let panel_w = 780.0 * k;
+        let margin = 28.0 * k;
+        let inner_w = panel_w - margin * 2.0;
+
+        let rows = self.tab.rows();
+        let cursor = self.cursor.min(rows.len().saturating_sub(1));
+        let row = rows[cursor];
+        let description = wrap(atlas, row.description(docked), small, inner_w);
+        // Reserve height for the longest description across all tabs so the panel never jumps.
+        let described = ALL_ROWS
+            .iter()
+            .map(|r| wrap(atlas, r.description(docked), small, inner_w).len())
+            .max()
+            .unwrap_or(1);
+
+        let header_h = line * 1.38;
+        let tab_h = line * 1.20;
+        let tab_gap = line * 0.45;
+        let rows_h = line * MAX_TAB_ROWS as f32;
+        let desc_h = line * 0.60 + small_line * described as f32 + line * 0.25;
+        let footer_h = line * 1.25;
+        let panel_h = header_h + tab_h + tab_gap + rows_h + desc_h + footer_h;
         let (left, top) = ((width as f32 - panel_w) / 2.0, ((height as f32 - panel_h) / 2.0).max(0.0));
 
-        // dim the game, then the panel
-        painter.rect([0.0, 0.0, width as f32, height as f32], color(0, 0, 0, 120));
-        painter.rect([left, top, left + panel_w, top + panel_h], color(16, 20, 40, 238));
+        // Dim the game, then draw the panel frame.
+        painter.rect([0.0, 0.0, width as f32, height as f32], color(0, 0, 0, 128));
+        painter.rect([left, top, left + panel_w, top + panel_h], color(16, 20, 40, 242));
+        let bw = (1.5 * k).max(1.0);
+        let border_c = color(68, 86, 138, 175);
+        painter.rect([left, top, left + bw, top + panel_h], border_c);
+        painter.rect([left + panel_w - bw, top, left + panel_w, top + panel_h], border_c);
+        painter.rect([left, top + panel_h - bw, left + panel_w, top + panel_h], border_c);
         painter.rect([left, top, left + panel_w, top + 3.0 * k], color(250, 200, 80, 255));
-        let title = format!("UprisingNX {} - playing {}", VERSION_LABEL, if docked_now { "docked" } else { "handheld" });
-        painter.text(left + margin, top + line * 0.4, &title, 1.0, color(250, 200, 80, 255));
-        for (index, row) in ROWS.iter().enumerate() {
-            let y = top + line * (1.5 + index as f32);
-            let chosen = index == self.cursor;
-            if chosen {
-                painter.rect([left + 10.0 * k, y - line * 0.14, left + panel_w - 10.0 * k, y + line * 0.86], color(70, 90, 160, 255));
+
+        // Header: title on left, docked/handheld indicator on right.
+        let title = format!("UprisingNX {}", VERSION_LABEL);
+        painter.text(left + margin, top + line * 0.36, &title, 1.0, color(250, 200, 80, 255));
+        let mode_badge = format!("Playing: {}", if docked_now { "Docked" } else { "Handheld" });
+        let badge_w = atlas.width(&mode_badge) * small;
+        painter.text(
+            left + panel_w - margin - badge_w,
+            top + line * 0.46,
+            &mode_badge,
+            small,
+            color(165, 180, 215, 255),
+        );
+
+        // Tab bar: [L]  Video | Controls | Save & System  [R]
+        let tabs_top = top + header_h;
+        let tabs_bot = tabs_top + tab_h;
+        painter.rect([left + margin, tabs_top, left + panel_w - margin, tabs_bot], color(10, 14, 30, 230));
+        let shoulder_w = 48.0 * k;
+        let tab_area_w = inner_w - shoulder_w * 2.0;
+        let tab_w = tab_area_w / TABS.len() as f32;
+        let tab_text_scale = 0.88;
+        let tab_text_y = tabs_top + (tab_h - atlas.px * tab_text_scale * 1.15) / 2.0;
+
+        let l_hint = "[L]";
+        let r_hint = "[R]";
+        let l_w = atlas.width(l_hint) * small;
+        let r_w = atlas.width(r_hint) * small;
+        let hint_y = tabs_top + (tab_h - atlas.px * small * 1.15) / 2.0;
+        painter.text(left + margin + (shoulder_w - l_w) / 2.0, hint_y, l_hint, small, color(135, 148, 180, 255));
+        painter.text(
+            left + panel_w - margin - shoulder_w + (shoulder_w - r_w) / 2.0,
+            hint_y,
+            r_hint,
+            small,
+            color(135, 148, 180, 255),
+        );
+
+        for (i, &tab) in TABS.iter().enumerate() {
+            let tx0 = left + margin + shoulder_w + tab_w * i as f32;
+            let tx1 = tx0 + tab_w;
+            let active = tab == self.tab;
+            if active {
+                painter.rect([tx0 + 2.0 * k, tabs_top + 2.0 * k, tx1 - 2.0 * k, tabs_bot], color(44, 60, 114, 255));
+                painter.rect([tx0 + 2.0 * k, tabs_bot - 2.5 * k, tx1 - 2.0 * k, tabs_bot], color(250, 200, 80, 255));
             }
-            let text = if *row == Row::Quit && self.quit_armed {
-                color(255, 150, 130, 255)
+            let label = tab.label();
+            let lw = atlas.width(label) * tab_text_scale;
+            let tc = if active { color(255, 255, 255, 255) } else { color(152, 162, 194, 255) };
+            painter.text(tx0 + (tab_w - lw) / 2.0, tab_text_y, label, tab_text_scale, tc);
+        }
+        painter.rect([left + margin, tabs_bot, left + panel_w - margin, tabs_bot + 1.0 * k], color(64, 78, 120, 200));
+
+        // Rows for active tab (fixed MAX_TAB_ROWS body height).
+        let rows_top = tabs_bot + tab_gap;
+        for (index, row) in rows.iter().enumerate() {
+            let y = rows_top + line * index as f32;
+            let chosen = index == cursor;
+            if chosen {
+                painter.rect(
+                    [left + 14.0 * k, y - line * 0.14, left + panel_w - 14.0 * k, y + line * 0.84],
+                    color(64, 84, 152, 255),
+                );
+                painter.rect(
+                    [left + 14.0 * k, y - line * 0.14, left + 17.5 * k, y + line * 0.84],
+                    color(250, 200, 80, 255),
+                );
+            }
+            let armed = (*row == Row::Quit && self.quit_armed) || (*row == Row::ImportSave && self.import_armed);
+            let text = if armed {
+                color(255, 168, 120, 255)
             } else if chosen {
                 color(255, 255, 255, 255)
             } else {
-                color(200, 205, 220, 255)
+                color(202, 208, 224, 255)
             };
             painter.text(left + margin, y, row.label(), 1.0, text);
-            let value = value(*row);
-            if !value.is_empty() {
-                let cycles = !matches!(row, Row::Quit);
-                let shown = if chosen && cycles { format!("< {value} >") } else { value };
+            let val = value(*row);
+            if !val.is_empty() {
+                let cycles = !matches!(row, Row::ImportSave | Row::ExportSave | Row::Resume | Row::Quit);
+                let shown = if chosen && cycles { format!("< {val} >") } else { val };
+                let val_color = if armed {
+                    color(255, 190, 110, 255)
+                } else if *row == Row::ImportSave && self.pending_saves > 0 && !chosen {
+                    color(140, 232, 168, 255)
+                } else {
+                    text
+                };
                 let x = left + panel_w - margin - atlas.width(&shown);
-                painter.text(x, y, &shown, 1.0, text);
+                painter.text(x, y, &shown, 1.0, val_color);
             }
         }
-        // the chosen row's description under a rule
-        let rule = top + line * (1.5 + ROWS.len() as f32) + line * 0.15;
-        painter.rect([left + margin, rule, left + panel_w - margin, rule + 1.5 * k], color(90, 100, 130, 255));
-        for (index, text) in description.iter().enumerate() {
-            let y = rule + line * 0.3 + small_line * index as f32;
-            painter.text(left + margin, y, text, small, color(175, 185, 210, 255));
+
+        // Inline status / quick-tip box in the lower body area of Save & System.
+        if self.tab == Tab::System {
+            let box_top = rows_top + line * (rows.len() as f32 + 0.35);
+            let box_bot = rows_top + rows_h - line * 0.25;
+            let box_pad = 14.0 * k;
+            let (bg, accent, heading, body) = match &self.status {
+                Some((msg, true)) => (
+                    color(52, 22, 34, 230),
+                    color(240, 105, 105, 255),
+                    "Save Action Notice",
+                    msg.as_str(),
+                ),
+                Some((msg, false)) => (
+                    color(20, 48, 42, 230),
+                    color(110, 228, 158, 255),
+                    "Save Action Complete",
+                    msg.as_str(),
+                ),
+                None => (
+                    color(22, 30, 56, 210),
+                    color(110, 152, 225, 255),
+                    "Drop-In 3DS Save Folder",
+                    "Copy decrypted 00.SAV / 01.SAV files from Checkpoint, JKSM, Citra, or Azahar into sdmc:/switch/uprisingnx/save/import/ to auto-import on launch, or press A above.",
+                ),
+            };
+            painter.rect([left + margin, box_top, left + panel_w - margin, box_bot], bg);
+            painter.rect([left + margin, box_top, left + margin + 3.0 * k, box_bot], accent);
+            painter.text(left + margin + box_pad, box_top + 10.0 * k, heading, small, accent);
+            let lines = wrap(atlas, body, small, inner_w - box_pad * 2.0);
+            for (i, ln) in lines.iter().take(3).enumerate() {
+                let ly = box_top + 10.0 * k + small_line * (1.05 + i as f32);
+                if ly + small_line <= box_bot + 4.0 * k {
+                    painter.text(left + margin + box_pad, ly, ln, small, color(215, 222, 238, 255));
+                }
+            }
         }
+
+        // Description box under a horizontal rule.
+        let rule = rows_top + rows_h + line * 0.25;
+        painter.rect([left + margin, rule, left + panel_w - margin, rule + 1.5 * k], color(86, 98, 134, 255));
+        for (index, text) in description.iter().enumerate() {
+            let y = rule + line * 0.30 + small_line * index as f32;
+            painter.text(left + margin, y, text, small, color(182, 192, 218, 255));
+        }
+
+        // Footer bar: live video state on left, navigation hints on right.
         let (now_scale, now_smooth) = now;
-        let help = format!("running {now_scale}x, smooth {}    A/Left/Right: change    B: back", if now_smooth { "on" } else { "off" });
-        let y = top + panel_h - line * 1.0;
-        painter.text(left + margin, y, &help, small, color(130, 140, 165, 255));
+        let left_help = format!("Running {now_scale}x, smooth {}", if now_smooth { "on" } else { "off" });
+        let right_help = "L/R: Tab   A/Left/Right: Change   B: Close";
+        let fy = top + panel_h - line * 0.92;
+        painter.text(left + margin, fy, &left_help, small, color(135, 146, 174, 255));
+        let rw = atlas.width(right_help) * small;
+        painter.text(left + panel_w - margin - rw, fy, right_help, small, color(152, 164, 194, 255));
     }
 
     /// Full-screen bootstrap / setup / progress card drawn before gameplay starts,

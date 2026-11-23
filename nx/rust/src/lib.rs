@@ -5,6 +5,7 @@
 mod aim;
 mod bootstrap;
 mod menu;
+mod saves;
 mod settings;
 
 use std::ffi::{c_char, c_void, CStr};
@@ -478,6 +479,8 @@ pub struct Unx {
     smooth: Smooth,
     /// the in-game settings menu
     menu: menu::Menu,
+    /// root data directory (`sdmc:/switch/uprisingnx/data`) for live saves & mods
+    data_dir: PathBuf,
     aim: aim::Aim,
     gyro_test: ([f32; 3], u32),
     /// Fiend's Cauldron live slider cursor X (0..320), floating badge opacity, and hold frames
@@ -1128,10 +1131,15 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
 
     nx_audio_init();
 
+    let data_dir_path = PathBuf::from(&data_dir);
+    if let Some(import_notice) = saves::auto_import_on_boot(&data_dir_path) {
+        menu.notify(import_notice);
+    }
+
     let smooth_forced = std::env::var("ZAKURO_INTERPOLATE").ok().map(|v| v.trim() != "0");
     let smooth_wanted = smooth_forced.unwrap_or(video.smooth);
     let config = Config {
-        data_dir: Some(PathBuf::from(&data_dir)),
+        data_dir: Some(data_dir_path.clone()),
         hardware_renderer: true,
         resolution,
         device: presenter.shared_device(),
@@ -1256,6 +1264,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             grace: 0,
         },
         menu,
+        data_dir: data_dir_path,
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
         cauldron_cursor_x: 0.0,
@@ -1489,6 +1498,7 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
     }
     if !was_open {
         audio_pause(true);
+        unx.menu.set_save_counts(saves::pending_import_count(), saves::live_save_count(&unx.data_dir));
     }
     unx.host_last = host;
     let docked = unx.docked;
@@ -1507,6 +1517,20 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
             MINUS_MENU.store(unx.settings.minus_opens_menu(), std::sync::atomic::Ordering::Relaxed);
             unx.aim.reload();
             unx.settings_changed("menu");
+        }
+        Some(menu::Changed::ImportSave) => {
+            match saves::import_from_menu(&unx.data_dir) {
+                Ok(msg) => unx.menu.set_status(msg, false),
+                Err(err) => unx.menu.set_status(err, true),
+            }
+            unx.menu.set_save_counts(saves::pending_import_count(), saves::live_save_count(&unx.data_dir));
+        }
+        Some(menu::Changed::ExportSave) => {
+            match saves::export_from_menu(&unx.data_dir) {
+                Ok(msg) => unx.menu.set_status(msg, false),
+                Err(err) => unx.menu.set_status(err, true),
+            }
+            unx.menu.set_save_counts(saves::pending_import_count(), saves::live_save_count(&unx.data_dir));
         }
         Some(menu::Changed::Quit) => {
             log::info!("unx: quit from the menu (frame {})", unx.frame);

@@ -35,7 +35,13 @@
 - **Dual-Stick & Gyro Aiming**: Native camera and reticle control using both analog sticks and built-in gyroscope support (`nx/rust/src/aim.rs`).
 - **Z-Targeting & Behind-Pit Camera Recenter (`R` / `L3`)**: Press **R** (or **Left Stick Click**) on foot to lock onto and smoothly track the closest live targetable enemy within 45m, or recenter the camera directly behind Pit's facing direction when no enemy is nearby. Moving the right stick breaks target lock naturally.
 - **Button Remapping & Touch Mapping**: Automatic touch-to-stick and button mapping across merged 16:9 menus and battles.
-- **Settings menu**: press `Minus` (or right stick click + `Minus`) to open it; the game pauses. D-pad Up/Down picks a row (its description shows underneath), Left/Right (or A) changes it, B or `Minus` closes it. The first row picks whose video settings you change, handheld or docked (it starts on the mode you're in; the other applies when you dock or undock). Changes apply at once and are saved to `settings.ini`: preset, battle and menu resolution, smooth mode, right stick / gyro aim, gyro and stick aim speed, invert Y, left stick aim mode and its aim button, and what Minus does. Minus opens the menu when let go, unless another button was pressed while it was held; the game's own Select only pauses in battles (as Plus does), and the menu's "Minus button" row gives Minus back to the game as Select (then right stick click + `Minus` opens the menu). Quit game (A twice) closes UprisingNX. The button that closes the menu never reaches the game.
+- **Tabbed Settings Menu (`Minus` / `L` & `R`)**: Press `Minus` (or right stick click + `Minus`) to pause the game and open the settings menu. Use **L / R** (or **ZL / ZR**) to switch between **Video**, **Controls**, and **Save & System** tabs; D-pad Up/Down picks a row (its description shows underneath), Left/Right (or A) changes it, and B or `Minus` closes it.
+  - **Video**: Per-mode Handheld/Docked preset (`Performance`, `Quality`, `Custom`), battle & menu resolution (`1x`–`4x`), smooth mode (60 fps), dynamic resolution, and power label placement.
+  - **Controls**: Right stick aim, gyro aim & speed, stick aim speed, invert aim Y, left stick aim mode & modifier button, and `Minus` button behavior.
+  - **Save & System**: Import decrypted 3DS saves from `sdmc:/switch/uprisingnx/save/import/` (with automatic backup of any existing Switch save), export your Switch save to `sdmc:/switch/uprisingnx/save/export/`, resume, or quit (press A twice).
+- **3DS Save Import & Export**: Decrypted US *Kid Icarus: Uprising* save files (`00.SAV`, `01.SAV`, etc.) from Checkpoint, JKSM, Citra, or Azahar are directly compatible:
+  - **Drop-in auto-import**: Copy your `.SAV` files (or Checkpoint backup folder) into `sdmc:/switch/uprisingnx/save/import/` before launching UprisingNX. On boot, UprisingNX backs up any existing Switch save to `save/backup_<timestamp>/`, imports your saves with the required `.format` header, and archives the consumed files to `save/imported/`.
+  - **In-menu import/export**: Open **Settings → Save & System** to import saves or export a clean backup to `sdmc:/switch/uprisingnx/save/export/` anytime.
 - **Hotkeys**:
   - Right stick click: shows or hides the bottom screen (on release). `Plus` is the 3DS's Start; `Minus` opens the settings menu (or is Select, see above).
   - The resolution and smooth hotkeys below show what they set at the top of the screen for a moment.
@@ -66,7 +72,8 @@
 - **NRO Executable**: `sdmc:/switch/uprisingnx/uprising_nx.nro`
 - **Decrypted US ROM**: `sdmc:/switch/uprisingnx/rom/baserom.cia` (any filename ending in `.cia`, `.3ds`, or `.cci` matching US Title ID `0004000000030100`; `sdmc:/switch/uprisingnx/roms/` is also scanned)
 - **Generated AOT Cache**: `sdmc:/switch/uprisingnx/cache/aot_v1_0004000000030100_D6E028C6175A2B07.bin` (created automatically on first launch)
-- **Save Data**: `sdmc:/switch/uprisingnx/data/user/savedata/0004000000030100/`
+- **Save Data (Live)**: `sdmc:/switch/uprisingnx/data/user/savedata/0004000000030100/`
+- **3DS Save Import / Export**: `sdmc:/switch/uprisingnx/save/import/` (drop decrypted `00.SAV` / `01.SAV` files here to auto-import on launch or import from **Settings → Save & System**) and `sdmc:/switch/uprisingnx/save/export/` (destination for in-menu save backups)
 - **Optional Switch Tutorial Videos (RomFS Mod)**: `sdmc:/switch/uprisingnx/data/mods/0004000000030100/romfs/us/movie/`
 
 ---
