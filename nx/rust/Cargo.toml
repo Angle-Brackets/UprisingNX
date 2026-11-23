@@ -10,6 +10,8 @@ crate-type = ["staticlib"]
 
 [dependencies]
 zakuro-core = { path = "../../zakuro/crates/zakuro-core" }
+zakuro-aot = { path = "../../zakuro/crates/zakuro-aot" }
+zakuro-fs = { path = "../../zakuro/crates/zakuro-fs" }
 zakuro-gpu = { path = "../../zakuro/crates/zakuro-gpu", default-features = false, features = ["vulkan", "jit"] }
 zakuro-common = { path = "../../zakuro/crates/zakuro-common" }
 log = "0.4"

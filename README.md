@@ -1,21 +1,40 @@
 # UprisingNX
 
-**UprisingNX** is a static recompilation and runtime port of *Kid Icarus: Uprising* (Nintendo 3DS, USA Rev 1 `0004000000030100`) to the Nintendo Switch (Horizon OS / `aarch64-nintendo-switch-freestanding`).
+**UprisingNX** is a self-bootstrapping ahead-of-time (AOT) recompilation and runtime port of *Kid Icarus: Uprising* (Nintendo 3DS, USA `0004000000030100` / `CTR-P-AKDE`) for the Nintendo Switch (Horizon OS / `aarch64-nintendo-switch-freestanding`).
+
+`uprising_nx.nro` ships as a standalone, legally distributable homebrew binary containing **zero Nintendo game code or assets**. On first launch on your Switch, UprisingNX validates your decrypted US *Kid Icarus: Uprising* ROM, compiles all `12.14 MB` of ARMv6K + VFPv2 game code directly to native AArch64 machine code across the Switch's CPU cores, and saves the compiled cache to your SD card for sub-second launches from then on.
+
+---
+
+## Quick Start (Switch Setup)
+
+1. **Extract to SD Root**: Extract the release `.zip` to the root of your Switch SD card so you have:
+   - `sdmc:/switch/uprisingnx/uprising_nx.nro`
+   - `sdmc:/switch/uprisingnx/rom/`
+2. **Add Your Decrypted US ROM**: Copy your legally dumped, **decrypted** US *Kid Icarus: Uprising* (`0004000000030100`, `CTR-P-AKDE`) ROM — `.cia`, `.3ds`, or `.cci` (for example `baserom.cia`) — into:
+   ```text
+   sdmc:/switch/uprisingnx/rom/
+   ```
+   *(Legacy `sdmc:/switch/uprisingnx/roms/` paths are also detected automatically. Encrypted dumps must be decrypted first via GodMode9 on your 3DS.)*
+3. **Launch via Title Override**: Hold **R** while launching any installed Switch game from the HOME Menu to open Homebrew Menu in **Title Override** (full-RAM + JIT) mode, then start **UprisingNX**:
+   - **First launch**: Compiles the ROM directly to ~87 MiB of native AArch64 machine code on the Switch (~15–25s with an on-screen progress bar) and writes `sdmc:/switch/uprisingnx/cache/aot_v1_0004000000030100_D6E028C6175A2B07.bin`.
+   - **Every launch after**: Streams the cached AArch64 image straight into a single Horizon `CodeMemory` region in `< 1s`.
 
 ---
 
 ## Architecture
 
-- **Static AOT Recompilation (`recomp/`)**: Uses `3dsrecomp` to ahead-of-time translate the 3DS ARMv6K executable (`.code`) into C, compiled to native ARM64 (`aarch64`) for the Switch.
-- **Horizon Runtime & PICA200 → Vulkan Renderer (`zakuro/`)**: Horizon OS port of the `zakuro` 3DS runtime and GPU renderer, translating PICA200 commands and shaders to Vulkan (`VK_NN_vi_surface`) via `mesa-switch` (NVK / Nouveau Tegra X1 Vulkan driver).
-- **Switch Frontend (`nx/`)**: Rust staticlib (`nx/rust/`) + `libnx` C shell (`nx/c/`) providing single-screen widescreen/top-screen presentation, composited HD title screen, top-screen battle HUD & dialogue portraits, dual-stick + gyro aiming (`nx/rust/src/aim.rs`), and `audren` audio output.
+- **On-Switch Direct ARMv6K → AArch64 AOT Compiler (`zakuro/crates/zakuro-aot/`)**: Multi-core position-independent ARMv6K/Thumb/VFPv2 → AArch64 compiler with 1.0× single-owner instruction deduplication (`86.9 MiB` total native code — 4.5× smaller than static C recompilation, fitting inside a single `±128 MiB` Horizon `CodeMemory` slot while leaving 9 slots for shader JIT), `.text` literal-pool constant folding, hardware ASIMD MobiClip media intrinsics, and built-in Rust gameplay hooks (`kiu_overrides.rs`).
+- **Horizon Runtime & PICA200 → Vulkan Renderer (`zakuro/`)**: Horizon OS port of the `zakuro` 3DS kernel, HLE services, and GPU renderer, translating PICA200 commands and geometry/vertex shaders to Vulkan (`VK_NN_vi_surface`) via `mesa-switch` (Nouveau / Tegra X1 Vulkan driver).
+- **Switch Frontend (`nx/`)**: Rust staticlib (`nx/rust/`) + `libnx` C shell (`nx/c/`) providing unified widescreen single-screen UI layouts (Title Screen, Mode Select, Solo Hub in Palutena's & Viridi's Domains, Chapter Select, Fiend's Cauldron, Arms Altar, Gear, Weapon Fusion), top-screen battle HUD & dialogue portraits, dual-stick + gyro aiming (`nx/rust/src/aim.rs`), and `audren` audio output.
 
 ---
 
 ## Controls & Features
 
-- **Dual-Stick & Gyro Aiming**: Precise camera control using both analog sticks and built-in gyroscope support (`nx/rust/src/aim.rs`).
-- **Button Remapping & Touch Mapping**: Automatic touch-to-stick and button mapping for menus and intensive battles.
+- **Dual-Stick & Gyro Aiming**: Native camera and reticle control using both analog sticks and built-in gyroscope support (`nx/rust/src/aim.rs`).
+- **Z-Targeting & Behind-Pit Camera Recenter (`R` / `L3`)**: Press **R** (or **Left Stick Click**) on foot to lock onto and smoothly track the closest live targetable enemy within 45m, or recenter the camera directly behind Pit's facing direction when no enemy is nearby. Moving the right stick breaks target lock naturally.
+- **Button Remapping & Touch Mapping**: Automatic touch-to-stick and button mapping across merged 16:9 menus and battles.
 - **Settings menu**: press `Minus` (or right stick click + `Minus`) to open it; the game pauses. D-pad Up/Down picks a row (its description shows underneath), Left/Right (or A) changes it, B or `Minus` closes it. The first row picks whose video settings you change, handheld or docked (it starts on the mode you're in; the other applies when you dock or undock). Changes apply at once and are saved to `settings.ini`: preset, battle and menu resolution, smooth mode, right stick / gyro aim, gyro and stick aim speed, invert Y, left stick aim mode and its aim button, and what Minus does. Minus opens the menu when let go, unless another button was pressed while it was held; the game's own Select only pauses in battles (as Plus does), and the menu's "Minus button" row gives Minus back to the game as Select (then right stick click + `Minus` opens the menu). Quit game (A twice) closes UprisingNX. The button that closes the menu never reaches the game.
 - **Hotkeys**:
   - Right stick click: shows or hides the bottom screen (on release). `Plus` is the 3DS's Start; `Minus` opens the settings menu (or is Select, see above).
@@ -44,24 +63,24 @@
 
 ## SD Card Layout
 
-Prepare your SD card with the following structure:
-
-- **ROM Path**: `sdmc:/switch/uprisingnx/roms/Kid Icarus - Uprising (USA) (En,Fr,Es) (Rev 1).cci` (or `.3ds`)
-- **NRO Path**: `sdmc:/switch/uprisingnx/uprising_nx.nro`
-- **Switch Tutorial Videos (RomFS Mod)**: `sdmc:/switch/uprisingnx/data/mods/0004000000030100/romfs/us/movie/` (copy `mods/0004000000030100/` into `sdmc:/switch/uprisingnx/data/mods/` to replace the 3DS hardware diagrams in *How to Play* and Chapter 1 tutorials with 3D Nintendo Switch hardware)
+- **NRO Executable**: `sdmc:/switch/uprisingnx/uprising_nx.nro`
+- **Decrypted US ROM**: `sdmc:/switch/uprisingnx/rom/baserom.cia` (any filename ending in `.cia`, `.3ds`, or `.cci` matching US Title ID `0004000000030100`; `sdmc:/switch/uprisingnx/roms/` is also scanned)
+- **Generated AOT Cache**: `sdmc:/switch/uprisingnx/cache/aot_v1_0004000000030100_D6E028C6175A2B07.bin` (created automatically on first launch)
+- **Save Data**: `sdmc:/switch/uprisingnx/data/user/savedata/0004000000030100/`
+- **Optional Switch Tutorial Videos (RomFS Mod)**: `sdmc:/switch/uprisingnx/data/mods/0004000000030100/romfs/us/movie/`
 
 ---
 
 ## Building
 
-1. **Rust Frontend (`nx/rust`)**:
+1. **Rust Runtime, On-Switch AOT Compiler & Frontend (`nx/rust`)**:
    ```bash
-   cd nx/rust && ../../scripts/cargo-nx.sh build --release
+   cd nx/rust && RUST_MIN_STACK=16777216 ../../scripts/cargo-nx.sh build --release
    ```
-2. **C Shell & Linking (`nx/c`)**:
-   Make sure you have devkitA64 and libnx configured in your environment.
+2. **C Shell & NRO Packaging (`nx/c`)**:
+   Make sure `devkitA64` and `libnx` are configured in your environment (`DEVKITPRO`).
    ```bash
-   make -C nx/c RECOMP=1
+   make -C nx/c KICKSTAND=0
    ```
 
 ---

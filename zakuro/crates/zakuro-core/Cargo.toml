@@ -10,6 +10,7 @@ symphonia-core = "0.6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zakuro-common.workspace = true
 zakuro-cpu.workspace = true
+zakuro-aot.workspace = true
 zakuro-fs.workspace = true
 zakuro-gpu = { workspace = true, features = ["vulkan"] }
 log.workspace = true

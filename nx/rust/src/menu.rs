@@ -687,4 +687,106 @@ impl Menu {
         let y = top + panel_h - line * 1.0;
         painter.text(left + margin, y, &help, small, color(130, 140, 165, 255));
     }
+
+    /// Full-screen bootstrap / setup / progress card drawn before gameplay starts.
+    pub fn status_overlay(
+        &mut self,
+        heading: &str,
+        paragraphs: &[&str],
+        progress: Option<(f32, &str)>,
+        footer: Option<&str>,
+        is_error: bool,
+        width: u32,
+        height: u32,
+    ) -> Overlay {
+        let mut overlay = Overlay::default();
+        if !self.ready(height, &mut overlay) {
+            return overlay;
+        }
+        let atlas = self.atlas.as_ref().unwrap();
+        let mut painter = Painter { atlas, vertices: Vec::new(), indices: Vec::new() };
+        let k = height as f32 / 720.0;
+        let line = (atlas.px * 1.38).round();
+        let body_scale = 0.88;
+        let body_line = line * 0.90;
+        let panel_w = 820.0 * k;
+        let margin = 32.0 * k;
+        let max_text_w = panel_w - margin * 2.0;
+
+        let mut wrapped_blocks: Vec<Vec<String>> = Vec::with_capacity(paragraphs.len());
+        let mut total_body_lines = 0usize;
+        for p in paragraphs {
+            if p.is_empty() {
+                wrapped_blocks.push(Vec::new());
+                total_body_lines += 1;
+            } else {
+                let w = wrap(atlas, p, body_scale, max_text_w);
+                total_body_lines += w.len().max(1);
+                wrapped_blocks.push(w);
+            }
+        }
+
+        let progress_h = if progress.is_some() { line * 2.4 } else { 0.0 };
+        let footer_h = if footer.is_some() { line * 1.5 } else { 0.0 };
+        let panel_h = line * 2.2 + body_line * (total_body_lines as f32) + progress_h + footer_h + margin * 0.9;
+        let left = (width as f32 - panel_w) * 0.5;
+        let top = ((height as f32 - panel_h) * 0.5).max(20.0 * k);
+
+        // Deep midnight background + card + accent bar
+        painter.rect([0.0, 0.0, width as f32, height as f32], color(8, 11, 24, 255));
+        painter.rect([left, top, left + panel_w, top + panel_h], color(18, 23, 46, 248));
+        let accent = if is_error { color(240, 95, 95, 255) } else { color(250, 200, 80, 255) };
+        painter.rect([left, top, left + panel_w, top + 4.0 * k], accent);
+
+        let title = format!("UprisingNX {} - {heading}", VERSION_LABEL);
+        painter.text(left + margin, top + line * 0.55, &title, 1.05, accent);
+
+        let mut y = top + line * 1.9;
+        for block in &wrapped_blocks {
+            if block.is_empty() {
+                y += body_line * 0.6;
+                continue;
+            }
+            for text in block {
+                let c = if text.starts_with("sdmc:/") || text.starts_with("switch/") {
+                    color(145, 220, 255, 255)
+                } else {
+                    color(225, 230, 242, 255)
+                };
+                painter.text(left + margin, y, text, body_scale, c);
+                y += body_line;
+            }
+            y += body_line * 0.2;
+        }
+
+        if let Some((pct, status)) = progress {
+            y += line * 0.35;
+            let bar_x0 = left + margin;
+            let bar_x1 = left + panel_w - margin;
+            let bar_h = 22.0 * k;
+            painter.rect([bar_x0, y, bar_x1, y + bar_h], color(36, 44, 78, 255));
+            let fill_w = (bar_x1 - bar_x0) * pct.clamp(0.0, 1.0);
+            if fill_w > 1.0 {
+                painter.rect([bar_x0, y, bar_x0 + fill_w, y + bar_h], color(250, 200, 80, 255));
+            }
+            let pct_label = format!("{:.0}%", (pct.clamp(0.0, 1.0) * 100.0));
+            let px_x = bar_x1 - atlas.width(&pct_label) * 0.85;
+            painter.text(bar_x0, y + bar_h + 8.0 * k, status, 0.82, color(190, 200, 225, 255));
+            painter.text(px_x, y + bar_h + 8.0 * k, &pct_label, 0.85, color(250, 200, 80, 255));
+        }
+
+        if let Some(foot) = footer {
+            let fy = top + panel_h - line * 1.15;
+            painter.text(left + margin, fy, foot, 0.80, color(145, 155, 185, 255));
+        }
+
+        let (vertices, indices) = (painter.vertices, painter.indices);
+        overlay.meshes.push(OverlayMesh {
+            texture: atlas.id,
+            clip: [0, 0, width, height],
+            vertices,
+            indices,
+        });
+        overlay
+    }
 }

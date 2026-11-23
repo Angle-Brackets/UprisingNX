@@ -73,6 +73,23 @@ enum {
 // Plus and Minus held together: quit (read from the controller, as Minus may
 // not reach the 3DS buttons)
 static bool g_quit;
+static PadState g_pad;
+
+int unx_is_applet_mode(void) {
+    AppletType at = appletGetAppletType();
+    return !(at == AppletType_Application || at == AppletType_SystemApplication);
+}
+
+int unx_bootstrap_step(void) {
+    if (!appletMainLoop()) return 1;
+    padUpdate(&g_pad);
+    u64 held = padGetButtons(&g_pad);
+    if ((held & (HidNpadButton_Plus | HidNpadButton_Minus)) == (HidNpadButton_Plus | HidNpadButton_Minus)) {
+        g_quit = true;
+        return 1;
+    }
+    return 0;
+}
 
 static float axis(s32 v) { return fmaxf(-1.0f, fminf(1.0f, v / 32767.0f)); }
 
@@ -212,8 +229,7 @@ static void *game(void *p) {
 
     padConfigureInput(8, HidNpadStyleSet_NpadStandard);
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 0x7);
-    PadState pad;
-    padInitializeAny(&pad);
+    padInitializeAny(&g_pad);
     hidGetSixAxisSensorHandles(&sixaxis_handheld, 1, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
     hidGetSixAxisSensorHandles(&sixaxis_fullkey, 1, HidNpadIdType_No1, HidNpadStyleTag_NpadFullKey);
     hidGetSixAxisSensorHandles(sixaxis_joydual, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual);
@@ -228,6 +244,7 @@ static void *game(void *p) {
     }
 
     load_env();
+    if (args->interpret) setenv("UNX_INTERPRET", "1", 1);
     // UNX_CLOCKS=docked (or a hex PerformanceConfiguration such as 0x92220008) asks apm for
     // the docked clocks (CPU 1020 MHz, GPU 768 MHz, stock docked values) while running
     // handheld; the session stays open for the run, since the setting may go with it
@@ -270,7 +287,7 @@ static void *game(void *p) {
     } else {
         UnxInput in;
         while (appletMainLoop()) {
-            read_input(&pad, &in);
+            read_input(&g_pad, &in);
             // + and - together quits (the game uses both alone)
             if (g_quit) break;
             if (unx_frame(unx, &in)) break;
@@ -313,7 +330,7 @@ int main(int argc, char **argv) {
     }
 
     struct args args = {
-        argc > 1 ? argv[1] : "sdmc:/switch/dekopon/roms/Kid Icarus Uprising (USA).cci",
+        argc > 1 ? argv[1] : NULL,
         argc > 2 && !strcmp(argv[2], "interpret"),
     };
     pthread_attr_t attr;

@@ -4660,6 +4660,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakuro-aot"
+version = "0.2.29"
+dependencies = [
+ "libc",
+ "log",
+ "rayon",
+ "recomp-abi",
+ "zakuro-cpu",
+ "zakuro-fs",
+]
+
+[[package]]
 name = "zakuro-common"
 version = "0.2.29"
 dependencies = [
@@ -4686,6 +4698,7 @@ dependencies = [
  "symphonia-codec-aac",
  "symphonia-core",
  "thiserror 2.0.20",
+ "zakuro-aot",
  "zakuro-common",
  "zakuro-cpu",
  "zakuro-fs",

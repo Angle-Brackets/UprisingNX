@@ -195,6 +195,32 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
             }
             Err(error) => log::warn!("could not load {}, {error}, interpreting everything", path.display()),
         }
+    } else if system.config.compile_aot {
+        #[cfg(all(unix, not(target_os = "horizon"), target_arch = "aarch64"))]
+        match crate::mods::code(&title, system.config.data_dir.as_deref()) {
+            Ok((code_bytes, _)) => {
+                let t_aot = std::time::Instant::now();
+                let opts = zakuro_aot::CompileOptions::for_title(title.program_id());
+                let image = zakuro_aot::compile_title(
+                    title.program_id(),
+                    &title.exheader,
+                    &code_bytes,
+                    &[],
+                    opts,
+                    |_, _| {},
+                );
+                match image.into_loaded_mmap() {
+                    Ok(aot) => {
+                        log::info!("compiled AOT in {:.2?}", t_aot.elapsed());
+                        system.set_aot(aot);
+                    }
+                    Err(e) => log::warn!("could not mmap AOT code, {e}, interpreting everything"),
+                }
+            }
+            Err(e) => log::warn!("could not read code for AOT, {e}"),
+        }
+        #[cfg(not(all(unix, not(target_os = "horizon"), target_arch = "aarch64")))]
+        log::warn!("compile_aot is only available on unix aarch64");
     }
 
     let mut on_gpu = false;

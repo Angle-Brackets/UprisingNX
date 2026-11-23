@@ -3,6 +3,7 @@
 //! frames and presents them through NVK.
 
 mod aim;
+mod bootstrap;
 mod menu;
 mod settings;
 
@@ -649,6 +650,7 @@ extern "C" {
     fn unx_memory(out: *mut u64);
     fn unx_display_resolution(out_w: *mut u32, out_h: *mut u32, force: i32);
     fn appletGetOperationMode() -> u32;
+    fn unx_is_applet_mode() -> i32;
 }
 
 fn query_window_size(docked: bool, hw_docked: bool, force: bool) -> (u32, u32) {
@@ -1025,26 +1027,38 @@ pub unsafe extern "C" fn unx_set_font(data: *const u8, len: usize) {
     }
 }
 
-/// starts Zakuro on the ROM at `rom`, presenting to `nwindow` (libnx's
-/// nwindowGetDefault()); `data_dir` holds saves and the like. `recomp` is the
-/// statically linked recompiled code, or null to interpret. Null on failure,
-/// with the reason logged.
+pub enum UnxHandle {
+    Running(Box<Unx>),
+    Notice {
+        presenter: VulkanPresenter,
+        menu: menu::Menu,
+        notice: bootstrap::SetupNotice,
+        armed: bool,
+    },
+}
+
+/// starts Zakuro on the ROM at `rom` (or auto-discovers it in
+/// `sdmc:/switch/uprisingnx/rom/` when `rom` is null), presenting to `nwindow`
+/// (libnx's nwindowGetDefault()); `data_dir` holds saves and the like. `recomp`
+/// is optional statically linked recompiled code; when null, UprisingNX loads or
+/// constructs its native Switch AOT cache automatically.
 ///
 /// # Safety
 /// `nwindow` is a live NWindow for the life of the returned handle; the
-/// strings are NUL-terminated; `recomp` is null or points to 3dsrecomp's
-/// tables, which live as long as the program.
+/// strings are null or NUL-terminated; `recomp` is null or points to
+/// 3dsrecomp's tables, which live as long as the program.
 #[no_mangle]
-pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, data_dir: *const c_char, recomp: *const UnxRecomp) -> *mut Unx {
+pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, data_dir: *const c_char, recomp: *const UnxRecomp) -> *mut UnxHandle {
     install_panic_hook();
     let _ = log::set_logger(&LOGGER);
     let _ = zakuro_gpu::THREAD_ROLE.set(place_thread);
     log::set_max_level(log::LevelFilter::Info);
     log::info!("unx: UprisingNX {}", menu::VERSION_LABEL);
-    let (Some(rom), Some(data_dir)) = (cstr(rom), cstr(data_dir)) else {
-        log::error!("unx: no ROM or data directory");
+    let Some(data_dir) = cstr(data_dir) else {
+        log::error!("unx: no data directory");
         return std::ptr::null_mut();
     };
+    let explicit_rom = cstr(rom);
 
     let docked = appletGetOperationMode() == 1;
     let window = query_window_size(docked, docked, true);
@@ -1079,12 +1093,41 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
     // start in fullscreen (top screen only) by default
     presenter.set_layout(ScreenLayout::TopOnly);
     presenter.set_scaling(ScreenFilter::Smooth, false);
-    nx_audio_init();
 
+    let mut menu = menu::Menu::new();
+    let make_notice = |presenter: VulkanPresenter, menu: menu::Menu, notice: bootstrap::SetupNotice| -> *mut UnxHandle {
+        log::warn!("unx: setup notice '{}': {}", notice.heading, notice.paragraphs.join(" "));
+        Box::into_raw(Box::new(UnxHandle::Notice { presenter, menu, notice, armed: false }))
+    };
+
+    if unx_is_applet_mode() != 0 {
+        return make_notice(presenter, menu, bootstrap::SetupNotice::applet_mode());
+    }
+
+    let (rom_path, title) = match bootstrap::discover_rom(explicit_rom.as_deref()) {
+        Ok(found) => found,
+        Err(notice) => return make_notice(presenter, menu, notice),
+    };
+    let rom = rom_path.to_string_lossy().into_owned();
+
+    let force_interpret = std::env::var("UNX_INTERPRET").is_ok_and(|v| v == "1");
     let linked = recomp.as_ref().map(|r| {
         log::info!("unx: recompiled code linked in, ABI {}, {} entries, {} modules", r.abi, r.entry_count, r.module_count);
         zakuro_core::recompiled::Linked::new(0x0004000000030100, r.abi, r.entries, r.entry_count, r.modules, r.module_count)
     });
+
+    let loaded_aot = if linked.is_none() && !force_interpret {
+        match bootstrap::load_or_build_aot(&title, std::path::Path::new(&data_dir), &mut presenter, &mut menu) {
+            Ok(aot) => Some(aot),
+            Err(notice) => return make_notice(presenter, menu, notice),
+        }
+    } else {
+        None
+    };
+    drop(title);
+
+    nx_audio_init();
+
     let smooth_forced = std::env::var("ZAKURO_INTERPOLATE").ok().map(|v| v.trim() != "0");
     let smooth_wanted = smooth_forced.unwrap_or(video.smooth);
     let config = Config {
@@ -1101,8 +1144,11 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         ..Config::default()
     };
     let started = Instant::now();
-    let system = match loader::load(&rom, config) {
+    let system = match loader::load(&rom_path, config) {
         Ok(mut system) => {
+            if let Some(aot) = loaded_aot {
+                system.set_aot(aot);
+            }
             // what the recompiled code leaves to the interpreter, printed
             // every 10 s (only when diagnostics or hints are requested)
             if std::env::var_os("UNX_DIAG").is_some() || std::env::var_os("ZAKURO_HINTS").is_some() {
@@ -1125,7 +1171,14 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         }
         Err(error) => {
             log::error!("unx: could not load {rom}, {error}");
-            return std::ptr::null_mut();
+            return make_notice(
+                presenter,
+                menu,
+                bootstrap::SetupNotice {
+                    heading: "Failed to Load ROM".to_owned(),
+                    paragraphs: vec![format!("Could not start {rom}: {error}")],
+                },
+            );
         }
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
@@ -1146,7 +1199,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         });
     start_watchdog();
     log::info!("unx: loaded {rom} in {:?}", started.elapsed());
-    Box::into_raw(Box::new(Unx {
+    Box::into_raw(Box::new(UnxHandle::Running(Box::new(Unx {
         system,
         presenter,
         frame: 0,
@@ -1202,14 +1255,14 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             scale_drop_failed: false,
             grace: 0,
         },
-        menu: menu::Menu::new(),
+        menu,
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
         cauldron_cursor_x: 0.0,
         cauldron_opacity: 0.48,
         cauldron_hold: 0,
         cmd_rx,
-    }))
+    }))))
 }
 
 fn empty_pixels() -> std::sync::Arc<Vec<u8>> {
@@ -1484,8 +1537,30 @@ static REPORT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// # Safety
 /// `unx` came from unx_create; `input` is null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32 {
-    let unx = &mut *unx;
+pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInput) -> u32 {
+    let unx: &mut Unx = match &mut *handle {
+        UnxHandle::Running(unx) => unx,
+        UnxHandle::Notice { presenter, menu, notice, armed } => {
+            let buttons = input.as_ref().map_or(0, |i| i.buttons);
+            if buttons == 0 {
+                *armed = true;
+            } else if *armed && (buttons & ((1 << 1) | (1 << 3))) != 0 {
+                // B (1<<1) or Plus/Start (1<<3) exits setup notice cleanly
+                return 1;
+            }
+            let refs: Vec<&str> = notice.paragraphs.iter().map(String::as_str).collect();
+            bootstrap::render_card(
+                presenter,
+                menu,
+                &notice.heading,
+                &refs,
+                None,
+                Some("Press + or B to exit to Homebrew Menu."),
+                true,
+            );
+            return 0;
+        }
+    };
     CURRENT_FRAME.store(unx.frame, std::sync::atomic::Ordering::Relaxed);
     FRAME_HEARTBEAT.fetch_add(1, std::sync::atomic::Ordering::Release);
     FRAME_PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
@@ -2189,12 +2264,15 @@ pub unsafe extern "C" fn unx_frame(unx: *mut Unx, input: *const UnxInput) -> u32
 /// # Safety
 /// `unx` came from unx_create and isn't used again.
 #[no_mangle]
-pub unsafe extern "C" fn unx_destroy(unx: *mut Unx) {
+pub unsafe extern "C" fn unx_destroy(handle: *mut UnxHandle) {
     FRAME_PHASE.store(PHASE_EXITING, std::sync::atomic::Ordering::Release);
     WATCHDOG_STOP.store(true, std::sync::atomic::Ordering::Release);
-    nx_audio_exit();
-    if !unx.is_null() {
-        drop(Box::from_raw(unx));
+    if !handle.is_null() {
+        let boxed = Box::from_raw(handle);
+        if matches!(*boxed, UnxHandle::Running(_)) {
+            nx_audio_exit();
+        }
+        drop(boxed);
     }
     stop_reporter();
 }

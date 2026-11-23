@@ -22,13 +22,20 @@ pub fn installed(program_id: u64) -> Option<std::path::PathBuf> {
 
 /// recompiled code, and how much of its work it handed back.
 pub struct Library {
-    code: recomp_abi::Library,
+    backend: Backend,
     /// instructions the code handed to the interpreter one at a time.
     fallbacks: Cell<u64>,
-    /// the code found for addresses lately, each in a slot its address
-    /// picks. a jump through a register looks its target up, which is a
-    /// search through every function otherwise.
-    found: Box<[Found]>,
+}
+
+enum Backend {
+    Abi {
+        code: recomp_abi::Library,
+        /// the code found for addresses lately, each in a slot its address
+        /// picks. a jump through a register looks its target up, which is a
+        /// search through every function otherwise.
+        found: Box<[Found]>,
+    },
+    Aot(zakuro_aot::LoadedAot),
 }
 
 /// a slot of Library::found, an address and the code found for it.
@@ -197,18 +204,36 @@ fn store(cpu: &Cpu, ctx: &mut Context) {
 }
 
 impl Library {
-    /// a library 3dsrecomp built.
+    /// a library 3dsrecomp built, or a cached `UNXAOT01` AOT image.
     pub fn open(path: &Path) -> Result<Library, String> {
-        recomp_abi::Library::open(path).map(Library::new)
+        #[cfg(all(unix, not(target_os = "horizon")))]
+        if let Ok(mut file) = std::fs::File::open(path) {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut magic = [0u8; 8];
+            if file.read_exact(&mut magic).is_ok() && &magic == zakuro_aot::CACHE_MAGIC {
+                let _ = file.seek(SeekFrom::Start(0));
+                let reader = std::io::BufReader::new(file);
+                return zakuro_aot::LoadedAot::read_mmap(reader).map(Library::from_aot);
+            }
+        }
+        recomp_abi::Library::open(path).map(Library::new_abi)
     }
 
     /// the code linked into the program.
     pub fn linked(linked: &Linked) -> Result<Library, String> {
-        recomp_abi::Library::linked(linked).map(Library::new)
+        recomp_abi::Library::linked(linked).map(Library::new_abi)
     }
 
-    fn new(code: recomp_abi::Library) -> Library {
-        Library { code, fallbacks: Cell::new(0), found: Library::nothing_found() }
+    /// native AArch64 AOT code compiled by `zakuro-aot`.
+    pub fn from_aot(aot: zakuro_aot::LoadedAot) -> Library {
+        Library { backend: Backend::Aot(aot), fallbacks: Cell::new(0) }
+    }
+
+    fn new_abi(code: recomp_abi::Library) -> Library {
+        Library {
+            backend: Backend::Abi { code, found: Library::nothing_found() },
+            fallbacks: Cell::new(0),
+        }
     }
 
     /// every slot of found empty, an address no code starts at in each.
@@ -219,13 +244,19 @@ impl Library {
     /// whether the code came from an older 3dsrecomp than the one this
     /// build has, so that recompiling the game again makes it better.
     pub fn outdated(&self) -> bool {
-        self.code.generation() < recomp_abi::GENERATION
+        match &self.backend {
+            Backend::Abi { code, .. } => code.generation() < recomp_abi::GENERATION,
+            Backend::Aot(_) => false,
+        }
     }
 
     /// whether the code can tell the functions whose code changed in
     /// memory, which it can from generation 2 on.
     pub fn checks_itself(&self) -> bool {
-        self.code.origins(0).is_some()
+        match &self.backend {
+            Backend::Abi { code, .. } => code.origins(0).is_some(),
+            Backend::Aot(_) => true,
+        }
     }
 
     /// how many instructions the code has handed to the interpreter.
@@ -235,17 +266,23 @@ impl Library {
 
     /// how many functions and modules there is code for.
     pub fn describe(&self) -> String {
-        self.code.describe()
+        match &self.backend {
+            Backend::Abi { code, .. } => code.describe(),
+            Backend::Aot(aot) => aot.describe(),
+        }
     }
 
     /// the code that can run from address, bit 0 set for Thumb, in the
     /// executable or in a module that is loaded.
     fn lookup(&self, address: u32) -> Option<Code> {
-        let slot = &self.found[slot(address)];
+        let Backend::Abi { code, found } = &self.backend else {
+            return None;
+        };
+        let slot = &found[slot(address)];
         match slot.get() {
             (seen, code) if seen == address => code,
             _ => {
-                let code = self.code.lookup(address);
+                let code = code.lookup(address);
                 slot.set((address, code));
                 code
             }
@@ -253,31 +290,42 @@ impl Library {
     }
 
     pub fn has_code(&self, address: u32) -> bool {
-        self.lookup(address).is_some()
+        match &self.backend {
+            Backend::Abi { .. } => self.lookup(address).is_some(),
+            Backend::Aot(aot) => aot.has_code(address),
+        }
     }
 
     /// marks the executable's functions whose code in memory is not what
     /// they were recompiled from, which a mod or another version of the
     /// game does, so that the interpreter runs them. how many there are.
     pub fn check(&mut self, memory: &mut Memory) -> usize {
-        let stale = self.code.check(0, 0, |address, bytes| memory.read_bytes(address, bytes));
-        self.found = Library::nothing_found();
-        stale
+        match &mut self.backend {
+            Backend::Abi { code, found } => {
+                let stale = code.check(0, 0, |address, bytes| memory.read_bytes(address, bytes));
+                *found = Library::nothing_found();
+                stale
+            }
+            Backend::Aot(aot) => aot.check(|address, bytes| memory.read_bytes(address, bytes)),
+        }
     }
 
     /// tells the code of the module called name where the title loaded it,
     /// zero when it unloads it, and checks the module's code once it is in
     /// memory.
     pub fn place(&mut self, name: &str, base: u32, memory: &mut Memory) {
-        let Some(index) = self.code.module_index(name) else { return };
-        self.code.place(index, base);
+        let Backend::Abi { code, found } = &mut self.backend else {
+            return;
+        };
+        let Some(index) = code.module_index(name) else { return };
+        code.place(index, base);
         // what was found before may have moved or gone
-        self.found = Library::nothing_found();
+        *found = Library::nothing_found();
         if base == 0 {
             return;
         }
         log::info!("recompiled code for {name} runs at 0x{base:08X}");
-        let stale = self.code.check(index + 1, base, |address, bytes| memory.read_bytes(address, bytes));
+        let stale = code.check(index + 1, base, |address, bytes| memory.read_bytes(address, bytes));
         if stale > 0 {
             log::warn!("{stale} functions of {name} changed since it was recompiled, they run in the interpreter");
         }
@@ -321,28 +369,52 @@ impl Library {
         #[cfg(target_arch = "aarch64")]
         let mut fpcr = FpcrGuard::new(unsafe { *ctx.fpscr });
 
-        let stop = loop {
-            if ctx.budget <= 0 {
-                break Stop::Left;
-            }
-            let Some(code) = self.lookup(ctx.r[15] | ctx.thumb as u32) else {
-                break Stop::Left;
-            };
-            ctx.exit = 0;
-            ctx.depth = 0;
-            #[cfg(target_arch = "aarch64")]
-            fpcr.sync(unsafe { *ctx.fpscr });
-            // SAFETY: the code came from the library and ctx is set up the
-            // way it expects, with user pointing at machine
-            unsafe { code(&mut ctx) };
-            if let Some(exit) = machine.pending.take() {
-                break Stop::Exit(exit);
-            }
-            match ctx.exit {
-                EXIT_SVC => break Stop::Svc(ctx.svc),
-                EXIT_BUDGET => break Stop::Left,
-                _ => {}
-            }
+        let stop = match &self.backend {
+            Backend::Abi { .. } => loop {
+                if ctx.budget <= 0 {
+                    break Stop::Left;
+                }
+                let Some(code) = self.lookup(ctx.r[15] | ctx.thumb as u32) else {
+                    break Stop::Left;
+                };
+                ctx.exit = 0;
+                ctx.depth = 0;
+                #[cfg(target_arch = "aarch64")]
+                fpcr.sync(unsafe { *ctx.fpscr });
+                // SAFETY: the code came from the library and ctx is set up the
+                // way it expects, with user pointing at machine
+                unsafe { code(&mut ctx) };
+                if let Some(exit) = machine.pending.take() {
+                    break Stop::Exit(exit);
+                }
+                match ctx.exit {
+                    EXIT_SVC => break Stop::Svc(ctx.svc),
+                    EXIT_BUDGET => break Stop::Left,
+                    _ => {}
+                }
+            },
+            Backend::Aot(aot) => loop {
+                if ctx.budget <= 0 {
+                    break Stop::Left;
+                }
+                let Some(target_rx) = aot.lookup(ctx.r[15] | ctx.thumb as u32) else {
+                    break Stop::Left;
+                };
+                ctx.exit = 0;
+                ctx.depth = 0;
+                #[cfg(target_arch = "aarch64")]
+                fpcr.sync(unsafe { *ctx.fpscr });
+                // SAFETY: `target_rx` came from `aot.lookup`, and `ctx.user` points at `machine`.
+                unsafe { aot.enter(&mut ctx, target_rx) };
+                if let Some(exit) = machine.pending.take() {
+                    break Stop::Exit(exit);
+                }
+                match ctx.exit {
+                    EXIT_SVC => break Stop::Svc(ctx.svc),
+                    EXIT_BUDGET => break Stop::Left,
+                    _ => {}
+                }
+            },
         };
 
         load(&ctx, machine.cpu);

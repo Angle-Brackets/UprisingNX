@@ -4,6 +4,7 @@ members = [
     "crates/zakuro-common",
     "crates/zakuro-fs",
     "crates/zakuro-cpu",
+    "crates/zakuro-aot",
     "crates/zakuro-gpu",
     "crates/zakuro-core",
     "crates/zakuro",
@@ -20,6 +21,7 @@ repository = "https://github.com/fearkov/zakuro"
 zakuro-common = { path = "crates/zakuro-common" }
 zakuro-fs     = { path = "crates/zakuro-fs" }
 zakuro-cpu    = { path = "crates/zakuro-cpu" }
+zakuro-aot    = { path = "crates/zakuro-aot" }
 zakuro-gpu    = { path = "crates/zakuro-gpu", default-features = false }
 zakuro-core   = { path = "crates/zakuro-core" }
 
@@ -40,6 +42,8 @@ debug = true
 # The emulator is unusably slow in a plain debug build; give the hot crates -O2
 # even in dev profile.
 [profile.dev.package.zakuro-cpu]
+opt-level = 3
+[profile.dev.package.zakuro-aot]
 opt-level = 3
 [profile.dev.package.zakuro-gpu]
 opt-level = 3

@@ -1,0 +1,17 @@
+[package]
+name = "zakuro-aot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+rayon.workspace = true
+recomp-abi.workspace = true
+zakuro-fs.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "horizon")))'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+zakuro-cpu.workspace = true

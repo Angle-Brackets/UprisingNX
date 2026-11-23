@@ -33,6 +33,8 @@ fn main() {
         // ZAKURO_FIND_RECOMPILED=1 runs the library 3dsrecomp installed for
         // it, as the frontend does.
         find_recompiled: std::env::var_os("ZAKURO_FIND_RECOMPILED").is_some(),
+        // ZAKURO_AOT=1 compiles ARMv6K -> AArch64 AOT code directly from the ROM.
+        compile_aot: std::env::var("ZAKURO_AOT").is_ok_and(|v| v == "1"),
         // ZAKURO_RASTERIZER=hardware draws on the host GPU.
         hardware_renderer: std::env::var("ZAKURO_RASTERIZER").is_ok_and(|v| v == "hardware"),
         // ZAKURO_RESOLUTION=3 draws at three times the console's resolution.
@@ -411,6 +413,14 @@ fn main() {
         println!("in between:    {betweens} of {executed} refreshes");
     }
     println!("instructions:  {}", system.cpu.cycles);
+    if let Some(lib) = &system.recompiled {
+        println!(
+            "aot/recomp:    {} recompiled, {} interpreted, {} fallbacks",
+            system.recompiled_instructions,
+            system.interpreted_instructions,
+            lib.fallbacks()
+        );
+    }
     if system.idle.skipped > 0 {
         println!("idle skipped:  {} cycles of loops that changed nothing", system.idle.skipped);
     }

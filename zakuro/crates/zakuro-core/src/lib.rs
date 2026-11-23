@@ -53,6 +53,9 @@ pub struct Config {
     /// with no library given, run the one 3dsrecomp build installed for the
     /// title, if it did.
     pub find_recompiled: bool,
+    /// compile ARMv6K -> AArch64 AOT code directly in memory at load time
+    /// when running on an `aarch64` host without a prebuilt library.
+    pub compile_aot: bool,
     /// where saves and dumped system files live, the working directory
     /// when there is none.
     pub data_dir: Option<std::path::PathBuf>,
@@ -107,6 +110,7 @@ impl Default for Config {
             recompiled: None,
             linked: None,
             find_recompiled: false,
+            compile_aot: false,
             data_dir: None,
             hardware_renderer: false,
             texture_packs: true,
@@ -330,6 +334,18 @@ impl System {
             frame_recompiled: 0,
             p3d_submits: Default::default(),
         }
+    }
+
+    /// attaches a loaded AArch64 AOT image directly, checking it against guest
+    /// memory first so any modded or patched functions run in the interpreter.
+    pub fn set_aot(&mut self, aot: zakuro_aot::LoadedAot) {
+        let mut library = recompiled::Library::from_aot(aot);
+        let stale = library.check(&mut self.memory);
+        if stale > 0 {
+            log::warn!("{stale} functions changed since AOT compilation, they run in the interpreter");
+        }
+        log::info!("running {}", library.describe());
+        self.recompiled = Some(library);
     }
 
     // -- process setup ------------------------------------------------------
