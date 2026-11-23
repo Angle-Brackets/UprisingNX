@@ -283,56 +283,40 @@ struct WingSprite {
 }
 
 const WING_W: u32 = 640;
-const WING_H: u32 = 440;
+const WING_H: u32 = 520;
 
 type CubicSeg = ([f32; 2], [f32; 2], [f32; 2], [f32; 2]);
 
-const WING_BLADES: &[&[CubicSeg]] = &[
-    // 1) Main leading shoulder crest + Primary Feather #1 + continuous sweeping wing root
-    &[
-        ([134.0, 404.0], [66.0, 356.0], [48.0, 250.0], [112.0, 162.0]),
-        ([112.0, 162.0], [192.0, 62.0], [382.0, 18.0], [610.0, 36.0]),
-        ([610.0, 36.0], [528.0, 86.0], [424.0, 114.0], [314.0, 130.0]),
-        ([314.0, 130.0], [206.0, 146.0], [138.0, 212.0], [126.0, 304.0]),
-        ([126.0, 304.0], [120.0, 350.0], [144.0, 384.0], [176.0, 398.0]),
-        ([176.0, 398.0], [160.0, 408.0], [146.0, 412.0], [134.0, 404.0]),
-    ],
-    // 2) Primary Feather #2
-    &[
-        ([152.0, 248.0], [212.0, 160.0], [350.0, 126.0], [576.0, 102.0]),
-        ([576.0, 102.0], [492.0, 154.0], [386.0, 178.0], [274.0, 192.0]),
-        ([274.0, 192.0], [210.0, 200.0], [172.0, 224.0], [152.0, 248.0]),
-    ],
-    // 3) Primary Feather #3
-    &[
-        ([146.0, 288.0], [208.0, 214.0], [336.0, 188.0], [524.0, 172.0]),
-        ([524.0, 172.0], [446.0, 218.0], [350.0, 240.0], [250.0, 250.0]),
-        ([250.0, 250.0], [194.0, 256.0], [164.0, 272.0], [146.0, 288.0]),
-    ],
-    // 4) Primary Feather #4
-    &[
-        ([146.0, 326.0], [202.0, 266.0], [314.0, 246.0], [464.0, 238.0]),
-        ([464.0, 238.0], [394.0, 280.0], [310.0, 298.0], [222.0, 304.0]),
-        ([222.0, 304.0], [178.0, 308.0], [158.0, 316.0], [146.0, 326.0]),
-    ],
-    // 5) Primary Feather #5
-    &[
-        ([152.0, 358.0], [204.0, 312.0], [294.0, 298.0], [402.0, 298.0]),
-        ([402.0, 298.0], [342.0, 336.0], [268.0, 350.0], [196.0, 352.0]),
-        ([196.0, 352.0], [170.0, 354.0], [160.0, 356.0], [152.0, 358.0]),
-    ],
-    // 6) Primary Feather #6 (lower tail plume)
-    &[
-        ([164.0, 386.0], [212.0, 356.0], [278.0, 350.0], [344.0, 354.0]),
-        ([344.0, 354.0], [292.0, 386.0], [226.0, 398.0], [164.0, 386.0]),
-    ],
-    // 7) Delicate upper-left crest accent plume
-    &[
-        ([38.0, 234.0], [36.0, 166.0], [82.0, 102.0], [166.0, 62.0]),
-        ([166.0, 62.0], [114.0, 110.0], [76.0, 166.0], [58.0, 230.0]),
-        ([58.0, 230.0], [50.0, 238.0], [42.0, 238.0], [38.0, 234.0]),
-    ],
-];
+// Unified concave-arch soaring angelic wing SVG (640x520 viewBox):
+// Concave sweeping upper crest rising steeply to a razor-sharp skyward primary tip,
+// with 6 stepped upward-hooking crescent feathers and a smooth rounded base.
+const WING_BLADES: &[&[CubicSeg]] = &[&[
+    // Concave sweeping top leading edge -> soaring Primary Tip #1
+    ([74.0, 218.0], [196.0, 232.0], [382.0, 184.0], [558.0, 18.0]),
+    // Feather #1 trailing edge -> deep tapered Notch #1
+    ([558.0, 18.0], [576.0, 98.0], [512.0, 174.0], [402.0, 224.0]),
+    // Notch #1 -> upward-hooking Primary Tip #2
+    ([402.0, 224.0], [464.0, 200.0], [522.0, 174.0], [566.0, 134.0]),
+    // Feather #2 trailing edge -> deep tapered Notch #2
+    ([566.0, 134.0], [560.0, 212.0], [488.0, 266.0], [380.0, 294.0]),
+    // Notch #2 -> upward-hooking Primary Tip #3
+    ([380.0, 294.0], [438.0, 282.0], [488.0, 268.0], [524.0, 242.0]),
+    // Feather #3 trailing edge -> deep tapered Notch #3
+    ([524.0, 242.0], [498.0, 304.0], [424.0, 338.0], [336.0, 344.0]),
+    // Notch #3 -> Primary Tip #4
+    ([336.0, 344.0], [388.0, 342.0], [430.0, 336.0], [460.0, 320.0]),
+    // Feather #4 trailing edge -> Notch #4
+    ([460.0, 320.0], [428.0, 368.0], [362.0, 388.0], [288.0, 384.0]),
+    // Notch #4 -> Primary Tip #5
+    ([288.0, 384.0], [334.0, 388.0], [370.0, 386.0], [396.0, 376.0]),
+    // Feather #5 trailing edge -> Notch #5
+    ([396.0, 376.0], [358.0, 412.0], [298.0, 422.0], [232.0, 412.0]),
+    // Notch #5 -> lower trailing plume Tip #6
+    ([232.0, 412.0], [272.0, 424.0], [304.0, 428.0], [328.0, 424.0]),
+    // Feather #6 lower curve sweeping smoothly into rounded shoulder base
+    ([328.0, 424.0], [274.0, 456.0], [176.0, 454.0], [104.0, 408.0]),
+    ([104.0, 408.0], [40.0, 366.0], [26.0, 272.0], [74.0, 218.0]),
+]];
 
 /// Rasterizes the cubic-Bezier angelic wing SVG paths into a crisp 4x-supersampled
 /// premultiplied white-alpha RGBA texture (`WING_W` x `WING_H`).
@@ -421,7 +405,7 @@ fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
 }
 
 fn wing_grad_color(u: f32, v: f32, phase: f32, is_error: bool) -> [u8; 4] {
-    let d = 0.68 * u + 0.32 * (1.0 - v);
+    let d = 0.62 * u + 0.38 * (1.0 - v);
     let tau = std::f32::consts::TAU;
     let wave = 0.5 + 0.5 * ((d * 0.85 - phase) * tau).sin();
     let s = ((d * 1.10 - phase) * tau).sin().max(0.0);
@@ -429,14 +413,14 @@ fn wing_grad_color(u: f32, v: f32, phase: f32, is_error: bool) -> [u8; 4] {
     let (r, g, b, alpha) = if !is_error {
         let r = lerp_f32(lerp_f32(64.0, 250.0, wave), 255.0, sheen * 0.65);
         let g = lerp_f32(lerp_f32(148.0, 206.0, wave), 246.0, sheen * 0.65);
-        let b = lerp_f32(lerp_f32(242.0, 94.0, wave), 214.0, sheen * 0.65);
-        let a = (lerp_f32(0.18, 0.36, wave) + sheen * 0.16).min(1.0);
+        let b = lerp_f32(lerp_f32(244.0, 92.0, wave), 214.0, sheen * 0.65);
+        let a = (lerp_f32(0.16, 0.34, wave) + sheen * 0.16).min(1.0);
         (r, g, b, a)
     } else {
         let r = lerp_f32(lerp_f32(175.0, 245.0, wave), 255.0, sheen * 0.50);
         let g = lerp_f32(lerp_f32(48.0, 128.0, wave), 204.0, sheen * 0.50);
         let b = lerp_f32(lerp_f32(82.0, 92.0, wave), 178.0, sheen * 0.50);
-        let a = (lerp_f32(0.16, 0.32, wave) + sheen * 0.14).min(1.0);
+        let a = (lerp_f32(0.15, 0.30, wave) + sheen * 0.14).min(1.0);
         (r, g, b, a)
     };
     color(r as u8, g as u8, b as u8, (alpha * 255.0) as u8)
@@ -920,14 +904,14 @@ impl Menu {
             });
         }
 
-        // Mesh 2: Soaring angelic wing SVG with animated diagonal celestial gradient fill
+        // Mesh 2: Logo-inspired concave-arch soaring wing SVG with animated celestial gradient
         {
             const COLS: usize = 20;
-            const ROWS: usize = 14;
-            let ww = 1040.0 * k;
-            let wh = 715.0 * k;
-            let wx0 = w_f * 0.52 - ww * 0.48;
-            let wy0 = h_f * 0.50 - wh * 0.50;
+            const ROWS: usize = 16;
+            let ww = 960.0 * k;
+            let wh = 780.0 * k;
+            let wx0 = w_f * 0.56 - ww * 0.42;
+            let wy0 = h_f * 0.50 - wh * 0.52;
             let mut vertices = Vec::with_capacity((COLS + 1) * (ROWS + 1));
             for ry in 0..=ROWS {
                 let v = ry as f32 / ROWS as f32;
