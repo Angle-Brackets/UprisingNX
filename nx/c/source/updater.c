@@ -46,6 +46,20 @@ void unx_updater_mark_pending_swap(void) {
     atomic_store(&g_pending_swap, true);
 }
 
+// Fast check via nifm: returns 1 when the Switch has an active internet
+// connection (Wi-Fi or Ethernet), 0 when offline / airplane mode.
+int unx_updater_has_internet(void) {
+    if (R_FAILED(nifmInitialize(NifmServiceType_User))) {
+        return 0;
+    }
+    NifmInternetConnectionType conn_type = 0;
+    u32 wifi_strength = 0;
+    NifmInternetConnectionStatus conn_status = 0;
+    Result rc = nifmGetInternetConnectionStatus(&conn_type, &wifi_strength, &conn_status);
+    nifmExit();
+    return (R_SUCCEEDED(rc) && conn_status == NifmInternetConnectionStatus_Connected) ? 1 : 0;
+}
+
 typedef struct {
     char *buf;
     size_t cap;

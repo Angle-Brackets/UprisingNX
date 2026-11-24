@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/Angle-Brackets/UprisingNX/releases/latest";
 const ASSET_NAME: &str = "uprising_nx.nro";
-const AUTO_CHECK_DELAY: Duration = Duration::from_secs(15);
+const AUTO_CHECK_DELAY: Duration = Duration::from_secs(3);
 const MIN_VALID_NRO_BYTES: u64 = 1024 * 1024; // 1 MiB sanity floor
 #[cfg(target_os = "horizon")]
 const HTTP_BUF_CAP: usize = 128 * 1024;
@@ -29,6 +29,7 @@ const HTTP_BUF_CAP: usize = 128 * 1024;
 extern "C" {
     fn unx_updater_nro_path() -> *const c_char;
     fn unx_updater_mark_pending_swap();
+    fn unx_updater_has_internet() -> c_int;
     fn unx_updater_http_get(
         url: *const c_char,
         out_buf: *mut c_char,
@@ -181,15 +182,32 @@ impl Updater {
         }
     }
 
-    /// Triggers one silent background check after `AUTO_CHECK_DELAY` so it never
-    /// competes with boot or AOT streaming.
-    pub fn maybe_auto_check(&mut self) {
-        if self.auto_checked || self.started_at.elapsed() < AUTO_CHECK_DELAY {
+    /// Triggers one silent background check once on the Title Screen (or after
+    /// `AUTO_CHECK_DELAY`) if internet is connected. Skips quietly when offline.
+    pub fn maybe_auto_check(&mut self, on_title: bool) {
+        if self.auto_checked {
+            return;
+        }
+        if !on_title && self.started_at.elapsed() < AUTO_CHECK_DELAY {
             return;
         }
         self.auto_checked = true;
+        if !has_internet() {
+            log::info!("unx: updater skipping auto-check (offline)");
+            return;
+        }
         if matches!(self.state(), UpdateState::Idle) {
             self.start_check(true);
+        }
+    }
+
+    /// Short yellow badge text shown above the version label on the Title Screen
+    /// whenever a newer release is available or ready to apply.
+    pub fn title_badge(&self) -> Option<&'static str> {
+        match self.state() {
+            UpdateState::Available { .. } => Some("Update Available!"),
+            UpdateState::Ready { .. } => Some("Update Ready!"),
+            _ => None,
         }
     }
 
@@ -301,7 +319,25 @@ impl Drop for Updater {
 }
 
 #[cfg(target_os = "horizon")]
+fn has_internet() -> bool {
+    unsafe { unx_updater_has_internet() != 0 }
+}
+
+#[cfg(not(target_os = "horizon"))]
+fn has_internet() -> bool {
+    false
+}
+
+#[cfg(target_os = "horizon")]
 fn run_check(shared: &Shared, current_version: &str, announce: bool) {
+    if !has_internet() {
+        if announce {
+            Updater::set_state(shared, UpdateState::Idle);
+        } else {
+            Updater::set_state(shared, UpdateState::Failed("No internet connection.".to_owned()));
+        }
+        return;
+    }
     let Ok(c_url) = CString::new(LATEST_RELEASE_URL) else {
         Updater::set_state(shared, UpdateState::Failed("Invalid release URL".to_owned()));
         return;
@@ -339,7 +375,11 @@ fn run_check(shared: &Shared, current_version: &str, announce: bool) {
             format!("Could not reach GitHub: {msg}")
         };
         log::warn!("unx: updater check failed: {detail}");
-        Updater::set_state(shared, UpdateState::Failed(detail));
+        if announce {
+            Updater::set_state(shared, UpdateState::Idle);
+        } else {
+            Updater::set_state(shared, UpdateState::Failed(detail));
+        }
         return;
     }
 

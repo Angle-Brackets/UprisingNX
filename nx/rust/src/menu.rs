@@ -867,7 +867,16 @@ impl Menu {
 
     /// the menu, a hotkey's notice, or the title-screen version watermark over
     /// the game, in a window `width` x `height` pixels
-    pub fn overlay(&mut self, settings: &Settings, docked: bool, now: (u32, bool), width: u32, height: u32, show_version: bool) -> Overlay {
+    pub fn overlay(
+        &mut self,
+        settings: &Settings,
+        docked: bool,
+        now: (u32, bool),
+        width: u32,
+        height: u32,
+        show_version: bool,
+        update_badge: Option<&str>,
+    ) -> Overlay {
         let mut overlay = Overlay::default();
         // Release the bootstrap wing texture once normal gameplay takes over.
         if let Some(wing) = self.wing.take() {
@@ -908,6 +917,13 @@ impl Menu {
                 let sh = (1.5 * k).max(1.0);
                 painter.text(x + sh, y + sh, VERSION_LABEL, size, color(0, 0, 0, 175));
                 painter.text(x, y, VERSION_LABEL, size, color(245, 248, 255, 220));
+                if let Some(badge) = update_badge {
+                    let bw = atlas.width(badge) * size;
+                    let bx = (width as f32 - bw - pad_x).max(0.0);
+                    let by = (y - th - 5.0 * k).max(0.0);
+                    painter.text(bx + sh, by + sh, badge, size, color(0, 0, 0, 205));
+                    painter.text(bx, by, badge, size, color(255, 226, 72, 248));
+                }
             }
         } else {
             self.paint_menu(&mut painter, settings, docked, now, width, height);

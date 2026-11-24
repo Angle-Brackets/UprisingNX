@@ -732,7 +732,8 @@ impl Unx {
         }
         let (width, height) = self.presenter.extent();
         let now = (self.system.gpu.scale(), self.smooth.on);
-        self.menu.overlay(&self.settings, self.docked, now, width, height, self.on_title)
+        let badge = self.updater.title_badge();
+        self.menu.overlay(&self.settings, self.docked, now, width, height, self.on_title, badge)
     }
 
     /// writes the settings back and says what this mode runs at now
@@ -1598,7 +1599,7 @@ pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInpu
     CURRENT_FRAME.store(unx.frame, std::sync::atomic::Ordering::Relaxed);
     FRAME_HEARTBEAT.fetch_add(1, std::sync::atomic::Ordering::Release);
     FRAME_PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
-    unx.updater.maybe_auto_check();
+    unx.updater.maybe_auto_check(unx.on_title);
     if !unx.in_play && !unx.menu.open {
         if let Some(notice) = unx.updater.take_announcement() {
             unx.menu.notify(notice);
