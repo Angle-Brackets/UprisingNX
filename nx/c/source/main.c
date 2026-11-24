@@ -61,6 +61,8 @@ u32 unx_minus_opens_menu(void);
 void nx_tls_init(void);
 void prof_start(void);
 void prof_stop(void);
+void unx_updater_set_nro_path(const char *argv0);
+void unx_updater_apply_and_relaunch(void);
 
 // 3DS PadState bits, from zakuro-core services/hid.rs
 enum {
@@ -300,6 +302,7 @@ static void *game(void *p) {
 
 int main(int argc, char **argv) {
     appletLockExit();
+    unx_updater_set_nro_path(argc > 0 ? argv[0] : NULL);
     socketInitializeDefault();
     nxlinkStdio();
     nx_tls_init();
@@ -342,6 +345,7 @@ int main(int argc, char **argv) {
     } else {
         pthread_join(thread, NULL);
     }
+    unx_updater_apply_and_relaunch();
     printf("uprising_nx: exiting\n");
     fflush(stdout);
     socketExit();

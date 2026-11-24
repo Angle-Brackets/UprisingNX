@@ -13,6 +13,7 @@ use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
 use zakuro_gpu::backend::{Overlay, OverlayMesh, OverlayTexture, OverlayVertex};
 
 use crate::settings::{Preset, Settings};
+use crate::updater::{UpdateTone, UpdateView};
 
 /// the system font, kept by unx_set_font
 pub static FONT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
@@ -221,6 +222,7 @@ enum Row {
     LeftStick,
     Modifier,
     Minus,
+    Update,
     ImportSave,
     ExportSave,
     Resume,
@@ -249,13 +251,14 @@ const CONTROLS_ROWS: &[Row] = &[
 ];
 
 const SYSTEM_ROWS: &[Row] = &[
+    Row::Update,
     Row::ImportSave,
     Row::ExportSave,
     Row::Resume,
     Row::Quit,
 ];
 
-const ALL_ROWS: [Row; 19] = [
+const ALL_ROWS: [Row; 20] = [
     Row::Editing,
     Row::Preset,
     Row::BattleScale,
@@ -271,6 +274,7 @@ const ALL_ROWS: [Row; 19] = [
     Row::LeftStick,
     Row::Modifier,
     Row::Minus,
+    Row::Update,
     Row::ImportSave,
     Row::ExportSave,
     Row::Resume,
@@ -298,6 +302,7 @@ impl Row {
             Row::LeftStick => "Left stick aim",
             Row::Modifier => "Aim button",
             Row::Minus => "Minus button",
+            Row::Update => "Software update",
             Row::ImportSave => "Import 3DS save",
             Row::ExportSave => "Export save backup",
             Row::Resume => "Resume game",
@@ -328,6 +333,7 @@ impl Row {
             Row::LeftStick => "Off: the left stick only moves Pit. 1: in the air it also aims, and on foot holding the aim button turns the camera with it. 2: as 1, but in the air it aims only while the aim button is held.",
             Row::Modifier => "The button held with the left stick to aim or turn the camera (Left stick aim 1 or 2). Fire stays on L/ZL.",
             Row::Minus => "Settings menu: Minus alone opens and closes this menu (Plus still pauses; the game's Select only pauses in battles, like Plus). 3DS Select: Minus goes to the game, and right stick click + Minus opens this menu.",
+            Row::Update => "Checks GitHub Releases for a newer UprisingNX Switch build, downloads and verifies uprising_nx.nro in the background, then swaps and relaunches on restart.",
             Row::ImportSave => "Imports decrypted 3DS saves (00.SAV, 01.SAV...) from sdmc:/switch/uprisingnx/save/import/. Automatically backs up your current Switch save first. Restart or return to Title Screen to load.",
             Row::ExportSave => "Copies your current Switch save files to sdmc:/switch/uprisingnx/save/export/ for use with Checkpoint, JKSM, Citra, or Azahar.",
             Row::Resume => "Back to the game. B or Minus (or right stick click + Minus) also closes this menu.",
@@ -341,6 +347,7 @@ impl Row {
 pub enum Changed {
     Video,
     Controls,
+    Update,
     ImportSave,
     ExportSave,
     Quit,
@@ -513,6 +520,8 @@ pub struct Menu {
     /// Cached save counts refreshed on menu open and after import/export
     pending_saves: usize,
     live_saves: usize,
+    /// Snapshot of the GitHub Releases auto-updater state
+    update: UpdateView,
     /// Inline status message shown on the Save & System tab (`(text, is_error)`)
     status: Option<(String, bool)>,
     /// whose video settings the menu shows and changes, docked or handheld;
@@ -579,6 +588,13 @@ impl Menu {
             import_armed: false,
             pending_saves: 0,
             live_saves: 0,
+            update: UpdateView {
+                value: "Check now".to_owned(),
+                tone: UpdateTone::Neutral,
+                heading: format!("UprisingNX {VERSION_LABEL}"),
+                detail: "Checks GitHub Releases for a newer Switch build. Press A to check now.".to_owned(),
+                progress: None,
+            },
             status: None,
             editing_docked: false,
             blocking: false,
@@ -596,6 +612,10 @@ impl Menu {
     pub fn set_save_counts(&mut self, pending: usize, live: usize) {
         self.pending_saves = pending;
         self.live_saves = live;
+    }
+
+    pub fn set_update_view(&mut self, view: UpdateView) {
+        self.update = view;
     }
 
     pub fn set_status(&mut self, text: String, is_error: bool) {
@@ -772,6 +792,12 @@ impl Menu {
                 set_control(settings, "aim_modifier", MODIFIERS[index].into());
                 Changed::Controls
             }
+            Row::Update => {
+                if !a {
+                    return None;
+                }
+                Changed::Update
+            }
             Row::ImportSave => {
                 if !a {
                     return None;
@@ -929,6 +955,7 @@ impl Menu {
                 },
                 Row::Modifier => MODIFIERS[modifier_index(settings)].into(),
                 Row::Minus => if settings.minus_opens_menu() { "Settings menu".into() } else { "3DS Select".into() },
+                Row::Update => self.update.value.clone(),
                 Row::ImportSave => {
                     if self.import_armed {
                         "Press A again".into()
@@ -1068,10 +1095,17 @@ impl Menu {
             painter.text(left + margin, y, row.label(), 1.0, text);
             let val = value(*row);
             if !val.is_empty() {
-                let cycles = !matches!(row, Row::ImportSave | Row::ExportSave | Row::Resume | Row::Quit);
+                let cycles = !matches!(row, Row::Update | Row::ImportSave | Row::ExportSave | Row::Resume | Row::Quit);
                 let shown = if chosen && cycles { format!("< {val} >") } else { val };
                 let val_color = if armed {
                     color(255, 190, 110, 255)
+                } else if *row == Row::Update && !chosen {
+                    match self.update.tone {
+                        UpdateTone::Accent => color(250, 208, 92, 255),
+                        UpdateTone::Success => color(140, 232, 168, 255),
+                        UpdateTone::Error => color(245, 130, 130, 255),
+                        UpdateTone::Neutral => text,
+                    }
                 } else if *row == Row::ImportSave && self.pending_saves > 0 && !chosen {
                     color(140, 232, 168, 255)
                 } else {
@@ -1084,37 +1118,69 @@ impl Menu {
 
         // Inline status / quick-tip box in the lower body area of Save & System.
         if self.tab == Tab::System {
-            let box_top = rows_top + line * (rows.len() as f32 + 0.35);
-            let box_bot = rows_top + rows_h - line * 0.25;
+            let box_top = rows_top + line * (rows.len() as f32 + 0.28);
+            let box_bot = rows_top + rows_h - line * 0.10;
             let box_pad = 14.0 * k;
-            let (bg, accent, heading, body) = match &self.status {
-                Some((msg, true)) => (
-                    color(52, 22, 34, 230),
-                    color(240, 105, 105, 255),
-                    "Save Action Notice",
-                    msg.as_str(),
-                ),
-                Some((msg, false)) => (
-                    color(20, 48, 42, 230),
-                    color(110, 228, 158, 255),
-                    "Save Action Complete",
-                    msg.as_str(),
-                ),
-                None => (
-                    color(22, 30, 56, 210),
-                    color(110, 152, 225, 255),
-                    "Drop-In 3DS Save Folder",
-                    "Copy decrypted 00.SAV / 01.SAV files from Checkpoint, JKSM, Citra, or Azahar into sdmc:/switch/uprisingnx/save/import/ to auto-import on launch, or press A above.",
-                ),
+            let show_updater = row == Row::Update || self.update.progress.is_some();
+            let (bg, accent, heading, body, progress) = if show_updater {
+                let (bg, accent) = match self.update.tone {
+                    UpdateTone::Success => (color(20, 48, 42, 230), color(110, 228, 158, 255)),
+                    UpdateTone::Accent => (color(36, 36, 56, 230), color(250, 204, 88, 255)),
+                    UpdateTone::Error => (color(52, 22, 34, 230), color(240, 105, 105, 255)),
+                    UpdateTone::Neutral => (color(22, 30, 56, 210), color(110, 152, 225, 255)),
+                };
+                (
+                    bg,
+                    accent,
+                    self.update.heading.as_str(),
+                    self.update.detail.as_str(),
+                    self.update.progress,
+                )
+            } else {
+                match &self.status {
+                    Some((msg, true)) => (
+                        color(52, 22, 34, 230),
+                        color(240, 105, 105, 255),
+                        "Save Action Notice",
+                        msg.as_str(),
+                        None,
+                    ),
+                    Some((msg, false)) => (
+                        color(20, 48, 42, 230),
+                        color(110, 228, 158, 255),
+                        "Save Action Complete",
+                        msg.as_str(),
+                        None,
+                    ),
+                    None => (
+                        color(22, 30, 56, 210),
+                        color(110, 152, 225, 255),
+                        "Drop-In 3DS Save Folder",
+                        "Copy decrypted 00.SAV / 01.SAV files from Checkpoint, JKSM, Citra, or Azahar into sdmc:/switch/uprisingnx/save/import/ to auto-import on launch, or press A above.",
+                        None,
+                    ),
+                }
             };
             painter.rect([left + margin, box_top, left + panel_w - margin, box_bot], bg);
             painter.rect([left + margin, box_top, left + margin + 3.0 * k, box_bot], accent);
-            painter.text(left + margin + box_pad, box_top + 10.0 * k, heading, small, accent);
+            painter.text(left + margin + box_pad, box_top + 8.0 * k, heading, small, accent);
+            let max_lines = if progress.is_some() { 1 } else { 2 };
             let lines = wrap(atlas, body, small, inner_w - box_pad * 2.0);
-            for (i, ln) in lines.iter().take(3).enumerate() {
-                let ly = box_top + 10.0 * k + small_line * (1.05 + i as f32);
+            for (i, ln) in lines.iter().take(max_lines).enumerate() {
+                let ly = box_top + 8.0 * k + small_line * (1.02 + i as f32);
                 if ly + small_line <= box_bot + 4.0 * k {
                     painter.text(left + margin + box_pad, ly, ln, small, color(215, 222, 238, 255));
+                }
+            }
+            if let Some(frac) = progress {
+                let bar_h = 6.0 * k;
+                let bar_y0 = box_bot - bar_h - 8.0 * k;
+                let bar_x0 = left + margin + box_pad;
+                let bar_x1 = left + panel_w - margin - box_pad;
+                painter.rect([bar_x0, bar_y0, bar_x1, bar_y0 + bar_h], color(12, 16, 32, 240));
+                let fill_x1 = bar_x0 + (bar_x1 - bar_x0) * frac.clamp(0.0, 1.0);
+                if fill_x1 > bar_x0 + 1.0 {
+                    painter.rect([bar_x0, bar_y0, fill_x1, bar_y0 + bar_h], accent);
                 }
             }
         }

@@ -7,6 +7,7 @@ mod bootstrap;
 mod menu;
 mod saves;
 mod settings;
+mod updater;
 
 use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
@@ -481,6 +482,8 @@ pub struct Unx {
     menu: menu::Menu,
     /// root data directory (`sdmc:/switch/uprisingnx/data`) for live saves & mods
     data_dir: PathBuf,
+    /// background GitHub Releases auto-updater
+    updater: updater::Updater,
     aim: aim::Aim,
     gyro_test: ([f32; 3], u32),
     /// Fiend's Cauldron live slider cursor X (0..320), floating badge opacity, and hold frames
@@ -1264,6 +1267,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         },
         menu,
         data_dir: data_dir_path,
+        updater: updater::Updater::new(menu::VERSION_LABEL),
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
         cauldron_cursor_x: 0.0,
@@ -1499,6 +1503,7 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
         audio_pause(true);
         unx.menu.set_save_counts(saves::pending_import_count(), saves::live_save_count(&unx.data_dir));
     }
+    unx.menu.set_update_view(unx.updater.view());
     unx.host_last = host;
     let docked = unx.docked;
     match unx.menu.input(buttons, &mut unx.settings, docked) {
@@ -1516,6 +1521,12 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
             MINUS_MENU.store(unx.settings.minus_opens_menu(), std::sync::atomic::Ordering::Relaxed);
             unx.aim.reload();
             unx.settings_changed("menu");
+        }
+        Some(menu::Changed::Update) => {
+            if unx.updater.trigger_action() {
+                return Some(1);
+            }
+            unx.menu.set_update_view(unx.updater.view());
         }
         Some(menu::Changed::ImportSave) => {
             match saves::import_from_menu(&unx.data_dir) {
@@ -1587,6 +1598,12 @@ pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInpu
     CURRENT_FRAME.store(unx.frame, std::sync::atomic::Ordering::Relaxed);
     FRAME_HEARTBEAT.fetch_add(1, std::sync::atomic::Ordering::Release);
     FRAME_PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
+    unx.updater.maybe_auto_check();
+    if !unx.in_play && !unx.menu.open {
+        if let Some(notice) = unx.updater.take_announcement() {
+            unx.menu.notify(notice);
+        }
+    }
     if let Some(done) = unx_menu(unx, input.as_ref()) {
         return done;
     }

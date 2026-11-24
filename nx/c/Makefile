@@ -71,7 +71,7 @@ ifeq ($(RECOMP),1)
 RECOMP_LIBS := -L$(TOPDIR)/../../build/nx-recomp -lrecomp
 CFLAGS += -DUNX_RECOMP
 endif
-LIBS	:= $(RECOMP_LIBS) -L$(RUST_LIB_DIR) -L$(MESA_VK_DIR) -luprising_nx -lvulkan -lzstd -lexpat -lz -lnx -lm
+LIBS	:= $(RECOMP_LIBS) -L$(RUST_LIB_DIR) -L$(MESA_VK_DIR) -luprising_nx -lvulkan -lzstd -lexpat -lcurl -lz -lnx -lm
 
 # libkickstand (the Kickstand dev tools' in-app helper: clean quits for hot
 # reloads), linked when it's there; KICKSTAND=0 leaves it out
