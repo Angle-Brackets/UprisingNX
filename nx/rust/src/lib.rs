@@ -1268,7 +1268,12 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         },
         menu,
         data_dir: data_dir_path,
-        updater: updater::Updater::new(menu::VERSION_LABEL),
+        updater: updater::Updater::new(
+            env!("UNX_VERSION"),
+            env!("UNX_GIT_SHA"),
+            env!("UNX_RELEASE_TAG"),
+            menu::VERSION_LABEL,
+        ),
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
         cauldron_cursor_x: 0.0,

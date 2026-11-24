@@ -7,6 +7,7 @@ fn main() {
 
     let version_path = repo_root.join("VERSION");
     println!("cargo:rerun-if-changed={}", version_path.display());
+    println!("cargo:rerun-if-env-changed=UNX_RELEASE_TAG");
 
     let git_dir = repo_root.join(".git");
     let head_path = git_dir.join("HEAD");
@@ -46,7 +47,14 @@ fn main() {
         .filter(|o| o.status.success())
         .is_some_and(|o| !o.stdout.is_empty());
 
-    let label = if dirty {
+    let release_tag = std::env::var("UNX_RELEASE_TAG")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let label = if let Some(ref tag) = release_tag {
+        tag.clone()
+    } else if dirty {
         format!("v{version} ({sha}*)")
     } else {
         format!("v{version} ({sha})")
@@ -54,5 +62,6 @@ fn main() {
 
     println!("cargo:rustc-env=UNX_VERSION={version}");
     println!("cargo:rustc-env=UNX_GIT_SHA={sha}");
+    println!("cargo:rustc-env=UNX_RELEASE_TAG={}", release_tag.as_deref().unwrap_or(""));
     println!("cargo:rustc-env=UNX_VERSION_LABEL={label}");
 }

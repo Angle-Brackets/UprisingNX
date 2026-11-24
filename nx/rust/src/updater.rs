@@ -87,20 +87,34 @@ struct Shared {
     announce: AtomicBool,
 }
 
+#[derive(Clone, Debug)]
+#[cfg_attr(not(target_os = "horizon"), allow(dead_code))]
+struct BuildVersion {
+    version: String,
+    git_sha: String,
+    release_tag: String,
+    display_label: String,
+}
+
 pub struct Updater {
     started_at: Instant,
     auto_checked: bool,
-    current_version: String,
+    build: BuildVersion,
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Updater {
-    pub fn new(current_version: &str) -> Self {
+    pub fn new(version: &str, git_sha: &str, release_tag: &str, display_label: &str) -> Self {
         Self {
             started_at: Instant::now(),
             auto_checked: false,
-            current_version: current_version.to_owned(),
+            build: BuildVersion {
+                version: version.to_owned(),
+                git_sha: git_sha.to_owned(),
+                release_tag: release_tag.to_owned(),
+                display_label: display_label.to_owned(),
+            },
             shared: Arc::new(Shared {
                 state: Mutex::new(UpdateState::Idle),
                 progress_pct: AtomicI32::new(0),
@@ -130,7 +144,7 @@ impl Updater {
             UpdateState::Idle => UpdateView {
                 value: "Check now".to_owned(),
                 tone: UpdateTone::Neutral,
-                heading: format!("UprisingNX {}", self.current_version),
+                heading: format!("UprisingNX {}", self.build.display_label),
                 detail: "Checks GitHub Releases for a newer Switch build. Press A to check now.".to_owned(),
                 progress: None,
             },
@@ -144,7 +158,7 @@ impl Updater {
             UpdateState::UpToDate(tag) => UpdateView {
                 value: "Up to date".to_owned(),
                 tone: UpdateTone::Success,
-                heading: format!("Up to Date ({})", self.current_version),
+                heading: format!("Up to Date ({})", self.build.display_label),
                 detail: format!("Latest GitHub release is {tag}. Press A to check again."),
                 progress: None,
             },
@@ -154,7 +168,7 @@ impl Updater {
                 heading: format!("Update Available: {tag}"),
                 detail: format!(
                     "Currently running {}. Press A to download {ASSET_NAME} (~22 MB) in the background.",
-                    self.current_version
+                    self.build.display_label
                 ),
                 progress: None,
             },
@@ -271,12 +285,12 @@ impl Updater {
         self.join_finished_worker();
         Self::set_state(&self.shared, UpdateState::Checking);
         let shared = Arc::clone(&self.shared);
-        let current = self.current_version.clone();
+        let build = self.build.clone();
         let spawned = std::thread::Builder::new()
             .name("unx-upd-chk".into())
             .stack_size(256 << 10)
             .spawn(move || {
-                run_check(&shared, &current, announce);
+                run_check(&shared, &build, announce);
             });
         match spawned {
             Ok(h) => self.worker = Some(h),
@@ -329,7 +343,7 @@ fn has_internet() -> bool {
 }
 
 #[cfg(target_os = "horizon")]
-fn run_check(shared: &Shared, current_version: &str, announce: bool) {
+fn run_check(shared: &Shared, build: &BuildVersion, announce: bool) {
     if !has_internet() {
         if announce {
             Updater::set_state(shared, UpdateState::Idle);
@@ -365,7 +379,7 @@ fn run_check(shared: &Shared, current_version: &str, announce: bool) {
     }
     if rc != 0 {
         if http_status == 404 {
-            Updater::set_state(shared, UpdateState::UpToDate(current_version.to_owned()));
+            Updater::set_state(shared, UpdateState::UpToDate(build.display_label.clone()));
             return;
         }
         let msg = c_buf_to_string(&err);
@@ -393,11 +407,19 @@ fn run_check(shared: &Shared, current_version: &str, announce: bool) {
         return;
     };
 
-    let newer = is_newer_release(&release.tag_name, current_version);
+    let newer = is_newer_release(
+        &release.tag_name,
+        &build.version,
+        &build.git_sha,
+        &build.release_tag,
+    );
     log::info!(
-        "unx: updater latest={} current={} newer={} asset={}",
+        "unx: updater latest={} current={} (ver={} sha={} tag={}) newer={} asset={}",
         release.tag_name,
-        current_version,
+        build.display_label,
+        build.version,
+        build.git_sha,
+        build.release_tag,
         newer,
         release.asset_url.is_some()
     );
@@ -429,7 +451,7 @@ fn run_check(shared: &Shared, current_version: &str, announce: bool) {
 }
 
 #[cfg(not(target_os = "horizon"))]
-fn run_check(shared: &Shared, _current_version: &str, _announce: bool) {
+fn run_check(shared: &Shared, _build: &BuildVersion, _announce: bool) {
     Updater::set_state(
         shared,
         UpdateState::Failed("Auto-updater is only supported on Nintendo Switch.".to_owned()),
@@ -539,22 +561,41 @@ fn strip_v_prefix(s: &str) -> &str {
 }
 
 fn parse_numeric_prefix(s: &str) -> Vec<u32> {
-    let core = strip_v_prefix(s).split('-').next().unwrap_or("");
+    let core = strip_v_prefix(s).split(['-', ' ', '(']).next().unwrap_or("");
     core.split('.')
         .filter_map(|part| part.parse::<u32>().ok())
         .collect()
 }
 
 /// Returns `true` if `remote_tag` (e.g. `"v0.1.0-abc1234"` or `"v0.2.0"`) is
-/// newer than `current_label` (e.g. `"0.1.0-73a9696"`).
-pub fn is_newer_release(remote_tag: &str, current_label: &str) -> bool {
+/// newer than the currently running build (`cur_version`, `cur_sha`, `cur_release_tag`).
+pub fn is_newer_release(
+    remote_tag: &str,
+    cur_version: &str,
+    cur_sha: &str,
+    cur_release_tag: &str,
+) -> bool {
     let r_norm = strip_v_prefix(remote_tag);
-    let c_norm = strip_v_prefix(current_label);
     if r_norm.is_empty() {
         return false;
     }
     let r_nums = parse_numeric_prefix(r_norm);
-    let c_nums = parse_numeric_prefix(c_norm);
+    if r_nums.is_empty() {
+        return false;
+    }
+
+    let cur_rel_norm = strip_v_prefix(cur_release_tag);
+    let c_nums = if !cur_rel_norm.is_empty() {
+        let rel_nums = parse_numeric_prefix(cur_rel_norm);
+        if !rel_nums.is_empty() {
+            rel_nums
+        } else {
+            parse_numeric_prefix(cur_version)
+        }
+    } else {
+        parse_numeric_prefix(cur_version)
+    };
+
     let max_len = r_nums.len().max(c_nums.len());
     for i in 0..max_len {
         let r = r_nums.get(i).copied().unwrap_or(0);
@@ -563,9 +604,30 @@ pub fn is_newer_release(remote_tag: &str, current_label: &str) -> bool {
             return r > c;
         }
     }
-    // Equal semver numbers (e.g. rolling `0.1.0-<sha>` releases): any different
-    // tag on GitHub's `/releases/latest` is offered as an update until installed.
-    !r_norm.eq_ignore_ascii_case(c_norm)
+
+    // Equal numeric (major, minor, patch) prefix:
+    // 1. Exact release tag match (case-insensitive, ignoring leading `v`).
+    if !cur_rel_norm.is_empty() && cur_rel_norm.eq_ignore_ascii_case(r_norm) {
+        return false;
+    }
+
+    // 2. Remote rolling/pre-release `-<suffix>` matching current git SHA.
+    let r_suffix = r_norm.split_once('-').map(|(_, s)| s.trim()).filter(|s| !s.is_empty());
+    let cur_sha = cur_sha.trim();
+    if let Some(suffix) = r_suffix {
+        if !cur_sha.is_empty() && !cur_sha.eq_ignore_ascii_case("unknown") && suffix.eq_ignore_ascii_case(cur_sha) {
+            return false;
+        }
+        // 3. Clean release (e.g. `v0.1.0`, no `-` suffix) never downgrades to a
+        //    same-version `-<sha>` pre-release/rolling tag.
+        if !cur_rel_norm.is_empty() && !cur_rel_norm.contains('-') {
+            return false;
+        }
+    }
+
+    // 4. Otherwise offer update (e.g. rolling `v0.1.0 (3deff39)` -> clean `v0.1.0`
+    //    or newer rolling `v0.1.0-abc1234`, or pre-release `v0.1.0-rc1` -> `v0.1.0`).
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -807,13 +869,39 @@ mod tests {
 
     #[test]
     fn version_comparison_handles_semver_and_rolling_sha() {
-        assert!(is_newer_release("v0.2.0", "0.1.0-73a9696"));
-        assert!(is_newer_release("v0.1.1-abc1234", "0.1.0-73a9696"));
-        assert!(is_newer_release("v0.1.0-def5678", "0.1.0-73a9696"));
-        assert!(is_newer_release("v0.1.0", "0.1.0-73a9696"));
-        assert!(!is_newer_release("v0.1.0-73a9696", "0.1.0-73a9696"));
-        assert!(!is_newer_release("0.1.0-73a9696", "0.1.0-73a9696"));
-        assert!(!is_newer_release("v0.0.9-fffffff", "0.1.0-73a9696"));
+        // Rolling dev build `v0.1.0 (3deff39)` (cur_release_tag == "")
+        assert!(!is_newer_release("v0.1.0-3deff39", "0.1.0", "3deff39", ""));
+        assert!(!is_newer_release("0.1.0-3deff39", "0.1.0", "3deff39", ""));
+        assert!(!is_newer_release("V0.1.0-3DEFF39", "0.1.0", "3deff39", ""));
+        assert!(is_newer_release("v0.1.0-abc1234", "0.1.0", "3deff39", ""));
+        assert!(is_newer_release("v0.1.0", "0.1.0", "3deff39", ""));
+        assert!(is_newer_release("v0.1.1-abc1234", "0.1.0", "3deff39", ""));
+        assert!(is_newer_release("v0.2.0", "0.1.0", "3deff39", ""));
+        assert!(!is_newer_release("v0.0.9-fffffff", "0.1.0", "3deff39", ""));
+        assert!(!is_newer_release("v0.0.9", "0.1.0", "3deff39", ""));
+
+        // Clean tagged release `v0.1.0` (cur_release_tag == "v0.1.0")
+        assert!(!is_newer_release("v0.1.0", "0.1.0", "3deff39", "v0.1.0"));
+        assert!(!is_newer_release("0.1.0", "0.1.0", "3deff39", "v0.1.0"));
+        assert!(!is_newer_release("V0.1.0", "0.1.0", "3deff39", "v0.1.0"));
+        // Never downgrade a clean `v0.1.0` to a same-version rolling `-<sha>` tag
+        assert!(!is_newer_release("v0.1.0-3deff39", "0.1.0", "3deff39", "v0.1.0"));
+        assert!(!is_newer_release("v0.1.0-abc1234", "0.1.0", "3deff39", "v0.1.0"));
+        // Higher semver always triggers update from clean release
+        assert!(is_newer_release("v0.1.1", "0.1.0", "3deff39", "v0.1.0"));
+        assert!(is_newer_release("v0.1.1-abc1234", "0.1.0", "3deff39", "v0.1.0"));
+        assert!(is_newer_release("v0.2.0", "0.1.0", "3deff39", "v0.1.0"));
+        assert!(!is_newer_release("v0.0.9", "0.1.0", "3deff39", "v0.1.0"));
+
+        // Pre-release tag (e.g. `v0.1.0-rc1`) upgrades to clean `v0.1.0` or `v0.1.0-rc2`, not itself
+        assert!(!is_newer_release("v0.1.0-rc1", "0.1.0", "3deff39", "v0.1.0-rc1"));
+        assert!(is_newer_release("v0.1.0-rc2", "0.1.0", "3deff39", "v0.1.0-rc1"));
+        assert!(is_newer_release("v0.1.0", "0.1.0", "3deff39", "v0.1.0-rc1"));
+
+        // Malformed / non-semver remote tags never trigger bogus updates
+        assert!(!is_newer_release("", "0.1.0", "3deff39", ""));
+        assert!(!is_newer_release("build-8b5738b", "0.1.0", "3deff39", ""));
+        assert!(!is_newer_release("build-8b5738b", "0.1.0", "3deff39", "v0.1.0"));
     }
 
     #[test]
