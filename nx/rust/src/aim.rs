@@ -835,8 +835,9 @@ impl Aim {
     ///   reticle against left-stick movement drift), or `MOUSE_AIM_RECENTER` (`"MAMR"`)
     ///   when a recenter is requested.
     /// - `MOUSE_LOOK` (`"MLK1"`) on foot / in vehicles, `MOUSE_LOOK_RECENTER` (`"MLKR"`)
-    ///   on the rising edge of `R`/`L3` to acquire a Z-target (or center behind Pit),
-    ///   and `MOUSE_LOOK_HOLD` (`"MLKH"`) while `R`/`L3` stays held to keep tracking.
+    ///   on the rising edge of `R` to acquire a Z-target (or center behind Pit),
+    ///   `MOUSE_LOOK_HOLD` (`"MLKH"`) while `R` stays held to keep tracking, and
+    ///   `MOUSE_LOOK_CENTER` (`"MLKC"`) on the rising edge of `L3` to recenter behind Pit.
     pub fn feed(&mut self, mailbox: &mut [u32], (across, down): (f32, f32)) {
         let (mark, recenter_mark, center_mark, hold_mark) = match self.game {
             GAME_ON_FOOT | GAME_VEHICLE if self.right_stick || self.gyro || self.mode != 0 => {
