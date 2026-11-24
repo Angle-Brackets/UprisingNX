@@ -42,7 +42,11 @@ APP_TITLE	:=	UprisingNX
 APP_AUTHOR	:=	Angle-Brackets
 UNX_VER		:=	$(shell tr -d ' \r\n' < $(TOPDIR)/../../VERSION 2>/dev/null || echo 0.1.0)
 UNX_SHA		:=	$(shell git -C $(TOPDIR)/../.. rev-parse --short HEAD 2>/dev/null || echo unknown)
+ifneq ($(strip $(UNX_RELEASE_TAG)),)
+APP_VERSION	:=	$(shell printf '%s' '$(UNX_VER)' | cut -c1-15)
+else
 APP_VERSION	:=	$(shell printf '%s-%s' '$(UNX_VER)' '$(UNX_SHA)' | cut -c1-15)
+endif
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data

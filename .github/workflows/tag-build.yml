@@ -1,14 +1,136 @@
-name: Test and Tag Build
+name: Test, Version Check, and Tag Build
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  release:
+    types: [created, published, edited]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  verify-version:
+    name: Verify VERSION & Release Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enforce VERSION format, Cargo.toml sync, and release bump
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+          from pathlib import Path
+
+          SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+          CLEAN_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+          def parse_ver(s: str):
+              m = SEMVER_RE.match(s.strip())
+              if not m:
+                  return None
+              return tuple(int(g) for g in m.groups())
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          ver_raw = Path("VERSION").read_text(encoding="utf-8").strip()
+          ver = parse_ver(ver_raw)
+          if ver is None:
+              sys.exit(f"ERROR: VERSION must be strict MAJOR.MINOR.PATCH semver (got {ver_raw!r})")
+
+          cargo_toml = Path("nx/rust/Cargo.toml").read_text(encoding="utf-8")
+          m_cargo = re.search(r'(?m)^version\s*=\s*"([^"]+)"', cargo_toml)
+          if not m_cargo or m_cargo.group(1) != ver_raw:
+              found = m_cargo.group(1) if m_cargo else "<missing>"
+              sys.exit(
+                  f"ERROR: nx/rust/Cargo.toml version ({found}) does not match VERSION ({ver_raw}). "
+                  "Update both files together."
+              )
+
+          head_sha = git("rev-parse", "HEAD")
+          all_tags = [t for t in git("tag", "-l", "v*").splitlines() if t.strip()]
+          clean_tags = []
+          for t in all_tags:
+              m = CLEAN_TAG_RE.match(t)
+              if m:
+                  clean_tags.append((tuple(int(g) for g in m.groups()), t))
+          clean_tags.sort()
+
+          event = os.environ["EVENT_NAME"]
+          ref_type = os.environ["REF_TYPE"]
+          ref_name = os.environ["REF_NAME"]
+          release_tag = os.environ.get("RELEASE_TAG", "").strip()
+
+          active_tag = None
+          if event == "release" and release_tag:
+              active_tag = release_tag
+          elif ref_type == "tag" and ref_name:
+              active_tag = ref_name
+
+          print(f"VERSION={ver_raw} HEAD={head_sha[:7]} event={event} active_tag={active_tag or '-'}")
+
+          if active_tag:
+              if CLEAN_TAG_RE.match(active_tag):
+                  expected_tag = f"v{ver_raw}"
+                  if active_tag != expected_tag:
+                      sys.exit(
+                          f"ERROR: Release tag {active_tag} does not match VERSION file ({expected_tag}). "
+                          "Update VERSION (and nx/rust/Cargo.toml) before cutting this release."
+                      )
+                  # Ensure VERSION was strictly bumped compared to all older clean release tags
+                  other_tags = [(v, t) for (v, t) in clean_tags if t != active_tag]
+                  if other_tags:
+                      prev_ver, prev_tag = other_tags[-1]
+                      if ver <= prev_ver:
+                          sys.exit(
+                              f"ERROR: VERSION ({ver_raw}) was not bumped past previous release {prev_tag}. "
+                              "Update VERSION before releasing."
+                          )
+                      prev_file = git("show", f"{prev_tag}:VERSION").strip()
+                      if prev_file == ver_raw:
+                          sys.exit(
+                              f"ERROR: VERSION file is identical to previous release {prev_tag} ({ver_raw}). "
+                              "Update VERSION before releasing."
+                          )
+                  print(f"OK: Clean release tag {active_tag} matches VERSION and is properly bumped.")
+              else:
+                  # Rolling tag vX.Y.Z-<sha>
+                  if not active_tag.startswith(f"v{ver_raw}-"):
+                      sys.exit(
+                          f"ERROR: Rolling tag {active_tag} does not match VERSION prefix v{ver_raw}-"
+                      )
+                  print(f"OK: Rolling tag {active_tag} matches VERSION {ver_raw}.")
+          else:
+              # Branch push / PR / workflow_dispatch:
+              # If v{VERSION} was already released on an earlier commit (not HEAD), force a VERSION bump.
+              for tag_ver, tag_name in clean_tags:
+                  if tag_ver == ver:
+                      tag_sha = git("rev-list", "-n", "1", tag_name)
+                      if tag_sha != head_sha:
+                          sys.exit(
+                              f"ERROR: VERSION ({ver_raw}) was already released at tag {tag_name} ({tag_sha[:7]}). "
+                              "Bump VERSION (and nx/rust/Cargo.toml) before pushing new commits after a release."
+                          )
+                  elif tag_ver > ver:
+                      sys.exit(
+                          f"ERROR: VERSION ({ver_raw}) is older than existing release tag {tag_name}."
+                      )
+              print(f"OK: VERSION {ver_raw} is valid and up to date.")
+          PY
+
   test:
     name: Desktop Unit Tests
     runs-on: ubuntu-latest
@@ -32,7 +154,8 @@ jobs:
 
   tag:
     name: Tag Commit Build
-    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [verify-version, test]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -44,6 +167,15 @@ jobs:
         run: |
           VER="$(tr -d ' \r\n' < VERSION)"
           SHORT_SHA="$(git rev-parse --short HEAD)"
+          CLEAN_TAG="v${VER}"
+          if git rev-parse -q --verify "refs/tags/${CLEAN_TAG}" >/dev/null; then
+            CLEAN_SHA="$(git rev-list -n 1 "${CLEAN_TAG}")"
+            HEAD_SHA="$(git rev-parse HEAD)"
+            if [ "${CLEAN_SHA}" = "${HEAD_SHA}" ]; then
+              echo "Clean release tag ${CLEAN_TAG} already points to HEAD; skipping rolling tag."
+              exit 0
+            fi
+          fi
           TAG="v${VER}-${SHORT_SHA}"
           echo "Computed build tag: ${TAG}"
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then

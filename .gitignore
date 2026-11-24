@@ -33,3 +33,8 @@ __pycache__/
 # Tutorial voiceover / mod tooling & datasets
 tools/
 mods/
+
+# Local agent / scratch notes
+CLAUDE.md
+context/
+.claude/
