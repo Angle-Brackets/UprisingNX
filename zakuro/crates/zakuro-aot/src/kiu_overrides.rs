@@ -59,18 +59,28 @@ const FIGHTER_LIST_HEAD: u32 = 0x00F2_5A68;
 const TARGET_COMP_KEY: u32 = 0x00D7_6244;
 
 const PI_F: f32 = std::f32::consts::PI;
-const ZTARGET_MAX_RANGE: f32 = 45.0;
-const ZTARGET_HOLD_MAX_RANGE: f32 = 60.0;
+/// Close-quarters 360-degree lock-on radius: any live enemy this close locks on
+/// immediately even if flanking to Pit's side or rear.
+const ZTARGET_CLOSE_RANGE: f32 = 16.0;
+/// Mid/far forward-hemisphere lock-on range when acquiring a target.
+const ZTARGET_MAX_RANGE: f32 = 52.0;
+/// Range within which an already-locked target stays tracked while holding R/L3.
+const ZTARGET_HOLD_MAX_RANGE: f32 = 68.0;
 const ZTARGET_MIN_DIST_FOOT: f32 = 0.6;
 const ZTARGET_MIN_DIST_VEHICLE: f32 = 1.8;
-/// Initial lock-on cone half-angle: 65 deg from camera forward ray (`cos(65 deg)`).
-/// Anything outside this front cone cleanly falls back to behind-Pit recenter.
-const ZTARGET_MAX_FOV_RAD: f32 = 65.0 * PI_F / 180.0;
-const ZTARGET_MIN_FWD_DOT: f32 = 0.422_618_27;
+/// Forward hemisphere half-angle for mid/far acquisition: 85 deg (`cos(85 deg)`).
+const ZTARGET_FAR_FOV_RAD: f32 = 85.0 * PI_F / 180.0;
+const ZTARGET_FAR_MIN_FWD_DOT: f32 = 0.087_155_74;
 const ZTARGET_TAP_TICKS: i32 = 14;
-const ZTARGET_SLEW_GAIN: f32 = 0.55;
-const ZTARGET_MIN_STEP: f32 = 0.08;
-const ZTARGET_MAX_STEP: f32 = 0.85;
+const ZTARGET_SLEW_GAIN: f32 = 0.65;
+const ZTARGET_MIN_STEP: f32 = 0.09;
+const ZTARGET_MAX_STEP: f32 = 1.00;
+/// Angular threshold (~18 deg) under which held Z-target switches from initial
+/// snap slew to 1:1 tight Zelda lock tracking so circle-strafing never lags.
+const ZTARGET_TIGHT_LOCK_RAD: f32 = 0.32;
+/// 30 Hz ticks to keep tracking a locked enemy through brief untargetable
+/// hit-stun / hop / flash frames while holding R/L3 before dropping lock.
+const ZTARGET_FLICKER_GRACE: u8 = 15;
 const ZTARGET_DONE_EPS: f32 = 0.005;
 const ZTARGET_PITCH_LIMIT: f32 = 0.75;
 const ZTARGET_CANCEL_STICK_PX: f32 = 1.5;
@@ -79,7 +89,12 @@ const ZTARGET_CANCEL_STICK_PX: f32 = 1.5;
 #[derive(Clone, Copy, Default)]
 pub struct ZTargetState {
     pub locked_entity: u32,
-    pub active: i32,
+    pub active: u8,
+    /// Non-zero once initial snap has converged onto `locked_entity` (enables 1:1 tight tracking).
+    pub locked_on: u8,
+    /// Consecutive ticks `locked_entity` had its targetable flag cleared while still alive in list.
+    pub lost_ticks: u8,
+    pub _pad: u8,
     pub snap_ticks: i32,
     pub fallback_yaw: f32,
 }
@@ -304,7 +319,11 @@ unsafe fn find_target_holder(ctx: &mut Context, entity: u32) -> u32 {
     found
 }
 
-unsafe fn get_target_center(ctx: &mut Context, entity: u32) -> Option<(f32, f32, f32)> {
+unsafe fn get_target_center(
+    ctx: &mut Context,
+    entity: u32,
+    require_targetable: bool,
+) -> Option<(f32, f32, f32)> {
     if !valid_heap_ptr(entity) {
         return None;
     }
@@ -319,7 +338,7 @@ unsafe fn get_target_center(ctx: &mut Context, entity: u32) -> Option<(f32, f32,
     if (unsafe { mem_read32(ctx, comp + 0x38) } & 1) == 0 {
         return None;
     }
-    if (unsafe { mem_read32(ctx, comp + 0x34) } & 4) == 0 {
+    if require_targetable && (unsafe { mem_read32(ctx, comp + 0x34) } & 4) == 0 {
         return None;
     }
     let x0 = unsafe { read_f32(ctx, comp + 0x54) };
@@ -356,6 +375,7 @@ unsafe fn entity_in_list(ctx: &mut Context, guard_addr: u32, head_addr: u32, nee
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn is_live_target(
     ctx: &mut Context,
     entity: u32,
@@ -365,6 +385,7 @@ unsafe fn is_live_target(
     pz: f32,
     min_dist: f32,
     max_dist: f32,
+    require_targetable: bool,
 ) -> Option<(f32, f32, f32)> {
     if !valid_heap_ptr(entity) || entity == pit_entity {
         return None;
@@ -376,7 +397,7 @@ unsafe fn is_live_target(
     if !in_lists {
         return None;
     }
-    let (tx, ty, tz) = unsafe { get_target_center(ctx, entity) }?;
+    let (tx, ty, tz) = unsafe { get_target_center(ctx, entity, require_targetable) }?;
     let (dx, dy, dz) = (tx - px, ty - py, tz - pz);
     let d2 = dx * dx + dy * dy + dz * dz;
     if d2 < min_dist * min_dist || d2 > max_dist * max_dist {
@@ -421,7 +442,7 @@ unsafe fn scan_entity_list(
         if ent == pit_entity {
             continue;
         }
-        let Some((tx, ty, tz)) = (unsafe { get_target_center(ctx, ent) }) else {
+        let Some((tx, ty, tz)) = (unsafe { get_target_center(ctx, ent, true) }) else {
             continue;
         };
         let (dx, dy, dz) = (tx - px, ty - py, tz - pz);
@@ -430,17 +451,18 @@ unsafe fn scan_entity_list(
             continue;
         }
         let dist = d2.sqrt();
-        // Require the target to sit inside the +/-65 deg 3D front cone of the
-        // camera so off-screen/rear enemies never hijack behind-Pit recenter.
         let inv_dist = 1.0 / dist;
         let fwd_dot = (dx * cam_fx + dy * cam_fy + dz * cam_fz) * inv_dist;
-        if fwd_dot < ZTARGET_MIN_FWD_DOT {
+        // 2-zone Zelda targeting:
+        // - Close quarters (<= 16u): full 360-degree lock-on so flanking enemies right
+        //   next to Pit are never ignored.
+        // - Mid/far (> 16u): generous +/-85 deg forward hemisphere so anything visible
+        //   on screen locks on, while distant rear enemies still allow behind-Pit recenter.
+        if dist > ZTARGET_CLOSE_RANGE && fwd_dot < ZTARGET_FAR_MIN_FWD_DOT {
             continue;
         }
         let ang_err = fwd_dot.clamp(-1.0, 1.0).acos();
-        // Strongly prioritize enemies closest to the crosshair, using distance
-        // as a secondary tie-breaker.
-        let score = dist * (0.20 + 2.80 * (ang_err / ZTARGET_MAX_FOV_RAD));
+        let score = dist * (0.25 + 2.20 * (ang_err / ZTARGET_FAR_FOV_RAD));
         if score < *best_score {
             *best_score = score;
             *best_entity = ent;
@@ -588,10 +610,11 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
             }
 
             let mut holding = mark == MOUSE_LOOK_HOLD;
+            let pos_ok = px.is_finite() && py.is_finite() && pz.is_finite();
             if mark == MOUSE_LOOK_RECENTER {
                 mem_write32(&mut ec.ctx, MAILBOX, MOUSE_LOOK_HOLD);
                 holding = true;
-                ec.ztarget.locked_entity = if px.is_finite() && py.is_finite() && pz.is_finite() {
+                ec.ztarget.locked_entity = if pos_ok {
                     find_best_target(
                         &mut ec.ctx,
                         pit_entity,
@@ -608,10 +631,35 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                 };
                 ec.ztarget.fallback_yaw = pit_yaw;
                 ec.ztarget.active = 1;
+                ec.ztarget.locked_on = 0;
+                ec.ztarget.lost_ticks = 0;
                 ec.ztarget.snap_ticks = ZTARGET_TAP_TICKS;
             } else if !holding && ec.ztarget.active != 0 {
                 if across.abs() > ZTARGET_CANCEL_STICK_PX || down.abs() > ZTARGET_CANCEL_STICK_PX {
                     ec.ztarget = ZTargetState::default();
+                }
+            }
+
+            // While R/L3 is held without a locked target, keep scanning every tick
+            // so approaching or turning toward an enemy locks on automatically.
+            if holding && ec.ztarget.locked_entity == 0 && pos_ok {
+                let found = find_best_target(
+                    &mut ec.ctx,
+                    pit_entity,
+                    px,
+                    py,
+                    pz,
+                    cur_yaw,
+                    cur_pitch,
+                    min_dist,
+                    ZTARGET_MAX_RANGE,
+                );
+                if found != 0 {
+                    ec.ztarget.locked_entity = found;
+                    ec.ztarget.active = 1;
+                    ec.ztarget.locked_on = 0;
+                    ec.ztarget.lost_ticks = 0;
+                    ec.ztarget.snap_ticks = ZTARGET_TAP_TICKS;
                 }
             }
 
@@ -622,8 +670,8 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
 
                 if ec.ztarget.locked_entity != 0 {
                     let range = if holding { ZTARGET_HOLD_MAX_RANGE } else { ZTARGET_MAX_RANGE };
-                    let live = if px.is_finite() && py.is_finite() && pz.is_finite() {
-                        is_live_target(
+                    let live = if pos_ok {
+                        match is_live_target(
                             &mut ec.ctx,
                             ec.ztarget.locked_entity,
                             pit_entity,
@@ -632,7 +680,33 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                             pz,
                             min_dist,
                             range,
-                        )
+                            true,
+                        ) {
+                            Some(pos) => {
+                                ec.ztarget.lost_ticks = 0;
+                                Some(pos)
+                            }
+                            None if holding && ec.ztarget.lost_ticks < ZTARGET_FLICKER_GRACE => {
+                                // Keep tracking through brief hit-stun/dodge flicker frames as
+                                // long as the entity is still alive in the enemy/fighter list.
+                                let soft = is_live_target(
+                                    &mut ec.ctx,
+                                    ec.ztarget.locked_entity,
+                                    pit_entity,
+                                    px,
+                                    py,
+                                    pz,
+                                    min_dist,
+                                    range,
+                                    false,
+                                );
+                                if soft.is_some() {
+                                    ec.ztarget.lost_ticks = ec.ztarget.lost_ticks.saturating_add(1);
+                                }
+                                soft
+                            }
+                            None => None,
+                        }
                     } else {
                         None
                     };
@@ -641,7 +715,7 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                         goal_yaw = dx.atan2(dz);
                         goal_pitch = (-dy.atan2(dx.hypot(dz))).clamp(-ZTARGET_PITCH_LIMIT, ZTARGET_PITCH_LIMIT);
                         have_goal = true;
-                    } else if holding && px.is_finite() && py.is_finite() && pz.is_finite() {
+                    } else if holding && pos_ok {
                         ec.ztarget.locked_entity = find_best_target(
                             &mut ec.ctx,
                             pit_entity,
@@ -653,8 +727,10 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                             min_dist,
                             ZTARGET_MAX_RANGE,
                         );
+                        ec.ztarget.locked_on = 0;
+                        ec.ztarget.lost_ticks = 0;
                         let next_center = if ec.ztarget.locked_entity != 0 {
-                            get_target_center(&mut ec.ctx, ec.ztarget.locked_entity)
+                            get_target_center(&mut ec.ctx, ec.ztarget.locked_entity, true)
                         } else {
                             None
                         };
@@ -664,6 +740,7 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                             goal_pitch = (-dy.atan2(dx.hypot(dz))).clamp(-ZTARGET_PITCH_LIMIT, ZTARGET_PITCH_LIMIT);
                             have_goal = true;
                         } else {
+                            // Keep waiting while R stays held; top-of-frame scan will re-acquire.
                             ec.ztarget.active = 0;
                             ec.ztarget.snap_ticks = 0;
                         }
@@ -677,8 +754,20 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                 if have_goal {
                     let yaw_err = wrap_pi(goal_yaw - cur_yaw);
                     let pitch_err = goal_pitch - cur_pitch;
-                    let dyaw = slew_step(yaw_err);
-                    let dpitch = slew_step(pitch_err);
+                    let tight_hold = holding
+                        && ec.ztarget.locked_entity != 0
+                        && (ec.ztarget.locked_on != 0
+                            || (yaw_err.abs() < ZTARGET_TIGHT_LOCK_RAD
+                                && pitch_err.abs() < ZTARGET_TIGHT_LOCK_RAD));
+                    let (dyaw, dpitch) = if tight_hold {
+                        ec.ztarget.locked_on = 1;
+                        (
+                            yaw_err.clamp(-ZTARGET_MAX_STEP, ZTARGET_MAX_STEP),
+                            pitch_err.clamp(-ZTARGET_MAX_STEP, ZTARGET_MAX_STEP),
+                        )
+                    } else {
+                        (slew_step(yaw_err), slew_step(pitch_err))
+                    };
 
                     if valid_heap_ptr(ctrl) {
                         mem_write32(&mut ec.ctx, ctrl + 0x24, 0);
@@ -707,7 +796,7 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                         ec.ztarget.snap_ticks = 0;
                     }
                 }
-            } else {
+            } else if !holding {
                 ec.ztarget = ZTargetState::default();
             }
 
