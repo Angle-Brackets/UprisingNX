@@ -8,9 +8,8 @@
 
 ## Gameplay Demo
 
-[![Watch Kid Icarus: Uprising running on Nintendo Switch](https://img.youtube.com/vi/jP63aGFbcz8/maxresdefault.jpg)](https://www.youtube.com/watch?v=jP63aGFbcz8)
-
-**[Watch Gameplay on YouTube →](https://www.youtube.com/watch?v=jP63aGFbcz8)**
+**[Watch Gameplay on YouTube →](https://www.youtube.com/watch?v=jP63aGFbcz8)**  
+*(Recorded on an older build, though most things are the same — and please don't make fun of my gameplay :P)*
 
 | Title Screen (16:9 Upscaled) | Air Battle & Unified HUD |
 | :---: | :---: |
