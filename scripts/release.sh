@@ -132,9 +132,11 @@ REMAP_FLAGS=(
   "--cfg" "unix"
   "-A" "explicit_builtin_cfgs_in_flags"
   "-Z" "has-thread-local=true"
-  "--remap-path-prefix=${REPO_ROOT}=."
-  "--remap-path-prefix=${CARGO_HOME_DIR}=/cargo"
+  # rustc evaluates --remap-path-prefix in reverse order (last match wins),
+  # so put the broadest prefix first and the repo root last.
   "--remap-path-prefix=${HOME}=/builder"
+  "--remap-path-prefix=${CARGO_HOME_DIR}=/cargo"
+  "--remap-path-prefix=${REPO_ROOT}=/uprisingnx"
 )
 export CARGO_ENCODED_RUSTFLAGS="$(IFS=$'\x1f'; echo "${REMAP_FLAGS[*]}")"
 (cd nx/rust && ../../scripts/cargo-nx.sh build --release)
@@ -142,7 +144,7 @@ export CARGO_ENCODED_RUSTFLAGS="$(IFS=$'\x1f'; echo "${REMAP_FLAGS[*]}")"
 echo "[release] Linking Switch NRO (KICKSTAND=0)..."
 make -C nx/c clean
 make -C nx/c -j"$(nproc)" KICKSTAND=0 UNX_RELEASE_TAG="${TAG}" \
-  EXTRA_CFLAGS="-ffile-prefix-map=${REPO_ROOT}=."
+  EXTRA_CFLAGS="-ffile-prefix-map=${REPO_ROOT}=/uprisingnx"
 
 NRO="nx/c/uprising_nx.nro"
 python3 - "$NRO" "$TAG" "$HOME" "$REPO_ROOT" <<'PY'
@@ -151,13 +153,22 @@ from pathlib import Path
 
 nro = Path(sys.argv[1]).read_bytes()
 tag = sys.argv[2].encode("ascii")
-home = sys.argv[3].encode("utf-8")
-repo = sys.argv[4].encode("utf-8")
+home = Path(sys.argv[3])
+repo = Path(sys.argv[4])
 assert len(nro) >= 1_048_576, f"NRO unexpectedly small: {len(nro)} bytes"
 assert nro[0x10:0x14] == b"NRO0", f"Invalid NRO0 magic at 0x10: {nro[0x10:0x14]!r}"
 assert tag in nro, f"Release tag {tag!r} not found in built NRO"
-assert home not in nro, f"Host home path {home!r} leaked into built NRO!"
-assert repo not in nro, f"Host repo path {repo!r} leaked into built NRO!"
+assert str(home).encode() not in nro, f"Host home path {home} leaked into built NRO!"
+assert str(repo).encode() not in nro, f"Host repo path {repo} leaked into built NRO!"
+assert b"/builder/" not in nro, "Unmapped /builder/ path leaked into built NRO!"
+# Also ensure intermediate host directories between $HOME and repo root did not leak
+try:
+    rel_parent = repo.parent.relative_to(home)
+    if str(rel_parent) not in ("", "."):
+        needle = f"/{rel_parent}/".encode()
+        assert needle not in nro, f"Host intermediate path {needle!r} leaked into built NRO!"
+except ValueError:
+    pass
 print(f"[release] Verified {sys.argv[1]}: {len(nro):,} bytes, NRO0 magic OK, embedded {tag.decode()} OK, zero host paths leaked")
 PY
 
