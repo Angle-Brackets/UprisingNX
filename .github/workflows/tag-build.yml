@@ -115,20 +115,15 @@ jobs:
                   print(f"OK: Rolling tag {active_tag} matches VERSION {ver_raw}.")
           else:
               # Branch push / PR / workflow_dispatch:
-              # If v{VERSION} was already released on an earlier commit (not HEAD), force a VERSION bump.
+              # Prevent regressing VERSION below an already-released tag.
+              # Note: Cutting a new release tag/GitHub Release (or running scripts/release.sh)
+              # strictly enforces bumping VERSION past the previous release.
               for tag_ver, tag_name in clean_tags:
-                  if tag_ver == ver:
-                      tag_sha = git("rev-list", "-n", "1", tag_name)
-                      if tag_sha != head_sha:
-                          sys.exit(
-                              f"ERROR: VERSION ({ver_raw}) was already released at tag {tag_name} ({tag_sha[:7]}). "
-                              "Bump VERSION (and nx/rust/Cargo.toml) before pushing new commits after a release."
-                          )
-                  elif tag_ver > ver:
+                  if tag_ver > ver:
                       sys.exit(
                           f"ERROR: VERSION ({ver_raw}) is older than existing release tag {tag_name}."
                       )
-              print(f"OK: VERSION {ver_raw} is valid and up to date.")
+              print(f"OK: VERSION {ver_raw} is valid and matches Cargo.toml.")
           PY
 
   test:
@@ -169,12 +164,12 @@ jobs:
           SHORT_SHA="$(git rev-parse --short HEAD)"
           CLEAN_TAG="v${VER}"
           if git rev-parse -q --verify "refs/tags/${CLEAN_TAG}" >/dev/null; then
-            CLEAN_SHA="$(git rev-list -n 1 "${CLEAN_TAG}")"
-            HEAD_SHA="$(git rev-parse HEAD)"
-            if [ "${CLEAN_SHA}" = "${HEAD_SHA}" ]; then
-              echo "Clean release tag ${CLEAN_TAG} already points to HEAD; skipping rolling tag."
-              exit 0
-            fi
+            echo "Clean release tag ${CLEAN_TAG} already exists; skipping rolling tag until VERSION is bumped."
+            {
+              echo "### Rolling Tag Skipped"
+              echo "- **Version:** \`v${VER}\` was already released (bump \`VERSION\` and \`nx/rust/Cargo.toml\` for the next release)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           TAG="v${VER}-${SHORT_SHA}"
           echo "Computed build tag: ${TAG}"
