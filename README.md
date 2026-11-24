@@ -197,7 +197,14 @@ The 3DS generates audio in emulated time (one 160-sample frame at 32,728 Hz ever
 
 `nx/c/source/audio.c` decouples playback onto its own thread feeding Horizon's `audren` service through a **WSOLA (Waveform Similarity Overlap-Add)** time-stretcher. The stretcher smoothly adjusts playback tempo to match ring-buffer fill, preventing clicks and pitch drops during brief slowdowns without ever blocking the game thread.
 
-### 5. Repository Layout
+### 5. Hardware-in-the-Loop Development with Kickstand
+Bringing up a 3DS AOT compiler, Vulkan renderer, and custom 16:9 UI directly on retail Switch hardware requires fast iteration—not endless SD card swapping. UprisingNX was developed, profiled, and verified end-to-end on a real Nintendo Switch using **[Kickstand](https://github.com/Angle-Brackets/kickstand)**, an MCP server and Rust Horizon sysmodule built for live Switch homebrew development:
+
+- **One-step hot reload:** Dev builds optionally link `libkickstand` (automatically excluded from public releases via `KICKSTAND=0`) to upload, cleanly relaunch, and inspect `uprising_nx.nro` over the network or USB without leaving the desk.
+- **Live visual & control verification:** Every widescreen UI redesign, shader optimization, and dual-stick/gyro aiming tweak was tested on real Tegra X1 hardware using Kickstand's live screenshot capture, scripted button/stick/gyro input injection, and audio recording.
+- **On-console profiling & crash symbolization:** Stack-sampled CPU profiles (`nx/c/source/prof.c`), live memory inspection, and automatic Atmosphere crash report symbolization made it possible to hunt down hot loops, GPU sync stalls, and AOT edge cases directly on hardware.
+
+### 6. Repository Layout
 
 | Path | Role |
 | --- | --- |
@@ -239,6 +246,7 @@ Requires **devkitPro (`devkitA64` + `libnx` + Switch `portlibs`)**, nightly Rust
 ## Credits & License
 
 - **License:** UprisingNX is released under the [MIT License](LICENSE). Built on **Zakuro** (`zakuro/LICENSE`, MIT License, Copyright © 2026 fearkov).
+- **Hardware Tooling:** Built, profiled, and verified on real Switch hardware with **[Kickstand](https://github.com/Angle-Brackets/kickstand)**.
 - **3D Switch Tutorial Assets** ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), modified with articulated controls for UprisingNX):
   - *"Nintendo Switch"* console mesh by **gabrieljuan0322** ([Sketchfab](https://sketchfab.com/3d-models/nintendo-switch-19f3d13edffd4e85acfbbe8adefb72fb))
   - *"Joy-con Switch"* controllers by **Wevensson** ([Sketchfab](https://sketchfab.com/3d-models/joy-con-switch-f8cf0fb92ac544d38079e8d294a5330a))
