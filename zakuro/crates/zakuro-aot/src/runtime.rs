@@ -718,51 +718,79 @@ impl LoadedAot {
     }
 
     /// Streams a cached `UNXAOT01` file directly into a caller-provided executable allocator
-    /// without allocating a duplicate `Vec<u8>` for the machine code.
+    /// without allocating a duplicate `Vec<u8>` for the machine code. Reads metadata in a
+    /// single bulk I/O call and streams the machine code directly into the executable buffer.
     pub fn read_streaming<R: Read>(
         mut r: R,
         alloc_exec: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> Result<(), String>) -> Result<ExecBuffer, String>,
     ) -> Result<Self, String> {
         let hdr = AotImage::read_header(&mut r)?;
-        let u32_le = |r: &mut R| -> Result<u32, String> {
-            let mut b = [0u8; 4];
-            r.read_exact(&mut b).map_err(|e| e.to_string())?;
-            Ok(u32::from_le_bytes(b))
+        let n_entries = hdr.entry_count as usize;
+        let n_pieces = hdr.piece_count as usize;
+        let n_funcs = hdr.func_count as usize;
+        let n_runs = hdr.run_count as usize;
+
+        let meta_bytes = n_entries
+            .checked_mul(12)
+            .and_then(|v| v.checked_add(n_pieces.checked_mul(16)?))
+            .and_then(|v| v.checked_add(n_funcs.checked_mul(12)?))
+            .and_then(|v| v.checked_add(n_runs.checked_mul(8)?))
+            .ok_or_else(|| "AOT header metadata size overflow".to_owned())?;
+
+        let mut meta = vec![0u8; meta_bytes];
+        r.read_exact(&mut meta).map_err(|e| e.to_string())?;
+        let mut cursor = 0usize;
+        let next_u32 = |buf: &[u8], cur: &mut usize| -> u32 {
+            let v = u32::from_le_bytes([buf[*cur], buf[*cur + 1], buf[*cur + 2], buf[*cur + 3]]);
+            *cur += 4;
+            v
         };
-        let u64_le = |r: &mut R| -> Result<u64, String> {
-            let mut b = [0u8; 8];
-            r.read_exact(&mut b).map_err(|e| e.to_string())?;
-            Ok(u64::from_le_bytes(b))
+        let next_u64 = |buf: &[u8], cur: &mut usize| -> u64 {
+            let v = u64::from_le_bytes([
+                buf[*cur],
+                buf[*cur + 1],
+                buf[*cur + 2],
+                buf[*cur + 3],
+                buf[*cur + 4],
+                buf[*cur + 5],
+                buf[*cur + 6],
+                buf[*cur + 7],
+            ]);
+            *cur += 8;
+            v
         };
 
-        let mut entries = Vec::with_capacity(hdr.entry_count as usize);
-        for _ in 0..hdr.entry_count {
-            entries.push((u32_le(&mut r)?, u32_le(&mut r)?));
+        let mut entries = Vec::with_capacity(n_entries);
+        for _ in 0..n_entries {
+            let a = next_u32(&meta, &mut cursor);
+            let b = next_u32(&meta, &mut cursor);
+            entries.push((a, b));
         }
-        let mut owners = Vec::with_capacity(hdr.entry_count as usize);
-        for _ in 0..hdr.entry_count {
-            owners.push(u32_le(&mut r)?);
+        let mut owners = Vec::with_capacity(n_entries);
+        for _ in 0..n_entries {
+            owners.push(next_u32(&meta, &mut cursor));
         }
-        let mut pieces = Vec::with_capacity(hdr.piece_count as usize);
-        for _ in 0..hdr.piece_count {
-            pieces.push(Piece {
-                start: u32_le(&mut r)?,
-                end: u32_le(&mut r)?,
-                hash: u64_le(&mut r)?,
-            });
+        let mut pieces = Vec::with_capacity(n_pieces);
+        for _ in 0..n_pieces {
+            let start = next_u32(&meta, &mut cursor);
+            let end = next_u32(&meta, &mut cursor);
+            let hash = next_u64(&meta, &mut cursor);
+            pieces.push(Piece { start, end, hash });
         }
-        let mut functions = Vec::with_capacity(hdr.func_count as usize);
-        for _ in 0..hdr.func_count {
-            functions.push(FuncOrigin {
-                first: u32_le(&mut r)?,
-                count: u32_le(&mut r)?,
-                start: u32_le(&mut r)?,
-            });
+        let mut functions = Vec::with_capacity(n_funcs);
+        for _ in 0..n_funcs {
+            let first = next_u32(&meta, &mut cursor);
+            let count = next_u32(&meta, &mut cursor);
+            let start = next_u32(&meta, &mut cursor);
+            functions.push(FuncOrigin { first, count, start });
         }
-        let mut runs = Vec::with_capacity(hdr.run_count as usize);
-        for _ in 0..hdr.run_count {
-            runs.push(Run { first: u32_le(&mut r)?, end: u32_le(&mut r)? });
+        let mut runs = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            let first = next_u32(&meta, &mut cursor);
+            let end = next_u32(&meta, &mut cursor);
+            runs.push(Run { first, end });
         }
+        drop(meta);
 
         let code_len = hdr.code_bytes_len as usize;
         let exec = alloc_exec(code_len, &mut |dst| {
@@ -923,5 +951,57 @@ impl LoadedAot {
 
         unsafe { *self.ztarget.get() = ec.ztarget };
         *ctx = ec.ctx;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_streaming_roundtrips_bulk_metadata() {
+        let image = AotImage {
+            program_id: 0x0004_0000_0003_0100,
+            text_hash: 0xD6E0_28C6_175A_2B07,
+            enter_offset: 0x40,
+            entries: vec![(0x0010_0000, 0x100), (0x0010_0010, 0x180)],
+            origins: OriginData {
+                pieces: vec![Piece { start: 0x0010_0000, end: 0x0010_0020, hash: 0x1234_5678_9ABC_DEF0 }],
+                functions: vec![FuncOrigin { first: 0, count: 1, start: 0x0010_0000 }],
+                runs: vec![Run { first: 0, end: 1 }],
+                owners: vec![0, 0],
+            },
+            code: vec![0xD503_201F, 0xD65F_03C0],
+        };
+        let mut buf = Vec::new();
+        image.write_to(&mut buf).unwrap();
+
+        let mut captured = Vec::new();
+        let loaded = LoadedAot::read_streaming(Cursor::new(&buf), |len, fill| {
+            let mut mem = vec![0u8; len].into_boxed_slice();
+            fill(&mut mem)?;
+            captured.extend_from_slice(&mem);
+            let ptr = mem.as_ptr();
+            Ok(unsafe {
+                ExecBuffer::from_external(
+                    ptr,
+                    len,
+                    Some(Box::new(move || {
+                        drop(mem);
+                    })),
+                )
+            })
+        })
+        .unwrap();
+
+        assert_eq!(loaded.program_id, image.program_id);
+        assert_eq!(loaded.text_hash, image.text_hash);
+        assert_eq!(loaded.enter_offset, image.enter_offset);
+        assert_eq!(loaded.entries, image.entries);
+        assert_eq!(loaded.origins.owners, image.origins.owners);
+        assert_eq!(loaded.origins.pieces.len(), 1);
+        assert_eq!(loaded.origins.pieces[0].hash, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(captured, image.code_bytes());
     }
 }

@@ -59,16 +59,19 @@ const FIGHTER_LIST_HEAD: u32 = 0x00F2_5A68;
 const TARGET_COMP_KEY: u32 = 0x00D7_6244;
 
 const PI_F: f32 = std::f32::consts::PI;
-const ZTARGET_MAX_RANGE: f32 = 65.0;
-const ZTARGET_HOLD_MAX_RANGE: f32 = 80.0;
+const ZTARGET_MAX_RANGE: f32 = 45.0;
+const ZTARGET_HOLD_MAX_RANGE: f32 = 60.0;
 const ZTARGET_MIN_DIST_FOOT: f32 = 0.6;
 const ZTARGET_MIN_DIST_VEHICLE: f32 = 1.8;
-const ZTARGET_FRONT_WEIGHT: f32 = 0.65;
-const ZTARGET_TAP_TICKS: i32 = 10;
-const ZTARGET_SLEW_GAIN: f32 = 0.45;
-const ZTARGET_MIN_STEP: f32 = 0.06;
-const ZTARGET_MAX_STEP: f32 = 0.75;
-const ZTARGET_DONE_EPS: f32 = 0.015;
+/// Initial lock-on cone half-angle: 65 deg from camera forward ray (`cos(65 deg)`).
+/// Anything outside this front cone cleanly falls back to behind-Pit recenter.
+const ZTARGET_MAX_FOV_RAD: f32 = 65.0 * PI_F / 180.0;
+const ZTARGET_MIN_FWD_DOT: f32 = 0.422_618_27;
+const ZTARGET_TAP_TICKS: i32 = 14;
+const ZTARGET_SLEW_GAIN: f32 = 0.55;
+const ZTARGET_MIN_STEP: f32 = 0.08;
+const ZTARGET_MAX_STEP: f32 = 0.85;
+const ZTARGET_DONE_EPS: f32 = 0.005;
 const ZTARGET_PITCH_LIMIT: f32 = 0.75;
 const ZTARGET_CANCEL_STICK_PX: f32 = 1.5;
 
@@ -391,7 +394,9 @@ unsafe fn scan_entity_list(
     px: f32,
     py: f32,
     pz: f32,
-    cur_yaw: f32,
+    cam_fx: f32,
+    cam_fy: f32,
+    cam_fz: f32,
     min_dist: f32,
     max_dist: f32,
     best_entity: &mut u32,
@@ -425,8 +430,17 @@ unsafe fn scan_entity_list(
             continue;
         }
         let dist = d2.sqrt();
-        let ang_err = wrap_pi(dx.atan2(dz) - cur_yaw).abs();
-        let score = dist * (1.0 + ZTARGET_FRONT_WEIGHT * (ang_err / PI_F));
+        // Require the target to sit inside the +/-65 deg 3D front cone of the
+        // camera so off-screen/rear enemies never hijack behind-Pit recenter.
+        let inv_dist = 1.0 / dist;
+        let fwd_dot = (dx * cam_fx + dy * cam_fy + dz * cam_fz) * inv_dist;
+        if fwd_dot < ZTARGET_MIN_FWD_DOT {
+            continue;
+        }
+        let ang_err = fwd_dot.clamp(-1.0, 1.0).acos();
+        // Strongly prioritize enemies closest to the crosshair, using distance
+        // as a secondary tie-breaker.
+        let score = dist * (0.20 + 2.80 * (ang_err / ZTARGET_MAX_FOV_RAD));
         if score < *best_score {
             *best_score = score;
             *best_entity = ent;
@@ -442,9 +456,16 @@ unsafe fn find_best_target(
     py: f32,
     pz: f32,
     cur_yaw: f32,
+    cur_pitch: f32,
     min_dist: f32,
     max_dist: f32,
 ) -> u32 {
+    let (sy, cy) = cur_yaw.sin_cos();
+    let (sp, cp) = cur_pitch.sin_cos();
+    let cam_fx = sy * cp;
+    let cam_fy = -sp;
+    let cam_fz = cy * cp;
+
     let mut best = 0u32;
     let mut best_score = 1.0e30_f32;
     unsafe {
@@ -456,7 +477,9 @@ unsafe fn find_best_target(
             px,
             py,
             pz,
-            cur_yaw,
+            cam_fx,
+            cam_fy,
+            cam_fz,
             min_dist,
             max_dist,
             &mut best,
@@ -470,7 +493,9 @@ unsafe fn find_best_target(
             px,
             py,
             pz,
-            cur_yaw,
+            cam_fx,
+            cam_fy,
+            cam_fz,
             min_dist,
             max_dist,
             &mut best,
@@ -478,6 +503,36 @@ unsafe fn find_best_target(
         );
     }
     best
+}
+
+/// Applies `(yaw, pitch)` directly to KIU's on-foot camera struct, matching the
+/// exact 8-float commit performed by `f_006063E8` (`cam+0x34/0x38`, `cam+0x0C..0x14`
+/// forward vector, and `cam+0x00..0x08` eye position) without `f_0090AE6C` spring
+/// damping or deadzone stalls.
+unsafe fn apply_cam_angles(ctx: &mut Context, cam: u32, yaw: f32, pitch: f32) {
+    let yaw = wrap_pi(yaw);
+    let pitch = pitch.clamp(-ZTARGET_PITCH_LIMIT, ZTARGET_PITCH_LIMIT);
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let fx = sy * cp;
+    let fy = -sp;
+    let fz = cy * cp;
+    unsafe {
+        mem_write32(ctx, cam + 0x34, yaw.to_bits());
+        mem_write32(ctx, cam + 0x38, pitch.to_bits());
+        mem_write32(ctx, cam + 0x0C, fx.to_bits());
+        mem_write32(ctx, cam + 0x10, fy.to_bits());
+        mem_write32(ctx, cam + 0x14, fz.to_bits());
+        let dist = read_f32(ctx, cam + 0x30);
+        let px = read_f32(ctx, cam + 0x24);
+        let py = read_f32(ctx, cam + 0x28);
+        let pz = read_f32(ctx, cam + 0x2C);
+        if dist.is_finite() && px.is_finite() && py.is_finite() && pz.is_finite() {
+            mem_write32(ctx, cam + 0x00, (px - fx * dist).to_bits());
+            mem_write32(ctx, cam + 0x04, (py - fy * dist).to_bits());
+            mem_write32(ctx, cam + 0x08, (pz - fz * dist).to_bits());
+        }
+    }
 }
 
 unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: *const u8) {
@@ -489,6 +544,7 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
         let in_vehicle = cam_ok && mem_read8(&mut ec.ctx, cam - 0xFF) != 0xFF;
         mem_write32(&mut ec.ctx, MAILBOX + 12, if in_vehicle { 3 } else { 1 });
 
+        let mut direct_angles: Option<(f32, f32)> = None;
         let mark = mem_read32(&mut ec.ctx, MAILBOX);
         if mark == MOUSE_LOOK || mark == MOUSE_LOOK_RECENTER || mark == MOUSE_LOOK_HOLD {
             let mut across = f32::from_bits(mem_read32(&mut ec.ctx, MAILBOX + 4));
@@ -536,7 +592,17 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                 mem_write32(&mut ec.ctx, MAILBOX, MOUSE_LOOK_HOLD);
                 holding = true;
                 ec.ztarget.locked_entity = if px.is_finite() && py.is_finite() && pz.is_finite() {
-                    find_best_target(&mut ec.ctx, pit_entity, px, py, pz, cur_yaw, min_dist, ZTARGET_MAX_RANGE)
+                    find_best_target(
+                        &mut ec.ctx,
+                        pit_entity,
+                        px,
+                        py,
+                        pz,
+                        cur_yaw,
+                        cur_pitch,
+                        min_dist,
+                        ZTARGET_MAX_RANGE,
+                    )
                 } else {
                     0
                 };
@@ -549,7 +615,6 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                 }
             }
 
-            let mut applied_z = false;
             if ec.ztarget.active != 0 && (holding || ec.ztarget.snap_ticks > 0) {
                 let mut goal_yaw = ec.ztarget.fallback_yaw;
                 let mut goal_pitch = 0.0_f32;
@@ -577,8 +642,17 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                         goal_pitch = (-dy.atan2(dx.hypot(dz))).clamp(-ZTARGET_PITCH_LIMIT, ZTARGET_PITCH_LIMIT);
                         have_goal = true;
                     } else if holding && px.is_finite() && py.is_finite() && pz.is_finite() {
-                        ec.ztarget.locked_entity =
-                            find_best_target(&mut ec.ctx, pit_entity, px, py, pz, cur_yaw, min_dist, ZTARGET_MAX_RANGE);
+                        ec.ztarget.locked_entity = find_best_target(
+                            &mut ec.ctx,
+                            pit_entity,
+                            px,
+                            py,
+                            pz,
+                            cur_yaw,
+                            cur_pitch,
+                            min_dist,
+                            ZTARGET_MAX_RANGE,
+                        );
                         let next_center = if ec.ztarget.locked_entity != 0 {
                             get_target_center(&mut ec.ctx, ec.ztarget.locked_entity)
                         } else {
@@ -611,11 +685,16 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                         mem_write32(&mut ec.ctx, ctrl + 0x38, 0);
                     }
 
-                    vfp_set_s(&mut ec.ctx, 0, dyaw);
-                    vfp_set_s(&mut ec.ctx, 1, dpitch);
-                    applied_z = true;
+                    // Pass zero delta to `f_007462A4` so its spring damper (`f_0090AE6C`)
+                    // does not undershoot or stall our Z-target step; we commit the exact
+                    // camera angles immediately after `call_original` returns.
+                    vfp_set_s(&mut ec.ctx, 0, 0.0);
+                    vfp_set_s(&mut ec.ctx, 1, 0.0);
+                    direct_angles = Some((cur_yaw + dyaw, cur_pitch + dpitch));
 
-                    let close_enough = yaw_err.abs() < ZTARGET_DONE_EPS && pitch_err.abs() < ZTARGET_DONE_EPS;
+                    let rem_yaw = wrap_pi(goal_yaw - (cur_yaw + dyaw)).abs();
+                    let rem_pitch = (goal_pitch - (cur_pitch + dpitch)).abs();
+                    let close_enough = rem_yaw < ZTARGET_DONE_EPS && rem_pitch < ZTARGET_DONE_EPS;
                     if ec.ztarget.snap_ticks > 0 {
                         ec.ztarget.snap_ticks -= 1;
                     }
@@ -632,7 +711,7 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
                 ec.ztarget = ZTargetState::default();
             }
 
-            if !applied_z {
+            if direct_angles.is_none() {
                 let s0 = vfp_s(&ec.ctx, 0);
                 let s1 = vfp_s(&ec.ctx, 1);
                 vfp_set_s(&mut ec.ctx, 0, s0 + across * YAW_PER_PIXEL);
@@ -642,6 +721,15 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
             ec.ztarget = ZTargetState::default();
         }
 
-        call_original(aot_ctx, orig_body, 0x0074_62A4);
+        if call_original(aot_ctx, orig_body, 0x0074_62A4) {
+            if let Some((new_yaw, new_pitch)) = direct_angles {
+                let ec = &mut *aot_ctx;
+                if valid_heap_ptr(ctrl) {
+                    mem_write32(&mut ec.ctx, ctrl + 0x24, 0);
+                    mem_write32(&mut ec.ctx, ctrl + 0x38, 0);
+                }
+                apply_cam_angles(&mut ec.ctx, cam, new_yaw, new_pitch);
+            }
+        }
     }
 }

@@ -17,8 +17,8 @@
    ```
    *(Legacy `sdmc:/switch/uprisingnx/roms/` paths are also detected automatically. Encrypted dumps must be decrypted first via GodMode9 on your 3DS.)*
 3. **Launch via Title Override**: Hold **R** while launching any installed Switch game from the HOME Menu to open Homebrew Menu in **Title Override** (full-RAM + JIT) mode, then start **UprisingNX**:
-   - **First launch**: Compiles the ROM directly to ~87 MiB of native AArch64 machine code on the Switch (~15–25s with an on-screen progress bar) and writes `sdmc:/switch/uprisingnx/cache/aot_v1_0004000000030100_D6E028C6175A2B07.bin`.
-   - **Every launch after**: Streams the cached AArch64 image straight into a single Horizon `CodeMemory` region in `< 1s`.
+   - **First launch**: Compiles the ROM directly to ~87 MiB of native AArch64 machine code on the Switch (~30–60s with an on-screen progress bar) and writes `sdmc:/switch/uprisingnx/cache/aot_v1_0004000000030100_D6E028C6175A2B07.bin`.
+   - **Every launch after**: Streams the cached AArch64 image straight into a single Horizon `CodeMemory` region without recompiling.
 
 ---
 
@@ -33,7 +33,7 @@
 ## Controls & Features
 
 - **Dual-Stick & Gyro Aiming**: Native camera and reticle control using both analog sticks and built-in gyroscope support (`nx/rust/src/aim.rs`).
-- **Z-Targeting & Behind-Pit Camera Recenter (`R` / `L3`)**: Press **R** (or **Left Stick Click**) on foot to lock onto and smoothly track the closest live targetable enemy within 45m, or recenter the camera directly behind Pit's facing direction when no enemy is nearby. Moving the right stick breaks target lock naturally.
+- **Z-Targeting & Behind-Pit Camera Recenter (`R` / `L3`)**: Press **R** (or **Left Stick Click**) on foot to snap onto and track the live targetable enemy closest to your crosshair inside a `±65°` front cone within `45` units (`60` units while held), or cleanly recenter the camera directly behind Pit when no enemy is in front of you. Moving the right stick breaks target lock naturally.
 - **Button Remapping & Touch Mapping**: Automatic touch-to-stick and button mapping across merged 16:9 menus and battles.
 - **Tabbed Settings Menu (`Minus` / `L` & `R`)**: Press `Minus` (or right stick click + `Minus`) to pause the game and open the settings menu. Use **L / R** (or **ZL / ZR**) to switch between **Video**, **Controls**, and **Save & System** tabs; D-pad Up/Down picks a row (its description shows underneath), Left/Right (or A) changes it, and B or `Minus` closes it.
   - **Video**: Per-mode Handheld/Docked preset (`Performance`, `Quality`, `Custom`), battle & menu resolution (`1x`–`4x`), smooth mode (60 fps), dynamic resolution, and power label placement.

@@ -2,7 +2,7 @@
 //! cache construction, and single-CodeMemory `jitCreate` streaming loader.
 
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -259,22 +259,23 @@ fn alloc_nx_jit(
     })
 }
 
-/// Loads a cached AOT binary from `sdmc:/switch/uprisingnx/cache/` in ~0.3s, or compiles it on
+/// Loads a cached AOT binary from `sdmc:/switch/uprisingnx/cache/`, or compiles it on
 /// the Switch from the user's ROM on first launch while displaying a live progress bar.
+///
+/// On a warm cache hit, also returns the already-decompressed `(code_bytes, modded)`
+/// so `loader::load_preloaded` skips reading and decompressing `.code` a second time.
 pub fn load_or_build_aot(
     title: &Title,
     data_dir: &Path,
     presenter: &mut VulkanPresenter,
     menu: &mut Menu,
-) -> Result<LoadedAot, SetupNotice> {
+) -> Result<(LoadedAot, Option<(Vec<u8>, bool)>), SetupNotice> {
     let (code_bytes, modded) = zakuro_core::mods::code(title, Some(data_dir)).map_err(|e| SetupNotice {
         heading: "Could Not Read ROM Code".to_owned(),
         paragraphs: vec![format!("Failed to decompress .code from ROM: {e}")],
     })?;
-    let parsed = zakuro_aot::discover::Image::from_exheader(&title.exheader, &code_bytes);
-    let text_hash = parsed.text.hash();
+    let text_hash = zakuro_aot::discover::Image::text_hash(&title.exheader, &code_bytes);
     let program_id = title.program_id();
-    drop(parsed);
 
     let cache_path = PathBuf::from(format!(
         "{CACHE_DIR}/aot_v{FORMAT_VERSION}_{program_id:016X}_{text_hash:016X}.bin"
@@ -293,10 +294,8 @@ pub fn load_or_build_aot(
         let t0 = Instant::now();
         match File::open(&cache_path)
             .map_err(|e| e.to_string())
-            .and_then(|f| {
-                let reader = BufReader::with_capacity(1 << 20, f);
-                LoadedAot::read_streaming(reader, alloc_nx_jit)
-            }) {
+            .and_then(|f| LoadedAot::read_streaming(f, alloc_nx_jit))
+        {
             Ok(loaded) if loaded.program_id == program_id && loaded.text_hash == text_hash => {
                 log::info!(
                     "unx: streamed cached AOT {} in {:?}{}",
@@ -304,7 +303,7 @@ pub fn load_or_build_aot(
                     t0.elapsed(),
                     if modded { " (modded code)" } else { "" }
                 );
-                return Ok(loaded);
+                return Ok((loaded, Some((code_bytes, modded))));
             }
             Ok(_) => {
                 log::warn!("unx: cached AOT header mismatch, rebuilding");
@@ -395,13 +394,15 @@ pub fn load_or_build_aot(
             "First-Time Game Setup",
             &[
                 "Constructing native Switch executable cache from your Kid Icarus: Uprising ROM.",
-                "This only runs once (~10-25 seconds). Subsequent launches start in under a second!",
+                "This only runs once (~30-60 seconds). Subsequent launches load straight from cache.",
             ],
             Some((p as f32 / 100.0, stage)),
             Some("Please do not turn off the console while the cache is saved."),
             false,
         );
-        std::thread::sleep(Duration::from_millis(16));
+        // 30 fps refresh keeps the animated wing smooth while giving more CPU time
+        // to the 3-core Rayon AOT compiler pool.
+        std::thread::sleep(Duration::from_millis(33));
     }
 
     let image = match handle.join() {
@@ -442,5 +443,5 @@ pub fn load_or_build_aot(
 
     let AotImage { program_id, text_hash, enter_offset, entries, origins, code } = image;
     drop(code);
-    Ok(LoadedAot::new(program_id, text_hash, enter_offset, exec, entries, origins))
+    Ok((LoadedAot::new(program_id, text_hash, enter_offset, exec, entries, origins), None))
 }

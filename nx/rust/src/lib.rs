@@ -1119,15 +1119,14 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         zakuro_core::recompiled::Linked::new(0x0004000000030100, r.abi, r.entries, r.entry_count, r.modules, r.module_count)
     });
 
-    let loaded_aot = if linked.is_none() && !force_interpret {
+    let (loaded_aot, preloaded_code) = if linked.is_none() && !force_interpret {
         match bootstrap::load_or_build_aot(&title, std::path::Path::new(&data_dir), &mut presenter, &mut menu) {
-            Ok(aot) => Some(aot),
+            Ok((aot, code)) => (Some(aot), code),
             Err(notice) => return make_notice(presenter, menu, notice),
         }
     } else {
-        None
+        (None, None)
     };
-    drop(title);
 
     nx_audio_init();
 
@@ -1152,7 +1151,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         ..Config::default()
     };
     let started = Instant::now();
-    let system = match loader::load(&rom_path, config) {
+    let system = match loader::load_preloaded(title, preloaded_code, config, None) {
         Ok(mut system) => {
             if let Some(aot) = loaded_aot {
                 system.set_aot(aot);

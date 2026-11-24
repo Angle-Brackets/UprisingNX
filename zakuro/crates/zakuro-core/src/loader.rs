@@ -62,10 +62,23 @@ fn load_dlc(title: &Title, paths: &[std::path::PathBuf]) -> Vec<zakuro_fs::Dlc> 
 /// is what the retail kernel does.
 const STACK_TOP: u32 = SHARED_MEMORY_VADDR;
 
-pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<System, LoadError> {
+pub fn load(path: impl AsRef<std::path::Path>, config: Config) -> Result<System, LoadError> {
     let t0 = std::time::Instant::now();
-    let mut title = Title::load(path)?;
-    let t_title = t0.elapsed();
+    let title = Title::load(path)?;
+    load_preloaded(title, None, config, Some(t0.elapsed()))
+}
+
+/// Loads a system from an already-opened [`Title`] and optionally already-decompressed
+/// `.code` bytes (`(bytes, modded)`), avoiding duplicate ROM reads and BLZ decompression
+/// on self-bootstrapping warm launches.
+pub fn load_preloaded(
+    mut title: Title,
+    preloaded_code: Option<(Vec<u8>, bool)>,
+    mut config: Config,
+    title_elapsed: Option<std::time::Duration>,
+) -> Result<System, LoadError> {
+    let t0 = std::time::Instant::now();
+    let t_title = title_elapsed.unwrap_or_default();
     log::info!("loaded {}", title.describe());
     if let Some(update) = &config.update {
         attach_update(&mut title, update);
@@ -123,7 +136,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     system.kernel.shared_device_memory = exheader.shared_device_memory;
 
     map_special_pages(&mut system, app_bytes);
-    let modded = map_code(&mut system, &title)?;
+    let modded = map_code(&mut system, &title, preloaded_code)?;
     map_stack(&mut system, exheader.stack_size);
 
     system.kernel.heap_top = HEAP_VADDR;
@@ -380,8 +393,11 @@ fn map_special_pages(system: &mut System, app_bytes: u32) {
 }
 
 /// maps the code segments, saying whether a mod changed them.
-fn map_code(system: &mut System, title: &Title) -> Result<bool, LoadError> {
-    let (code, modded) = crate::mods::code(title, system.config.data_dir.as_deref())?;
+fn map_code(system: &mut System, title: &Title, preloaded: Option<(Vec<u8>, bool)>) -> Result<bool, LoadError> {
+    let (code, modded) = match preloaded {
+        Some(pair) => pair,
+        None => crate::mods::code(title, system.config.data_dir.as_deref())?,
+    };
     let exheader = &title.exheader;
 
     let segments = [

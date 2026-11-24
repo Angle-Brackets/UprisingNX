@@ -74,6 +74,15 @@ pub struct Image {
 }
 
 impl Image {
+    /// Computes the FNV-1a hash of the `.text` segment directly from raw `.code`
+    /// bytes without allocating copies of `.text`, `.rodata`, or `.data`.
+    pub fn text_hash(header: &ExHeader, code: &[u8]) -> u64 {
+        let mut h = CodeHash::default();
+        let bytes = code.get(0..header.text.size as usize).unwrap_or_default();
+        h.add(bytes);
+        h.value()
+    }
+
     pub fn from_exheader(header: &ExHeader, code: &[u8]) -> Image {
         let segment = |info: CodeSetInfo, offset: usize| Segment {
             base: info.address,
