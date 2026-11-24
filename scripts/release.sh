@@ -123,23 +123,42 @@ export UNX_RELEASE_TAG="${TAG}"
 
 echo "[release] Building Rust staticlib (UNX_RELEASE_TAG=${TAG})..."
 touch nx/rust/build.rs
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+REMAP_FLAGS=(
+  "-C" "target-cpu=cortex-a57"
+  "-C" "force-frame-pointers=yes"
+  "--cfg" 'target_family="unix"'
+  "--cfg" 'target_env="newlib"'
+  "--cfg" "unix"
+  "-A" "explicit_builtin_cfgs_in_flags"
+  "-Z" "has-thread-local=true"
+  "--remap-path-prefix=${REPO_ROOT}=."
+  "--remap-path-prefix=${CARGO_HOME_DIR}=/cargo"
+  "--remap-path-prefix=${HOME}=/builder"
+)
+export CARGO_ENCODED_RUSTFLAGS="$(IFS=$'\x1f'; echo "${REMAP_FLAGS[*]}")"
 (cd nx/rust && ../../scripts/cargo-nx.sh build --release)
 
 echo "[release] Linking Switch NRO (KICKSTAND=0)..."
 make -C nx/c clean
-make -C nx/c -j"$(nproc)" KICKSTAND=0 UNX_RELEASE_TAG="${TAG}"
+make -C nx/c -j"$(nproc)" KICKSTAND=0 UNX_RELEASE_TAG="${TAG}" \
+  EXTRA_CFLAGS="-ffile-prefix-map=${REPO_ROOT}=."
 
 NRO="nx/c/uprising_nx.nro"
-python3 - "$NRO" "$TAG" <<'PY'
+python3 - "$NRO" "$TAG" "$HOME" "$REPO_ROOT" <<'PY'
 import sys
 from pathlib import Path
 
 nro = Path(sys.argv[1]).read_bytes()
 tag = sys.argv[2].encode("ascii")
+home = sys.argv[3].encode("utf-8")
+repo = sys.argv[4].encode("utf-8")
 assert len(nro) >= 1_048_576, f"NRO unexpectedly small: {len(nro)} bytes"
 assert nro[0x10:0x14] == b"NRO0", f"Invalid NRO0 magic at 0x10: {nro[0x10:0x14]!r}"
 assert tag in nro, f"Release tag {tag!r} not found in built NRO"
-print(f"[release] Verified {sys.argv[1]}: {len(nro):,} bytes, NRO0 magic OK, embedded {tag.decode()} OK")
+assert home not in nro, f"Host home path {home!r} leaked into built NRO!"
+assert repo not in nro, f"Host repo path {repo!r} leaked into built NRO!"
+print(f"[release] Verified {sys.argv[1]}: {len(nro):,} bytes, NRO0 magic OK, embedded {tag.decode()} OK, zero host paths leaked")
 PY
 
 # 3. Package release ZIP + standalone NRO
