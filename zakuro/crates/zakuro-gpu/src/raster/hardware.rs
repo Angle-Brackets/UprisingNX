@@ -1321,16 +1321,30 @@ fn key_from_bytes(bytes: &[u8]) -> Option<PipelineKey> {
     Some(PipelineKey { blend, logic_op, mask: word(8), depth: bytes[6] != 0, vertex, fragment })
 }
 
+/// Portable GPU-independent PICA200 fixed-function pipeline keys pre-recorded
+/// for Kid Icarus: Uprising (USA `0004000000030100`, `VertexStage::Placed`).
+/// Contains zero Nintendo shader code — only numeric PICA200 combiner state so
+/// the background Vulkan compiler warms up the Switch NVK pipeline cache at boot.
+const KIU_USA_BAKED_KEYS: &[u8] = include_bytes!("../kiu_usa_pipelines.keys32");
+
 /// the pipelines a title used before, from the list beside its cache, each
 /// once, none when there is no list or it is unreadable.
 fn read_keys(cache: &std::path::Path) -> Vec<PipelineKey> {
     let bytes = std::fs::read(keys_path(cache)).unwrap_or_default();
     // the list from before the lighting's constants, its keys without them
     let old = std::fs::read(cache.with_extension("keys")).unwrap_or_default();
+    let baked: &[u8] = if cache.file_name().and_then(|n| n.to_str()) == Some("0004000000030100.bin") {
+        KIU_USA_BAKED_KEYS
+    } else {
+        &[]
+    };
     let mut seen = std::collections::HashSet::new();
+    // Reversed baked keys go after on-disk keys so Title/Menu pipelines land at
+    // the top of the compiler's LIFO queue and warm up first on a fresh install.
     old.chunks_exact(OLD_KEY_BYTES)
         .filter_map(key_from_bytes)
         .chain(bytes.chunks_exact(KEY_BYTES).filter_map(key_from_bytes))
+        .chain(baked.chunks_exact(KEY_BYTES).rev().filter_map(key_from_bytes))
         .filter(|key| seen.insert(*key))
         .collect()
 }
@@ -8226,6 +8240,18 @@ mod tests {
         let got = libraries.part(Part::Input(false), true, || Ok(vk::Pipeline::null()));
         assert_eq!(got, Ok(vk::Pipeline::null()));
         assert!(panicker.join().is_err());
+    }
+
+    #[test]
+    fn baked_kiu_pipeline_keys_decode_cleanly() {
+        assert_eq!(KIU_USA_BAKED_KEYS.len() % KEY_BYTES, 0);
+        let expected = KIU_USA_BAKED_KEYS.len() / KEY_BYTES;
+        assert!(expected >= 400);
+        let decoded = read_keys(std::path::Path::new("/nonexistent/0004000000030100.bin"));
+        assert_eq!(decoded.len(), expected);
+        assert!(decoded.iter().all(|k| k.vertex == VertexStage::Placed));
+        // Non-KIU title should not receive KIU baked keys.
+        assert!(read_keys(std::path::Path::new("/nonexistent/0004000000053F00.bin")).is_empty());
     }
 }
 
