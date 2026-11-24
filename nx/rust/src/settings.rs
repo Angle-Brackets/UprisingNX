@@ -83,7 +83,7 @@ impl Mode {
 }
 
 /// the aim and HUD keys, each the env var the runtime reads
-const CONTROLS: [(&str, &str); 10] = [
+const CONTROLS: [(&str, &str); 11] = [
     ("right_stick_aim", "UNX_RIGHT_STICK_AIM"),
     ("gyro_aim", "UNX_GYRO_AIM"),
     ("gyro_speed", "UNX_GYRO_SPEED"),
@@ -94,6 +94,7 @@ const CONTROLS: [(&str, &str); 10] = [
     ("power_label", "ZAKURO_POWER_LABEL"),
     ("minus_button", "UNX_MINUS_BUTTON"),
     ("smooth_scale_drop", "UNX_SMOOTH_SCALE_DROP"),
+    ("update_prerelease", "UNX_UPDATE_PRERELEASE"),
 ];
 
 #[derive(Clone, PartialEq, Debug)]
@@ -121,6 +122,7 @@ impl Default for Settings {
                 ("power_label".into(), "bottom".into()),
                 ("minus_button".into(), "menu".into()),
                 ("smooth_scale_drop".into(), "0".into()),
+                ("update_prerelease".into(), "0".into()),
             ],
         }
     }
@@ -229,6 +231,7 @@ impl Settings {
              # power_label: bottom (centered at bottom), bar (above power icons) or off\n\
              # minus_button: menu (Minus alone opens the settings menu) or select (the 3DS's Select)\n\
              # smooth_scale_drop: 0 (keep battle resolution fixed; default) or 1 (drop 1x before pausing smooth mode)\n\
+             # update_prerelease: 0 (stable releases only; default) or 1 (also check pre-releases / RCs)\n\
              [controls]\n",
         );
         for (key, value) in &self.controls {
@@ -260,6 +263,14 @@ impl Settings {
         self.controls
             .iter()
             .find(|(k, _)| k == "smooth_scale_drop")
+            .is_some_and(|(_, v)| on_off(&v.trim().to_ascii_lowercase()).unwrap_or(false))
+    }
+
+    /// Whether the GitHub Releases auto-updater also checks pre-releases / release candidates.
+    pub fn update_prerelease(&self) -> bool {
+        self.controls
+            .iter()
+            .find(|(k, _)| k == "update_prerelease")
             .is_some_and(|(_, v)| on_off(&v.trim().to_ascii_lowercase()).unwrap_or(false))
     }
 

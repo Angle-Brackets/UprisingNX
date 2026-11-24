@@ -223,6 +223,7 @@ enum Row {
     Modifier,
     Minus,
     Update,
+    UpdateChannel,
     ImportSave,
     ExportSave,
     Resume,
@@ -252,13 +253,14 @@ const CONTROLS_ROWS: &[Row] = &[
 
 const SYSTEM_ROWS: &[Row] = &[
     Row::Update,
+    Row::UpdateChannel,
     Row::ImportSave,
     Row::ExportSave,
     Row::Resume,
     Row::Quit,
 ];
 
-const ALL_ROWS: [Row; 20] = [
+const ALL_ROWS: [Row; 21] = [
     Row::Editing,
     Row::Preset,
     Row::BattleScale,
@@ -275,6 +277,7 @@ const ALL_ROWS: [Row; 20] = [
     Row::Modifier,
     Row::Minus,
     Row::Update,
+    Row::UpdateChannel,
     Row::ImportSave,
     Row::ExportSave,
     Row::Resume,
@@ -303,6 +306,7 @@ impl Row {
             Row::Modifier => "Aim button",
             Row::Minus => "Minus button",
             Row::Update => "Software update",
+            Row::UpdateChannel => "Update channel",
             Row::ImportSave => "Import 3DS save",
             Row::ExportSave => "Export save backup",
             Row::Resume => "Resume game",
@@ -334,6 +338,7 @@ impl Row {
             Row::Modifier => "The button held with the left stick to aim or turn the camera (Left stick aim 1 or 2). Fire stays on L/ZL.",
             Row::Minus => "Settings menu: Minus alone opens and closes this menu (Plus still pauses; the game's Select only pauses in battles, like Plus). 3DS Select: Minus goes to the game, and right stick click + Minus opens this menu.",
             Row::Update => "Checks GitHub Releases for a newer UprisingNX Switch build, downloads and verifies uprising_nx.nro in the background, then swaps and relaunches on restart.",
+            Row::UpdateChannel => "Stable (default): only checks full releases. Pre-release: also picks up release candidates (e.g. v0.1.1-rc.1) for early testing.",
             Row::ImportSave => "Imports decrypted 3DS saves (00.SAV, 01.SAV...) from sdmc:/switch/uprisingnx/save/import/. Automatically backs up your current Switch save first. Restart or return to Title Screen to load.",
             Row::ExportSave => "Copies your current Switch save files to sdmc:/switch/uprisingnx/save/export/ for use with Checkpoint, JKSM, Citra, or Azahar.",
             Row::Resume => "Back to the game. B or Minus (or right stick click + Minus) also closes this menu.",
@@ -348,6 +353,7 @@ pub enum Changed {
     Video,
     Controls,
     Update,
+    UpdateChannel,
     ImportSave,
     ExportSave,
     Quit,
@@ -798,6 +804,11 @@ impl Menu {
                 }
                 Changed::Update
             }
+            Row::UpdateChannel => {
+                let value = if settings.update_prerelease() { "0" } else { "1" };
+                set_control(settings, "update_prerelease", value.into());
+                Changed::UpdateChannel
+            }
             Row::ImportSave => {
                 if !a {
                     return None;
@@ -972,6 +983,13 @@ impl Menu {
                 Row::Modifier => MODIFIERS[modifier_index(settings)].into(),
                 Row::Minus => if settings.minus_opens_menu() { "Settings menu".into() } else { "3DS Select".into() },
                 Row::Update => self.update.value.clone(),
+                Row::UpdateChannel => {
+                    if settings.update_prerelease() {
+                        "Pre-release".into()
+                    } else {
+                        "Stable".into()
+                    }
+                }
                 Row::ImportSave => {
                     if self.import_armed {
                         "Press A again".into()
@@ -1137,7 +1155,7 @@ impl Menu {
             let box_top = rows_top + line * (rows.len() as f32 + 0.28);
             let box_bot = rows_top + rows_h - line * 0.10;
             let box_pad = 14.0 * k;
-            let show_updater = row == Row::Update || self.update.progress.is_some();
+            let show_updater = matches!(row, Row::Update | Row::UpdateChannel) || self.update.progress.is_some();
             let (bg, accent, heading, body, progress) = if show_updater {
                 let (bg, accent) = match self.update.tone {
                     UpdateTone::Success => (color(20, 48, 42, 230), color(110, 228, 158, 255)),

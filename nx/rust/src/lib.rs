@@ -1220,6 +1220,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         });
     start_watchdog();
     log::info!("unx: loaded {rom} in {:?}", started.elapsed());
+    let update_prerelease = settings.update_prerelease();
     Box::into_raw(Box::new(UnxHandle::Running(Box::new(Unx {
         system,
         presenter,
@@ -1284,6 +1285,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
             env!("UNX_GIT_SHA"),
             env!("UNX_RELEASE_TAG"),
             menu::VERSION_LABEL,
+            update_prerelease,
         ),
         aim: aim::Aim::from_env(),
         gyro_test: ([0.0; 3], 0),
@@ -1618,6 +1620,12 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
                 return Some(1);
             }
             unx.menu.set_update_view(unx.updater.view());
+        }
+        Some(menu::Changed::UpdateChannel) => {
+            unx.settings.export_controls();
+            unx.updater.set_include_prereleases(unx.settings.update_prerelease());
+            unx.menu.set_update_view(unx.updater.view());
+            unx.settings_changed("menu");
         }
         Some(menu::Changed::ImportSave) => {
             match saves::import_from_menu(&unx.data_dir) {
