@@ -237,73 +237,75 @@ unsafe extern "C" fn override_006d269c(aot_ctx: *mut AotExecContext, orig_body: 
 
 unsafe extern "C" fn override_006d2abc(aot_ctx: *mut AotExecContext, orig_body: *const u8) {
     unsafe {
-        // Verified `f_006D2ABC` ABI (`code500.c:25900`): `s0 = xmax, s1 = xmin, s2 = ymax, s3 = ymin`.
-        let (reticle, xmax, xmin, ymax, ymin) = {
-            let ctx = &(*aot_ctx).ctx;
-            (
-                ctx.r[0],
-                vfp_s(ctx, 0),
-                vfp_s(ctx, 1),
-                vfp_s(ctx, 2),
-                vfp_s(ctx, 3),
-            )
-        };
+        let reticle = (*aot_ctx).ctx.r[0];
+        let mut applied_aim = false;
+
+        if valid_heap_ptr(reticle) {
+            let ctx = &mut (*aot_ctx).ctx;
+            let locked_center = mem_read8(ctx, reticle + 0xD5) != 0;
+            let on_foot_box = mem_read8(ctx, reticle + 0x81) != 0;
+
+            // Only report `GAME_FLYING` for full-screen free-reticle modes (`D5 == 0 && 0x81 == 0`).
+            // On foot (`0x81 != 0`), `f_006D2ABC` still runs every tick with a small inner deadzone
+            // box (`140..260 x 48..168`) and must NOT overwrite `GAME_ON_FOOT` / `GAME_VEHICLE`.
+            if !locked_center && !on_foot_box {
+                mem_write32(ctx, MAILBOX + 12, GAME_FLYING);
+            }
+
+            // Strictly gate on `MOUSE_AIM` / `MOUSE_AIM_RECENTER` (`"MAM1"` / `"MAMR"`), matching
+            // desktop `kiu_air_aim.c`. In Land Battle (`"MLK1"` / `"MLKR"` / `"MLKH"` / `"MLKC"`),
+            // leave `MAILBOX + 4/8` untouched so `override_007462a4` receives all right-stick and
+            // gyro input directly without `f_006D2ABC` stealing it or trapping it in its inner box.
+            let mark = mem_read32(ctx, MAILBOX);
+            if !locked_center && (mark == MOUSE_AIM || mark == MOUSE_AIM_RECENTER) {
+                let dx = f32::from_bits(mem_read32(ctx, MAILBOX + 4));
+                let dy = f32::from_bits(mem_read32(ctx, MAILBOX + 8));
+                if dx != 0.0 || dy != 0.0 {
+                    mem_write32(ctx, MAILBOX + 4, 0);
+                    mem_write32(ctx, MAILBOX + 8, 0);
+                }
+
+                let mut x = f32::from_bits(mem_read32(ctx, reticle + 0xA4));
+                let mut y = f32::from_bits(mem_read32(ctx, reticle + 0xA8));
+                if !x.is_finite() {
+                    x = 200.0;
+                }
+                if !y.is_finite() {
+                    y = 120.5;
+                }
+
+                if mark == MOUSE_AIM_RECENTER {
+                    mem_write32(ctx, MAILBOX, MOUSE_AIM);
+                    let cx = f32::from_bits(mem_read32(ctx, reticle + 0x2EC));
+                    let cy = f32::from_bits(mem_read32(ctx, reticle + 0x2F0));
+                    x = if cx.is_finite() && cx > 0.0 && cx < 400.0 { cx } else { 200.0 };
+                    y = if cy.is_finite() && cy > 0.0 && cy < 240.0 { cy } else { 120.5 };
+                    mem_write32(ctx, reticle + 0x208, 0);
+                    mem_write32(ctx, reticle + 0x20C, 0);
+                } else if dx.is_finite() && dy.is_finite() {
+                    x += dx;
+                    y += dy;
+                }
+
+                // Write updated reticle position BEFORE `call_original(0x006D2ABC)` (matching
+                // `kiu_air_aim.c`): in Air Battle (`0x81 == 0`) KIU clamps cleanly to the full
+                // top screen `(0..400, 0..240)`; in any camera-steering air mode (`0x81 != 0`),
+                // KIU sees the overflow past the inner box and writes `[cam + 0xD38, 0xD3C]`.
+                mem_write32(ctx, reticle + 0xA4, x.clamp(0.0, 400.0).to_bits());
+                mem_write32(ctx, reticle + 0xA8, y.clamp(0.0, 240.0).to_bits());
+                applied_aim = true;
+            }
+        }
 
         if !call_original(aot_ctx, orig_body, 0x006D_2ABC) {
             return;
         }
 
-        if !valid_heap_ptr(reticle) {
-            return;
+        if applied_aim {
+            let ctx = &mut (*aot_ctx).ctx;
+            let flags84 = mem_read32(ctx, reticle + 0x84);
+            mem_write32(ctx, reticle + 0x84, flags84 | 2);
         }
-
-        let ctx = &mut (*aot_ctx).ctx;
-        mem_write32(ctx, MAILBOX + 12, 2);
-
-        if mem_read8(ctx, reticle + 0xD5) != 0 {
-            return;
-        }
-
-        let flags84 = mem_read32(ctx, reticle + 0x84);
-        mem_write32(ctx, reticle + 0x84, flags84 | 2);
-
-        let mark = mem_read32(ctx, MAILBOX);
-        let dx = f32::from_bits(mem_read32(ctx, MAILBOX + 4));
-        let dy = f32::from_bits(mem_read32(ctx, MAILBOX + 8));
-        if dx != 0.0 || dy != 0.0 {
-            mem_write32(ctx, MAILBOX + 4, 0);
-            mem_write32(ctx, MAILBOX + 8, 0);
-        }
-
-        let mut x = f32::from_bits(mem_read32(ctx, reticle + 0xA4));
-        let mut y = f32::from_bits(mem_read32(ctx, reticle + 0xA8));
-
-        if mark == MOUSE_AIM_RECENTER {
-            mem_write32(ctx, MAILBOX, MOUSE_AIM);
-            let cx = f32::from_bits(mem_read32(ctx, reticle + 0x2EC));
-            let cy = f32::from_bits(mem_read32(ctx, reticle + 0x2F0));
-            x = if cx.is_finite() && cx > 0.0 && cx < 400.0 { cx } else { 200.0 };
-            y = if cy.is_finite() && cy > 0.0 && cy < 240.0 { cy } else { 120.5 };
-            mem_write32(ctx, reticle + 0x208, 0);
-            mem_write32(ctx, reticle + 0x20C, 0);
-        } else if dx.is_finite() && dy.is_finite() {
-            x += dx;
-            y += dy;
-        }
-
-        x = if xmin.is_finite() && xmax.is_finite() && xmax > xmin {
-            x.clamp(xmin, xmax)
-        } else {
-            x.clamp(0.0, 400.0)
-        };
-        y = if ymin.is_finite() && ymax.is_finite() && ymax > ymin {
-            y.clamp(ymin, ymax)
-        } else {
-            y.clamp(0.0, 240.0)
-        };
-
-        mem_write32(ctx, reticle + 0xA4, x.to_bits());
-        mem_write32(ctx, reticle + 0xA8, y.to_bits());
     }
 }
 

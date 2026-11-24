@@ -952,6 +952,7 @@ impl<'a> JsonScanner<'a> {
 
 /// Parses GitHub's `/releases/latest` JSON payload, extracting `tag_name` and
 /// the `browser_download_url` of the asset matching `wanted_asset`.
+#[cfg(test)]
 pub fn parse_github_release(json: &str, wanted_asset: &str) -> Option<ReleaseInfo> {
     parse_github_release_for_channel(json, wanted_asset, true)
 }
