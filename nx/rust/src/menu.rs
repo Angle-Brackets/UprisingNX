@@ -180,7 +180,7 @@ enum Tab {
 }
 
 const TABS: [Tab; 3] = [Tab::Video, Tab::Controls, Tab::System];
-const MAX_TAB_ROWS: usize = 8;
+const MAX_TAB_ROWS: usize = 9;
 
 impl Tab {
     fn label(self) -> &'static str {
@@ -218,7 +218,8 @@ enum Row {
     Gyro,
     GyroSpeed,
     AimSpeed,
-    InvertY,
+    InvertYAir,
+    InvertYLand,
     LeftStick,
     Modifier,
     Minus,
@@ -245,7 +246,8 @@ const CONTROLS_ROWS: &[Row] = &[
     Row::Gyro,
     Row::GyroSpeed,
     Row::AimSpeed,
-    Row::InvertY,
+    Row::InvertYAir,
+    Row::InvertYLand,
     Row::LeftStick,
     Row::Modifier,
     Row::Minus,
@@ -260,7 +262,7 @@ const SYSTEM_ROWS: &[Row] = &[
     Row::Quit,
 ];
 
-const ALL_ROWS: [Row; 21] = [
+const ALL_ROWS: [Row; 22] = [
     Row::Editing,
     Row::Preset,
     Row::BattleScale,
@@ -272,7 +274,8 @@ const ALL_ROWS: [Row; 21] = [
     Row::Gyro,
     Row::GyroSpeed,
     Row::AimSpeed,
-    Row::InvertY,
+    Row::InvertYAir,
+    Row::InvertYLand,
     Row::LeftStick,
     Row::Modifier,
     Row::Minus,
@@ -301,7 +304,8 @@ impl Row {
             Row::Gyro => "Gyro aim",
             Row::GyroSpeed => "Gyro speed",
             Row::AimSpeed => "Stick aim speed",
-            Row::InvertY => "Invert aim Y",
+            Row::InvertYAir => "Invert Y (air)",
+            Row::InvertYLand => "Invert Y (ground)",
             Row::LeftStick => "Left stick aim",
             Row::Modifier => "Aim button",
             Row::Minus => "Minus button",
@@ -330,10 +334,11 @@ impl Row {
             Row::DynamicRes => "Off (default): keeps your chosen battle resolution fixed; only in-between 60 fps frames render lower. On: tries dropping real battle resolution 1 step before pausing smooth mode.",
             Row::PowerLabel => "Where the selected power's name appears on foot. Bottom: centered at the bottom in crisp white text. Above bar: in a bubble over the power icons. Off: icons only.",
             Row::RightStick => "Aims the reticle in the air and turns the camera on foot with the right stick, in place of the touch screen.",
-            Row::Gyro => "Fine aiming by tilting the console or controller. On foot, press or hold R to Z-target (flick right stick to switch targets) or click L3 to center behind Pit; both pause gyro to reposition your hands.",
+            Row::Gyro => "Fine aiming by tilting the console or controller. On foot: R quick-turns / Z-targets (flick right stick to switch), Y or L3 centers camera and reticle behind Pit. In air: both R and Y/L3 recenter; holding either pauses gyro.",
             Row::GyroSpeed => "How far the reticle moves for a tilt. The game's own Controls options scale it further.",
             Row::AimSpeed => "How fast the right stick aims and turns the camera.",
-            Row::InvertY => "Flips up and down for aiming and the camera.",
+            Row::InvertYAir => "Flips up and down aiming in Air Battles (independent of Ground Battles).",
+            Row::InvertYLand => "Flips up and down aiming and camera pitch in Ground Battles and vehicles (independent of Air Battles).",
             Row::LeftStick => "Off: the left stick only moves Pit. 1: in the air it also aims, and on foot holding the aim button turns the camera with it. 2: as 1, but in the air it aims only while the aim button is held.",
             Row::Modifier => "Only used when Left stick aim is 1 or 2: hold this button with the left stick to aim or turn the camera (Fire stays on L). When Left stick aim is Off, L, ZL, and ZR all Fire.",
             Row::Minus => "Settings menu: Minus alone opens and closes this menu (Plus still pauses; the game's Select only pauses in battles, like Plus). 3DS Select: Minus goes to the game, and right stick click + Minus opens this menu.",
@@ -767,11 +772,12 @@ impl Menu {
                 set_control(settings, "power_label", POWER_LABELS[index].into());
                 Changed::Controls
             }
-            Row::RightStick | Row::Gyro | Row::InvertY => {
+            Row::RightStick | Row::Gyro | Row::InvertYAir | Row::InvertYLand => {
                 let key = match row {
                     Row::RightStick => "right_stick_aim",
                     Row::Gyro => "gyro_aim",
-                    _ => "aim_invert_y",
+                    Row::InvertYAir => "aim_invert_y_air",
+                    _ => "aim_invert_y_land",
                 };
                 let value = if on(settings, key) { "0" } else { "1" };
                 set_control(settings, key, value.into());
@@ -975,7 +981,8 @@ impl Menu {
                 Row::Gyro => flag(on(settings, "gyro_aim")),
                 Row::GyroSpeed => format!("{:.2}", speed(settings, "gyro_speed")),
                 Row::AimSpeed => format!("{:.2}", speed(settings, "aim_speed")),
-                Row::InvertY => flag(on(settings, "aim_invert_y")),
+                Row::InvertYAir => flag(on(settings, "aim_invert_y_air")),
+                Row::InvertYLand => flag(on(settings, "aim_invert_y_land")),
                 Row::LeftStick => match left_stick(settings) {
                     0 => "Off".into(),
                     n => n.to_string(),

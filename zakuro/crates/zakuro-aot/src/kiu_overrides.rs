@@ -237,7 +237,10 @@ unsafe extern "C" fn override_006d269c(aot_ctx: *mut AotExecContext, orig_body: 
 
 unsafe extern "C" fn override_006d2abc(aot_ctx: *mut AotExecContext, orig_body: *const u8) {
     unsafe {
-        let reticle = (*aot_ctx).ctx.r[0];
+        let (reticle, cam_mgr) = {
+            let ctx = &(*aot_ctx).ctx;
+            (ctx.r[0], ctx.r[1])
+        };
 
         // Run KIU's native `f_006D2ABC` FIRST (matching `v0.1.0`):
         // On foot (`reticle + 0x81 != 0`), any reticle position written beyond KIU's inner
@@ -268,10 +271,23 @@ unsafe extern "C" fn override_006d2abc(aot_ctx: *mut AotExecContext, orig_body: 
         mem_write32(ctx, reticle + 0x84, flags84 | 2);
 
         let mark = mem_read32(ctx, MAILBOX);
-        // During active Z-target (`R` press/hold) or behind-Pit recenter (`L3`), leave
-        // `MAILBOX + 4/8` untouched so `override_007462a4` receives right-stick flicks to
-        // switch locked targets and keeps the reticle centered on the locked enemy.
+        // During active Z-target (`R` press/hold) or behind-Pit center (`Y` / `L3`):
+        // - Snap the on-foot reticle cleanly back to KIU's exact neutral crosshair center
+        //   (`f_00575F3C`: `(200, 120 * (1 - ratio))`) so gyro/reticle re-centers cleanly
+        //   and Z-target locks land dead-center on the target.
+        // - Leave `MAILBOX + 4/8` untouched so `override_007462a4` receives right-stick
+        //   flicks to switch locked targets while holding `R`.
         if mark == MOUSE_LOOK_RECENTER || mark == MOUSE_LOOK_HOLD || mark == MOUSE_LOOK_CENTER {
+            let cx_raw = read_f32(ctx, reticle + 0xE4);
+            let cy_base = read_f32(ctx, reticle + 0xEC);
+            let cx = if cx_raw.is_finite() && cx_raw > 0.0 && cx_raw < 400.0 { cx_raw } else { 200.0 };
+            let base_y = if cy_base.is_finite() && cy_base > 0.0 && cy_base < 240.0 { cy_base } else { 120.0 };
+            let ratio = read_crosshair_ratio(ctx, cam_mgr);
+            let cy = (base_y * (1.0 - ratio)).clamp(0.0, 240.0);
+            mem_write32(ctx, reticle + 0xA4, cx.to_bits());
+            mem_write32(ctx, reticle + 0xA8, cy.to_bits());
+            mem_write32(ctx, reticle + 0x208, 0);
+            mem_write32(ctx, reticle + 0x20C, 0);
             return;
         }
 
@@ -385,6 +401,24 @@ unsafe fn find_target_holder(ctx: &mut Context, entity: u32) -> u32 {
     found
 }
 
+#[inline]
+fn crosshair_ratio_from_fields(vfov_raw: f32, offset_raw: f32, disabled: bool) -> f32 {
+    if disabled || !vfov_raw.is_finite() || !offset_raw.is_finite() || vfov_raw <= 1e-4 {
+        return 0.0;
+    }
+    (offset_raw / (vfov_raw * 0.5)).clamp(-0.2, 0.3)
+}
+
+unsafe fn read_crosshair_ratio(ctx: &mut Context, cam_mgr: u32) -> f32 {
+    if !valid_heap_ptr(cam_mgr) {
+        return 0.0;
+    }
+    let disabled = unsafe { mem_read8(ctx, cam_mgr + 0xC08) == 1 && mem_read8(ctx, cam_mgr + 0xC04) == 1 };
+    let vfov_raw = unsafe { read_f32(ctx, cam_mgr + 0x358) };
+    let offset_raw = unsafe { read_f32(ctx, cam_mgr + 0x44C) };
+    crosshair_ratio_from_fields(vfov_raw, offset_raw, disabled)
+}
+
 /// Computes KIU's on-foot vertical crosshair elevation angle in radians from
 /// `f_005928B0` (`code420.c:2406..2570`) and `f_00575F3C` (`code400.c:5416..5431`).
 ///
@@ -395,10 +429,10 @@ unsafe fn find_target_holder(ctx: &mut Context, entity: u32) -> u32 {
 /// squarely under Pit's crosshair rather than at screen center.
 #[inline]
 fn crosshair_pitch_offset_from_fields(vfov_raw: f32, offset_raw: f32, disabled: bool) -> f32 {
-    if disabled || !vfov_raw.is_finite() || !offset_raw.is_finite() || vfov_raw <= 1e-4 {
+    let ratio = crosshair_ratio_from_fields(vfov_raw, offset_raw, disabled);
+    if ratio == 0.0 {
         return 0.0;
     }
-    let ratio = (offset_raw / (vfov_raw * 0.5)).clamp(-0.2, 0.3);
     // `cam_mgr + 0x358` is vertical FOV (convert degrees -> radians if > 3.2).
     let vfov_rad = if vfov_raw > 3.2 { vfov_raw.to_radians() } else { vfov_raw };
     let vfov_rad = if (0.25..=2.2).contains(&vfov_rad) { vfov_rad } else { 60.0_f32.to_radians() };

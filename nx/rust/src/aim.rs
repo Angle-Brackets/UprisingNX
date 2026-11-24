@@ -212,7 +212,8 @@ pub struct Aim {
     gyro_speed: f32,
     mode: u32,
     modifier: PadState,
-    invert_y: bool,
+    invert_y_air: bool,
+    invert_y_land: bool,
     speed: f32,
     /// What the overrides last said (`GAME_ON_FOOT` or `GAME_FLYING`), `0` for nothing.
     game: u32,
@@ -311,19 +312,28 @@ impl Aim {
         self.gyro_speed = fresh.gyro_speed;
         self.mode = fresh.mode;
         self.modifier = fresh.modifier;
-        self.invert_y = fresh.invert_y;
+        self.invert_y_air = fresh.invert_y_air;
+        self.invert_y_land = fresh.invert_y_land;
         self.speed = fresh.speed;
     }
 
     pub fn from_env() -> Aim {
         let var = |name: &str| std::env::var(name).ok();
+        let legacy_invert = var("UNX_AIM_INVERT_Y").is_some_and(|v| v.trim() == "1");
+        let invert_y_air = var("UNX_AIM_INVERT_Y_AIR")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(legacy_invert);
+        let invert_y_land = var("UNX_AIM_INVERT_Y_LAND")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(legacy_invert);
         let aim = Aim {
             right_stick: var("UNX_RIGHT_STICK_AIM").map_or(true, |v| v.trim() != "0"),
             gyro: var("UNX_GYRO_AIM").map_or(true, |v| v.trim() != "0"),
             gyro_speed: var("UNX_GYRO_SPEED").and_then(|v| v.trim().parse().ok()).unwrap_or(1.0),
             mode: var("UNX_LEFT_STICK_AIM").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
             modifier: modifier(var("UNX_AIM_MODIFIER").as_deref().unwrap_or("ZL")),
-            invert_y: var("UNX_AIM_INVERT_Y").is_some_and(|v| v.trim() == "1"),
+            invert_y_air,
+            invert_y_land,
             speed: var("UNX_AIM_SPEED").and_then(|v| v.trim().parse().ok()).unwrap_or(1.0),
             game: 0,
             quiet: 0,
@@ -346,8 +356,8 @@ impl Aim {
             motion_tilt: [0.0, 0.0],
         };
         log::info!(
-            "unx: aim right_stick {} gyro {} (gyro_speed {}) left_stick_mode {} (modifier {:?}, invert y {}, speed {})",
-            aim.right_stick, aim.gyro, aim.gyro_speed, aim.mode, aim.modifier, aim.invert_y, aim.speed
+            "unx: aim right_stick {} gyro {} (gyro_speed {}) left_stick_mode {} (modifier {:?}, invert_y air {} land {}, speed {})",
+            aim.right_stick, aim.gyro, aim.gyro_speed, aim.mode, aim.modifier, aim.invert_y_air, aim.invert_y_land, aim.speed
         );
         aim
     }
@@ -523,7 +533,10 @@ impl Aim {
             input.tilt = [0.0, 0.0];
             return;
         }
-        let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
+        let y_is_center = !(self.mode != 0 && self.modifier == PadState::Y);
+        let recenter_now = input.buttons.contains(PadState::R)
+            || (y_is_center && input.buttons.contains(PadState::Y))
+            || (host & (1 << 1)) != 0;
         if recenter_now {
             self.motion_tilt = [0.0, 0.0];
             input.tilt = [0.0, 0.0];
@@ -566,8 +579,14 @@ impl Aim {
             return;
         }
 
-        let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
+        let y_is_center = !(self.mode != 0 && self.modifier == PadState::Y);
+        let recenter_now = input.buttons.contains(PadState::R)
+            || (y_is_center && input.buttons.contains(PadState::Y))
+            || (host & (1 << 1)) != 0;
         input.buttons.remove(PadState::R);
+        if y_is_center {
+            input.buttons.remove(PadState::Y);
+        }
         if recenter_now && !self.recenter_held && self.fallback_touch.is_some() {
             self.fallback_touch = None;
             self.fallback_lift = FALLBACK_RECENTER_LIFT_FRAMES;
@@ -585,7 +604,7 @@ impl Aim {
         }
 
         let menu_invert_y = self.controls.air_invert_y();
-        let invert_y = self.invert_y != menu_invert_y;
+        let invert_y = self.invert_y_air != menu_invert_y;
         let menu_scale = GuestControls::slider_scale(self.controls.air_speed);
         let menu_gyro_scale = GuestControls::gyro_scale(self.controls.air_stop);
 
@@ -661,18 +680,22 @@ impl Aim {
 
         // In battle:
         // - R (Right Bumper): snaps Air Battle reticle to rail center, or in Land Battle /
-        //   Vehicles engages full-range 2-tier Z-targeting (tap to snap, hold to lock 1:1,
-        //   right-stick flick to switch targets).
-        // - L3 (Left Stick Click, `UNX_HOST_RECENTER` bit 1): snaps Air Battle reticle to
-        //   rail center, or in Land Battle / Vehicles performs a dedicated behind-Pit
-        //   camera recenter without locking onto enemies.
-        // - Both R and L3 pause gyro while held (+ brief settle grace on release) for hand
-        //   ratcheting.
+        //   Vehicles engages Quick Turn / full-range 2-tier Z-targeting (tap to snap, hold
+        //   to lock 1:1, right-stick flick to switch targets) and centers the reticle.
+        // - Y (or L3, `UNX_HOST_RECENTER` bit 1): snaps Air Battle reticle to rail center,
+        //   or in Land Battle / Vehicles performs a dedicated behind-Pit camera + reticle
+        //   center without locking onto enemies.
+        // - Both R and Y / L3 pause gyro while held (+ brief settle grace on release) for
+        //   hand ratcheting.
         // - ZL (Nunchuk Z trigger) and ZR (Wii Remote B trigger) act as Fire (`PadState::L`).
+        let y_is_center = !(self.mode != 0 && self.modifier == PadState::Y);
         let ztarget_now = input.buttons.contains(PadState::R);
-        let center_now = (host & (1 << 1)) != 0;
+        let center_now = (y_is_center && input.buttons.contains(PadState::Y)) || (host & (1 << 1)) != 0;
         let recenter_now = ztarget_now || center_now;
         input.buttons.remove(PadState::R);
+        if y_is_center {
+            input.buttons.remove(PadState::Y);
+        }
         if ztarget_now && !self.recenter_held {
             self.recenter_pending = true;
             self.center_pending = false;
@@ -724,12 +747,12 @@ impl Aim {
         let mut across = 0.0;
         let mut down = 0.0;
 
-        let menu_invert_y = if self.game == GAME_FLYING {
-            self.controls.air_invert_y()
+        let (host_invert_y, menu_invert_y) = if self.game == GAME_FLYING {
+            (self.invert_y_air, self.controls.air_invert_y())
         } else {
-            self.controls.land_invert_y()
+            (self.invert_y_land, self.controls.land_invert_y())
         };
-        let invert_y = self.invert_y != menu_invert_y;
+        let invert_y = host_invert_y != menu_invert_y;
 
         let (menu_scale_x, menu_scale_y, menu_gyro_scale) = if self.game == GAME_FLYING {
             let s = GuestControls::slider_scale(self.controls.air_speed);
@@ -896,7 +919,8 @@ mod tests {
             gyro_speed: 1.0,
             mode: 0,
             modifier: PadState::ZL,
-            invert_y: false,
+            invert_y_air: false,
+            invert_y_land: false,
             speed: 1.0,
             game: 0,
             quiet: 0,
@@ -1099,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn on_foot_r_ztargets_and_l3_recenters_behind_pit() {
+    fn on_foot_r_ztargets_and_y_or_l3_centers_behind_pit_and_both_recenter_in_air() {
         let mut foot = test_aim();
         foot.said(GAME_ON_FOOT);
         let mut mb = [0u32; 4];
@@ -1122,11 +1146,48 @@ mod tests {
         foot.feed(&mut mb, (0.0, 0.0));
         assert_eq!(mb[0], MOUSE_LOOK);
 
-        // Pressing L3 (host bit 1) triggers dedicated behind-Pit recenter (`MLKC`).
+        // Pressing Y on foot triggers dedicated behind-Pit center (`MLKC`) and consumes Y.
+        let mut y_press = InputState { buttons: PadState::Y, ..InputState::default() };
+        foot.apply(&mut y_press, [0.0; 3], 0);
+        assert!(!y_press.buttons.contains(PadState::Y));
+        foot.feed(&mut mb, (0.0, 0.0));
+        assert_eq!(mb[0], MOUSE_LOOK_CENTER);
+
+        // Release Y, then L3 (host bit 1) also triggers `MLKC`.
+        let mut idle2 = InputState::default();
+        foot.apply(&mut idle2, [0.0; 3], 0);
+        foot.feed(&mut mb, (0.0, 0.0));
         let mut l3_press = InputState::default();
         foot.apply(&mut l3_press, [0.0; 3], 1 << 1);
         foot.feed(&mut mb, (0.0, 0.0));
         assert_eq!(mb[0], MOUSE_LOOK_CENTER);
+
+        // In Air Battle, both R and Y trigger `MAMR`.
+        let mut air = test_aim();
+        air.said(GAME_FLYING);
+        let mut air_mb = [0u32; 4];
+        let mut air_y = InputState { buttons: PadState::Y, ..InputState::default() };
+        air.apply(&mut air_y, [0.0; 3], 0);
+        assert!(!air_y.buttons.contains(PadState::Y));
+        air.feed(&mut air_mb, (0.0, 0.0));
+        assert_eq!(air_mb[0], MOUSE_AIM_RECENTER);
+    }
+
+    #[test]
+    fn separate_air_and_ground_invert_y_settings() {
+        let mut aim = test_aim();
+        aim.invert_y_air = true;
+        aim.invert_y_land = false;
+
+        aim.said(GAME_FLYING);
+        let mut stick_up = InputState { c_stick_y: 1.0, ..InputState::default() };
+        let (_, air_down) = aim.apply(&mut stick_up, [0.0; 3], 0);
+        assert!(air_down > 0.0, "invert_y_air flips stick-up to down > 0 in Air Battle");
+
+        aim.said(GAME_ON_FOOT);
+        let mut stick_up2 = InputState { c_stick_y: 1.0, ..InputState::default() };
+        let (_, land_down) = aim.apply(&mut stick_up2, [0.0; 3], 0);
+        assert!(land_down < 0.0, "invert_y_land=false keeps stick-up at down < 0 on Ground");
     }
 
     #[test]

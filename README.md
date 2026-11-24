@@ -71,8 +71,8 @@ Every major screen—Title Screen, Mode Select, Solo Hub, Chapter Select, Fiend'
 
 ### Dual-Stick, Gyro & Zelda-Style Z-Targeting
 
-- **Dual-Stick & Gyro Aiming:** Native analog camera and reticle control with optional gyroscope aiming, independent sensitivity tuning, Y-axis inversion, and left-stick aim options.
-- **Z-Targeting (`R`) & Dedicated Recenter (`L3`):** Tap or hold **R** on foot to lock directly onto visible enemies up to `160` units away (`±65°` forward cone prioritizing your crosshair, with a `360°` fallback within `80` units if a boss dashes past you). Holding **R** maintains a tight 1:1 lock for circle-strafing, flicking the right stick left/right switches targets, and clicking **Left Stick (`L3`)** always recenters the camera cleanly behind Pit.
+- **Dual-Stick & Gyro Aiming:** Native analog camera and reticle control with optional gyroscope aiming, independent sensitivity tuning, separate Air and Ground Y-axis inversion, and left-stick aim options.
+- **Z-Targeting (`R`) & Dedicated Center (`Y` / `L3`):** Tap or hold **R** on foot to quick-turn / lock directly onto visible enemies up to `160` units away (`±65°` forward cone prioritizing your crosshair, with a `360°` fallback within `80` units if a boss dashes past you). Holding **R** maintains a tight 1:1 lock for circle-strafing, flicking the right stick left/right switches targets, and pressing **Y** (or clicking **Left Stick `L3`**) cleanly centers both the camera and reticle behind Pit. In Air Battles, both **R** and **Y** / **L3** recenter the reticle.
 
 <br>
 
@@ -108,8 +108,8 @@ Decrypted US saves (`00.SAV`, `01.SAV`, etc.) from Checkpoint, JKSM, Citra, and 
 | Input | Action |
 | --- | --- |
 | **Left / Right Stick + Gyro** | Movement & native aiming / camera control |
-| **R** | Z-Target enemy on foot (tap to snap, hold to lock 1:1, right-stick flick to switch) / recenter reticle in air |
-| **Left Stick Click (`L3`)** | Dedicated recenter camera behind Pit (on foot) / recenter reticle (air) |
+| **R** | Quick Turn / Z-Target enemy on foot (tap to snap, hold to lock 1:1, right-stick flick to switch) / recenter reticle in air |
+| **Y** or **Left Stick Click (`L3`)** | Dedicated center camera & reticle behind Pit (on foot) / recenter reticle (air) |
 | **Right Stick Click (`R3`)** | Toggle bottom screen overlay |
 | **`Minus` (`-`)** | Open / close tabbed Settings menu (`L` / `R` switches tabs) |
 | **`Plus` (`+`)** | 3DS `Start` |
