@@ -46,9 +46,10 @@ const MOUSE_AIM: u32 = 0x314D_414D; // "MAM1"
 const MOUSE_AIM_RECENTER: u32 = 0x524D_414D; // "MAMR"
 
 const MOUSE_LOOK: u32 = 0x314B_4C4D; // "MLK1"
-const MOUSE_LOOK_RECENTER: u32 = 0x524B_4C4D; // "MLKR" (R: Z-target with 2-tier range)
+const MOUSE_LOOK_RECENTER: u32 = 0x524B_4C4D; // "MLKR" (R: Quick Turn / Z-target + reticle center)
 const MOUSE_LOOK_HOLD: u32 = 0x484B_4C4D; // "MLKH" (R held: keep tracking locked target)
-const MOUSE_LOOK_CENTER: u32 = 0x434B_4C4D; // "MLKC" (L3: dedicated recenter behind Pit)
+const MOUSE_LOOK_CENTER: u32 = 0x434B_4C4D; // "MLKC" (L3: dedicated camera + reticle center behind Pit)
+const MOUSE_RETICLE_CENTER: u32 = 0x4352_4C4D; // "MLRC" (Y: center on-foot reticle only, keep camera angle)
 
 const YAW_PER_PIXEL: f32 = -0.00408;
 const PITCH_PER_PIXEL: f32 = 0.00442;
@@ -193,10 +194,11 @@ unsafe extern "C" fn override_006d269c(aot_ctx: *mut AotExecContext, orig_body: 
         let mut preserve_pos: Option<(u32, u32)> = None;
         if valid_heap_ptr(reticle) && mem_read8(ctx, reticle + 0xD5) == 0 {
             let mark = mem_read32(ctx, MAILBOX);
-            if mark == MOUSE_AIM || mark == MOUSE_AIM_RECENTER {
+            if mark == MOUSE_AIM || mark == MOUSE_AIM_RECENTER || mark == MOUSE_LOOK {
                 // Unconditionally suppress KIU's 0.5s idle auto-centering (`f_006D1FF0`
-                // Mode 1) every tick—even when the player holds the right stick still
-                // (`dx == 0 && dy == 0`) while orbiting with the left stick.
+                // Mode 1) every tick—in both Air Battles and Land Battles—so KIU's
+                // auto-center spring never fights the player's gyro or pulls the
+                // reticle back toward screen center while aiming or orbiting.
                 mem_write32(ctx, reticle + 0x208, 0);
                 if valid_heap_ptr(player) {
                     let p_aim = player + 0x98;
@@ -271,13 +273,25 @@ unsafe extern "C" fn override_006d2abc(aot_ctx: *mut AotExecContext, orig_body: 
         mem_write32(ctx, reticle + 0x84, flags84 | 2);
 
         let mark = mem_read32(ctx, MAILBOX);
-        // During active Z-target (`R` press/hold) or behind-Pit center (`Y` / `L3`):
+        // During active Z-target (`R` press/hold), behind-Pit center (`L3`), or
+        // reticle-only center (`Y`):
         // - Snap the on-foot reticle cleanly back to KIU's exact neutral crosshair center
         //   (`f_00575F3C`: `(200, 120 * (1 - ratio))`) so gyro/reticle re-centers cleanly
         //   and Z-target locks land dead-center on the target.
-        // - Leave `MAILBOX + 4/8` untouched so `override_007462a4` receives right-stick
-        //   flicks to switch locked targets while holding `R`.
-        if mark == MOUSE_LOOK_RECENTER || mark == MOUSE_LOOK_HOLD || mark == MOUSE_LOOK_CENTER {
+        // - For `MOUSE_RETICLE_CENTER` (`Y`), reset `MAILBOX` back to `MOUSE_LOOK` so
+        //   `override_007462a4` leaves the camera angle completely untouched.
+        // - For `R` / `L3`, leave `MAILBOX + 4/8` untouched so `override_007462a4` receives
+        //   right-stick flicks to switch locked targets while holding `R`.
+        if mark == MOUSE_LOOK_RECENTER
+            || mark == MOUSE_LOOK_HOLD
+            || mark == MOUSE_LOOK_CENTER
+            || mark == MOUSE_RETICLE_CENTER
+        {
+            if mark == MOUSE_RETICLE_CENTER {
+                mem_write32(ctx, MAILBOX, MOUSE_LOOK);
+                mem_write32(ctx, MAILBOX + 4, 0);
+                mem_write32(ctx, MAILBOX + 8, 0);
+            }
             let cx_raw = read_f32(ctx, reticle + 0xE4);
             let cy_base = read_f32(ctx, reticle + 0xEC);
             let cx = if cx_raw.is_finite() && cx_raw > 0.0 && cx_raw < 400.0 { cx_raw } else { 200.0 };
@@ -891,7 +905,10 @@ unsafe extern "C" fn override_007462a4(aot_ctx: *mut AotExecContext, orig_body: 
 
         let mut direct_angles: Option<(f32, f32)> = None;
         let mark = mem_read32(&mut ec.ctx, MAILBOX);
-        if mark == MOUSE_LOOK
+        if mark == MOUSE_RETICLE_CENTER {
+            // `Y` centers only the on-foot reticle (`override_006d2abc`); leave camera untouched.
+            ec.ztarget = ZTargetState::default();
+        } else if mark == MOUSE_LOOK
             || mark == MOUSE_LOOK_RECENTER
             || mark == MOUSE_LOOK_HOLD
             || mark == MOUSE_LOOK_CENTER

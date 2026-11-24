@@ -334,7 +334,7 @@ impl Row {
             Row::DynamicRes => "Off (default): keeps your chosen battle resolution fixed; only in-between 60 fps frames render lower. On: tries dropping real battle resolution 1 step before pausing smooth mode.",
             Row::PowerLabel => "Where the selected power's name appears on foot. Bottom: centered at the bottom in crisp white text. Above bar: in a bubble over the power icons. Off: icons only.",
             Row::RightStick => "Aims the reticle in the air and turns the camera on foot with the right stick, in place of the touch screen.",
-            Row::Gyro => "Fine aiming by tilting the console or controller. On foot: R quick-turns / Z-targets (flick right stick to switch), Y or L3 centers camera and reticle behind Pit. In air: both R and Y/L3 recenter; holding either pauses gyro.",
+            Row::Gyro => "Fine aiming by tilting the console or controller. On foot: R quick-turns / Z-targets + centers reticle (flick right stick to switch), Y centers reticle only, L3 centers camera + reticle behind Pit. In air: R, Y, and L3 all recenter; holding pauses gyro.",
             Row::GyroSpeed => "How far the reticle moves for a tilt. The game's own Controls options scale it further.",
             Row::AimSpeed => "How fast the right stick aims and turns the camera.",
             Row::InvertYAir => "Flips up and down aiming in Air Battles (independent of Ground Battles).",
