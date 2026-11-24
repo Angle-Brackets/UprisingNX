@@ -140,6 +140,11 @@ pub enum ScreenLayout {
     /// Inspector with mirrored right-aligned Stars Plaque, left-side Weapon-Type
     /// icon, right-aligned Modifier pills, and 3D Weapon showcase.
     WeaponSelect,
+    /// Kid Icarus: Uprising's in-battle Pause screen (Main Pause, Options/Controls/Sound,
+    /// and Quit Confirmation) merged onto a single 16:9 screen: full-bleed frozen 3D top
+    /// screen keeping `|| PAUSED` (upper-left) and Options help text (bottom strip) visible,
+    /// with the interactive 320x240 bottom pause menu framed cleanly at 1:1 pixel aspect.
+    Pause,
 }
 
 /// how the screens' pixels are drawn when scaled to the window.
@@ -187,7 +192,8 @@ impl ScreenLayout {
             | ScreenLayout::ModeSelect
             | ScreenLayout::SoloHub
             | ScreenLayout::FileSelect
-            | ScreenLayout::WeaponSelect => (FUSE_DECK_WIDTH, 240.0),
+            | ScreenLayout::WeaponSelect
+            | ScreenLayout::Pause => (FUSE_DECK_WIDTH, 240.0),
         }
     }
 }
@@ -272,6 +278,7 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
             | ScreenLayout::SoloHub
             | ScreenLayout::FileSelect
             | ScreenLayout::WeaponSelect
+            | ScreenLayout::Pause
     ) {
         let stage = Viewport {
             x: offset_x,
@@ -338,7 +345,8 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
         | ScreenLayout::ModeSelect
         | ScreenLayout::SoloHub
         | ScreenLayout::FileSelect
-        | ScreenLayout::WeaponSelect => unreachable!(),
+        | ScreenLayout::WeaponSelect
+        | ScreenLayout::Pause => unreachable!(),
     };
     (top, bottom)
 }
@@ -658,6 +666,9 @@ pub trait Presenter {
     /// live sub-state for `ScreenLayout::WeaponSelect` (`1` = Weapon List,
     /// `2` = Weapon Category Select, `3` = Gear Hub).
     fn set_weapon_state(&mut self, _sub: u8) {}
+    /// live sub-state for `ScreenLayout::Pause` (`PauseMenu + 0x04`: `1..=2, 4` Main Pause,
+    /// `3` Quit Confirmation modal, `5..=7` Options / Controls / Sound).
+    fn set_pause_state(&mut self, _sub: u8) {}
 
     /// fraction (`0.80..=1.0`) of the window/swapchain used for the active
     /// display area, centering it inside black overscan borders on TVs.

@@ -122,6 +122,7 @@ pub struct VulkanPresenter {
     chapter_pipeline: vk::Pipeline,
     chapter_title_right: f32,
     weapon_sub: u8,
+    pause_sub: u8,
     hub_pipeline_layout: vk::PipelineLayout,
     hub_pipeline: vk::Pipeline,
     sampler: vk::Sampler,
@@ -481,6 +482,7 @@ impl VulkanPresenter {
             chapter_pipeline,
             chapter_title_right: 302.0,
             weapon_sub: 1,
+            pause_sub: 2,
             hub_pipeline_layout,
             hub_pipeline,
             sampler,
@@ -1076,6 +1078,7 @@ impl VulkanPresenter {
                     | ScreenLayout::SoloHub
                     | ScreenLayout::FileSelect
                     | ScreenLayout::WeaponSelect
+                    | ScreenLayout::Pause
             ) {
                 if let (Some((_, top_area)), Some((_, bot_area)), (Some(stage_vp), _)) = (
                     crop(0, [0.0, 0.0, 1.0, 1.0]),
@@ -1086,6 +1089,7 @@ impl VulkanPresenter {
                         ScreenLayout::SoloHub => 1,
                         ScreenLayout::FileSelect => 2,
                         ScreenLayout::WeaponSelect => 3,
+                        ScreenLayout::Pause => 4,
                         _ => 0,
                     };
                     let (pad0, pad1): (f32, f32) = if self.arrangement == ScreenLayout::WeaponSelect {
@@ -1095,6 +1099,8 @@ impl VulkanPresenter {
                             4 => (4.0, -0.80),
                             _ => (4.0, 0.77),
                         }
+                    } else if self.arrangement == ScreenLayout::Pause {
+                        (self.pause_sub as f32, 0.0)
                     } else {
                         (0.0, 0.0)
                     };
@@ -1296,6 +1302,7 @@ impl Presenter for VulkanPresenter {
                 | ScreenLayout::SoloHub
                 | ScreenLayout::FileSelect
                 | ScreenLayout::WeaponSelect
+                | ScreenLayout::Pause
         ) {
             self.write_cauldron_set(&sources);
         }
@@ -1401,6 +1408,10 @@ impl Presenter for VulkanPresenter {
 
     fn set_weapon_state(&mut self, sub: u8) {
         self.weapon_sub = sub;
+    }
+
+    fn set_pause_state(&mut self, sub: u8) {
+        self.pause_sub = sub;
     }
 
     fn set_safe_area(&mut self, factor: f32) {

@@ -472,6 +472,8 @@ pub struct Unx {
     title_boosted: bool,
     /// last seen sub-screen (`1..=3`) for `ScreenLayout::WeaponSelect`
     weapon_sub: u8,
+    /// last seen KIU in-battle PauseMenu state (`1..=7`, `3` = Quit modal)
+    pause_sub: u8,
     /// battle resolution steps dropped by smooth_guard during the current
     /// battle so smooth mode stays on (0 or 1, cleared when the scene changes)
     battle_scale_drop: u32,
@@ -524,10 +526,18 @@ impl Bottom {
 
     /// this frame's host input and what the overrides said; whether the bottom
     /// screen is shown now.
-    fn update(&mut self, host: u32, said: u32, on_fuse: bool, on_tutorial: bool, in_frontend_menu: bool) -> bool {
+    fn update(
+        &mut self,
+        host: u32,
+        said: u32,
+        on_fuse: bool,
+        on_pause: bool,
+        on_tutorial: bool,
+        in_frontend_menu: bool,
+    ) -> bool {
         let host_pressed = host & !self.host;
         self.host = host;
-        if !on_fuse {
+        if !on_fuse && !on_pause {
             self.fuse_override = false;
         }
         if !on_tutorial {
@@ -543,7 +553,7 @@ impl Bottom {
             self.shown = true;
         }
         if host_pressed & HOST_BOTTOM != 0 {
-            if on_fuse {
+            if on_fuse || on_pause {
                 self.fuse_override = !self.fuse_override;
             } else if on_tutorial {
                 self.tutorial_override = !self.tutorial_override;
@@ -1249,6 +1259,7 @@ pub unsafe extern "C" fn unx_create(nwindow: *mut c_void, rom: *const c_char, da
         on_title: false,
         title_boosted: true,
         weapon_sub: 1,
+        pause_sub: 2,
         battle_scale_drop: 0,
         host_last: 0,
         smooth: Smooth {
@@ -1298,11 +1309,85 @@ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<za
     (system.read_screen_scaled(screen), None)
 }
 
+/// Reads KIU (USA 1.0) in-battle PauseMenu state from guest RAM.
+/// Returns `Some(sub)` strictly while the in-battle Pause menu is open
+/// (`InfoManager+0xC0` bit 16):
+/// - `1, 2, 4` = Main Pause
+/// - `3` = Quit Confirmation modal
+/// - `5, 6, 7` = Options / Controls / Volume
+/// - `9` = Remove Display (photo mode, `info_btl + 0x243C` bit 30)
+fn read_guest_pause_state(memory: &mut zakuro_core::memory::Memory) -> Option<u8> {
+    if (memory.peek32(0x00D6_36C0) & 1) == 0 {
+        return None;
+    }
+    if (memory.peek32(0x00EE_3158) & 0x0001_0000) == 0 {
+        return None;
+    }
+    let info_btl = memory.peek32(0x00EE_31D8);
+    if (0x0800_0000..0x1800_0000).contains(&info_btl) && (info_btl & 3) == 0 {
+        let flags = memory.peek32(info_btl + 0x243C);
+        let sub = memory.peek32(info_btl + 0x2440);
+        if (flags & 0x4000_0000) != 0 && sub <= 2 {
+            return Some(9);
+        }
+        if (1..=7).contains(&sub) {
+            return Some(sub as u8);
+        }
+    }
+    Some(2)
+}
+
+fn pause_sub_mode(sub: u8) -> u8 {
+    match sub {
+        3 => 3,
+        9 => 9,
+        5..=7 => 5,
+        _ => 2,
+    }
+}
+
 /// where a touch on the 1280x720 screen lands on the 3DS bottom screen's 320x240,
 /// if it does. in TopOnly the bottom screen is not shown, and the touch aims the
 /// reticle over a 4:3 area in the middle of the screen; otherwise it maps 1:1 to
 /// the layout's bottom viewport (R3 matrix in FuseSplitDeck, corner in LargeTop).
-fn touch_on_bottom(layout: ScreenLayout, weapon_sub: u8, x: u16, y: u16) -> Option<(u16, u16)> {
+fn touch_on_bottom(layout: ScreenLayout, weapon_sub: u8, pause_sub: u8, x: u16, y: u16) -> Option<(u16, u16)> {
+    if layout == ScreenLayout::Pause {
+        let bottom = zakuro_gpu::layout(1280, 720, layout, zakuro_gpu::backend::TOP_WIDTH, false).1?;
+        let u = (x as f32 - bottom.x) / bottom.width;
+        let v = (y as f32 - bottom.y) / bottom.height;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        let wx = u * 426.66666;
+        let wy = v * 240.0;
+        if pause_sub >= 9 {
+            // Remove Display photo mode: only the bottom-right `DISPLAY` tab (`bx=222..320, by=207..240`).
+            let tab_x = 426.66666 - 88.0;
+            let tab_y = 240.0 - 30.0;
+            if wx >= tab_x && wy >= tab_y {
+                let lx = ((wx - tab_x) / 88.0).clamp(0.0, 1.0);
+                let ly = ((wy - tab_y) / 30.0).clamp(0.0, 1.0);
+                return Some(((222.0 + lx * 98.0).min(319.0) as u16, (207.0 + ly * 33.0).min(239.0) as u16));
+            }
+            return None;
+        }
+        let (src_x0, src_y0, src_w, src_h, card_w, card_h, card_y0) = if pause_sub == 3 {
+            (16.5, 18.5, 287.0, 203.0, 246.0, 174.0, (240.0 - 174.0) * 0.5)
+        } else if pause_sub >= 5 {
+            (0.0, 0.0, 320.0, 240.0, 224.0, 168.0, 10.0)
+        } else {
+            (0.0, 42.0, 320.0, 198.0, 256.0, 158.4, 50.0)
+        };
+        let card_x0 = (426.66666 - card_w) * 0.5;
+        let lx = (wx - card_x0) / card_w;
+        let ly = (wy - card_y0) / card_h;
+        if (0.0..1.0).contains(&lx) && (0.0..1.0).contains(&ly) {
+            let bx = (src_x0 + lx * src_w).clamp(0.0, 319.0) as u16;
+            let by = (src_y0 + ly * src_h).clamp(0.0, 239.0) as u16;
+            return Some((bx, by));
+        }
+        return None;
+    }
     if layout == ScreenLayout::FiendsCauldron && x <= 140 && y >= 595 {
         // Relocated bottom-left 16:9 Back button maps to native (16, 221) on 320x240.
         return Some((16, 221));
@@ -1623,6 +1708,15 @@ pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInpu
         unx.aim.patch_controls_ui(&mut unx.system.memory.phys.fcram, unx.frame);
     }
     let on_title = unx.system.gpu.flags().on_title.swap(false, std::sync::atomic::Ordering::Relaxed);
+    let guest_pause = read_guest_pause_state(&mut unx.system.memory);
+    let on_pause = guest_pause.is_some();
+    if let Some(sub) = guest_pause {
+        unx.aim.clear_game();
+        if pause_sub_mode(sub) != pause_sub_mode(unx.pause_sub) {
+            unx.system.reset_interpolation();
+        }
+        unx.pause_sub = sub;
+    }
     let mut look = (0.0, 0.0);
     if let Some(input) = input.as_ref() {
         // after the menu closes, nothing reaches the game until all is let go
@@ -1633,7 +1727,9 @@ pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInpu
             circle_y: input.circle_y,
             c_stick_x: input.c_stick_x,
             c_stick_y: input.c_stick_y,
-            touch: game_touch.then(|| touch_on_bottom(unx.layout, unx.weapon_sub, input.touch_x, input.touch_y)).flatten(),
+            touch: game_touch
+                .then(|| touch_on_bottom(unx.layout, unx.weapon_sub, unx.pause_sub, input.touch_x, input.touch_y))
+                .flatten(),
             tilt: [0.0, 0.0],
         };
         if unx.bench.as_ref().is_some_and(|bench| bench.fire) {
@@ -1649,7 +1745,7 @@ pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInpu
         let motion_active = unx.system.services.hid.accelerometer_users > 0
             || unx.system.services.hid.gyroscope_users > 0;
         unx.aim.apply_motion_tilt(&mut state, gyro, input.host, motion_active);
-        let fallback_ok = unx.in_play && !unx.title_boosted && (input.host & HOST_BOTTOM) == 0;
+        let fallback_ok = unx.in_play && !unx.title_boosted && !on_pause && (input.host & HOST_BOTTOM) == 0;
         unx.aim.set_in_battle_play(fallback_ok);
         look = unx.aim.apply(&mut state, gyro, input.host);
         if on_title && (!state.buttons.is_empty() || game_touch) {
@@ -1692,13 +1788,13 @@ pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInpu
     // cutscenes once play starts, until returning to a frontend menu.
     let res_battle = said != 0 || (unx.bottom.played && !in_frontend_menu && !on_special_pre);
     let on_tutorial_movie = in_battle && !res_battle;
-    let bottom_shown = unx.bottom.update(host, said, on_special_pre, on_tutorial_movie, in_frontend_menu);
+    let bottom_shown = unx.bottom.update(host, said, on_special_pre, on_pause, on_tutorial_movie, in_frontend_menu);
     unx.system
         .gpu
         .flags()
         .menu_override
         .store(unx.bottom.fuse_override, std::sync::atomic::Ordering::Relaxed);
-    let in_play = !bottom_shown && !on_special_pre;
+    let in_play = !bottom_shown && !on_special_pre && !on_pause;
     let host_pressed = host & !unx.host_last;
     unx.host_last = host;
     unx.controller_scale(host_pressed);
@@ -1707,6 +1803,7 @@ pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInpu
     flags.in_play.store(in_play, std::sync::atomic::Ordering::Relaxed);
     flags.in_battle.store(in_battle, std::sync::atomic::Ordering::Relaxed);
     flags.active_battle.store(res_battle, std::sync::atomic::Ordering::Relaxed);
+    flags.on_pause.store(on_pause, std::sync::atomic::Ordering::Relaxed);
     if said != 0 && unx.frame % 120 == 0 {
         log::info!("unx: overrides say {said} (frame {})", unx.frame);
     }
@@ -1965,8 +2062,19 @@ pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInpu
         && !on_solo_post
         && !on_mode_post
         && !on_weapon_post;
+    let guest_pause_post = read_guest_pause_state(&mut unx.system.memory);
+    // Require `on_pause` on both sides of `step_frame()` so the bottom pause UI has
+    // already been transferred to `bot_image` before showing the floating Pause card
+    // (avoiding a 1-frame stale battle-HUD flash on open while closing immediately).
+    let on_pause_post = on_pause && guest_pause_post.is_some();
     let bottom_blank = unx.system.gpu.flags().bottom_blank.load(std::sync::atomic::Ordering::Relaxed);
-    let desired_layout = if on_fuse_post {
+    let desired_layout = if on_pause_post {
+        if unx.bottom.fuse_override {
+            ScreenLayout::LargeTop
+        } else {
+            ScreenLayout::Pause
+        }
+    } else if on_fuse_post {
         if unx.bottom.fuse_override {
             ScreenLayout::LargeTop
         } else {
@@ -2019,6 +2127,13 @@ pub unsafe extern "C" fn unx_frame(handle: *mut UnxHandle, input: *const UnxInpu
     } else {
         ScreenLayout::LargeTop
     };
+    if let Some(sub) = guest_pause_post.filter(|_| on_pause_post) {
+        if pause_sub_mode(sub) != pause_sub_mode(unx.pause_sub) {
+            unx.system.reset_interpolation();
+        }
+        unx.pause_sub = sub;
+        unx.presenter.set_pause_state(sub);
+    }
     if on_chapter_post {
         let raw_bits = unx.system.gpu.flags().chapter_title_right.load(std::sync::atomic::Ordering::Relaxed);
         let title_r = if raw_bits != 0 { f32::from_bits(raw_bits) } else { 302.0 };

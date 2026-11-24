@@ -170,6 +170,7 @@ pub struct Flags {
     pub on_file_select: std::sync::atomic::AtomicBool,
     pub on_weapon: std::sync::atomic::AtomicBool,
     pub weapon_sub: std::sync::atomic::AtomicU8,
+    pub on_pause: std::sync::atomic::AtomicBool,
     pub on_frontend_menu: std::sync::atomic::AtomicBool,
     pub chapter_title_right: std::sync::atomic::AtomicU32,
     pub cauldron_hud: std::sync::atomic::AtomicBool,
@@ -484,6 +485,7 @@ impl Gpu {
             && !self.resources.portraits.solo_active
             && !self.resources.portraits.file_active
             && !self.resources.portraits.weapon_active
+            && !self.resources.portraits.pause_active
             && bottom
         {
             return;
@@ -842,6 +844,7 @@ impl Gpu {
         self.resources.portraits.in_play = self.flags.in_play.load(Relaxed);
         self.resources.portraits.in_battle = self.flags.in_battle.load(Relaxed);
         self.resources.portraits.active_battle = self.flags.active_battle.load(Relaxed);
+        self.resources.portraits.pause_active = self.flags.on_pause.load(Relaxed);
         self.resources.portraits.menu_override = self.flags.menu_override.load(Relaxed);
     }
 
