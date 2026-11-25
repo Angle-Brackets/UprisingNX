@@ -13,7 +13,7 @@ use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
 use zakuro_gpu::backend::{Overlay, OverlayMesh, OverlayTexture, OverlayVertex};
 
 use crate::settings::{Preset, Settings};
-use crate::updater::{UpdateTone, UpdateView};
+use crate::updater::{PickerView, UpdateTone, UpdateView};
 
 /// the system font, kept by unx_set_font
 pub static FONT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
@@ -180,7 +180,7 @@ enum Tab {
 }
 
 const TABS: [Tab; 3] = [Tab::Video, Tab::Controls, Tab::System];
-const MAX_TAB_ROWS: usize = 9;
+const MAX_TAB_ROWS: usize = 10;
 
 impl Tab {
     fn label(self) -> &'static str {
@@ -225,6 +225,7 @@ enum Row {
     Minus,
     Update,
     UpdateChannel,
+    VersionPicker,
     ImportSave,
     ExportSave,
     Resume,
@@ -256,13 +257,14 @@ const CONTROLS_ROWS: &[Row] = &[
 const SYSTEM_ROWS: &[Row] = &[
     Row::Update,
     Row::UpdateChannel,
+    Row::VersionPicker,
     Row::ImportSave,
     Row::ExportSave,
     Row::Resume,
     Row::Quit,
 ];
 
-const ALL_ROWS: [Row; 22] = [
+const ALL_ROWS: [Row; 23] = [
     Row::Editing,
     Row::Preset,
     Row::BattleScale,
@@ -281,6 +283,7 @@ const ALL_ROWS: [Row; 22] = [
     Row::Minus,
     Row::Update,
     Row::UpdateChannel,
+    Row::VersionPicker,
     Row::ImportSave,
     Row::ExportSave,
     Row::Resume,
@@ -311,6 +314,7 @@ impl Row {
             Row::Minus => "Minus button",
             Row::Update => "Software update",
             Row::UpdateChannel => "Update channel",
+            Row::VersionPicker => "Version history",
             Row::ImportSave => "Import 3DS save",
             Row::ExportSave => "Export save backup",
             Row::Resume => "Resume game",
@@ -342,8 +346,9 @@ impl Row {
             Row::LeftStick => "Off: the left stick only moves Pit. 1: in the air it also aims, and on foot holding the aim button turns the camera with it. 2: as 1, but in the air it aims only while the aim button is held.",
             Row::Modifier => "Only used when Left stick aim is 1 or 2: hold this button with the left stick to aim or turn the camera (Fire stays on L). When Left stick aim is Off, L, ZL, and ZR all Fire.",
             Row::Minus => "Settings menu: Minus alone opens and closes this menu (Plus still pauses; the game's Select only pauses in battles, like Plus). 3DS Select: Minus goes to the game, and right stick click + Minus opens this menu.",
-            Row::Update => "Checks GitHub Releases for a newer UprisingNX Switch build, downloads and verifies uprising_nx.nro in the background, then swaps and relaunches on restart.",
-            Row::UpdateChannel => "Stable (default): only checks full releases. Pre-release: also picks up release candidates (e.g. v0.1.1-rc.1) for early testing.",
+            Row::Update => "Checks versions.json / GitHub Releases for a newer UprisingNX Switch build, downloads and verifies uprising_nx.nro in the background, then swaps and relaunches on restart.",
+            Row::UpdateChannel => "Stable (default): only checks full releases. Pre-release: also includes snapshots / release candidates from versions.json.",
+            Row::VersionPicker => "Browse and install any release or snapshot from versions.json (Left/Right to pick, A to install or roll back). Enable Pre-release above to include snapshots.",
             Row::ImportSave => "Imports decrypted 3DS saves (00.SAV, 01.SAV...) from sdmc:/switch/uprisingnx/save/import/. Automatically backs up your current Switch save first. Restart or return to Title Screen to load.",
             Row::ExportSave => "Copies your current Switch save files to sdmc:/switch/uprisingnx/save/export/ for use with Checkpoint, JKSM, Citra, or Azahar.",
             Row::Resume => "Back to the game. B or Minus (or right stick click + Minus) also closes this menu.",
@@ -359,6 +364,8 @@ pub enum Changed {
     Controls,
     Update,
     UpdateChannel,
+    VersionPickerStep(i32),
+    VersionPickerInstall,
     ImportSave,
     ExportSave,
     Quit,
@@ -533,6 +540,8 @@ pub struct Menu {
     live_saves: usize,
     /// Snapshot of the GitHub Releases auto-updater state
     update: UpdateView,
+    /// Snapshot of the `versions.json` historical version picker
+    picker: PickerView,
     /// Inline status message shown on the Save & System tab (`(text, is_error)`)
     status: Option<(String, bool)>,
     /// whose video settings the menu shows and changes, docked or handheld;
@@ -603,9 +612,10 @@ impl Menu {
                 value: "Check now".to_owned(),
                 tone: UpdateTone::Neutral,
                 heading: format!("UprisingNX {VERSION_LABEL}"),
-                detail: "Checks GitHub Releases for a newer Switch build. Press A to check now.".to_owned(),
+                detail: "Checks versions.json / GitHub Releases for a newer Switch build. Press A to check now.".to_owned(),
                 progress: None,
             },
+            picker: PickerView::default(),
             status: None,
             editing_docked: false,
             blocking: false,
@@ -627,6 +637,10 @@ impl Menu {
 
     pub fn set_update_view(&mut self, view: UpdateView) {
         self.update = view;
+    }
+
+    pub fn set_picker_view(&mut self, view: PickerView) {
+        self.picker = view;
     }
 
     pub fn set_status(&mut self, text: String, is_error: bool) {
@@ -815,6 +829,13 @@ impl Menu {
                 set_control(settings, "update_prerelease", value.into());
                 Changed::UpdateChannel
             }
+            Row::VersionPicker => {
+                if a {
+                    Changed::VersionPickerInstall
+                } else {
+                    Changed::VersionPickerStep(delta)
+                }
+            }
             Row::ImportSave => {
                 if !a {
                     return None;
@@ -997,6 +1018,7 @@ impl Menu {
                         "Stable".into()
                     }
                 }
+                Row::VersionPicker => self.picker.value.clone(),
                 Row::ImportSave => {
                     if self.import_armed {
                         "Press A again".into()
@@ -1136,7 +1158,8 @@ impl Menu {
             painter.text(left + margin, y, row.label(), 1.0, text);
             let val = value(*row);
             if !val.is_empty() {
-                let cycles = !matches!(row, Row::Update | Row::ImportSave | Row::ExportSave | Row::Resume | Row::Quit);
+                let cycles = !matches!(row, Row::Update | Row::ImportSave | Row::ExportSave | Row::Resume | Row::Quit)
+                    && (*row != Row::VersionPicker || self.picker.loaded);
                 let shown = if chosen && cycles { format!("< {val} >") } else { val };
                 let val_color = if armed {
                     color(255, 190, 110, 255)
@@ -1162,8 +1185,22 @@ impl Menu {
             let box_top = rows_top + line * (rows.len() as f32 + 0.28);
             let box_bot = rows_top + rows_h - line * 0.10;
             let box_pad = 14.0 * k;
+            let show_picker = row == Row::VersionPicker && self.update.progress.is_none();
             let show_updater = matches!(row, Row::Update | Row::UpdateChannel) || self.update.progress.is_some();
-            let (bg, accent, heading, body, progress) = if show_updater {
+            let (bg, accent, heading, body, progress) = if show_picker {
+                let (bg, accent) = if self.picker.loaded {
+                    (color(28, 34, 62, 230), color(136, 198, 255, 255))
+                } else {
+                    (color(22, 30, 56, 210), color(110, 152, 225, 255))
+                };
+                (
+                    bg,
+                    accent,
+                    self.picker.heading.as_str(),
+                    self.picker.detail.as_str(),
+                    None,
+                )
+            } else if show_updater {
                 let (bg, accent) = match self.update.tone {
                     UpdateTone::Success => (color(20, 48, 42, 230), color(110, 228, 158, 255)),
                     UpdateTone::Accent => (color(36, 36, 56, 230), color(250, 204, 88, 255)),

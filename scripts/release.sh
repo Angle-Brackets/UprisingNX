@@ -228,3 +228,42 @@ fi
 
 gh "${GH_ARGS[@]}"
 echo "[release] Published GitHub Release ${TAG}!"
+
+# 5. Update versions.json manifest with this official release and sync to `snapshots`
+COMMIT_SHORT="$(git rev-parse --short HEAD)"
+DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RELEASE_SUMMARY="${TITLE}"
+python3 - "$TAG" "$DATE_UTC" "$COMMIT_SHORT" "$NRO_OUT" "$RELEASE_SUMMARY" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+
+tag, date_utc, commit, nro_path, summary = sys.argv[1:6]
+data = Path(nro_path).read_bytes()
+sha256 = hashlib.sha256(data).hexdigest()
+
+manifest_path = Path("versions.json")
+if manifest_path.exists():
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+else:
+    manifest = {"schema": 1, "latest": {"release": "", "snapshot": ""}, "versions": []}
+
+versions = [v for v in manifest.get("versions", []) if v.get("id") != tag]
+versions.insert(0, {
+    "id": tag,
+    "type": "release",
+    "date": date_utc,
+    "commit": commit,
+    "size": len(data),
+    "sha256": sha256,
+    "nro_url": f"https://github.com/Angle-Brackets/UprisingNX/releases/download/{tag}/uprising_nx.nro",
+    "zip_url": f"https://github.com/Angle-Brackets/UprisingNX/releases/download/{tag}/UprisingNX-{tag}.zip",
+    "notes": summary,
+})
+manifest["versions"] = versions
+manifest.setdefault("latest", {})["release"] = tag
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+if gh release view snapshots >/dev/null 2>&1; then
+  gh release upload snapshots versions.json --clobber
+  echo "[release] Synced updated versions.json to 'snapshots' archive release."
+fi

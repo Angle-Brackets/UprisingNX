@@ -1,0 +1,121 @@
+{
+  "schema": 1,
+  "latest": {
+    "release": "v0.1.1",
+    "snapshot": "v0.1.1-rc.9"
+  },
+  "versions": [
+    {
+      "id": "v0.1.1",
+      "type": "release",
+      "date": "2026-11-25T00:33:35Z",
+      "commit": "0fa63b0",
+      "size": 22803391,
+      "sha256": "862d7d8f55659cbecfa1ee6867afaf4ca1883a90fc9700e116513b70c01ec1a7",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/v0.1.1/uprising_nx.nro",
+      "notes": "Fixed Land Battle Y-axis inversion (#1), separate Air/Ground Invert Y, upgraded Z-targeting + R/Y/L3 split, orbit reticle stability, 16:9 Pause menu, Chapter End bonus alignment, and Pre-release updater channel.",
+      "zip_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/v0.1.1/UprisingNX-v0.1.1.zip"
+    },
+    {
+      "id": "v0.1.1-rc.9",
+      "type": "snapshot",
+      "date": "2026-11-25T00:25:21Z",
+      "commit": "cd41797",
+      "size": 22803391,
+      "sha256": "3f771ecec9dce60d7feaf6b5906df540f0711ed0c98f39f79267196f73fe9911",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/uprising_nx-v0.1.1-rc.9.nro",
+      "notes": "Restored v0.1.1-rc.6 controls, orbit-drift reticle lock, and R/Y/L3 split as the v0.1.1 release candidate."
+    },
+    {
+      "id": "v0.1.1-rc.8",
+      "type": "snapshot",
+      "date": "2026-11-25T00:19:20Z",
+      "commit": "696b49a",
+      "size": 22799295,
+      "sha256": "04f284121faab523d30d71e7c2dfd0da0be556c3d5b71b4fe8a4af27024b3d7a",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/uprising_nx-v0.1.1-rc.8.nro",
+      "notes": "A/B test: reverted aim/overrides to v0.1.0 while keeping Air/Ground Invert Y options."
+    },
+    {
+      "id": "v0.1.1-rc.7",
+      "type": "snapshot",
+      "date": "2026-11-25T00:10:53Z",
+      "commit": "90cfc16",
+      "size": 22803391,
+      "sha256": "8bebc8ffd8a05dc06305889d2b0605cf6b62858b7fd6e0f17d3b2774de5f1719",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/uprising_nx-v0.1.1-rc.7.nro",
+      "notes": "A/B test: reverted override_006d269c reticle lock to v0.1.0."
+    },
+    {
+      "id": "v0.1.1-rc.6",
+      "type": "snapshot",
+      "date": "2026-11-24T23:42:36Z",
+      "commit": "06a45ad",
+      "size": 22803391,
+      "sha256": "f1dc3a0e49bb122108607dbea5c474b1d1c00ada8aa318ed340e6b836794369f",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/uprising_nx-v0.1.1-rc.6.nro",
+      "notes": "Suppressed Land auto-center spring fighting gyro and made Y reticle-only center on foot."
+    },
+    {
+      "id": "v0.1.1-rc.5",
+      "type": "snapshot",
+      "date": "2026-11-24T23:33:20Z",
+      "commit": "0af2fc1",
+      "size": 22803391,
+      "sha256": "6d6c68a723df85ef786c5117851bdf415a57999c87c661e0fe8499954c6a15d3",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/uprising_nx-v0.1.1-rc.5.nro",
+      "notes": "Split Quick Turn/Z-target (R) vs Center (Y/L3), centered on-foot reticle, and added separate Air/Ground Invert Y."
+    },
+    {
+      "id": "v0.1.1-rc.4",
+      "type": "snapshot",
+      "date": "2026-11-24T23:18:13Z",
+      "commit": "18f53a3",
+      "size": 22799295,
+      "sha256": "0810bb8ec0c44dca2217ff6efd260469f783fef26616a0d261f997ab2ac01b6f",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/uprising_nx-v0.1.1-rc.4.nro",
+      "notes": "Restored v0.1.0 free-reticle + edge-pan Land feel with full-screen clamp."
+    },
+    {
+      "id": "v0.1.1-rc.3",
+      "type": "snapshot",
+      "date": "2026-11-24T22:55:11Z",
+      "commit": "a1e38eb",
+      "size": 22803391,
+      "sha256": "431a654f96d7773568cb8c61d37011cdbfc89c7513e8ecb7a3bbaf17ef41cdd5",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/uprising_nx-v0.1.1-rc.3.nro",
+      "notes": "Attempted Land camera turn bypass in override_006d2abc (superseded by rc.4)."
+    },
+    {
+      "id": "v0.1.1-rc.2",
+      "type": "snapshot",
+      "date": "2026-11-24T22:20:27Z",
+      "commit": "52379f3",
+      "size": 22803391,
+      "sha256": "219c25d414972b4737044c6338934f72c83be0f622dff73fc861db1a67ff404b",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/uprising_nx-v0.1.1-rc.2.nro",
+      "notes": "Added opt-in Pre-release update channel in Settings -> Save & System."
+    },
+    {
+      "id": "v0.1.1-rc.1",
+      "type": "snapshot",
+      "date": "2026-11-24T20:41:58Z",
+      "commit": "88e2a7a",
+      "size": 22795199,
+      "sha256": "4520172af019f304146eab3a391c32b3e0e006fc0b7be0ab3ef52abf31a638fc",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/uprising_nx-v0.1.1-rc.1.nro",
+      "notes": "Initial v0.1.1 RC: Land Y-invert fix, Z-target/orbit aim, 16:9 Pause merge, and Chapter End bonus alignment."
+    },
+    {
+      "id": "v0.1.0",
+      "type": "release",
+      "date": "2026-11-24T04:31:00Z",
+      "commit": "c787de2",
+      "size": 22782911,
+      "sha256": "65780e22fa68717940f35e7e60b823a9a68187cc8af37ea784d754c34260a9f2",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/v0.1.0/uprising_nx.nro",
+      "notes": "Initial public release: native AArch64 AOT recompiler, 60 fps Smooth Mode, dual-stick + gyro aiming, Z-targeting, 16:9 menus, baked-in shader warmup, 3DS save import/export, and auto-updater.",
+      "zip_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/v0.1.0/UprisingNX-v0.1.0.zip"
+    }
+  ]
+}

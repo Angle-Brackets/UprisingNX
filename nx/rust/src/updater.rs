@@ -17,6 +17,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "horizon")]
+const VERSIONS_MANIFEST_URL: &str =
+    "https://github.com/Angle-Brackets/UprisingNX/releases/download/snapshots/versions.json";
+#[cfg(target_os = "horizon")]
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/Angle-Brackets/UprisingNX/releases/latest";
 #[cfg(target_os = "horizon")]
@@ -83,8 +86,48 @@ pub struct UpdateView {
     pub progress: Option<f32>,
 }
 
+/// One historical release or snapshot entry from `versions.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionEntry {
+    pub id: String,
+    pub is_snapshot: bool,
+    pub date: String,
+    pub commit: String,
+    pub nro_url: String,
+    pub notes: String,
+}
+
+/// Parsed Minecraft-style `versions.json` manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionManifest {
+    pub latest_release: Option<String>,
+    pub latest_snapshot: Option<String>,
+    pub versions: Vec<VersionEntry>,
+}
+
+/// Snapshot passed to `Menu` for the `Version history` picker row.
+#[derive(Clone, Debug)]
+pub struct PickerView {
+    pub value: String,
+    pub heading: String,
+    pub detail: String,
+    pub loaded: bool,
+}
+
+impl Default for PickerView {
+    fn default() -> Self {
+        Self {
+            value: "Press A to load".to_owned(),
+            heading: "Version History (versions.json)".to_owned(),
+            detail: "Press A to load all past releases and snapshots, then Left/Right to pick and A to install or roll back.".to_owned(),
+            loaded: false,
+        }
+    }
+}
+
 struct Shared {
     state: Mutex<UpdateState>,
+    versions: Mutex<Vec<VersionEntry>>,
     progress_pct: AtomicI32,
     cancel: AtomicI32,
     announce: AtomicBool,
@@ -103,6 +146,7 @@ pub struct Updater {
     started_at: Instant,
     auto_checked: bool,
     include_prereleases: bool,
+    picker_index: usize,
     build: BuildVersion,
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
@@ -120,6 +164,7 @@ impl Updater {
             started_at: Instant::now(),
             auto_checked: false,
             include_prereleases,
+            picker_index: 0,
             build: BuildVersion {
                 version: version.to_owned(),
                 git_sha: git_sha.to_owned(),
@@ -128,6 +173,7 @@ impl Updater {
             },
             shared: Arc::new(Shared {
                 state: Mutex::new(UpdateState::Idle),
+                versions: Mutex::new(Vec::new()),
                 progress_pct: AtomicI32::new(0),
                 cancel: AtomicI32::new(0),
                 announce: AtomicBool::new(false),
@@ -143,6 +189,7 @@ impl Updater {
             return;
         }
         self.include_prereleases = include;
+        self.picker_index = 0;
         if !matches!(
             self.state(),
             UpdateState::Downloading { .. } | UpdateState::Ready { .. }
@@ -298,6 +345,102 @@ impl Updater {
         }
     }
 
+    fn filtered_versions(&self) -> Vec<VersionEntry> {
+        let Ok(guard) = self.shared.versions.lock() else {
+            return Vec::new();
+        };
+        guard
+            .iter()
+            .filter(|v| self.include_prereleases || !v.is_snapshot)
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot of the `Version history` picker row for `Menu`.
+    pub fn picker_view(&self) -> PickerView {
+        let list = self.filtered_versions();
+        if list.is_empty() {
+            if matches!(self.state(), UpdateState::Checking) {
+                return PickerView {
+                    value: "Loading...".to_owned(),
+                    heading: "Loading versions.json".to_owned(),
+                    detail: "Fetching full release and snapshot history from GitHub...".to_owned(),
+                    loaded: false,
+                };
+            }
+            return PickerView::default();
+        }
+        let idx = self.picker_index % list.len();
+        let entry = &list[idx];
+        let kind = if entry.is_snapshot { "Snapshot" } else { "Release" };
+        let date_short = entry.date.split('T').next().unwrap_or(&entry.date);
+        let commit_part = if entry.commit.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", entry.commit)
+        };
+        let heading = if date_short.is_empty() {
+            format!("{}  -  {}{}", entry.id, kind, commit_part)
+        } else {
+            format!("{}  -  {}  -  {}{}", entry.id, kind, date_short, commit_part)
+        };
+        let detail = if entry.notes.is_empty() {
+            format!("Press A to download and switch to {} ({}/{}).", entry.id, idx + 1, list.len())
+        } else {
+            format!("{} (Press A to install, {}/{})", entry.notes, idx + 1, list.len())
+        };
+        PickerView {
+            value: entry.id.clone(),
+            heading,
+            detail,
+            loaded: true,
+        }
+    }
+
+    /// Cycles the selected entry in `Version history` left (`-1`) or right (`+1`).
+    pub fn step_picker(&mut self, delta: i32) {
+        let list = self.filtered_versions();
+        if list.is_empty() {
+            self.start_check(false);
+            return;
+        }
+        let len = list.len() as i32;
+        let next = ((self.picker_index as i32 % len) + delta).rem_euclid(len) as usize;
+        self.picker_index = next;
+    }
+
+    /// Handles pressing `A` on the `Version history` row: loads `versions.json` if
+    /// not yet fetched, restarts to apply if a download is already ready, or
+    /// downloads the currently highlighted version (allowing upgrades or rollbacks).
+    pub fn trigger_picker_install(&mut self) -> bool {
+        if let UpdateState::Ready { tag } = self.state() {
+            log::info!("unx: applying staged version {tag} and relaunching");
+            #[cfg(target_os = "horizon")]
+            unsafe {
+                unx_updater_mark_pending_swap();
+            }
+            return true;
+        }
+        if matches!(self.state(), UpdateState::Checking | UpdateState::Downloading { .. }) {
+            return false;
+        }
+        let list = self.filtered_versions();
+        if list.is_empty() {
+            self.start_check(false);
+            return false;
+        }
+        let entry = &list[self.picker_index % list.len()];
+        if entry.nro_url.is_empty() {
+            Self::set_state(
+                &self.shared,
+                UpdateState::Failed(format!("Version {} has no downloadable NRO URL.", entry.id)),
+            );
+            return false;
+        }
+        self.start_download(entry.id.clone(), entry.nro_url.clone());
+        false
+    }
+
     fn join_finished_worker(&mut self) {
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
@@ -379,23 +522,12 @@ fn has_internet() -> bool {
 }
 
 #[cfg(target_os = "horizon")]
-fn run_check(shared: &Shared, build: &BuildVersion, include_prereleases: bool, announce: bool) {
-    if !has_internet() {
-        if announce {
-            Updater::set_state(shared, UpdateState::Idle);
-        } else {
-            Updater::set_state(shared, UpdateState::Failed("No internet connection.".to_owned()));
-        }
-        return;
-    }
-    let endpoint = if include_prereleases {
-        RELEASES_LIST_URL
-    } else {
-        LATEST_RELEASE_URL
-    };
-    let Ok(c_url) = CString::new(endpoint) else {
-        Updater::set_state(shared, UpdateState::Failed("Invalid release URL".to_owned()));
-        return;
+fn http_get_text(
+    shared: &Shared,
+    url: &str,
+) -> Result<String, (c_long, c_int, String)> {
+    let Ok(c_url) = CString::new(url) else {
+        return Err((0, -1, "Invalid URL".to_owned()));
     };
     let mut body = vec![0u8; HTTP_BUF_CAP];
     let mut err = [0u8; 256];
@@ -415,37 +547,102 @@ fn run_check(shared: &Shared, build: &BuildVersion, include_prereleases: bool, a
             err.len(),
         )
     };
-    if shared.cancel.load(Ordering::Acquire) != 0 {
-        return;
-    }
     if rc != 0 {
-        if http_status == 404 {
-            Updater::set_state(shared, UpdateState::UpToDate(build.display_label.clone()));
-            return;
-        }
-        let msg = c_buf_to_string(&err);
-        let detail = if msg.is_empty() {
-            format!("Could not reach GitHub (HTTP {http_status}, code {rc})")
-        } else {
-            format!("Could not reach GitHub: {msg}")
-        };
-        log::warn!("unx: updater check failed: {detail}");
+        return Err((http_status, rc, c_buf_to_string(&err)));
+    }
+    Ok(String::from_utf8_lossy(&body[..out_len.min(body.len())]).into_owned())
+}
+
+#[cfg(target_os = "horizon")]
+fn run_check(shared: &Shared, build: &BuildVersion, include_prereleases: bool, announce: bool) {
+    if !has_internet() {
         if announce {
             Updater::set_state(shared, UpdateState::Idle);
         } else {
-            Updater::set_state(shared, UpdateState::Failed(detail));
+            Updater::set_state(shared, UpdateState::Failed("No internet connection.".to_owned()));
         }
         return;
     }
 
-    let text = String::from_utf8_lossy(&body[..out_len.min(body.len())]);
-    let Some(release) = parse_github_release_for_channel(&text, ASSET_NAME, include_prereleases) else {
-        log::warn!("unx: updater got unexpected JSON from GitHub ({out_len} bytes)");
-        Updater::set_state(
-            shared,
-            UpdateState::Failed("GitHub returned an unexpected reply.".to_owned()),
-        );
-        return;
+    // 1. Prefer the Minecraft-style `versions.json` manifest (populates full
+    //    Version history picker and avoids GitHub REST API rate limits).
+    let mut resolved: Option<ReleaseInfo> = None;
+    match http_get_text(shared, VERSIONS_MANIFEST_URL) {
+        Ok(text) => {
+            if shared.cancel.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            if let Some(manifest) = parse_versions_manifest(&text) {
+                log::info!(
+                    "unx: loaded versions.json ({} versions, latest release={:?}, snapshot={:?})",
+                    manifest.versions.len(),
+                    manifest.latest_release,
+                    manifest.latest_snapshot,
+                );
+                if let Ok(mut guard) = shared.versions.lock() {
+                    *guard = manifest.versions.clone();
+                }
+                resolved = select_latest_from_manifest(&manifest, include_prereleases);
+            } else {
+                log::warn!("unx: versions.json parse failed ({} bytes), falling back to GitHub API", text.len());
+            }
+        }
+        Err((status, rc, msg)) => {
+            if shared.cancel.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            log::warn!("unx: versions.json fetch failed (HTTP {status}, code {rc}: {msg}), falling back to GitHub API");
+        }
+    }
+
+    // 2. Fallback to GitHub Releases API if `versions.json` wasn't reachable.
+    let release = match resolved {
+        Some(info) => info,
+        None => {
+            let endpoint = if include_prereleases {
+                RELEASES_LIST_URL
+            } else {
+                LATEST_RELEASE_URL
+            };
+            let text = match http_get_text(shared, endpoint) {
+                Ok(t) => t,
+                Err((http_status, rc, msg)) => {
+                    if shared.cancel.load(Ordering::Acquire) != 0 {
+                        return;
+                    }
+                    if http_status == 404 {
+                        Updater::set_state(shared, UpdateState::UpToDate(build.display_label.clone()));
+                        return;
+                    }
+                    let detail = if msg.is_empty() {
+                        format!("Could not reach GitHub (HTTP {http_status}, code {rc})")
+                    } else {
+                        format!("Could not reach GitHub: {msg}")
+                    };
+                    log::warn!("unx: updater check failed: {detail}");
+                    if announce {
+                        Updater::set_state(shared, UpdateState::Idle);
+                    } else {
+                        Updater::set_state(shared, UpdateState::Failed(detail));
+                    }
+                    return;
+                }
+            };
+            if shared.cancel.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            match parse_github_release_for_channel(&text, ASSET_NAME, include_prereleases) {
+                Some(info) => info,
+                None => {
+                    log::warn!("unx: updater got unexpected JSON from GitHub ({} bytes)", text.len());
+                    Updater::set_state(
+                        shared,
+                        UpdateState::Failed("GitHub returned an unexpected reply.".to_owned()),
+                    );
+                    return;
+                }
+            }
+        }
     };
 
     let newer = is_newer_release(
@@ -948,6 +1145,228 @@ impl<'a> JsonScanner<'a> {
             prerelease,
         ))
     }
+
+    fn parse_latest_object(&mut self) -> Option<(Option<String>, Option<String>)> {
+        if !self.expect(b'{') {
+            return None;
+        }
+        let mut release = None;
+        let mut snapshot = None;
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Some((release, snapshot));
+        }
+        loop {
+            let key = self.parse_string()?;
+            if !self.expect(b':') {
+                return None;
+            }
+            match key.as_str() {
+                "release" => release = self.parse_string(),
+                "snapshot" => snapshot = self.parse_string(),
+                _ => {
+                    if !self.skip_value() {
+                        return None;
+                    }
+                }
+            }
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Some((release, snapshot));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn parse_version_entry_object(&mut self) -> Option<VersionEntry> {
+        if !self.expect(b'{') {
+            return None;
+        }
+        let mut id: Option<String> = None;
+        let mut is_snapshot = false;
+        let mut date = String::new();
+        let mut commit = String::new();
+        let mut nro_url = String::new();
+        let mut notes = String::new();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return None;
+        }
+        loop {
+            let key = self.parse_string()?;
+            if !self.expect(b':') {
+                return None;
+            }
+            match key.as_str() {
+                "id" => id = self.parse_string(),
+                "type" => {
+                    if let Some(t) = self.parse_string() {
+                        is_snapshot = !t.eq_ignore_ascii_case("release");
+                    }
+                }
+                "date" => {
+                    if let Some(s) = self.parse_string() {
+                        date = s;
+                    }
+                }
+                "commit" => {
+                    if let Some(s) = self.parse_string() {
+                        commit = s;
+                    }
+                }
+                "nro_url" => {
+                    if let Some(s) = self.parse_string() {
+                        nro_url = s;
+                    }
+                }
+                "notes" => {
+                    if let Some(s) = self.parse_string() {
+                        notes = s;
+                    }
+                }
+                _ => {
+                    if !self.skip_value() {
+                        return None;
+                    }
+                }
+            }
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        Some(VersionEntry {
+            id: id?,
+            is_snapshot,
+            date,
+            commit,
+            nro_url,
+            notes,
+        })
+    }
+}
+
+/// Parses a Minecraft-style `versions.json` manifest (`latest` + `versions` array).
+pub fn parse_versions_manifest(json: &str) -> Option<VersionManifest> {
+    let mut sc = JsonScanner::new(json);
+    if !sc.expect(b'{') {
+        return None;
+    }
+    let mut latest_release: Option<String> = None;
+    let mut latest_snapshot: Option<String> = None;
+    let mut versions: Vec<VersionEntry> = Vec::new();
+    if sc.peek() == Some(b'}') {
+        return None;
+    }
+    loop {
+        let key = sc.parse_string()?;
+        if !sc.expect(b':') {
+            return None;
+        }
+        match key.as_str() {
+            "latest" => {
+                let (rel, snap) = sc.parse_latest_object()?;
+                latest_release = rel;
+                latest_snapshot = snap;
+            }
+            "versions" => {
+                if !sc.expect(b'[') {
+                    return None;
+                }
+                if sc.peek() != Some(b']') {
+                    loop {
+                        if let Some(entry) = sc.parse_version_entry_object() {
+                            versions.push(entry);
+                        } else {
+                            return None;
+                        }
+                        match sc.peek() {
+                            Some(b',') => sc.pos += 1,
+                            Some(b']') => {
+                                sc.pos += 1;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                } else {
+                    sc.pos += 1;
+                }
+            }
+            _ => {
+                if !sc.skip_value() {
+                    return None;
+                }
+            }
+        }
+        match sc.peek() {
+            Some(b',') => sc.pos += 1,
+            Some(b'}') => break,
+            _ => break,
+        }
+    }
+    if versions.is_empty() {
+        return None;
+    }
+    Some(VersionManifest {
+        latest_release,
+        latest_snapshot,
+        versions,
+    })
+}
+
+/// Selects the newest downloadable release from a parsed `versions.json` manifest
+/// for the active channel (`Stable` = latest release, `Pre-release` = newer of
+/// `latest.release` and `latest.snapshot`).
+pub fn select_latest_from_manifest(
+    manifest: &VersionManifest,
+    include_prereleases: bool,
+) -> Option<ReleaseInfo> {
+    let find_by_id = |id: &str| {
+        manifest
+            .versions
+            .iter()
+            .find(|v| v.id.eq_ignore_ascii_case(id) && !v.nro_url.is_empty())
+    };
+    let best_release = manifest
+        .latest_release
+        .as_deref()
+        .and_then(find_by_id)
+        .or_else(|| manifest.versions.iter().find(|v| !v.is_snapshot && !v.nro_url.is_empty()));
+
+    let chosen = if !include_prereleases {
+        best_release
+    } else {
+        let best_snapshot = manifest
+            .latest_snapshot
+            .as_deref()
+            .and_then(find_by_id)
+            .or_else(|| manifest.versions.iter().find(|v| v.is_snapshot && !v.nro_url.is_empty()));
+        match (best_release, best_snapshot) {
+            (Some(r), Some(s)) => {
+                if is_newer_release(&s.id, "", "", &r.id) {
+                    Some(s)
+                } else {
+                    Some(r)
+                }
+            }
+            (Some(r), None) => Some(r),
+            (None, Some(s)) => Some(s),
+            (None, None) => None,
+        }
+    }?;
+
+    Some(ReleaseInfo {
+        tag_name: chosen.id.clone(),
+        asset_url: Some(chosen.nro_url.clone()),
+    })
 }
 
 /// Parses GitHub's `/releases/latest` JSON payload, extracting `tag_name` and
@@ -1132,5 +1551,84 @@ mod tests {
         assert!(validate_nro_file(&path).is_err());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_versions_manifest_and_selects_by_channel() {
+        let sample = r#"{
+            "schema": 1,
+            "latest": {
+                "release": "v0.1.1",
+                "snapshot": "v0.1.1-rc.9"
+            },
+            "versions": [
+                {
+                    "id": "v0.1.1",
+                    "type": "release",
+                    "date": "2026-11-25T00:33:35Z",
+                    "commit": "0fa63b0",
+                    "size": 22803391,
+                    "sha256": "abcd",
+                    "nro_url": "https://example.invalid/v0.1.1/uprising_nx.nro",
+                    "notes": "Official v0.1.1 release."
+                },
+                {
+                    "id": "v0.1.1-rc.9",
+                    "type": "snapshot",
+                    "date": "2026-11-25T00:25:21Z",
+                    "commit": "cd41797",
+                    "nro_url": "https://example.invalid/snapshots/uprising_nx-v0.1.1-rc.9.nro",
+                    "notes": "Final RC."
+                },
+                {
+                    "id": "v0.1.0",
+                    "type": "release",
+                    "date": "2026-11-24T04:31:00Z",
+                    "commit": "c787de2",
+                    "nro_url": "https://example.invalid/v0.1.0/uprising_nx.nro",
+                    "notes": "Initial release."
+                }
+            ]
+        }"#;
+        let m = parse_versions_manifest(sample).unwrap();
+        assert_eq!(m.latest_release.as_deref(), Some("v0.1.1"));
+        assert_eq!(m.latest_snapshot.as_deref(), Some("v0.1.1-rc.9"));
+        assert_eq!(m.versions.len(), 3);
+        assert!(!m.versions[0].is_snapshot);
+        assert!(m.versions[1].is_snapshot);
+
+        // Both channels choose v0.1.1 over older v0.1.1-rc.9
+        let stable = select_latest_from_manifest(&m, false).unwrap();
+        assert_eq!(stable.tag_name, "v0.1.1");
+        let pre = select_latest_from_manifest(&m, true).unwrap();
+        assert_eq!(pre.tag_name, "v0.1.1");
+
+        // When a newer v0.1.2-rc.1 snapshot exists, Pre-release picks it while Stable stays on v0.1.1
+        let mut m2 = m.clone();
+        m2.latest_snapshot = Some("v0.1.2-rc.1".into());
+        m2.versions.insert(
+            0,
+            VersionEntry {
+                id: "v0.1.2-rc.1".into(),
+                is_snapshot: true,
+                date: "2026-11-26T00:00:00Z".into(),
+                commit: "1234567".into(),
+                nro_url: "https://example.invalid/snapshots/uprising_nx-v0.1.2-rc.1.nro".into(),
+                notes: "Next snapshot".into(),
+            },
+        );
+        assert_eq!(select_latest_from_manifest(&m2, false).unwrap().tag_name, "v0.1.1");
+        assert_eq!(select_latest_from_manifest(&m2, true).unwrap().tag_name, "v0.1.2-rc.1");
+
+        // Picker filters snapshots out on Stable channel and cycles cleanly on Pre-release channel
+        let mut upd = Updater::new("0.1.1", "0fa63b0", "v0.1.1", "v0.1.1", false);
+        *upd.shared.versions.lock().unwrap() = m2.versions.clone();
+        assert_eq!(upd.picker_view().value, "v0.1.1");
+        upd.step_picker(1);
+        assert_eq!(upd.picker_view().value, "v0.1.0");
+        upd.set_include_prereleases(true);
+        assert_eq!(upd.picker_view().value, "v0.1.2-rc.1");
+        upd.step_picker(1);
+        assert_eq!(upd.picker_view().value, "v0.1.1");
     }
 }

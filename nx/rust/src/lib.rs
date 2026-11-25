@@ -1597,6 +1597,7 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
         unx.menu.set_save_counts(saves::pending_import_count(), saves::live_save_count(&unx.data_dir));
     }
     unx.menu.set_update_view(unx.updater.view());
+    unx.menu.set_picker_view(unx.updater.picker_view());
     unx.host_last = host;
     let docked = unx.docked;
     match unx.menu.input(buttons, &mut unx.settings, docked) {
@@ -1620,12 +1621,25 @@ fn unx_menu(unx: &mut Unx, input: Option<&UnxInput>) -> Option<u32> {
                 return Some(1);
             }
             unx.menu.set_update_view(unx.updater.view());
+            unx.menu.set_picker_view(unx.updater.picker_view());
         }
         Some(menu::Changed::UpdateChannel) => {
             unx.settings.export_controls();
             unx.updater.set_include_prereleases(unx.settings.update_prerelease());
             unx.menu.set_update_view(unx.updater.view());
+            unx.menu.set_picker_view(unx.updater.picker_view());
             unx.settings_changed("menu");
+        }
+        Some(menu::Changed::VersionPickerStep(delta)) => {
+            unx.updater.step_picker(delta);
+            unx.menu.set_picker_view(unx.updater.picker_view());
+        }
+        Some(menu::Changed::VersionPickerInstall) => {
+            if unx.updater.trigger_picker_install() {
+                return Some(1);
+            }
+            unx.menu.set_update_view(unx.updater.view());
+            unx.menu.set_picker_view(unx.updater.picker_view());
         }
         Some(menu::Changed::ImportSave) => {
             match saves::import_from_menu(&unx.data_dir) {
