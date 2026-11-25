@@ -83,7 +83,9 @@ jobs:
           print(f"VERSION={ver_raw} HEAD={head_sha[:7]} event={event} active_tag={active_tag or '-'}")
 
           if active_tag:
-              if CLEAN_TAG_RE.match(active_tag):
+              if active_tag == "snapshots":
+                  print("OK: Rolling snapshots archive release.")
+              elif CLEAN_TAG_RE.match(active_tag):
                   expected_tag = f"v{ver_raw}"
                   if active_tag != expected_tag:
                       sys.exit(
