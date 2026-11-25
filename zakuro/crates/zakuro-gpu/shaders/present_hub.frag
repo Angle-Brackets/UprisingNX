@@ -229,6 +229,89 @@ void main() {
         return;
     }
 
+    if (crop.layout_kind == 4) {
+        // Pause (In-Battle Pause Menu, Options/Controls/Sound, Quit Modal, & Remove Display):
+        //   pad0 = PauseMenu state:
+        //     1, 2, 4 -> Main Pause (centered card, faded top strip cropped: by=42..240)
+        //     3       -> Quit Confirmation modal (exact dialog box cropped: bx=16.5..303.5, by=18.5..221.5)
+        //     5, 6, 7 -> Options / Controls / Volume (centered full 4:3 card above 54px bottom help bar)
+        //     9       -> Remove Display / Photo Mode (clean 16:9 view + bottom-right DISPLAY tab only)
+        vec3 col = sample_top(uv, duv);
+
+        bool is_quit = abs(crop.pad0 - 3.0) < 0.5;
+        bool is_photo = crop.pad0 >= 8.5;
+        bool is_options = !is_photo && crop.pad0 >= 4.5;
+
+        if (is_photo) {
+            // Clean 16:9 screenshot view: show only KIU's bottom-right `DISPLAY` tab
+            // (`bx = 222..320, by = 207..240` = 98x33) anchored cleanly at bottom-right.
+            vec2 tab_min = vec2(W - 88.0, H - 30.0);
+            vec2 tab_max = vec2(W, H);
+            if (p.x >= tab_min.x && p.x <= tab_max.x && p.y >= tab_min.y && p.y <= tab_max.y) {
+                vec2 local = (p - tab_min) / (tab_max - tab_min);
+                vec2 buv = vec2(mix(222.0 / 320.0, 1.0, local.x), mix(207.0 / 240.0, 1.0, local.y));
+                vec2 bduv = dp / (tab_max - tab_min) * vec2(98.0 / 320.0, 33.0 / 240.0);
+                col = sample_bot(buv, bduv);
+            }
+            colour = vec4(clamp(col, 0.0, 1.0), 1.0);
+            return;
+        }
+
+        // Source UV sub-rect on the 320x240 bottom screen and destination rect in 426.67x240 space.
+        vec2 src_min = is_quit
+            ? vec2(16.5 / 320.0, 18.5 / 240.0)
+            : (is_options ? vec2(0.0, 0.0) : vec2(0.0, 42.0 / 240.0));
+        vec2 src_max = is_quit
+            ? vec2(303.5 / 320.0, 221.5 / 240.0)
+            : vec2(1.0, 1.0);
+
+        vec2 card_size = is_quit
+            ? vec2(246.0, 174.0)
+            : (is_options ? vec2(224.0, 168.0) : vec2(256.0, 158.4));
+        float card_y0 = is_quit
+            ? (H - 174.0) * 0.5
+            : (is_options ? 10.0 : 50.0);
+        vec2 card_min = vec2((W - card_size.x) * 0.5, card_y0);
+        vec2 card_max = card_min + card_size;
+        float radius = is_quit ? 7.5 : (is_options ? 5.0 : 6.0);
+
+        // Signed distance to the rounded card rectangle (`<= 0` inside).
+        vec2 card_center = 0.5 * (card_min + card_max);
+        vec2 card_half = 0.5 * card_size;
+        vec2 q = abs(p - card_center) - (card_half - vec2(radius));
+        float dist = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+
+        // Soft drop shadow behind the card (offset +2.5px downward).
+        vec2 qs = abs((p - vec2(0.0, 2.5)) - card_center) - (card_half - vec2(radius));
+        float sdist = length(max(qs, vec2(0.0))) + min(max(qs.x, qs.y), 0.0) - radius;
+        if (sdist > 0.0 && sdist < 11.0) {
+            float shadow = (1.0 - smoothstep(0.0, 11.0, sdist)) * 0.58;
+            col *= (1.0 - shadow);
+        }
+
+        // Anti-aliased rounded card + optional warm gold hairline frame (Quit dialog already has its own black border).
+        float aa = max(dp.x, dp.y) * 0.75;
+        if (!is_quit) {
+            float border_w = 1.4;
+            float border_mask = 1.0 - smoothstep(border_w - aa, border_w + aa, dist);
+            if (border_mask > 0.0) {
+                vec3 frame_col = vec3(0.88, 0.76, 0.42);
+                col = mix(col, frame_col, border_mask * 0.88);
+            }
+        }
+        float card_mask = 1.0 - smoothstep(-aa, aa, dist);
+        if (card_mask > 0.0) {
+            vec2 local_uv = clamp((p - card_min) / card_size, vec2(0.0), vec2(1.0));
+            vec2 buv = mix(src_min, src_max, local_uv);
+            vec2 bduv = (dp / card_size) * (src_max - src_min);
+            vec3 card_col = sample_bot(buv, bduv);
+            col = mix(col, card_col, card_mask);
+        }
+
+        colour = vec4(clamp(col, 0.0, 1.0), 1.0);
+        return;
+    }
+
     // SoloHub (Option B — Perimeter Sanctuary Frame):
     // 1. Live 3D Sanctuary camera + relocated top-left Total Hearts + bottom-center blurb
     vec3 col = sample_top(uv, duv);

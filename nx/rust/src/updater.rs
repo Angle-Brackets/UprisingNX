@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "horizon")]
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/Angle-Brackets/UprisingNX/releases/latest";
+#[cfg(target_os = "horizon")]
+const RELEASES_LIST_URL: &str =
+    "https://api.github.com/repos/Angle-Brackets/UprisingNX/releases?per_page=5";
 const ASSET_NAME: &str = "uprising_nx.nro";
 const AUTO_CHECK_DELAY: Duration = Duration::from_secs(3);
 const MIN_VALID_NRO_BYTES: u64 = 1024 * 1024; // 1 MiB sanity floor
@@ -99,16 +102,24 @@ struct BuildVersion {
 pub struct Updater {
     started_at: Instant,
     auto_checked: bool,
+    include_prereleases: bool,
     build: BuildVersion,
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Updater {
-    pub fn new(version: &str, git_sha: &str, release_tag: &str, display_label: &str) -> Self {
+    pub fn new(
+        version: &str,
+        git_sha: &str,
+        release_tag: &str,
+        display_label: &str,
+        include_prereleases: bool,
+    ) -> Self {
         Self {
             started_at: Instant::now(),
             auto_checked: false,
+            include_prereleases,
             build: BuildVersion {
                 version: version.to_owned(),
                 git_sha: git_sha.to_owned(),
@@ -122,6 +133,22 @@ impl Updater {
                 announce: AtomicBool::new(false),
             }),
             worker: None,
+        }
+    }
+
+    /// Switches between Stable (`false`) and Pre-release (`true`) channels.
+    /// If no download/staging is active, immediately re-checks the new channel.
+    pub fn set_include_prereleases(&mut self, include: bool) {
+        if self.include_prereleases == include {
+            return;
+        }
+        self.include_prereleases = include;
+        if !matches!(
+            self.state(),
+            UpdateState::Downloading { .. } | UpdateState::Ready { .. }
+        ) {
+            Self::set_state(&self.shared, UpdateState::Idle);
+            self.start_check(false);
         }
     }
 
@@ -145,14 +172,22 @@ impl Updater {
                 value: "Check now".to_owned(),
                 tone: UpdateTone::Neutral,
                 heading: format!("UprisingNX {}", self.build.display_label),
-                detail: "Checks GitHub Releases for a newer Switch build. Press A to check now.".to_owned(),
+                detail: if self.include_prereleases {
+                    "Checks GitHub Releases (including pre-releases) for a newer build. Press A to check now.".to_owned()
+                } else {
+                    "Checks GitHub Releases for a newer Switch build. Press A to check now.".to_owned()
+                },
                 progress: None,
             },
             UpdateState::Checking => UpdateView {
                 value: "Checking...".to_owned(),
                 tone: UpdateTone::Accent,
                 heading: "Checking GitHub Releases".to_owned(),
-                detail: "Contacting github.com/Angle-Brackets/UprisingNX for the latest release...".to_owned(),
+                detail: if self.include_prereleases {
+                    "Contacting github.com/Angle-Brackets/UprisingNX for the latest release or pre-release...".to_owned()
+                } else {
+                    "Contacting github.com/Angle-Brackets/UprisingNX for the latest release...".to_owned()
+                },
                 progress: None,
             },
             UpdateState::UpToDate(tag) => UpdateView {
@@ -286,11 +321,12 @@ impl Updater {
         Self::set_state(&self.shared, UpdateState::Checking);
         let shared = Arc::clone(&self.shared);
         let build = self.build.clone();
+        let include_prereleases = self.include_prereleases;
         let spawned = std::thread::Builder::new()
             .name("unx-upd-chk".into())
             .stack_size(256 << 10)
             .spawn(move || {
-                run_check(&shared, &build, announce);
+                run_check(&shared, &build, include_prereleases, announce);
             });
         match spawned {
             Ok(h) => self.worker = Some(h),
@@ -343,7 +379,7 @@ fn has_internet() -> bool {
 }
 
 #[cfg(target_os = "horizon")]
-fn run_check(shared: &Shared, build: &BuildVersion, announce: bool) {
+fn run_check(shared: &Shared, build: &BuildVersion, include_prereleases: bool, announce: bool) {
     if !has_internet() {
         if announce {
             Updater::set_state(shared, UpdateState::Idle);
@@ -352,7 +388,12 @@ fn run_check(shared: &Shared, build: &BuildVersion, announce: bool) {
         }
         return;
     }
-    let Ok(c_url) = CString::new(LATEST_RELEASE_URL) else {
+    let endpoint = if include_prereleases {
+        RELEASES_LIST_URL
+    } else {
+        LATEST_RELEASE_URL
+    };
+    let Ok(c_url) = CString::new(endpoint) else {
         Updater::set_state(shared, UpdateState::Failed("Invalid release URL".to_owned()));
         return;
     };
@@ -398,7 +439,7 @@ fn run_check(shared: &Shared, build: &BuildVersion, announce: bool) {
     }
 
     let text = String::from_utf8_lossy(&body[..out_len.min(body.len())]);
-    let Some(release) = parse_github_release(&text, ASSET_NAME) else {
+    let Some(release) = parse_github_release_for_channel(&text, ASSET_NAME, include_prereleases) else {
         log::warn!("unx: updater got unexpected JSON from GitHub ({out_len} bytes)");
         Updater::set_state(
             shared,
@@ -451,7 +492,7 @@ fn run_check(shared: &Shared, build: &BuildVersion, announce: bool) {
 }
 
 #[cfg(not(target_os = "horizon"))]
-fn run_check(shared: &Shared, _build: &BuildVersion, _announce: bool) {
+fn run_check(shared: &Shared, _build: &BuildVersion, _include_prereleases: bool, _announce: bool) {
     Updater::set_state(
         shared,
         UpdateState::Failed("Auto-updater is only supported on Nintendo Switch.".to_owned()),
@@ -567,7 +608,23 @@ fn parse_numeric_prefix(s: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Returns `true` if `remote_tag` (e.g. `"v0.1.0-abc1234"` or `"v0.2.0"`) is
+/// Parses a pre-release label like `"rc.2"`, `"rc2"`, `"beta.1"`, `"alpha1"` into
+/// `(lowercase_prefix, trailing_number)` so `rc.2 > rc.1` and `rc.1 > beta.2`.
+fn parse_prerelease_tag(suffix: &str) -> Option<(String, u32)> {
+    let s = suffix.trim().to_ascii_lowercase();
+    let num_start = s.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |i| i + 1);
+    if num_start >= s.len() {
+        return None;
+    }
+    let num = s[num_start..].parse::<u32>().ok()?;
+    let prefix = s[..num_start].trim_end_matches(['.', '-', '_']).to_owned();
+    if prefix.is_empty() {
+        return None;
+    }
+    Some((prefix, num))
+}
+
+/// Returns `true` if `remote_tag` (e.g. `"v0.1.0-abc1234"`, `"v0.1.1-rc.1"`, or `"v0.2.0"`) is
 /// newer than the currently running build (`cur_version`, `cur_sha`, `cur_release_tag`).
 pub fn is_newer_release(
     remote_tag: &str,
@@ -613,20 +670,29 @@ pub fn is_newer_release(
 
     // 2. Remote rolling/pre-release `-<suffix>` matching current git SHA.
     let r_suffix = r_norm.split_once('-').map(|(_, s)| s.trim()).filter(|s| !s.is_empty());
+    let c_suffix = cur_rel_norm.split_once('-').map(|(_, s)| s.trim()).filter(|s| !s.is_empty());
     let cur_sha = cur_sha.trim();
     if let Some(suffix) = r_suffix {
         if !cur_sha.is_empty() && !cur_sha.eq_ignore_ascii_case("unknown") && suffix.eq_ignore_ascii_case(cur_sha) {
             return false;
         }
         // 3. Clean release (e.g. `v0.1.0`, no `-` suffix) never downgrades to a
-        //    same-version `-<sha>` pre-release/rolling tag.
-        if !cur_rel_norm.is_empty() && !cur_rel_norm.contains('-') {
+        //    same-version `-<sha>` or `-rc.N` pre-release tag.
+        if !cur_rel_norm.is_empty() && c_suffix.is_none() {
             return false;
+        }
+        // 4. Both current and remote are structured pre-releases of the same version
+        //    (e.g. `v0.1.1-rc.2` vs `v0.1.1-rc.1`): order them so we never downgrade.
+        if let (Some((rp, rn)), Some((cp, cn))) = (
+            parse_prerelease_tag(suffix),
+            c_suffix.and_then(parse_prerelease_tag),
+        ) {
+            return (rp, rn) > (cp, cn);
         }
     }
 
-    // 4. Otherwise offer update (e.g. rolling `v0.1.0 (3deff39)` -> clean `v0.1.0`
-    //    or newer rolling `v0.1.0-abc1234`, or pre-release `v0.1.0-rc1` -> `v0.1.0`).
+    // 5. Otherwise offer update (e.g. rolling `v0.1.0 (3deff39)` -> clean `v0.1.0`
+    //    or newer rolling `v0.1.0-abc1234`, or pre-release `v0.1.1-rc.1` -> `v0.1.1`).
     true
 }
 
@@ -801,66 +867,144 @@ impl<'a> JsonScanner<'a> {
             }
         }
     }
+    fn parse_bool(&mut self) -> Option<bool> {
+        self.skip_ws();
+        if self.bytes[self.pos..].starts_with(b"true") {
+            self.pos += 4;
+            Some(true)
+        } else if self.bytes[self.pos..].starts_with(b"false") {
+            self.pos += 5;
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn parse_release_object(&mut self, wanted_asset: &str) -> Option<(ReleaseInfo, bool, bool)> {
+        if !self.expect(b'{') {
+            return None;
+        }
+        let mut tag_name: Option<String> = None;
+        let mut asset_url: Option<String> = None;
+        let mut draft = false;
+        let mut prerelease = false;
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return None;
+        }
+        loop {
+            let key = self.parse_string()?;
+            if !self.expect(b':') {
+                return None;
+            }
+            match key.as_str() {
+                "tag_name" => tag_name = self.parse_string(),
+                "draft" => draft = self.parse_bool().unwrap_or(false),
+                "prerelease" => prerelease = self.parse_bool().unwrap_or(false),
+                "assets" => {
+                    if !self.expect(b'[') {
+                        return None;
+                    }
+                    if self.peek() != Some(b']') {
+                        loop {
+                            let (name, url) = self.parse_asset_object()?;
+                            if name.as_deref() == Some(wanted_asset) {
+                                asset_url = url;
+                            }
+                            match self.peek() {
+                                Some(b',') => self.pos += 1,
+                                Some(b']') => {
+                                    self.pos += 1;
+                                    break;
+                                }
+                                _ => return None,
+                            }
+                        }
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+                _ => {
+                    if !self.skip_value() {
+                        return None;
+                    }
+                }
+            }
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => break, // allow graceful completion even if response was truncated after assets
+            }
+        }
+        Some((
+            ReleaseInfo {
+                tag_name: tag_name?,
+                asset_url,
+            },
+            draft,
+            prerelease,
+        ))
+    }
 }
 
 /// Parses GitHub's `/releases/latest` JSON payload, extracting `tag_name` and
 /// the `browser_download_url` of the asset matching `wanted_asset`.
+#[cfg(test)]
 pub fn parse_github_release(json: &str, wanted_asset: &str) -> Option<ReleaseInfo> {
+    parse_github_release_for_channel(json, wanted_asset, true)
+}
+
+/// Parses either a single GitHub release object (`/releases/latest`) or a release
+/// list array (`/releases?per_page=N`), skipping drafts (and pre-releases when
+/// `include_prereleases` is `false`) and preferring the newest entry that includes
+/// `wanted_asset`.
+pub fn parse_github_release_for_channel(
+    json: &str,
+    wanted_asset: &str,
+    include_prereleases: bool,
+) -> Option<ReleaseInfo> {
     let mut sc = JsonScanner::new(json);
-    if !sc.expect(b'{') {
-        return None;
-    }
-    let mut tag_name: Option<String> = None;
-    let mut asset_url: Option<String> = None;
-    if sc.peek() == Some(b'}') {
-        return None;
-    }
-    loop {
-        let key = sc.parse_string()?;
-        if !sc.expect(b':') {
-            return None;
+    match sc.peek()? {
+        b'{' => {
+            let (info, draft, prerelease) = sc.parse_release_object(wanted_asset)?;
+            if draft || (!include_prereleases && prerelease) {
+                return None;
+            }
+            Some(info)
         }
-        match key.as_str() {
-            "tag_name" => tag_name = sc.parse_string(),
-            "assets" => {
-                if !sc.expect(b'[') {
-                    return None;
-                }
-                if sc.peek() != Some(b']') {
-                    loop {
-                        let (name, url) = sc.parse_asset_object()?;
-                        if name.as_deref() == Some(wanted_asset) {
-                            asset_url = url;
-                        }
-                        match sc.peek() {
-                            Some(b',') => sc.pos += 1,
-                            Some(b']') => {
-                                sc.pos += 1;
-                                break;
+        b'[' => {
+            sc.pos += 1;
+            if sc.peek() == Some(b']') {
+                return None;
+            }
+            let mut fallback: Option<ReleaseInfo> = None;
+            loop {
+                match sc.parse_release_object(wanted_asset) {
+                    Some((info, draft, prerelease)) => {
+                        if !draft && (include_prereleases || !prerelease) {
+                            if info.asset_url.is_some() {
+                                return Some(info);
                             }
-                            _ => return None,
+                            if fallback.is_none() {
+                                fallback = Some(info);
+                            }
                         }
                     }
-                } else {
-                    sc.pos += 1;
+                    None => break,
+                }
+                match sc.peek() {
+                    Some(b',') => sc.pos += 1,
+                    Some(b']') => break,
+                    _ => break,
                 }
             }
-            _ => {
-                if !sc.skip_value() {
-                    return None;
-                }
-            }
+            fallback
         }
-        match sc.peek() {
-            Some(b',') => sc.pos += 1,
-            Some(b'}') => break,
-            _ => break, // allow graceful completion even if response was truncated after assets
-        }
+        _ => None,
     }
-    Some(ReleaseInfo {
-        tag_name: tag_name?,
-        asset_url,
-    })
 }
 
 #[cfg(test)]
@@ -893,10 +1037,18 @@ mod tests {
         assert!(is_newer_release("v0.2.0", "0.1.0", "3deff39", "v0.1.0"));
         assert!(!is_newer_release("v0.0.9", "0.1.0", "3deff39", "v0.1.0"));
 
-        // Pre-release tag (e.g. `v0.1.0-rc1`) upgrades to clean `v0.1.0` or `v0.1.0-rc2`, not itself
+        // Pre-release tag (e.g. `v0.1.0-rc.1`) upgrades to `v0.1.0-rc.2` or clean `v0.1.0`,
+        // never downgrades `rc.2` -> `rc.1` or clean `v0.1.1` -> `v0.1.1-rc.1`.
         assert!(!is_newer_release("v0.1.0-rc1", "0.1.0", "3deff39", "v0.1.0-rc1"));
         assert!(is_newer_release("v0.1.0-rc2", "0.1.0", "3deff39", "v0.1.0-rc1"));
+        assert!(!is_newer_release("v0.1.0-rc1", "0.1.0", "3deff39", "v0.1.0-rc2"));
+        assert!(is_newer_release("v0.1.1-rc.2", "0.1.1", "3deff39", "v0.1.1-rc.1"));
+        assert!(!is_newer_release("v0.1.1-rc.1", "0.1.1", "3deff39", "v0.1.1-rc.2"));
+        assert!(is_newer_release("v0.1.1-rc.1", "0.1.0", "3deff39", "v0.1.0"));
         assert!(is_newer_release("v0.1.0", "0.1.0", "3deff39", "v0.1.0-rc1"));
+        assert!(is_newer_release("v0.1.1", "0.1.1", "3deff39", "v0.1.1-rc.2"));
+        assert!(!is_newer_release("v0.1.1-rc.2", "0.1.1", "3deff39", "v0.1.1"));
+        assert!(!is_newer_release("v0.1.0", "0.1.1", "3deff39", "v0.1.1-rc.1"));
 
         // Malformed / non-semver remote tags never trigger bogus updates
         assert!(!is_newer_release("", "0.1.0", "3deff39", ""));
@@ -931,6 +1083,37 @@ mod tests {
             info.asset_url.as_deref(),
             Some("https://github.com/Angle-Brackets/UprisingNX/releases/download/v0.1.0-abc1234/uprising_nx.nro")
         );
+    }
+
+    #[test]
+    fn parses_github_releases_array_for_prerelease_and_stable_channels() {
+        let sample = r#"[
+            {
+                "tag_name": "v0.1.2-draft",
+                "draft": true,
+                "prerelease": true,
+                "assets": [{"name": "uprising_nx.nro", "browser_download_url": "https://example.invalid/draft.nro"}]
+            },
+            {
+                "tag_name": "v0.1.1-rc.1",
+                "draft": false,
+                "prerelease": true,
+                "assets": [{"name": "uprising_nx.nro", "browser_download_url": "https://example.invalid/rc1.nro"}]
+            },
+            {
+                "tag_name": "v0.1.0",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{"name": "uprising_nx.nro", "browser_download_url": "https://example.invalid/010.nro"}]
+            }
+        ]"#;
+        let pre = parse_github_release_for_channel(sample, "uprising_nx.nro", true).unwrap();
+        assert_eq!(pre.tag_name, "v0.1.1-rc.1");
+        assert_eq!(pre.asset_url.as_deref(), Some("https://example.invalid/rc1.nro"));
+
+        let stable = parse_github_release_for_channel(sample, "uprising_nx.nro", false).unwrap();
+        assert_eq!(stable.tag_name, "v0.1.0");
+        assert_eq!(stable.asset_url.as_deref(), Some("https://example.invalid/010.nro"));
     }
 
     #[test]

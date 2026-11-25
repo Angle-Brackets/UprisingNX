@@ -180,7 +180,7 @@ enum Tab {
 }
 
 const TABS: [Tab; 3] = [Tab::Video, Tab::Controls, Tab::System];
-const MAX_TAB_ROWS: usize = 8;
+const MAX_TAB_ROWS: usize = 9;
 
 impl Tab {
     fn label(self) -> &'static str {
@@ -218,11 +218,13 @@ enum Row {
     Gyro,
     GyroSpeed,
     AimSpeed,
-    InvertY,
+    InvertYAir,
+    InvertYLand,
     LeftStick,
     Modifier,
     Minus,
     Update,
+    UpdateChannel,
     ImportSave,
     ExportSave,
     Resume,
@@ -244,7 +246,8 @@ const CONTROLS_ROWS: &[Row] = &[
     Row::Gyro,
     Row::GyroSpeed,
     Row::AimSpeed,
-    Row::InvertY,
+    Row::InvertYAir,
+    Row::InvertYLand,
     Row::LeftStick,
     Row::Modifier,
     Row::Minus,
@@ -252,13 +255,14 @@ const CONTROLS_ROWS: &[Row] = &[
 
 const SYSTEM_ROWS: &[Row] = &[
     Row::Update,
+    Row::UpdateChannel,
     Row::ImportSave,
     Row::ExportSave,
     Row::Resume,
     Row::Quit,
 ];
 
-const ALL_ROWS: [Row; 20] = [
+const ALL_ROWS: [Row; 22] = [
     Row::Editing,
     Row::Preset,
     Row::BattleScale,
@@ -270,11 +274,13 @@ const ALL_ROWS: [Row; 20] = [
     Row::Gyro,
     Row::GyroSpeed,
     Row::AimSpeed,
-    Row::InvertY,
+    Row::InvertYAir,
+    Row::InvertYLand,
     Row::LeftStick,
     Row::Modifier,
     Row::Minus,
     Row::Update,
+    Row::UpdateChannel,
     Row::ImportSave,
     Row::ExportSave,
     Row::Resume,
@@ -298,11 +304,13 @@ impl Row {
             Row::Gyro => "Gyro aim",
             Row::GyroSpeed => "Gyro speed",
             Row::AimSpeed => "Stick aim speed",
-            Row::InvertY => "Invert aim Y",
+            Row::InvertYAir => "Invert Y (air)",
+            Row::InvertYLand => "Invert Y (ground)",
             Row::LeftStick => "Left stick aim",
             Row::Modifier => "Aim button",
             Row::Minus => "Minus button",
             Row::Update => "Software update",
+            Row::UpdateChannel => "Update channel",
             Row::ImportSave => "Import 3DS save",
             Row::ExportSave => "Export save backup",
             Row::Resume => "Resume game",
@@ -326,14 +334,16 @@ impl Row {
             Row::DynamicRes => "Off (default): keeps your chosen battle resolution fixed; only in-between 60 fps frames render lower. On: tries dropping real battle resolution 1 step before pausing smooth mode.",
             Row::PowerLabel => "Where the selected power's name appears on foot. Bottom: centered at the bottom in crisp white text. Above bar: in a bubble over the power icons. Off: icons only.",
             Row::RightStick => "Aims the reticle in the air and turns the camera on foot with the right stick, in place of the touch screen.",
-            Row::Gyro => "Fine aiming by tilting the console or controller. Press or hold R / L3 on foot to Z-target the nearest enemy (or center behind Pit), while pausing gyro to reposition your hands.",
+            Row::Gyro => "Fine aiming by tilting the console or controller. On foot: R quick-turns / Z-targets + centers reticle (flick right stick to switch), Y centers reticle only, L3 centers camera + reticle behind Pit. In air: R, Y, and L3 all recenter; holding pauses gyro.",
             Row::GyroSpeed => "How far the reticle moves for a tilt. The game's own Controls options scale it further.",
             Row::AimSpeed => "How fast the right stick aims and turns the camera.",
-            Row::InvertY => "Flips up and down for aiming and the camera.",
+            Row::InvertYAir => "Flips up and down aiming in Air Battles (independent of Ground Battles).",
+            Row::InvertYLand => "Flips up and down aiming and camera pitch in Ground Battles and vehicles (independent of Air Battles).",
             Row::LeftStick => "Off: the left stick only moves Pit. 1: in the air it also aims, and on foot holding the aim button turns the camera with it. 2: as 1, but in the air it aims only while the aim button is held.",
-            Row::Modifier => "The button held with the left stick to aim or turn the camera (Left stick aim 1 or 2). Fire stays on L/ZL.",
+            Row::Modifier => "Only used when Left stick aim is 1 or 2: hold this button with the left stick to aim or turn the camera (Fire stays on L). When Left stick aim is Off, L, ZL, and ZR all Fire.",
             Row::Minus => "Settings menu: Minus alone opens and closes this menu (Plus still pauses; the game's Select only pauses in battles, like Plus). 3DS Select: Minus goes to the game, and right stick click + Minus opens this menu.",
             Row::Update => "Checks GitHub Releases for a newer UprisingNX Switch build, downloads and verifies uprising_nx.nro in the background, then swaps and relaunches on restart.",
+            Row::UpdateChannel => "Stable (default): only checks full releases. Pre-release: also picks up release candidates (e.g. v0.1.1-rc.1) for early testing.",
             Row::ImportSave => "Imports decrypted 3DS saves (00.SAV, 01.SAV...) from sdmc:/switch/uprisingnx/save/import/. Automatically backs up your current Switch save first. Restart or return to Title Screen to load.",
             Row::ExportSave => "Copies your current Switch save files to sdmc:/switch/uprisingnx/save/export/ for use with Checkpoint, JKSM, Citra, or Azahar.",
             Row::Resume => "Back to the game. B or Minus (or right stick click + Minus) also closes this menu.",
@@ -348,6 +358,7 @@ pub enum Changed {
     Video,
     Controls,
     Update,
+    UpdateChannel,
     ImportSave,
     ExportSave,
     Quit,
@@ -761,11 +772,12 @@ impl Menu {
                 set_control(settings, "power_label", POWER_LABELS[index].into());
                 Changed::Controls
             }
-            Row::RightStick | Row::Gyro | Row::InvertY => {
+            Row::RightStick | Row::Gyro | Row::InvertYAir | Row::InvertYLand => {
                 let key = match row {
                     Row::RightStick => "right_stick_aim",
                     Row::Gyro => "gyro_aim",
-                    _ => "aim_invert_y",
+                    Row::InvertYAir => "aim_invert_y_air",
+                    _ => "aim_invert_y_land",
                 };
                 let value = if on(settings, key) { "0" } else { "1" };
                 set_control(settings, key, value.into());
@@ -797,6 +809,11 @@ impl Menu {
                     return None;
                 }
                 Changed::Update
+            }
+            Row::UpdateChannel => {
+                let value = if settings.update_prerelease() { "0" } else { "1" };
+                set_control(settings, "update_prerelease", value.into());
+                Changed::UpdateChannel
             }
             Row::ImportSave => {
                 if !a {
@@ -964,7 +981,8 @@ impl Menu {
                 Row::Gyro => flag(on(settings, "gyro_aim")),
                 Row::GyroSpeed => format!("{:.2}", speed(settings, "gyro_speed")),
                 Row::AimSpeed => format!("{:.2}", speed(settings, "aim_speed")),
-                Row::InvertY => flag(on(settings, "aim_invert_y")),
+                Row::InvertYAir => flag(on(settings, "aim_invert_y_air")),
+                Row::InvertYLand => flag(on(settings, "aim_invert_y_land")),
                 Row::LeftStick => match left_stick(settings) {
                     0 => "Off".into(),
                     n => n.to_string(),
@@ -972,6 +990,13 @@ impl Menu {
                 Row::Modifier => MODIFIERS[modifier_index(settings)].into(),
                 Row::Minus => if settings.minus_opens_menu() { "Settings menu".into() } else { "3DS Select".into() },
                 Row::Update => self.update.value.clone(),
+                Row::UpdateChannel => {
+                    if settings.update_prerelease() {
+                        "Pre-release".into()
+                    } else {
+                        "Stable".into()
+                    }
+                }
                 Row::ImportSave => {
                     if self.import_armed {
                         "Press A again".into()
@@ -1137,7 +1162,7 @@ impl Menu {
             let box_top = rows_top + line * (rows.len() as f32 + 0.28);
             let box_bot = rows_top + rows_h - line * 0.10;
             let box_pad = 14.0 * k;
-            let show_updater = row == Row::Update || self.update.progress.is_some();
+            let show_updater = matches!(row, Row::Update | Row::UpdateChannel) || self.update.progress.is_some();
             let (bg, accent, heading, body, progress) = if show_updater {
                 let (bg, accent) = match self.update.tone {
                     UpdateTone::Success => (color(20, 48, 42, 230), color(110, 228, 158, 255)),

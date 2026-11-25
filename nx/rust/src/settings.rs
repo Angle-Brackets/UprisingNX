@@ -83,17 +83,19 @@ impl Mode {
 }
 
 /// the aim and HUD keys, each the env var the runtime reads
-const CONTROLS: [(&str, &str); 10] = [
+const CONTROLS: [(&str, &str); 12] = [
     ("right_stick_aim", "UNX_RIGHT_STICK_AIM"),
     ("gyro_aim", "UNX_GYRO_AIM"),
     ("gyro_speed", "UNX_GYRO_SPEED"),
     ("left_stick_aim", "UNX_LEFT_STICK_AIM"),
     ("aim_modifier", "UNX_AIM_MODIFIER"),
-    ("aim_invert_y", "UNX_AIM_INVERT_Y"),
+    ("aim_invert_y_air", "UNX_AIM_INVERT_Y_AIR"),
+    ("aim_invert_y_land", "UNX_AIM_INVERT_Y_LAND"),
     ("aim_speed", "UNX_AIM_SPEED"),
     ("power_label", "ZAKURO_POWER_LABEL"),
     ("minus_button", "UNX_MINUS_BUTTON"),
     ("smooth_scale_drop", "UNX_SMOOTH_SCALE_DROP"),
+    ("update_prerelease", "UNX_UPDATE_PRERELEASE"),
 ];
 
 #[derive(Clone, PartialEq, Debug)]
@@ -116,11 +118,13 @@ impl Default for Settings {
                 ("gyro_speed".into(), "1.0".into()),
                 ("left_stick_aim".into(), "0".into()),
                 ("aim_modifier".into(), "ZL".into()),
-                ("aim_invert_y".into(), "0".into()),
+                ("aim_invert_y_air".into(), "0".into()),
+                ("aim_invert_y_land".into(), "0".into()),
                 ("aim_speed".into(), "1.0".into()),
                 ("power_label".into(), "bottom".into()),
                 ("minus_button".into(), "menu".into()),
                 ("smooth_scale_drop".into(), "0".into()),
+                ("update_prerelease".into(), "0".into()),
             ],
         }
     }
@@ -144,6 +148,9 @@ impl Settings {
     pub fn parse(text: &str) -> Settings {
         let mut settings = Settings::default();
         let mut section = String::new();
+        let mut legacy_invert_y: Option<String> = None;
+        let mut seen_invert_air = false;
+        let mut seen_invert_land = false;
         for (number, line) in text.lines().enumerate() {
             let line = line.split(['#', ';']).next().unwrap_or("").trim();
             if line.is_empty() {
@@ -169,7 +176,16 @@ impl Settings {
                         _ => false,
                     }
                 }
+                "controls" if key == "aim_invert_y" => {
+                    legacy_invert_y = Some(value.to_string());
+                    true
+                }
                 "controls" if CONTROLS.iter().any(|(name, _)| *name == key) => {
+                    if key == "aim_invert_y_air" {
+                        seen_invert_air = true;
+                    } else if key == "aim_invert_y_land" {
+                        seen_invert_land = true;
+                    }
                     match settings.controls.iter_mut().find(|(name, _)| *name == key) {
                         Some(entry) => entry.1 = value.to_string(),
                         None => settings.controls.push((key.clone(), value.to_string())),
@@ -180,6 +196,18 @@ impl Settings {
             };
             if !good {
                 log::warn!("unx: settings.ini line {} not understood: {line:?}", number + 1);
+            }
+        }
+        if let Some(val) = legacy_invert_y {
+            if !seen_invert_air {
+                if let Some(entry) = settings.controls.iter_mut().find(|(n, _)| n == "aim_invert_y_air") {
+                    entry.1 = val.clone();
+                }
+            }
+            if !seen_invert_land {
+                if let Some(entry) = settings.controls.iter_mut().find(|(n, _)| n == "aim_invert_y_land") {
+                    entry.1 = val;
+                }
             }
         }
         settings
@@ -225,10 +253,11 @@ impl Settings {
         }
         text.push_str(
             "\n# aim: right_stick_aim / gyro_aim 1 or 0, left_stick_aim 0 (off) / 1 / 2,\n\
-             # aim_modifier ZL, ZR, L, R, X, Y or A, aim_invert_y 1 or 0, speeds 1.0 = normal\n\
+             # aim_modifier ZL, ZR, L, R, X, Y or A, aim_invert_y_air / aim_invert_y_land 1 or 0, speeds 1.0 = normal\n\
              # power_label: bottom (centered at bottom), bar (above power icons) or off\n\
              # minus_button: menu (Minus alone opens the settings menu) or select (the 3DS's Select)\n\
              # smooth_scale_drop: 0 (keep battle resolution fixed; default) or 1 (drop 1x before pausing smooth mode)\n\
+             # update_prerelease: 0 (stable releases only; default) or 1 (also check pre-releases / RCs)\n\
              [controls]\n",
         );
         for (key, value) in &self.controls {
@@ -260,6 +289,14 @@ impl Settings {
         self.controls
             .iter()
             .find(|(k, _)| k == "smooth_scale_drop")
+            .is_some_and(|(_, v)| on_off(&v.trim().to_ascii_lowercase()).unwrap_or(false))
+    }
+
+    /// Whether the GitHub Releases auto-updater also checks pre-releases / release candidates.
+    pub fn update_prerelease(&self) -> bool {
+        self.controls
+            .iter()
+            .find(|(k, _)| k == "update_prerelease")
             .is_some_and(|(_, v)| on_off(&v.trim().to_ascii_lowercase()).unwrap_or(false))
     }
 
@@ -310,5 +347,16 @@ mod tests {
         assert_eq!(settings.handheld, Settings::default().handheld);
         assert_eq!(settings.docked.preset, Preset::Quality);
         assert!(!settings.docked.video(true).smooth);
+    }
+
+    #[test]
+    fn legacy_invert_y_migrates_to_air_and_land() {
+        let settings = Settings::parse("[controls]\naim_invert_y = 1\n");
+        assert_eq!(settings.controls.iter().find(|(k, _)| k == "aim_invert_y_air").map(|(_, v)| v.as_str()), Some("1"));
+        assert_eq!(settings.controls.iter().find(|(k, _)| k == "aim_invert_y_land").map(|(_, v)| v.as_str()), Some("1"));
+
+        let override_one = Settings::parse("[controls]\naim_invert_y = 1\naim_invert_y_land = 0\n");
+        assert_eq!(override_one.controls.iter().find(|(k, _)| k == "aim_invert_y_air").map(|(_, v)| v.as_str()), Some("1"));
+        assert_eq!(override_one.controls.iter().find(|(k, _)| k == "aim_invert_y_land").map(|(_, v)| v.as_str()), Some("0"));
     }
 }

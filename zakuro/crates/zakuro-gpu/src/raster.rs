@@ -1698,6 +1698,8 @@ pub(crate) struct Portraits {
     pub(crate) in_battle: bool,
     /// whether the current battle session is still active across quiet flight swoops.
     pub(crate) active_battle: bool,
+    /// whether KIU's in-battle Pause menu is currently open (`InfoManager+0xC0` bit 16).
+    pub(crate) pause_active: bool,
     /// whether the bottom screen drew a large dialogue portrait since the
     /// frontend last asked, see note_big_portrait: a conversation in a
     /// battle, before the player has control, that the game's overrides say
@@ -1817,12 +1819,73 @@ fn note_text(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
 
 /// the subtitles' vertices with each line of text in the middle of the top
 /// screen: every quad of the draw, the text and the title's own shadow, cut
+/// Checks whether a top-screen 512x128 RGBA8 text draw is actually KIU's
+/// bottom-strip battle dialogue subtitle box rather than another 512x128 text
+/// draw (such as Chapter End bonus labels like "No Damage" / "Melee Finisher"
+/// or Pause screen notices).
+///
+/// KIU's real battle subtitle quad (`each_subtitle_line_goes_to_the_middle_of_the_screen`)
+/// occupies `bx = 15.1..56.0` (`sy = 184..225`), `by = 97.6..361.0` (`sx = 39..302`),
+/// width ~263 px, height ~41 px, with 1 or 2 identical-UV quads (text + shadow).
+fn is_top_subtitle_quad(vertices: &[Vertex]) -> bool {
+    if vertices.len() < 6 || !vertices.len().is_multiple_of(6) {
+        return false;
+    }
+    let uv_bounds = |quad: &[Vertex]| -> (f32, f32, f32, f32) {
+        let mut u0 = f32::MAX;
+        let mut u1 = f32::MIN;
+        let mut v0 = f32::MAX;
+        let mut v1 = f32::MIN;
+        for v in quad {
+            u0 = u0.min(v.texcoords[0][0]);
+            u1 = u1.max(v.texcoords[0][0]);
+            v0 = v0.min(v.texcoords[0][1]);
+            v1 = v1.max(v.texcoords[0][1]);
+        }
+        (u0, v0, u1, v1)
+    };
+    let (mut low_bx, mut high_bx) = (f32::MAX, f32::MIN);
+    let (mut low_by, mut high_by) = (f32::MAX, f32::MIN);
+    for v in &vertices[..6] {
+        let w = v.clip[3];
+        if !w.is_finite() || w.abs() < 1e-6 {
+            return false;
+        }
+        let bx = (v.clip[0] / w * 0.5 + 0.5) * 240.0;
+        let by = (v.clip[1] / w * 0.5 + 0.5) * 400.0;
+        low_bx = low_bx.min(bx);
+        high_bx = high_bx.max(bx);
+        low_by = low_by.min(by);
+        high_by = high_by.max(by);
+    }
+    let h = high_bx - low_bx;
+    let w = high_by - low_by;
+    if !(low_bx >= 2.0 && high_bx <= 72.0 && (20.0..=64.0).contains(&h)) {
+        return false;
+    }
+    if !(w >= 200.0 && low_by <= 150.0 && high_by >= 250.0) {
+        return false;
+    }
+    let first_uv = uv_bounds(&vertices[..6]);
+    for quad in vertices[6..].chunks_exact(6) {
+        let uv = uv_bounds(quad);
+        if (uv.0 - first_uv.0).abs() > 1e-3
+            || (uv.1 - first_uv.1).abs() > 1e-3
+            || (uv.2 - first_uv.2).abs() > 1e-3
+            || (uv.3 - first_uv.3).abs() > 1e-3
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// into one slice per line across the text buffer's rows, each slid along
 /// the screen by what its line needs. none when the draw is not quads
 /// across the lines the buffer holds.
 #[allow(dead_code)]
 fn centered_subtitle(vertices: &[Vertex], lines: &[TextLine]) -> Option<Vec<Vertex>> {
-    if lines.is_empty() || vertices.is_empty() || vertices.len() % 6 != 0 {
+    if lines.is_empty() || vertices.is_empty() || !vertices.len().is_multiple_of(6) {
         return None;
     }
     let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
@@ -1837,6 +1900,18 @@ fn centered_subtitle(vertices: &[Vertex], lines: &[TextLine]) -> Option<Vec<Vert
     let first = corners(&vertices[..6])?;
     let [u0, v0] = first[0][0].texcoords[0];
     let [u1, v1] = first[1][1].texcoords[0];
+    for quad in vertices[6..].chunks_exact(6) {
+        let edges = corners(quad)?;
+        let [qu0, qv0] = edges[0][0].texcoords[0];
+        let [qu1, qv1] = edges[1][1].texcoords[0];
+        if (qu0 - u0).abs() > 1e-3
+            || (qv0 - v0).abs() > 1e-3
+            || (qu1 - u1).abs() > 1e-3
+            || (qv1 - v1).abs() > 1e-3
+        {
+            return None;
+        }
+    }
     // the lines the quads show, low rows first, in texture terms
     let mut shown: Vec<TextLine> = lines
         .iter()
@@ -6028,11 +6103,12 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
             }
         }
     }
-    if (resources.portraits.in_play
+    if ((resources.portraits.in_play
         || resources.portraits.fuse_active
         || resources.portraits.cauldron_active
         || resources.portraits.chapter_active)
-        && !resources.portraits.in_battle
+        && !resources.portraits.in_battle)
+        || resources.portraits.pause_active
     {
         resources.portraits.sides = Default::default();
         resources.portraits.hud.clear();
@@ -8598,40 +8674,45 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                 ]);
             }
             if resources.portraits.in_play
-                && (resources.portraits.in_battle || resources.portraits.active_battle)
+                && resources.portraits.in_battle
+                && !resources.portraits.pause_active
                 && is_subtitle(registers)
             {
-                // the CPU decodes its arrays, so its lines can be centered
+                // the CPU decodes its arrays, so we can verify it is KIU's bottom-strip
+                // dialogue subtitle box before centering (leaving Chapter End score/bonus
+                // labels and other 512x128 text draws untouched).
                 #[cfg(feature = "vulkan")]
                 if matches!(vertices, Vertices::Raw { .. }) {
                     return None;
                 }
-                resources.portraits.top_subtitle_quiet = 0;
-                resources.portraits.tutorial_dialogue_hold = 0;
-                resources.portraits.adding = true;
-                // the portraits go under the subtitles, in the buffer that
-                // goes out, once a frame
-                let top = resources.portraits.top.map(|[address, ..]| address);
-                if top == Some(registers[REG_COLOR_BUFFER_ADDRESS]) && !resources.portraits.flushed {
-                    resources.portraits.flushed = true;
-                    flush_portraits(memory, resources);
+                let shaded = shaded_in_order(registers, vertices);
+                if shaded.as_deref().is_some_and(is_top_subtitle_quad) {
+                    resources.portraits.top_subtitle_quiet = 0;
+                    resources.portraits.tutorial_dialogue_hold = 0;
+                    resources.portraits.adding = true;
+                    // the portraits go under the subtitles, in the buffer that
+                    // goes out, once a frame
+                    let top = resources.portraits.top.map(|[address, ..]| address);
+                    if top == Some(registers[REG_COLOR_BUFFER_ADDRESS]) && !resources.portraits.flushed {
+                        resources.portraits.flushed = true;
+                        flush_portraits(memory, resources);
+                    }
+                    let tex_addr = loc_register(registers, TEXTURE_UNIT_BASES[0] + 4);
+                    let buf_lines = resources.portraits.text_lines_for(tex_addr);
+                    let centered = shaded.as_deref().and_then(|v| centered_subtitle(v, &buf_lines));
+                    let draw_vertices = match &centered {
+                        Some(v) => Vertices::Shaded(v),
+                        None => vertices,
+                    };
+                    draw_subtitle_shadow(registers, memory, resources, draw_vertices);
+                    rasterize(registers, memory, resources, draw_vertices);
+                    resources.portraits.adding = false;
+                    return Some(0);
                 }
-                let tex_addr = loc_register(registers, TEXTURE_UNIT_BASES[0] + 4);
-                let buf_lines = resources.portraits.text_lines_for(tex_addr);
-                let centered = shaded_in_order(registers, vertices)
-                    .as_deref()
-                    .and_then(|v| centered_subtitle(v, &buf_lines));
-                let draw_vertices = match &centered {
-                    Some(v) => Vertices::Shaded(v),
-                    None => vertices,
-                };
-                draw_subtitle_shadow(registers, memory, resources, draw_vertices);
-                rasterize(registers, memory, resources, draw_vertices);
-                resources.portraits.adding = false;
-                return Some(0);
             }
         } else if resources.portraits.in_play
-            && (resources.portraits.in_battle || resources.portraits.active_battle)
+            && resources.portraits.in_battle
+            && !resources.portraits.pause_active
             && is_text_buffer(registers)
         {
             // the CPU decodes its arrays, so its letters say where they are
@@ -12800,6 +12881,31 @@ mod tests {
         }
         // no lines known: the subtitles are left as the title drew them
         assert!(centered_subtitle(&quad, &[]).is_none());
+        assert!(is_top_subtitle_quad(&quad), "real KIU battle subtitle quad must pass");
+
+        // Chapter End bonus labels (mid-screen, narrow left column, or batched multi-row UVs)
+        // must NOT be intercepted or shifted to screen center.
+        let bonus_row = [
+            corner(140.0, 360.0, 0.01, 0.25),
+            corner(140.0, 210.0, 0.30, 0.25),
+            corner(122.0, 360.0, 0.01, 0.12),
+            corner(140.0, 210.0, 0.30, 0.25),
+            corner(122.0, 210.0, 0.30, 0.12),
+            corner(122.0, 360.0, 0.01, 0.12),
+        ];
+        assert!(!is_top_subtitle_quad(&bonus_row), "mid-screen chapter-end bonus row must not be treated as subtitle");
+
+        let mut batched_rows = quad.to_vec();
+        batched_rows.extend_from_slice(&[
+            corner(56.0, 361.0, 0.008, 0.700),
+            corner(56.0, 97.6, 0.522, 0.700),
+            corner(15.1, 361.0, 0.008, 0.500),
+            corner(56.0, 97.6, 0.522, 0.700),
+            corner(15.1, 97.6, 0.522, 0.500),
+            corner(15.1, 361.0, 0.008, 0.500),
+        ]);
+        assert!(!is_top_subtitle_quad(&batched_rows), "batched multi-UV rows must not be treated as a single subtitle");
+        assert!(centered_subtitle(&batched_rows, &lines).is_none());
     }
 
     /// a portrait fades in over 8 frames, the next picture fades in over it
