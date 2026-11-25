@@ -47,10 +47,14 @@ pub const GUEST_CONTROLS_VADDR: u32 = 0x00EF9638;
 /// Host mailbox mark for on-foot camera look (`"MLK1"`), followed by `across`
 /// and `down` as `f32` bottom-screen pixels (`zakuro::input::MOUSE_LOOK`).
 const MOUSE_LOOK: u32 = u32::from_le_bytes(*b"MLK1");
-/// Host mailbox mark for on-foot Z-target / behind-Pit camera recenter press (`"MLKR"`).
+/// Host mailbox mark for on-foot Z-target press (`"MLKR"`, `R` button).
 const MOUSE_LOOK_RECENTER: u32 = u32::from_le_bytes(*b"MLKR");
-/// Host mailbox mark while on-foot Z-target / recenter button remains held (`"MLKH"`).
+/// Host mailbox mark while on-foot Z-target button (`R`) remains held (`"MLKH"`).
 const MOUSE_LOOK_HOLD: u32 = u32::from_le_bytes(*b"MLKH");
+/// Host mailbox mark for dedicated behind-Pit camera + reticle center (`"MLKC"`, `L3` click).
+const MOUSE_LOOK_CENTER: u32 = u32::from_le_bytes(*b"MLKC");
+/// Host mailbox mark for on-foot reticle-only center (`"MLRC"`, `Y` button; leaves camera alone).
+const MOUSE_RETICLE_CENTER: u32 = u32::from_le_bytes(*b"MLRC");
 /// Host mailbox mark for flying reticle aim (`"MAM1"`), followed by `across`
 /// and `down` as `f32` bottom-screen pixels (`zakuro::input::MOUSE_AIM`).
 const MOUSE_AIM: u32 = u32::from_le_bytes(*b"MAM1");
@@ -225,11 +229,19 @@ pub struct Aim {
     controls: GuestControls,
     /// Cached FCRAM byte offset of the Options/Menu `MsgStdBn` (`_r/b_03`, size `0x26DD0`).
     msbt_offset: Option<usize>,
-    /// Rising-edge tracker for the gyro/reticle recenter button (`R` or `StickL`).
+    /// Rising-edge tracker for `R` (Quick Turn / Z-target + center on foot, rail-center in air).
     recenter_held: bool,
-    /// Set when a gyro/reticle recenter has been requested for the next guest tick.
+    /// Rising-edge tracker for `L3` (`UNX_HOST_RECENTER`, behind-Pit camera + reticle center).
+    center_held: bool,
+    /// Rising-edge tracker for `Y` (reticle-only center on foot, rail-center in air).
+    reticle_center_held: bool,
+    /// Set when `R` Z-target / air recenter was triggered for the next guest tick.
     recenter_pending: bool,
-    /// Remaining 60 Hz frames to mute gyro after releasing recenter (gyro ratchet settle).
+    /// Set when `L3` behind-Pit camera + reticle center was triggered for the next guest tick.
+    center_pending: bool,
+    /// Set when `Y` reticle-only center was triggered for the next guest tick.
+    reticle_center_pending: bool,
+    /// Remaining 60 Hz frames to mute gyro after releasing R / L3 (gyro ratchet settle).
     recenter_grace: u8,
     /// Rising-edge tracker for `A` in `GAME_VEHICLE` (tap-and-release Special Action).
     vehicle_a_held: bool,
@@ -337,7 +349,11 @@ impl Aim {
             controls: GuestControls::default(),
             msbt_offset: None,
             recenter_held: false,
+            center_held: false,
+            reticle_center_held: false,
             recenter_pending: false,
+            center_pending: false,
+            reticle_center_pending: false,
             recenter_grace: 0,
             vehicle_a_held: false,
             vehicle_b_held: false,
@@ -458,6 +474,8 @@ impl Aim {
         self.game = 0;
         self.quiet = 0;
         self.recenter_pending = false;
+        self.center_pending = false;
+        self.reticle_center_pending = false;
         self.vehicle_tap = None;
     }
 
@@ -524,7 +542,10 @@ impl Aim {
             input.tilt = [0.0, 0.0];
             return;
         }
-        let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
+        let y_is_center = !(self.mode != 0 && self.modifier == PadState::Y);
+        let recenter_now = input.buttons.contains(PadState::R)
+            || (y_is_center && input.buttons.contains(PadState::Y))
+            || (host & (1 << 1)) != 0;
         if recenter_now {
             self.motion_tilt = [0.0, 0.0];
             input.tilt = [0.0, 0.0];
@@ -567,8 +588,14 @@ impl Aim {
             return;
         }
 
-        let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
+        let y_is_center = !(self.mode != 0 && self.modifier == PadState::Y);
+        let recenter_now = input.buttons.contains(PadState::R)
+            || (y_is_center && input.buttons.contains(PadState::Y))
+            || (host & (1 << 1)) != 0;
         input.buttons.remove(PadState::R);
+        if y_is_center {
+            input.buttons.remove(PadState::Y);
+        }
         if recenter_now && !self.recenter_held && self.fallback_touch.is_some() {
             self.fallback_touch = None;
             self.fallback_lift = FALLBACK_RECENTER_LIFT_FRAMES;
@@ -661,23 +688,43 @@ impl Aim {
         self.fallback_lift = 0;
 
         // In battle:
-        // - R (Right Bumper) or Left Stick Click (`UNX_HOST_RECENTER`, bit 1) snaps
-        //   the Air Battle reticle to the rail center, or in Land Battle / Vehicles
-        //   Z-targets the nearest enemy (or centers yaw+pitch behind Pit if none is
-        //   in range). Holding keeps tracking the locked target while pausing gyro
-        //   (+ brief settle grace on release) so players can ratchet their hands.
+        // - R (Right Bumper): snaps Air Battle reticle to rail center, or in Land Battle /
+        //   Vehicles engages Quick Turn / full-range 2-tier Z-targeting (tap to snap, hold
+        //   to lock 1:1, right-stick flick to switch targets) and centers the reticle.
+        // - Y: snaps Air Battle reticle to rail center, or in Land Battle / Vehicles
+        //   centers ONLY the reticle without moving the camera.
+        // - L3 (`UNX_HOST_RECENTER` bit 1): snaps Air Battle reticle to rail center, or
+        //   in Land Battle / Vehicles centers both the camera and reticle behind Pit.
+        // - Holding R, Y, or L3 pauses gyro (+ brief settle grace on release) for hand
+        //   ratcheting.
         // - ZL (Nunchuk Z trigger) and ZR (Wii Remote B trigger) act as Fire (`PadState::L`).
-        let recenter_now = input.buttons.contains(PadState::R) || (host & (1 << 1)) != 0;
+        let y_is_center = !(self.mode != 0 && self.modifier == PadState::Y);
+        let ztarget_now = input.buttons.contains(PadState::R);
+        let reticle_center_now = y_is_center && input.buttons.contains(PadState::Y);
+        let center_now = (host & (1 << 1)) != 0;
+        let recenter_now = ztarget_now || reticle_center_now || center_now;
         input.buttons.remove(PadState::R);
-        if recenter_now && !self.recenter_held {
+        if y_is_center {
+            input.buttons.remove(PadState::Y);
+        }
+        if ztarget_now && !self.recenter_held {
             self.recenter_pending = true;
+            self.center_pending = false;
+            self.reticle_center_pending = false;
+        } else if center_now && !self.center_held {
+            self.center_pending = true;
+            self.reticle_center_pending = false;
+        } else if reticle_center_now && !self.reticle_center_held {
+            self.reticle_center_pending = true;
         }
         if recenter_now {
             self.recenter_grace = RECENTER_GRACE_FRAMES;
         } else {
             self.recenter_grace = self.recenter_grace.saturating_sub(1);
         }
-        self.recenter_held = recenter_now;
+        self.recenter_held = ztarget_now;
+        self.center_held = center_now;
+        self.reticle_center_held = reticle_center_now;
 
         if self.mode == 0 && input.buttons.intersects(PadState::ZL | PadState::ZR) {
             input.buttons.remove(PadState::ZL | PadState::ZR);
@@ -827,36 +874,64 @@ impl Aim {
     ///   reticle against left-stick movement drift), or `MOUSE_AIM_RECENTER` (`"MAMR"`)
     ///   when a recenter is requested.
     /// - `MOUSE_LOOK` (`"MLK1"`) on foot / in vehicles, `MOUSE_LOOK_RECENTER` (`"MLKR"`)
-    ///   on the rising edge of `R`/`L3` to acquire a Z-target (or center behind Pit),
-    ///   and `MOUSE_LOOK_HOLD` (`"MLKH"`) while `R`/`L3` stays held to keep tracking.
+    ///   on the rising edge of `R` to acquire a Z-target (or center behind Pit),
+    ///   `MOUSE_LOOK_HOLD` (`"MLKH"`) while `R` stays held to keep tracking, and
+    ///   `MOUSE_LOOK_CENTER` (`"MLKC"`) on the rising edge of `L3` to recenter behind Pit.
     pub fn feed(&mut self, mailbox: &mut [u32], (across, down): (f32, f32)) {
-        let (mark, recenter_mark, hold_mark) = match self.game {
-            GAME_ON_FOOT | GAME_VEHICLE if self.right_stick || self.gyro || self.mode != 0 => {
-                (MOUSE_LOOK, MOUSE_LOOK_RECENTER, MOUSE_LOOK_HOLD)
-            }
-            GAME_FLYING if (self.right_stick || self.gyro) && !self.touching => {
-                (MOUSE_AIM, MOUSE_AIM_RECENTER, MOUSE_AIM)
-            }
+        let (mark, recenter_mark, center_mark, reticle_center_mark, hold_mark) = match self.game {
+            GAME_ON_FOOT | GAME_VEHICLE if self.right_stick || self.gyro || self.mode != 0 => (
+                MOUSE_LOOK,
+                MOUSE_LOOK_RECENTER,
+                MOUSE_LOOK_CENTER,
+                MOUSE_RETICLE_CENTER,
+                MOUSE_LOOK_HOLD,
+            ),
+            GAME_FLYING if (self.right_stick || self.gyro) && !self.touching => (
+                MOUSE_AIM,
+                MOUSE_AIM_RECENTER,
+                MOUSE_AIM_RECENTER,
+                MOUSE_AIM_RECENTER,
+                MOUSE_AIM,
+            ),
             _ => {
                 self.recenter_pending = false;
+                self.center_pending = false;
+                self.reticle_center_pending = false;
                 mailbox[..3].fill(0);
                 return;
             }
         };
-        let waiting_recenter = mailbox[0] == recenter_mark;
-        let waiting = waiting_recenter
+        let waiting_pulse = mailbox[0] == recenter_mark
+            || mailbox[0] == center_mark
+            || mailbox[0] == reticle_center_mark;
+        let waiting = waiting_pulse
             || ((mailbox[0] == mark || mailbox[0] == hold_mark)
                 && (mailbox[1] != 0 || mailbox[2] != 0));
         self.untaken = if waiting { self.untaken.saturating_add(1) } else { 0 };
         let keep = waiting && self.untaken <= STALE_FRAMES;
         if self.recenter_pending {
             self.recenter_pending = false;
+            self.center_pending = false;
+            self.reticle_center_pending = false;
             self.untaken = 0;
             mailbox[..3].copy_from_slice(&[recenter_mark, 0, 0]);
             return;
         }
-        let active_mark = if waiting_recenter && keep {
-            recenter_mark
+        if self.center_pending {
+            self.center_pending = false;
+            self.reticle_center_pending = false;
+            self.untaken = 0;
+            mailbox[..3].copy_from_slice(&[center_mark, 0, 0]);
+            return;
+        }
+        if self.reticle_center_pending {
+            self.reticle_center_pending = false;
+            self.untaken = 0;
+            mailbox[..3].copy_from_slice(&[reticle_center_mark, 0, 0]);
+            return;
+        }
+        let active_mark = if waiting_pulse && keep {
+            mailbox[0]
         } else if self.recenter_held {
             hold_mark
         } else {
@@ -890,7 +965,11 @@ mod tests {
             controls: GuestControls::default(),
             msbt_offset: None,
             recenter_held: false,
+            center_held: false,
+            reticle_center_held: false,
             recenter_pending: false,
+            center_pending: false,
+            reticle_center_pending: false,
             recenter_grace: 0,
             vehicle_a_held: false,
             vehicle_b_held: false,
@@ -975,23 +1054,6 @@ mod tests {
             down_gyro_up < 0.0,
             "tilting gyro nose up on foot must also decrease camera pitch (down < 0 -> look up)"
         );
-    }
-
-    #[test]
-    fn separate_air_and_ground_invert_y_settings() {
-        let mut aim = test_aim();
-        aim.invert_y_air = true;
-        aim.invert_y_land = false;
-
-        aim.said(GAME_FLYING);
-        let mut stick_up = InputState { c_stick_y: 1.0, ..InputState::default() };
-        let (_, air_down) = aim.apply(&mut stick_up, [0.0; 3], 0);
-        assert!(air_down > 0.0, "invert_y_air flips stick-up to down > 0 in Air Battle");
-
-        aim.said(GAME_ON_FOOT);
-        let mut stick_up2 = InputState { c_stick_y: 1.0, ..InputState::default() };
-        let (_, land_down) = aim.apply(&mut stick_up2, [0.0; 3], 0);
-        assert!(land_down < 0.0, "invert_y_land=false keeps stick-up at down < 0 on Ground");
     }
 
     #[test]
@@ -1095,6 +1157,74 @@ mod tests {
         let mut resumed = InputState::default();
         let (across, down) = aim.apply(&mut resumed, motion, 0);
         assert!(across > 0.0 && down < 0.0, "gyro resumes smoothly after settle grace");
+    }
+
+    #[test]
+    fn on_foot_r_ztargets_and_y_or_l3_centers_behind_pit_and_both_recenter_in_air() {
+        let mut foot = test_aim();
+        foot.said(GAME_ON_FOOT);
+        let mut mb = [0u32; 4];
+
+        // Pressing R on foot triggers Z-target (`MLKR`), holding keeps `MLKH`.
+        let mut r_press = InputState { buttons: PadState::R, ..InputState::default() };
+        foot.apply(&mut r_press, [0.0; 3], 0);
+        foot.feed(&mut mb, (0.0, 0.0));
+        assert_eq!(mb[0], MOUSE_LOOK_RECENTER);
+
+        mb[0] = MOUSE_LOOK_HOLD;
+        let mut r_hold = InputState { buttons: PadState::R, ..InputState::default() };
+        foot.apply(&mut r_hold, [0.0; 3], 0);
+        foot.feed(&mut mb, (0.0, 0.0));
+        assert_eq!(mb[0], MOUSE_LOOK_HOLD);
+
+        // Release R -> normal `MLK1`.
+        let mut idle = InputState::default();
+        foot.apply(&mut idle, [0.0; 3], 0);
+        foot.feed(&mut mb, (0.0, 0.0));
+        assert_eq!(mb[0], MOUSE_LOOK);
+
+        // Pressing Y on foot triggers reticle-only center (`MLRC`, leaves camera alone) and consumes Y.
+        let mut y_press = InputState { buttons: PadState::Y, ..InputState::default() };
+        foot.apply(&mut y_press, [0.0; 3], 0);
+        assert!(!y_press.buttons.contains(PadState::Y));
+        foot.feed(&mut mb, (0.0, 0.0));
+        assert_eq!(mb[0], MOUSE_RETICLE_CENTER);
+
+        // Release Y, then L3 (host bit 1) also triggers `MLKC`.
+        let mut idle2 = InputState::default();
+        foot.apply(&mut idle2, [0.0; 3], 0);
+        foot.feed(&mut mb, (0.0, 0.0));
+        let mut l3_press = InputState::default();
+        foot.apply(&mut l3_press, [0.0; 3], 1 << 1);
+        foot.feed(&mut mb, (0.0, 0.0));
+        assert_eq!(mb[0], MOUSE_LOOK_CENTER);
+
+        // In Air Battle, both R and Y trigger `MAMR`.
+        let mut air = test_aim();
+        air.said(GAME_FLYING);
+        let mut air_mb = [0u32; 4];
+        let mut air_y = InputState { buttons: PadState::Y, ..InputState::default() };
+        air.apply(&mut air_y, [0.0; 3], 0);
+        assert!(!air_y.buttons.contains(PadState::Y));
+        air.feed(&mut air_mb, (0.0, 0.0));
+        assert_eq!(air_mb[0], MOUSE_AIM_RECENTER);
+    }
+
+    #[test]
+    fn separate_air_and_ground_invert_y_settings() {
+        let mut aim = test_aim();
+        aim.invert_y_air = true;
+        aim.invert_y_land = false;
+
+        aim.said(GAME_FLYING);
+        let mut stick_up = InputState { c_stick_y: 1.0, ..InputState::default() };
+        let (_, air_down) = aim.apply(&mut stick_up, [0.0; 3], 0);
+        assert!(air_down > 0.0, "invert_y_air flips stick-up to down > 0 in Air Battle");
+
+        aim.said(GAME_ON_FOOT);
+        let mut stick_up2 = InputState { c_stick_y: 1.0, ..InputState::default() };
+        let (_, land_down) = aim.apply(&mut stick_up2, [0.0; 3], 0);
+        assert!(land_down < 0.0, "invert_y_land=false keeps stick-up at down < 0 on Ground");
     }
 
     #[test]

@@ -72,7 +72,7 @@ Every major screen—Title Screen, Mode Select, Solo Hub, Chapter Select, Fiend'
 ### Dual-Stick, Gyro & Zelda-Style Z-Targeting
 
 - **Dual-Stick & Gyro Aiming:** Native analog camera and reticle control with optional gyroscope aiming, independent sensitivity tuning, separate Air and Ground Y-axis inversion, and left-stick aim options.
-- **Z-Targeting & Recenter (`R` / `L3`):** Tap or hold **R** (or **Left Stick Click**) on foot to lock onto nearby enemies—covering a `360°` close-range bubble within `16` units or a `±85°` forward cone up to `52` units prioritizing your crosshair. Holding maintains a tight 1:1 camera lock for circle-strafing and automatically re-acquires nearby enemies; tapping with no target smoothly swings the camera behind Pit.
+- **Z-Targeting (`R`) & Reticle Center (`Y` / `L3`):** Tap or hold **R** on foot to quick-turn / lock directly onto visible enemies up to `160` units away (`±65°` forward cone prioritizing your crosshair, with a `360°` fallback within `80` units if a boss dashes past you) while centering the reticle. Holding **R** maintains a tight 1:1 lock for circle-strafing and flicking the right stick switches targets. Press **Y** on foot to center **only the reticle** (without moving the camera) or click **Left Stick (`L3`)** to center both camera and reticle behind Pit. In Air Battles, **R**, **Y**, and **L3** all recenter the reticle.
 
 <br>
 
@@ -108,7 +108,9 @@ Decrypted US saves (`00.SAV`, `01.SAV`, etc.) from Checkpoint, JKSM, Citra, and 
 | Input | Action |
 | --- | --- |
 | **Left / Right Stick + Gyro** | Movement & native aiming / camera control |
-| **R** or **Left Stick Click (`L3`)** | Z-Target enemy (tap or hold) / recenter camera behind Pit |
+| **R** | Quick Turn / Z-Target + center reticle on foot (tap to snap, hold to lock 1:1, right-stick flick to switch) / recenter reticle in air |
+| **Y** | Center reticle only on foot (keeps camera angle, pauses gyro while held) / recenter reticle in air |
+| **Left Stick Click (`L3`)** | Dedicated center camera & reticle behind Pit (on foot) / recenter reticle (air) |
 | **Right Stick Click (`R3`)** | Toggle bottom screen overlay |
 | **`Minus` (`-`)** | Open / close tabbed Settings menu (`L` / `R` switches tabs) |
 | **`Plus` (`+`)** | 3DS `Start` |
