@@ -1,10 +1,21 @@
 {
   "schema": 1,
   "latest": {
-    "release": "v0.1.1",
+    "release": "v0.1.2",
     "snapshot": "v0.1.1-rc.9"
   },
   "versions": [
+    {
+      "id": "v0.1.2",
+      "type": "release",
+      "date": "2026-11-25T02:17:17Z",
+      "commit": "ed27e86",
+      "size": 22815679,
+      "sha256": "9f4fa322962a8cafd94fbc7107f71cc6809218f4262ac68a1144ef32b6f306d4",
+      "nro_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/v0.1.2/uprising_nx.nro",
+      "zip_url": "https://github.com/Angle-Brackets/UprisingNX/releases/download/v0.1.2/UprisingNX-v0.1.2.zip",
+      "notes": "Minecraft-style versions.json updater manifest, rolling snapshots archive, and in-app Version History picker (upgrade or roll back to any release or snapshot)."
+    },
     {
       "id": "v0.1.1",
       "type": "release",
