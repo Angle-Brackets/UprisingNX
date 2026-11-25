@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 526" width="1280" height="526" role="img" aria-label="UprisingNX default Nintendo Switch controls">
+<defs><style>.sans{font-family:Archivo, 'Helvetica Neue', Helvetica, Arial, sans-serif}.mono{font-family:'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace}.kc{fill:none;stroke:#15171C;stroke-width:1.25}.kt{font-family:'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;font-size:11px;font-weight:600;fill:#15171C;text-anchor:middle;letter-spacing:0.4px}.tp{font-family:Archivo, 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:14px;font-weight:500;fill:#15171C}.ts{font-family:Archivo, 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:13.5px;font-weight:400;fill:#6B6E76}.pre{font-family:'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;font-size:11.5px;font-weight:600;fill:#6B6E76}.lbl{font-family:'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;font-size:11.5px;font-weight:600;fill:#15171C;letter-spacing:1.6px}.ld{fill:none;stroke:#8C9099;stroke-width:1;stroke-linejoin:round}.bt{fill:#2A2E36;stroke:#15171C;stroke-width:1.3}.bl{font-family:'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;font-size:9px;font-weight:600;fill:#F2F0EA;text-anchor:middle}</style></defs>
+<rect width="1280" height="526" fill="#F2F0EA"/>
+<rect x="0.5" y="0.5" width="1279" height="525" fill="none" stroke="#D9D6CD" stroke-width="1"/>
+<g transform="translate(0,-124)">
+<path d="M404,276 L392.4,270.5 Q388.5,262 391.5,254 A65,65 0 0 1 446,225 L466,225 Q472,225 472,231 L472,250 L446,290 Z" fill="#2A2E36" stroke="#15171C" stroke-width="1.3" stroke-linejoin="round"/>
+<path d="M 876 276 L 887.6 270.5 Q 891.5 262 888.5 254 A 65 65 0 0 0 834 225 L 814 225 Q 808 225 808 231 L 808 250 L 834 290 Z" fill="#2A2E36" stroke="#15171C" stroke-width="1.3" stroke-linejoin="round"/>
+<path d="M398,306 Q389,304 389,294 L389,290 A57,57 0 0 1 446,233 L480,233 L480,250 L446,290 Z" fill="#4A505B" stroke="#15171C" stroke-width="1.3" stroke-linejoin="round"/>
+<path d="M 882 306 Q 891 304 891 294 L 891 290 A 57 57 0 0 0 834 233 L 800 233 L 800 250 L 834 290 Z" fill="#4A505B" stroke="#15171C" stroke-width="1.3" stroke-linejoin="round"/>
+<path d="M480,240 L446,240 A50,50 0 0 0 396,290 L396,442 A50,50 0 0 0 446,492 L480,492 Z" fill="#0AB9E6" stroke="#15171C" stroke-width="1.6" stroke-linejoin="round"/>
+<path d="M 800 240 L 834 240 A 50 50 0 0 1 884 290 L 884 442 A 50 50 0 0 1 834 492 L 800 492 Z" fill="#FF3C28" stroke="#15171C" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="480" y="240" width="320" height="252" fill="#15171C"/>
+<rect x="496" y="256" width="288" height="220" rx="4" fill="#1D2027" stroke="#2C3039" stroke-width="1"/>
+<g transform="translate(640,352)" fill="none" stroke="#5E626B"><circle r="24" stroke-width="1.4"/><ellipse rx="24" ry="8.5" stroke-width="1.1"/><ellipse rx="8.5" ry="24" stroke-width="1.1"/><rect x="-2.5" y="-2.5" width="5" height="5" fill="#FF4554" stroke="none"/></g>
+<text x="640" y="406" class="mono" font-size="10.5" font-weight="600" fill="#A3A8B3" text-anchor="middle" letter-spacing="2.4">GYRO AIM</text>
+<rect x="454" y="262.2" width="14" height="3.6" fill="#15171C"/>
+<circle cx="438" cy="312" r="21" class="bt"/>
+<circle cx="438" cy="312" r="14.5" fill="#15171C" stroke="#4B505A" stroke-width="1"/>
+<text x="438" y="315.2" class="bl" fill="#F2F0EA" style="fill:#F2F0EA">L3</text>
+<circle cx="438" cy="380" r="8.6" class="bt"/>
+<circle cx="438" cy="416" r="8.6" class="bt"/>
+<circle cx="420" cy="398" r="8.6" class="bt"/>
+<circle cx="456" cy="398" r="8.6" class="bt"/>
+<g fill="#F2F0EA"><polygon points="438,376.5 435,381.5 441,381.5"/><polygon points="438,419.5 435,414.5 441,414.5"/><polygon points="416.5,398 421.5,395 421.5,401"/><polygon points="459.5,398 454.5,395 454.5,401"/></g>
+<rect x="448" y="450" width="12" height="12" rx="1.5" class="bt"/><circle cx="454" cy="456" r="2.8" fill="#9CA3AF"/>
+<path d="M824.2,258 h3.6 v4.2 h4.2 v3.6 h-4.2 v4.2 h-3.6 v-4.2 h-4.2 v-3.6 h4.2 z" fill="#15171C"/>
+<circle cx="842" cy="294" r="9.4" class="bt"/>
+<text x="842" y="297.2" class="bl">X</text>
+<circle cx="822" cy="314" r="9.4" class="bt"/>
+<text x="822" y="317.2" class="bl">Y</text>
+<circle cx="862" cy="314" r="9.4" class="bt"/>
+<text x="862" y="317.2" class="bl">A</text>
+<circle cx="842" cy="334" r="9.4" class="bt"/>
+<text x="842" y="337.2" class="bl">B</text>
+<circle cx="842" cy="398" r="21" class="bt"/>
+<circle cx="842" cy="398" r="14.5" fill="#15171C" stroke="#4B505A" stroke-width="1"/>
+<text x="842" y="401.2" class="bl" style="fill:#F2F0EA">R3</text>
+<circle cx="826" cy="456" r="7.4" class="bt"/><circle cx="826" cy="456" r="3.3" fill="none" stroke="#9CA3AF" stroke-width="1"/>
+<rect x="283.2" y="185.0" width="22.6" height="22" class="kc"/><text x="294.5" y="199.9" class="kt">L</text><rect x="310.8" y="185.0" width="29.2" height="22" class="kc"/><text x="325.4" y="199.9" class="kt">ZL</text>
+<text x="271.2" y="200.6" class="tp" text-anchor="end">Fire / Melee</text>
+<polyline points="350,196 372,196 408.2,252.2" class="ld"/>
+<rect x="404.7" y="248.7" width="7" height="7" fill="#15171C" stroke="#F2F0EA" stroke-width="1.5"/>
+<rect x="317.4" y="253.0" width="22.6" height="22" class="kc"/><text x="328.7" y="267.9" class="kt">−</text>
+<text x="305.4" y="268.6" class="tp" text-anchor="end">Settings menu</text>
+<polyline points="350,264 447,264" class="ld"/>
+<rect x="443.5" y="260.5" width="7" height="7" fill="#15171C" stroke="#F2F0EA" stroke-width="1.5"/>
+<rect x="277.8" y="301.0" width="62.2" height="22" class="kc"/><text x="308.9" y="315.9" class="kt">L-STICK</text>
+<text x="265.8" y="316.6" class="tp" text-anchor="end">Move · Flick to dash</text><text x="265.8" y="335.6" class="ts" text-anchor="end"><tspan class="pre">L3</tspan><tspan dx="7">Center camera and reticle</tspan></text>
+<polyline points="350,312 417,312" class="ld"/>
+<rect x="413.5" y="308.5" width="7" height="7" fill="#15171C" stroke="#F2F0EA" stroke-width="1.5"/>
+<rect x="291.0" y="387.0" width="49.0" height="22" class="kc"/><text x="315.5" y="401.9" class="kt">D-PAD</text>
+<text x="279.0" y="402.6" class="tp" text-anchor="end"><tspan class="pre">◀ ▶</tspan><tspan dx="7">Select power</tspan></text><text x="279.0" y="421.6" class="ts" text-anchor="end"><tspan class="pre">▼</tspan><tspan dx="7">Activate power</tspan></text>
+<polyline points="350,398 410,398" class="ld"/>
+<rect x="406.5" y="394.5" width="7" height="7" fill="#15171C" stroke="#F2F0EA" stroke-width="1.5"/>
+<rect x="940.0" y="165.0" width="29.2" height="22" class="kc"/><text x="954.6" y="179.9" class="kt">ZR</text>
+<text x="981.2" y="180.6" class="tp" text-anchor="start">Fire / Melee</text>
+<polyline points="930,176 900,176 828,229" class="ld"/>
+<rect x="824.5" y="225.5" width="7" height="7" fill="#15171C" stroke="#F2F0EA" stroke-width="1.5"/>
+<rect x="940.0" y="203.0" width="22.6" height="22" class="kc"/><text x="951.3" y="217.9" class="kt">R</text>
+<text x="974.6" y="218.6" class="tp" text-anchor="start">Quick turn · Z-target</text><text x="974.6" y="237.6" class="ts" text-anchor="start">Air recenter</text>
+<polyline points="930,214 912,214 871.8,252.2" class="ld"/>
+<rect x="868.3" y="248.7" width="7" height="7" fill="#15171C" stroke="#F2F0EA" stroke-width="1.5"/>
+<rect x="940.0" y="253.0" width="22.6" height="22" class="kc"/><text x="951.3" y="267.9" class="kt">+</text>
+<text x="974.6" y="268.6" class="tp" text-anchor="start">Pause</text><text x="974.6" y="287.6" class="ts" text-anchor="start">3DS Start</text>
+<polyline points="930,264 839,264" class="ld"/>
+<rect x="835.5" y="260.5" width="7" height="7" fill="#15171C" stroke="#F2F0EA" stroke-width="1.5"/>
+<rect x="940.0" y="303.0" width="22.6" height="22" class="kc"/><text x="951.3" y="317.9" class="kt">Y</text><rect x="967.6" y="303.0" width="22.6" height="22" class="kc"/><text x="978.9" y="317.9" class="kt">A</text><rect x="995.2" y="303.0" width="22.6" height="22" class="kc"/><text x="1006.5" y="317.9" class="kt">B</text>
+<text x="1029.8" y="318.6" class="tp" text-anchor="start"><tspan class="pre">Y</tspan><tspan dx="7">Center reticle only</tspan></text><text x="1029.8" y="337.6" class="tp" text-anchor="start"><tspan class="pre">A</tspan><tspan dx="7">Confirm · Vehicle action</tspan></text><text x="1029.8" y="356.6" class="tp" text-anchor="start"><tspan class="pre">B</tspan><tspan dx="7">Back · Exit vehicle</tspan></text>
+<polyline points="930,314 872,314" class="ld"/>
+<rect x="868.5" y="310.5" width="7" height="7" fill="#15171C" stroke="#F2F0EA" stroke-width="1.5"/>
+<rect x="940.0" y="387.0" width="62.2" height="22" class="kc"/><text x="971.1" y="401.9" class="kt">R-STICK</text>
+<text x="1014.2" y="402.6" class="tp" text-anchor="start">Aim / Camera</text><text x="1014.2" y="421.6" class="ts" text-anchor="start"><tspan class="pre">R + flick</tspan><tspan dx="7">Switch target</tspan></text><text x="1014.2" y="440.6" class="ts" text-anchor="start"><tspan class="pre">R3</tspan><tspan dx="7">Toggle bottom screen</tspan></text>
+<polyline points="930,398 863,398" class="ld"/>
+<rect x="859.5" y="394.5" width="7" height="7" fill="#15171C" stroke="#F2F0EA" stroke-width="1.5"/>
+<text x="48.0" y="554" class="lbl">GYRO</text>
+<line x1="48.0" y1="567" x2="416.0" y2="567" stroke="#15171C" stroke-width="1.5"/>
+<text x="48.0" y="592.6" class="tp" text-anchor="start">Tilt to fine-aim</text><text x="48.0" y="611.6" class="ts" text-anchor="start">Hold R, Y or L3 to pause</text>
+<text x="456.0" y="554" class="lbl">HOTKEYS</text>
+<line x1="456.0" y1="567" x2="824.0" y2="567" stroke="#15171C" stroke-width="1.5"/>
+<text x="456.0" y="592.6" class="tp" text-anchor="start">Hold R3 + D-Pad</text><text x="456.0" y="611.6" class="ts" text-anchor="start">Preset · Resolution · 60 fps</text>
+<text x="864.0" y="554" class="lbl">QUIT</text>
+<line x1="864.0" y1="567" x2="1232.0" y2="567" stroke="#15171C" stroke-width="1.5"/>
+<text x="864.0" y="592.6" class="tp" text-anchor="start">Press + and −</text><text x="864.0" y="611.6" class="ts" text-anchor="start">Exit the game</text>
+</g>
+</svg>

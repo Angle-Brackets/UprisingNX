@@ -105,6 +105,8 @@ Decrypted US saves (`00.SAV`, `01.SAV`, etc.) from Checkpoint, JKSM, Citra, and 
 
 ### Controls & Hotkeys
 
+![UprisingNX Default Switch Controls](docs/controls.svg)
+
 | Input | Action |
 | --- | --- |
 | **Left / Right Stick + Gyro** | Movement & native aiming / camera control |
