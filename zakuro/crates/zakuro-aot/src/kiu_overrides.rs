@@ -59,8 +59,6 @@ const ENEMY_LIST_HEAD: u32 = 0x00F2_5A78;
 const FIGHTER_LIST_GUARD: u32 = 0x00D6_3708;
 const FIGHTER_LIST_HEAD: u32 = 0x00F2_5A68;
 const TARGET_COMP_KEY: u32 = 0x00D7_6244;
-/// Air-battle & Chapter 25 Great Sacred Treasure orbit reticle vtable (`code539.c`).
-const AIR_RETICLE_VTABLE: u32 = 0x00CF_1B40;
 
 const PI_F: f32 = std::f32::consts::PI;
 /// Tier-1 forward on-screen lock-on range (covers full KIU arenas & Staff/Bow range).
@@ -182,7 +180,7 @@ unsafe extern "C" fn override_00a3edcc(aot_ctx: *mut AotExecContext, orig_body: 
 }
 
 // ---------------------------------------------------------------------------
-// 2. Air-Battle & Orbit Boss Reticle Overrides (`kiu_air_aim.c`)
+// 2. Air-Battle Reticle Overrides (`kiu_air_aim.c`)
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" fn override_006d269c(aot_ctx: *mut AotExecContext, orig_body: *const u8) {
@@ -191,14 +189,10 @@ unsafe extern "C" fn override_006d269c(aot_ctx: *mut AotExecContext, orig_body: 
         let reticle = ctx.r[0];
         let player = ctx.r[2];
 
-        let mut preserve_pos: Option<(u32, u32)> = None;
         if valid_heap_ptr(reticle) && mem_read8(ctx, reticle + 0xD5) == 0 {
-            let mark = mem_read32(ctx, MAILBOX);
-            if mark == MOUSE_AIM || mark == MOUSE_AIM_RECENTER || mark == MOUSE_LOOK {
-                // Unconditionally suppress KIU's 0.5s idle auto-centering (`f_006D1FF0`
-                // Mode 1) every tick—in both Air Battles and Land Battles—so KIU's
-                // auto-center spring never fights the player's gyro or pulls the
-                // reticle back toward screen center while aiming or orbiting.
+            let dx = f32::from_bits(mem_read32(ctx, MAILBOX + 4));
+            let dy = f32::from_bits(mem_read32(ctx, MAILBOX + 8));
+            if dx.is_finite() && dy.is_finite() && (dx != 0.0 || dy != 0.0) {
                 mem_write32(ctx, reticle + 0x208, 0);
                 if valid_heap_ptr(player) {
                     let p_aim = player + 0x98;
@@ -206,34 +200,10 @@ unsafe extern "C" fn override_006d269c(aot_ctx: *mut AotExecContext, orig_body: 
                     mem_write32(ctx, p_aim + 0xDC, 0x3F00_0000); // 0.5f
                     mem_write8(ctx, p_aim + 0xE0, 0);
                 }
-
-                // Zero Pit/orbit screen-follow velocity (`[reticle + 0x2F4, 0x2F8]`)
-                // computed by `f_0076E854` so orbiting in air battles and Chapter 25
-                // (Great Sacred Treasure vs Hades) never drags the crosshair off target.
-                if mem_read32(ctx, reticle) == AIR_RETICLE_VTABLE {
-                    mem_write32(ctx, reticle + 0x2F4, 0);
-                    mem_write32(ctx, reticle + 0x2F8, 0);
-                }
-
-                // When the touchscreen stylus is up (`[reticle + 0x1D0] == 0`), hold
-                // `[reticle + 0xA4, 0xA8]` invariant across `f_006D269C` (blocking both
-                // follow-drift and `f_006D131C` pull) while still allowing real touch drags.
-                if mem_read8(ctx, reticle + 0x1D0) == 0 {
-                    preserve_pos = Some((
-                        mem_read32(ctx, reticle + 0xA4),
-                        mem_read32(ctx, reticle + 0xA8),
-                    ));
-                }
             }
         }
 
-        if call_original(aot_ctx, orig_body, 0x006D_269C) {
-            if let Some((orig_x, orig_y)) = preserve_pos {
-                let ctx = &mut (*aot_ctx).ctx;
-                mem_write32(ctx, reticle + 0xA4, orig_x);
-                mem_write32(ctx, reticle + 0xA8, orig_y);
-            }
-        }
+        call_original(aot_ctx, orig_body, 0x006D_269C);
     }
 }
 
