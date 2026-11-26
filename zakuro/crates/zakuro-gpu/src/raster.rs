@@ -1810,6 +1810,10 @@ fn note_text(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
                 }
             }
             None => {
+                if lines.len() >= 64 {
+                    lines.remove(0);
+                    addrs.remove(0);
+                }
                 lines.push(found);
                 addrs.push(target_addr);
             }
@@ -1824,9 +1828,11 @@ fn note_text(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
 /// draw (such as Chapter End bonus labels like "No Damage" / "Melee Finisher"
 /// or Pause screen notices).
 ///
-/// KIU's real battle subtitle quad (`each_subtitle_line_goes_to_the_middle_of_the_screen`)
+/// KIU's 2-line battle subtitle quad (`each_subtitle_line_goes_to_the_middle_of_the_screen`)
 /// occupies `bx = 15.1..56.0` (`sy = 184..225`), `by = 97.6..361.0` (`sx = 39..302`),
-/// width ~263 px, height ~41 px, with 1 or 2 identical-UV quads (text + shadow).
+/// while 1-line and short dialogue quads sit in the same bottom strip with
+/// smaller height (~14..24 px) and/or narrower width (anchored near `high_by ≈ 361`),
+/// with 1 or 2 identical-UV quads (text + shadow).
 fn is_top_subtitle_quad(vertices: &[Vertex]) -> bool {
     if vertices.len() < 6 || !vertices.len().is_multiple_of(6) {
         return false;
@@ -1860,10 +1866,10 @@ fn is_top_subtitle_quad(vertices: &[Vertex]) -> bool {
     }
     let h = high_bx - low_bx;
     let w = high_by - low_by;
-    if !(low_bx >= 2.0 && high_bx <= 72.0 && (20.0..=64.0).contains(&h)) {
+    if !(low_bx >= 2.0 && high_bx <= 72.0 && (10.0..=68.0).contains(&h)) {
         return false;
     }
-    if !(w >= 200.0 && low_by <= 150.0 && high_by >= 250.0) {
+    if !(w >= 8.0 && low_by >= 2.0 && high_by >= 200.0 && high_by <= 398.0) {
         return false;
     }
     let first_uv = uv_bounds(&vertices[..6]);
@@ -4597,17 +4603,10 @@ fn note_title_draw(registers: &[u32], portraits: &mut Portraits) {
                 && dims == (128 << 16 | 128)
                 && fmt == TextureFormat::Etc1A4
             {
+                // Do NOT activate `chapter_active` yet: Arms Altar's Redeem Hearts
+                // preview also draws `512x256 Etc1` followed by a `128x128 Etc1A4`
+                // weapon texture. Wait for Chapter Select's `256x64 Etc1` stage banner.
                 portraits.chapter_step = 2;
-                portraits.chapter_top_seen = true;
-                portraits.chapter_active = true;
-                portraits.chapter_missed = 0;
-                portraits.cauldron_active = false;
-                portraits.cauldron_hud_active = false;
-                portraits.solo_active = false;
-                portraits.weapon_active = false;
-                portraits.mode_active = false;
-                portraits.mode_top_latched = false;
-                portraits.file_active = false;
             } else if portraits.chapter_step == 2
                 && dims == (32 << 16 | 32)
                 && fmt == TextureFormat::La4
@@ -6119,8 +6118,6 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
         resources.portraits.dialogue.clear();
         resources.portraits.last_dialogue.clear();
         resources.portraits.tutorial_dialogue_hold = 0;
-        resources.portraits.text_lines.clear();
-        resources.portraits.text_line_addrs.clear();
         return drew_title;
     }
     let mut sides = std::mem::take(&mut resources.portraits.sides);
@@ -8710,12 +8707,10 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
                     return Some(0);
                 }
             }
-        } else if resources.portraits.in_play
-            && resources.portraits.in_battle
-            && !resources.portraits.pause_active
-            && is_text_buffer(registers)
-        {
-            // the CPU decodes its arrays, so its letters say where they are
+        } else if is_text_buffer(registers) {
+            // Track 512x128 A4 text line bounds unconditionally (zero visual side
+            // effects) so the first subtitle of a chapter/cutscene or after a pause
+            // always has its glyph bounds ready before `in_battle` wakes up.
             #[cfg(feature = "vulkan")]
             if matches!(vertices, Vertices::Raw { .. }) {
                 return None;
@@ -12881,9 +12876,29 @@ mod tests {
         }
         // no lines known: the subtitles are left as the title drew them
         assert!(centered_subtitle(&quad, &[]).is_none());
-        assert!(is_top_subtitle_quad(&quad), "real KIU battle subtitle quad must pass");
+        assert!(is_top_subtitle_quad(&quad), "real KIU 2-line battle subtitle quad must pass");
 
-        // Chapter End bonus labels (mid-screen, narrow left column, or batched multi-row UVs)
+        // Short 1-line battle subtitles (narrow width and/or tight single-row height)
+        // must also pass `is_top_subtitle_quad` and center cleanly.
+        let one_line_short = [
+            corner(44.0, 361.0, 0.008, 0.445),
+            corner(44.0, 313.0, 0.102, 0.445),
+            corner(26.0, 361.0, 0.008, 0.281),
+            corner(44.0, 313.0, 0.102, 0.445),
+            corner(26.0, 313.0, 0.102, 0.281),
+            corner(26.0, 361.0, 0.008, 0.281),
+        ];
+        assert!(is_top_subtitle_quad(&one_line_short), "short 1-line battle subtitle quad must pass");
+        let one_line = [TextLine { bottom: 38.0, top: 53.0, left: 17.0, right: 49.0 }];
+        let centered_one = centered_subtitle(&one_line_short, &one_line).expect("1-line centered");
+        assert_eq!(centered_one.len(), 6, "single slice for 1-line subtitle");
+        let low_u = centered_one.iter().find(|v| (v.texcoords[0][0] - 0.008).abs() < 1e-4).unwrap();
+        let high_u = centered_one.iter().find(|v| (v.texcoords[0][0] - 0.102).abs() < 1e-4).unwrap();
+        let middle = ((one_line[0].left + one_line[0].right) / 2.0 / 512.0 - 0.008) / (0.102 - 0.008);
+        let y = low_u.clip[1] + (high_u.clip[1] - low_u.clip[1]) * middle;
+        assert!(y.abs() < 1e-4, "1-line subtitle centered at {y}");
+
+        // Chapter End bonus labels (mid-screen, right-corner badges, or batched multi-row UVs)
         // must NOT be intercepted or shifted to screen center.
         let bonus_row = [
             corner(140.0, 360.0, 0.01, 0.25),
@@ -12894,6 +12909,16 @@ mod tests {
             corner(122.0, 360.0, 0.01, 0.12),
         ];
         assert!(!is_top_subtitle_quad(&bonus_row), "mid-screen chapter-end bonus row must not be treated as subtitle");
+
+        let right_corner_badge = [
+            corner(44.0, 150.0, 0.01, 0.25),
+            corner(44.0, 20.0, 0.26, 0.25),
+            corner(26.0, 150.0, 0.01, 0.12),
+            corner(44.0, 20.0, 0.26, 0.25),
+            corner(26.0, 20.0, 0.26, 0.12),
+            corner(26.0, 150.0, 0.01, 0.12),
+        ];
+        assert!(!is_top_subtitle_quad(&right_corner_badge), "bottom-right corner badge must not be treated as subtitle");
 
         let mut batched_rows = quad.to_vec();
         batched_rows.extend_from_slice(&[
@@ -12981,8 +13006,10 @@ mod tests {
         regs[base + 13] = match fmt {
             TextureFormat::Rgb565 => 3,
             TextureFormat::Rgba4 => 4,
+            TextureFormat::La4 => 9,
             TextureFormat::L4 => 10,
             TextureFormat::Etc1 => 12,
+            TextureFormat::Etc1A4 => 13,
             _ => unreachable!("unused test format {fmt:?}"),
         };
         regs
@@ -13044,5 +13071,32 @@ mod tests {
         note_title_draw(&top_tex_regs(64, 64, TextureFormat::Rgba4), &mut file_select);
         note_title_draw(&top_tex_regs(64, 64, TextureFormat::Rgba4), &mut file_select);
         assert!(!file_select.solo_active, "File Select must not trigger Solo Hub");
+    }
+
+    #[test]
+    fn chapter_select_does_not_false_trigger_on_arms_altar_redeem_hearts() {
+        // Arms Altar hovering Redeem Hearts draws `512x256 Etc1` (temple backdrop)
+        // followed by a `128x128 Etc1A4` 3D weapon texture, without Chapter Select's
+        // `256x64 Etc1` stage banner.
+        let mut altar = Portraits::default();
+        note_title_draw(&top_tex_regs(512, 256, TextureFormat::Etc1), &mut altar);
+        note_title_draw(&top_tex_regs(128, 128, TextureFormat::Etc1A4), &mut altar);
+        assert!(!altar.chapter_active && !altar.chapter_top_seen, "Arms Altar Redeem Hearts must not trigger Chapter Select");
+
+        // Real Chapter Select (cleared chapter with optional `32x32 La4` laurel wreath):
+        let mut chap_cleared = Portraits::default();
+        note_title_draw(&top_tex_regs(512, 256, TextureFormat::Etc1), &mut chap_cleared);
+        note_title_draw(&top_tex_regs(128, 128, TextureFormat::Etc1A4), &mut chap_cleared);
+        note_title_draw(&top_tex_regs(32, 32, TextureFormat::La4), &mut chap_cleared);
+        assert!(!chap_cleared.chapter_active, "must wait for 256x64 Etc1 stage banner");
+        note_title_draw(&top_tex_regs(256, 64, TextureFormat::Etc1), &mut chap_cleared);
+        assert!(chap_cleared.chapter_active && chap_cleared.chapter_top_seen, "cleared Chapter Select detected");
+
+        // Real Chapter Select (uncleared chapter without laurel wreath):
+        let mut chap_uncleared = Portraits::default();
+        note_title_draw(&top_tex_regs(512, 256, TextureFormat::Etc1), &mut chap_uncleared);
+        note_title_draw(&top_tex_regs(128, 128, TextureFormat::Etc1A4), &mut chap_uncleared);
+        note_title_draw(&top_tex_regs(256, 64, TextureFormat::Etc1), &mut chap_uncleared);
+        assert!(chap_uncleared.chapter_active && chap_uncleared.chapter_top_seen, "uncleared Chapter Select detected");
     }
 }
