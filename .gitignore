@@ -10,25 +10,27 @@ saves/
 *.cci
 code.bin
 recompiled/
-
-# probe build output
-probes/*/rust/target/
-probes/*/c/build/
-probes/*/c/*.elf
-probes/*/c/*.nro
-probes/*/c/*.nacp
-probes/*/c/*.map
-
-# frontend and Zakuro build outputs
-nx/rust/target/
-nx/c/build/
-zakuro/target/
+/target/
 *.lst
-nx/c/*.elf
-nx/c/*.nro
-nx/c/*.nacp
-nx/c/*.map
 __pycache__/
+
+# Archived probe build output
+docs/archive/probes/*/rust/target/
+docs/archive/probes/*/c/build/
+docs/archive/probes/*/c/*.elf
+docs/archive/probes/*/c/*.nro
+docs/archive/probes/*/c/*.nacp
+docs/archive/probes/*/c/*.map
+
+# Frontend and Zakuro build outputs
+platforms/nx/rust/target/
+platforms/nx/c/build/
+platforms/nx/c/*.elf
+platforms/nx/c/*.nro
+platforms/nx/c/*.nacp
+platforms/nx/c/*.map
+platforms/pc/target/
+zakuro/target/
 
 # Tutorial voiceover / mod tooling & datasets
 tools/

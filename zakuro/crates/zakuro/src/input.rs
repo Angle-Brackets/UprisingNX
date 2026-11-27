@@ -84,9 +84,9 @@ pub const MOUSE_AIM: u32 = u32::from_le_bytes(*b"MAM1");
 
 /// the host mailbox's fourth word, which game overrides set every tick to the
 /// kind of play going on, and the frontend reads and clears every frame.
-pub const GAME_ON_FOOT: u32 = zakuro_kiu::GAME_ON_FOOT;
-pub const GAME_FLYING: u32 = zakuro_kiu::GAME_FLYING;
-pub const GAME_VEHICLE: u32 = zakuro_kiu::GAME_VEHICLE;
+pub const GAME_ON_FOOT: u32 = kiu_common::GAME_ON_FOOT;
+pub const GAME_FLYING: u32 = kiu_common::GAME_FLYING;
+pub const GAME_VEHICLE: u32 = kiu_common::GAME_VEHICLE;
 
 /// frames with no word from the game before aim goes off, as in a menu. the
 /// overrides say it once per tick, every second frame for Kid Icarus.

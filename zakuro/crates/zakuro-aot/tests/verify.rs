@@ -5,16 +5,12 @@
 #![cfg(all(unix, target_arch = "aarch64"))]
 
 use std::ffi::c_void;
-use std::path::Path;
 use std::ptr::null_mut;
 use std::time::Instant;
 
 use recomp_abi::{Context, Host, EXIT_BUDGET, EXIT_NONE, EXIT_SVC, EXIT_UNWIND};
 use zakuro_aot::discover::{Program, Segment, Source};
-use zakuro_aot::{
-    compile_program, compile_title, CompileOptions, LoadedAot, KIU_USA_PROGRAM_ID,
-    KIU_USA_TEXT_HASH,
-};
+use zakuro_aot::{compile_program, compile_title, CompileOptions, LoadedAot};
 use zakuro_cpu::{Bus, Cpu, Exit};
 
 const PAGE_SIZE: usize = 0x1000;
@@ -659,19 +655,21 @@ fn direct_call_and_tail_jump_to_function_with_lower_prefix_block() {
 }
 
 #[test]
-fn compiles_and_verifies_kid_icarus_uprising_rom() {
-    let rom_path = Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../roms/Kid Icarus - Uprising (USA) (En,Fr,Es) (Rev 1).cci"
-    ));
-    if !rom_path.exists() {
-        eprintln!("KIU ROM not present at {}, skipping real-ROM test", rom_path.display());
+fn compiles_and_verifies_local_3ds_rom() {
+    let Some(rom_path) = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../roms"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("cci") || e.eq_ignore_ascii_case("3ds")))
+    else {
+        eprintln!("No test ROM in roms/, skipping real-ROM differential test");
         return;
-    }
+    };
 
-    let title = zakuro_fs::Title::load(rom_path).expect("load KIU CCI");
-    assert_eq!(title.program_id(), KIU_USA_PROGRAM_ID);
-    let code = title.code().expect("decompress KIU code.bin");
+    let title = zakuro_fs::Title::load(&rom_path).expect("load test ROM");
+    let code = title.code().expect("decompress code.bin");
 
     let t0 = Instant::now();
     let image = compile_title(
@@ -679,41 +677,40 @@ fn compiles_and_verifies_kid_icarus_uprising_rom() {
         &title.exheader,
         &code,
         &[],
-        CompileOptions::for_title(title.program_id()),
+        &[],
+        CompileOptions::default(),
         |_, _| {},
     );
     let compile_elapsed = t0.elapsed();
-    assert_eq!(image.text_hash, KIU_USA_TEXT_HASH);
 
     let code_mib = image.code_bytes().len() as f64 / (1024.0 * 1024.0);
     println!(
-        "KIU AOT compiled in {:.2?}: {:.2} MiB machine code ({} functions, {} entry points, {} pieces)",
+        "ROM AOT compiled in {:.2?}: {:.2} MiB machine code ({} functions, {} entry points, {} pieces)",
         compile_elapsed,
         code_mib,
         image.origins.functions.len(),
         image.entries.len(),
         image.origins.pieces.len(),
     );
-    // Must fit comfortably in one single Horizon CodeMemory (`<= 128 MiB`, target ~35-65 MiB vs 390 MiB librecomp.a!)
+    // Must fit comfortably in one single Horizon CodeMemory (`<= 128 MiB`)
     assert!(code_mib < 96.0, "expected compact AOT code < 96 MiB, got {code_mib:.2} MiB");
 
-    // Differential-verify 2,500 real KIU functions (sampled evenly across all 12.14 MB of .text,
-    // WITHOUT KIU overrides so AOT matches pure vanilla `zakuro-cpu` instruction-for-instruction!).
+    // Differential-verify 2,500 real functions against pure `zakuro-cpu` instruction-for-instruction.
     let parsed = zakuro_aot::discover::Image::from_exheader(&title.exheader, &code);
-    let hints = zakuro_aot::hints_kiu::builtin_hints(KIU_USA_PROGRAM_ID, KIU_USA_TEXT_HASH);
     let text_seg = parsed.text.clone();
     let ro_seg = parsed.rodata.clone();
     let data_seg = parsed.data.clone();
-    let prog = parsed.into_program(&[], &hints);
+    let text_hash = parsed.text.hash();
+    let prog = parsed.into_program(&[], &[]);
     let pure_image = compile_program(
-        KIU_USA_PROGRAM_ID,
-        KIU_USA_TEXT_HASH,
+        title.program_id(),
+        text_hash,
         &prog,
         &[],
-        CompileOptions::for_title(KIU_USA_PROGRAM_ID),
+        CompileOptions::default(),
         |_, _| {},
     );
-    let aot = pure_image.into_loaded_mmap().expect("mmap KIU AOT");
+    let aot = pure_image.into_loaded_mmap().expect("mmap ROM AOT");
 
     // Build pristine test memory matching `3dsrecomp/src/verify.rs`:
     let mut rng = 0x9E37_79B9_7F4A_7C15_u64;
@@ -836,9 +833,9 @@ fn compiles_and_verifies_kid_icarus_uprising_rom() {
     }
 
     println!(
-        "KIU differential verification: tested={tested}, returned={returned}, fallbacks={total_fallbacks}, mismatches={mismatches}"
+        "ROM differential verification: tested={tested}, returned={returned}, fallbacks={total_fallbacks}, mismatches={mismatches}"
     );
-    assert_eq!(mismatches, 0, "{mismatches} KIU functions mismatched zakuro-cpu!");
+    assert_eq!(mismatches, 0, "{mismatches} ROM functions mismatched zakuro-cpu!");
 }
 
 fn pure_image_starts(aot: &LoadedAot, code: &[u8], exh: &zakuro_fs::ExHeader) -> Vec<u32> {

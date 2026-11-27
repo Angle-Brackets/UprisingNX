@@ -152,10 +152,10 @@ fn recompile(
     let files = |path: &str| changes.as_ref()?.module(path);
     log::info!("recompiling {name} with {}", compiler.describe());
     let mut options = build::Options { cancel: Some(cancel), compiler: Some(compiler), background: true, ..build::Options::default() };
-    let kiu_overrides_dir = if program_id == zakuro_kiu::KIU_USA_PROGRAM_ID {
+    let kiu_overrides_dir = if program_id == kiu_common::KIU_USA_PROGRAM_ID {
         let base = data_dir.map(Path::to_owned).unwrap_or_else(std::env::temp_dir);
         let dir = base.join("overrides").join(format!("{program_id:016X}"));
-        match zakuro_kiu::write_usa_overrides(&dir) {
+        match kiu_common::write_usa_overrides(&dir) {
             Ok(()) => {
                 log::info!("applying built-in Kid Icarus: Uprising PC mouse/gamepad overrides from {}", dir.display());
                 Some(dir)

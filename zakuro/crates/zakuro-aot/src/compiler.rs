@@ -30,8 +30,6 @@ use crate::discover::{
     self, analyze, build_origins, decode_arm, decode_thumb, key, recompiles, Function, Image,
     Mode, Program, Segment,
 };
-use crate::hints_kiu::{builtin_hints, KIU_USA_PROGRAM_ID};
-use crate::kiu_overrides::overrides_for;
 use crate::runtime::{offsets, AotImage};
 
 const RECOMP_DEPTH_LIMIT: u16 = 2048;
@@ -40,8 +38,7 @@ const RECOMP_DEPTH_LIMIT: u16 = 2048;
 pub struct CompileOptions {
     /// Fold PC-relative loads from immutable `.text` literal pools into immediate moves.
     pub fold_text_literals: bool,
-    /// Emit `FPSCR.LEN != 0` short-vector checks on VFP arithmetic (`false` for KIU, which
-    /// never uses short vectors).
+    /// Emit `FPSCR.LEN != 0` short-vector checks on VFP arithmetic.
     pub emit_vfp_vectors: bool,
 }
 
@@ -51,33 +48,20 @@ impl Default for CompileOptions {
     }
 }
 
-impl CompileOptions {
-    pub fn for_title(program_id: u64) -> Self {
-        Self {
-            fold_text_literals: true,
-            emit_vfp_vectors: program_id != KIU_USA_PROGRAM_ID,
-        }
-    }
-}
-
-/// Compiles a 3DS title's decompressed `.code` image into a position-independent AArch64 `AotImage`.
+/// Compiles a 3DS title's decompressed `.code` image into a position-independent `AotImage`.
 pub fn compile_title(
     program_id: u64,
     exheader: &ExHeader,
     code: &[u8],
-    extra_hints: &[u32],
+    override_addrs: &[u32],
+    hints: &[u32],
     options: CompileOptions,
     progress: impl Fn(usize, usize) + Sync,
 ) -> AotImage {
     let image = Image::from_exheader(exheader, code);
     let text_hash = image.text.hash();
-    let mut hints = builtin_hints(program_id, text_hash);
-    hints.extend_from_slice(extra_hints);
-    let ovr_list = overrides_for(program_id, text_hash);
-    let ovr_addrs: Vec<u32> = ovr_list.iter().map(|&(a, _)| a).collect();
-
-    let program = image.into_program(&ovr_addrs, &hints);
-    compile_program(program_id, text_hash, &program, &ovr_addrs, options, progress)
+    let program = image.into_program(override_addrs, hints);
+    compile_program(program_id, text_hash, &program, override_addrs, options, progress)
 }
 
 pub fn compile_program(
@@ -3766,15 +3750,18 @@ mod size_tests {
     use super::*;
 
     #[test]
-    fn inspect_kiu_aot_size_and_speed() {
-        let rom_path = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../roms/Kid Icarus - Uprising (USA) (En,Fr,Es) (Rev 1).cci"
-        ));
-        if !rom_path.exists() {
+    fn inspect_3ds_rom_aot_size_and_speed() {
+        let Some(rom_path) = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../roms"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("cci") || e.eq_ignore_ascii_case("3ds")))
+        else {
             return;
-        }
-        let title = zakuro_fs::Title::load(rom_path).unwrap();
+        };
+        let title = zakuro_fs::Title::load(&rom_path).unwrap();
         let code = title.code().unwrap();
         let t0 = std::time::Instant::now();
         let image = compile_title(
@@ -3782,14 +3769,14 @@ mod size_tests {
             &title.exheader,
             &code,
             &[],
-            CompileOptions::for_title(title.program_id()),
+            &[],
+            CompileOptions::default(),
             |_, _| {},
         );
         let elapsed = t0.elapsed();
         let mib = image.code_bytes().len() as f64 / (1024.0 * 1024.0);
         println!(
-            "KIU AOT compiled on host in {elapsed:.2?}: {mib:.2} MiB ({} words, {} entries, {} functions, {} pieces)",
-            image.code.len(),
+            "3DS ROM AOT compiled on host in {elapsed:.2?}: {mib:.2} MiB ({} entries, {} functions, {} pieces)",
             image.entries.len(),
             image.origins.functions.len(),
             image.origins.pieces.len(),

@@ -1,0 +1,13 @@
+[package]
+name = "kiu-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared Kid Icarus: Uprising (USA) 16:9 UI state, touch mapping, AOT overrides, jump hints, and ROM validation for PC and Switch"
+
+[dependencies]
+recomp-abi.workspace = true
+zakuro-aot.workspace = true
+zakuro-core.workspace = true
+zakuro-fs.workspace = true
+zakuro-gpu.workspace = true

@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kiu-common",
+    "platforms/pc",
+    "zakuro/crates/zakuro-common",
+    "zakuro/crates/zakuro-fs",
+    "zakuro/crates/zakuro-cpu",
+    "zakuro/crates/zakuro-aot",
+    "zakuro/crates/zakuro-gpu",
+    "zakuro/crates/zakuro-core",
+    "zakuro/crates/zakuro",
+]
+exclude = [
+    "platforms/nx/rust",
+    "docs/archive/probes",
+]
+
+[workspace.package]
+version = "0.2.29"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/Angle-Brackets/UprisingNX"
+
+[workspace.dependencies]
+kiu-common    = { path = "crates/kiu-common" }
+zakuro-common = { path = "zakuro/crates/zakuro-common" }
+zakuro-fs     = { path = "zakuro/crates/zakuro-fs" }
+zakuro-cpu    = { path = "zakuro/crates/zakuro-cpu" }
+zakuro-aot    = { path = "zakuro/crates/zakuro-aot" }
+zakuro-gpu    = { path = "zakuro/crates/zakuro-gpu", default-features = false }
+zakuro-core   = { path = "zakuro/crates/zakuro-core" }
+zakuro        = { path = "zakuro/crates/zakuro" }
+
+log = "0.4"
+thiserror = "2"
+bitflags = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+recomp-abi = { git = "https://github.com/fearkov/3dsrecomp" }
+rayon = "1"
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+parking_lot = "0.12"
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+# The emulator is unusably slow in a plain debug build; give the hot crates -O2
+# even in dev profile.
+[profile.dev.package.zakuro-cpu]
+opt-level = 3
+[profile.dev.package.zakuro-aot]
+opt-level = 3
+[profile.dev.package.zakuro-gpu]
+opt-level = 3
+[profile.dev.package.zakuro-core]
+opt-level = 2
+# translated vertex shaders compile through it as games run
+[profile.dev.package.naga]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "unwind"
+debug = 1

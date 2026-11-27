@@ -195,7 +195,7 @@ impl Gamepads {
         self.reticle_center_held = y_now;
 
         // Vehicle Special Action (A) and Dismount (B) HUD touch pulses.
-        if self.game == zakuro_kiu::GAME_VEHICLE {
+        if self.game == kiu_common::GAME_VEHICLE {
             let a_now = self.holding(self.buttons.a);
             let b_now = self.holding(self.buttons.b);
             if a_now && !self.vehicle_a_held {
@@ -217,7 +217,7 @@ impl Gamepads {
 
         let (cx, cy) = stick_curve(rx, ry);
         let sign_y = if invert_y { 1.0 } else { -1.0 };
-        let (dx, dy, mark) = if self.game == zakuro_kiu::GAME_FLYING {
+        let (dx, dy, mark) = if self.game == kiu_common::GAME_FLYING {
             let dx = cx * AIR_PX_PER_FRAME;
             let dy = cy * sign_y * AIR_PX_PER_FRAME;
             let mark = if std::mem::take(&mut self.recenter_pending)

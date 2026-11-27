@@ -9,7 +9,16 @@ use std::mem::offset_of;
 use recomp_abi::{CodeHash, Context, Piece, Run, NO_ORIGIN};
 
 use crate::discover::{FuncOrigin, OriginData};
-use crate::kiu_overrides::{overrides_for, ZTargetState};
+
+#[cfg(target_arch = "x86_64")]
+pub type OverrideFn = unsafe extern "sysv64" fn(*mut AotExecContext, *const u8);
+#[cfg(not(target_arch = "x86_64"))]
+pub type OverrideFn = unsafe extern "C" fn(*mut AotExecContext, *const u8);
+
+/// Opaque game-specific state block carried inside [`AotExecContext`] and [`LoadedAot`].
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Default)]
+pub struct PluginState(pub [u64; 4]);
 
 pub const CACHE_MAGIC: &[u8; 8] = b"UNXAOT01";
 pub const FORMAT_VERSION: u32 = 1;
@@ -50,7 +59,7 @@ pub struct AotExecContext {
     pub fn_media_parallel: usize,    // 256
     pub fn_vfp_vector: usize,        // 264
     pub overrides: [usize; 8],       // 272..336
-    pub ztarget: ZTargetState,       // 336..352
+    pub plugin_state: PluginState,   // 336..368
 }
 
 pub mod offsets {
@@ -682,7 +691,7 @@ pub struct LoadedAot {
     stale: Vec<u8>,
     icache: UnsafeCell<Box<[ICacheSlot]>>,
     overrides: [usize; 8],
-    ztarget: UnsafeCell<ZTargetState>,
+    plugin_state: UnsafeCell<PluginState>,
 }
 
 // SAFETY: `LoadedAot` is accessed exclusively on the emulated CPU thread during `enter()`.
@@ -699,10 +708,6 @@ impl LoadedAot {
     ) -> Self {
         let stale = vec![0u8; origins.functions.len().max(1)];
         let icache = (0..ICACHE_SLOTS).map(|_| ICacheSlot::default()).collect();
-        let mut overrides = [0usize; 8];
-        for (i, (_, func)) in overrides_for(program_id, text_hash).into_iter().take(8).enumerate() {
-            overrides[i] = func as usize;
-        }
         Self {
             program_id,
             text_hash,
@@ -712,9 +717,26 @@ impl LoadedAot {
             origins,
             stale,
             icache: UnsafeCell::new(icache),
-            overrides,
-            ztarget: UnsafeCell::new(ZTargetState::default()),
+            overrides: [0usize; 8],
+            plugin_state: UnsafeCell::new(PluginState::default()),
         }
+    }
+
+    pub fn set_overrides(&mut self, overrides: &[(u32, OverrideFn)]) {
+        self.overrides = [0usize; 8];
+        for (i, &(_, func)) in overrides.iter().take(8).enumerate() {
+            self.overrides[i] = func as usize;
+        }
+    }
+
+    pub fn with_overrides(mut self, overrides: &[(u32, OverrideFn)]) -> Self {
+        self.set_overrides(overrides);
+        self
+    }
+
+    pub fn with_plugin_state(mut self, state: PluginState) -> Self {
+        *self.plugin_state.get_mut() = state;
+        self
     }
 
     /// Streams a cached `UNXAOT01` file directly into a caller-provided executable allocator
@@ -900,7 +922,7 @@ impl LoadedAot {
     pub unsafe fn enter(&self, ctx: &mut Context, target_body_rx: *const u8) {
         let enter_ptr = unsafe { self.exec.rx_ptr().add(self.enter_offset as usize) };
         let icache_ptr = unsafe { (*self.icache.get()).as_mut_ptr() };
-        let ztarget = unsafe { *self.ztarget.get() };
+        let plugin_state = unsafe { *self.plugin_state.get() };
 
         let mut ec = AotExecContext {
             ctx: Context {
@@ -942,14 +964,14 @@ impl LoadedAot {
             fn_media_parallel: media_parallel_helper as *const () as usize,
             fn_vfp_vector: vfp_vector_helper as *const () as usize,
             overrides: self.overrides,
-            ztarget,
+            plugin_state,
         };
 
         let enter_fn: unsafe extern "C" fn(*mut AotExecContext, *const u8) =
             unsafe { std::mem::transmute(enter_ptr) };
         unsafe { enter_fn(&mut ec, target_body_rx) };
 
-        unsafe { *self.ztarget.get() = ec.ztarget };
+        unsafe { *self.plugin_state.get() = ec.plugin_state };
         *ctx = ec.ctx;
     }
 }

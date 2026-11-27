@@ -351,7 +351,7 @@ struct Running {
     /// true when running Kid Icarus: Uprising (USA), enabling the shared 16:9 single-screen UI.
     is_kiu: bool,
     /// shared KIU 16:9 merged-hub & pause state machine.
-    kiu: zakuro_kiu::KiuUiState,
+    kiu: kiu_common::KiuUiState,
     /// one-shot trigger to toggle classic LargeTop vs merged 16:9 hub (F2 / R3).
     toggle_bottom_pressed: bool,
     /// when the game started, in seconds since 1970, for Discord.
@@ -363,7 +363,7 @@ impl Running {
         let is_kiu = system
             .title
             .as_ref()
-            .is_some_and(|title| title.program_id() == zakuro_kiu::KIU_USA_PROGRAM_ID);
+            .is_some_and(|title| title.program_id() == kiu_common::KIU_USA_PROGRAM_ID);
         Running {
             system,
             path,
@@ -377,7 +377,7 @@ impl Running {
             out_of_play: u32::MAX,
             flying: false,
             is_kiu,
-            kiu: zakuro_kiu::KiuUiState::new(),
+            kiu: kiu_common::KiuUiState::new(),
             toggle_bottom_pressed: false,
             started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()),
         }
@@ -1731,7 +1731,7 @@ impl App {
                 let touching_slider = self.mouse_down
                     && !self.menus.menu_open
                     && win_size.is_some_and(|size| {
-                        zakuro_kiu::is_touching_cauldron_slider(
+                        kiu_common::is_touching_cauldron_slider(
                             size.width,
                             size.height,
                             self.top_shape.width(),

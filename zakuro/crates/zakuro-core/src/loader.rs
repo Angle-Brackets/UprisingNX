@@ -213,13 +213,13 @@ pub fn load_preloaded(
         match crate::mods::code(&title, system.config.data_dir.as_deref()) {
             Ok((code_bytes, _)) => {
                 let t_aot = std::time::Instant::now();
-                let opts = zakuro_aot::CompileOptions::for_title(title.program_id());
                 let image = zakuro_aot::compile_title(
                     title.program_id(),
                     &title.exheader,
                     &code_bytes,
                     &[],
-                    opts,
+                    &[],
+                    zakuro_aot::CompileOptions::default(),
                     |_, _| {},
                 );
                 match image.into_loaded_mmap() {

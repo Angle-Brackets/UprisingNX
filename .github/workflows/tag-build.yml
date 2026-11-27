@@ -51,12 +51,12 @@ jobs:
           if ver is None:
               sys.exit(f"ERROR: VERSION must be strict MAJOR.MINOR.PATCH semver (got {ver_raw!r})")
 
-          cargo_toml = Path("nx/rust/Cargo.toml").read_text(encoding="utf-8")
+          cargo_toml = Path("platforms/nx/rust/Cargo.toml").read_text(encoding="utf-8")
           m_cargo = re.search(r'(?m)^version\s*=\s*"([^"]+)"', cargo_toml)
           if not m_cargo or m_cargo.group(1) != ver_raw:
               found = m_cargo.group(1) if m_cargo else "<missing>"
               sys.exit(
-                  f"ERROR: nx/rust/Cargo.toml version ({found}) does not match VERSION ({ver_raw}). "
+                  f"ERROR: platforms/nx/rust/Cargo.toml version ({found}) does not match VERSION ({ver_raw}). "
                   "Update both files together."
               )
 
@@ -90,7 +90,7 @@ jobs:
                   if active_tag != expected_tag:
                       sys.exit(
                           f"ERROR: Release tag {active_tag} does not match VERSION file ({expected_tag}). "
-                          "Update VERSION (and nx/rust/Cargo.toml) before cutting this release."
+                          "Update VERSION (and platforms/nx/rust/Cargo.toml) before cutting this release."
                       )
                   # Ensure VERSION was strictly bumped compared to all older clean release tags
                   other_tags = [(v, t) for (v, t) in clean_tags if t != active_tag]
@@ -118,7 +118,7 @@ jobs:
           else:
               # Branch push / PR / workflow_dispatch:
               # Prevent regressing VERSION below an already-released tag.
-              # Note: Cutting a new release tag/GitHub Release (or running scripts/release.sh)
+              # Note: Cutting a new release tag/GitHub Release (or running scripts/release/release.sh)
               # strictly enforces bumping VERSION past the previous release.
               for tag_ver, tag_name in clean_tags:
                   if tag_ver > ver:
@@ -142,12 +142,9 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: zakuro -> target
 
-      - name: Run zakuro release unit tests
-        working-directory: zakuro
-        run: cargo test --release -p zakuro-fs -p zakuro-gpu -p zakuro-core
+      - name: Run workspace release unit tests
+        run: cargo test --release -p kiu-common -p zakuro-fs -p zakuro-gpu -p zakuro-core -p zakuro-aot -p zakuro
 
   tag:
     name: Tag Commit Build
@@ -169,7 +166,7 @@ jobs:
             echo "Clean release tag ${CLEAN_TAG} already exists; skipping rolling tag until VERSION is bumped."
             {
               echo "### Rolling Tag Skipped"
-              echo "- **Version:** \`v${VER}\` was already released (bump \`VERSION\` and \`nx/rust/Cargo.toml\` for the next release)."
+              echo "- **Version:** \`v${VER}\` was already released (bump \`VERSION\` and \`platforms/nx/rust/Cargo.toml\` for the next release)."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi

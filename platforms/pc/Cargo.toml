@@ -1,0 +1,15 @@
+[package]
+name = "uprising-recompiled"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Kid Icarus: Uprising Recompiled — Native PC & Steam Deck port"
+
+[[bin]]
+name = "uprising-recompiled"
+path = "src/main.rs"
+
+[dependencies]
+kiu-common.workspace = true
+zakuro.workspace = true
