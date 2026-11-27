@@ -92,7 +92,7 @@ impl Menus {
                                     SettingsTab::Graphics => tab_graphics(ui, settings),
                                     SettingsTab::AudioWindow => tab_audio_window(ui, settings, &mut actions),
                                     SettingsTab::Controls => tab_controls(ui, self, settings),
-                                    SettingsTab::Controller => tab_controller(ui, self, settings, pad_snapshot),
+                                    SettingsTab::Controller => tab_controller(ui, self, settings, pad_snapshot, &mut actions),
                                     SettingsTab::System => tab_system(ui, self.kiu_mode, settings, &mut actions),
                                 }
                                 ui.add_space(6.0);
@@ -480,7 +480,13 @@ fn stick_scope(ui: &mut Ui, tag: &str, stick: (f32, f32), deadzone: f32) {
     painter.circle_stroke(dot_pos, 3.6, Stroke::new(1.0, Color32::WHITE));
 }
 
-fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings, pad_snapshot: Option<&GamepadSnapshot>) {
+fn tab_controller(
+    ui: &mut Ui,
+    menus: &mut Menus,
+    settings: &mut Settings,
+    pad_snapshot: Option<&GamepadSnapshot>,
+    actions: &mut Vec<Action>,
+) {
     let default_snap = GamepadSnapshot::default();
     let snap = pad_snapshot.unwrap_or(&default_snap);
     let effective_style = match settings.pad_labels {
@@ -488,7 +494,7 @@ fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings, pad_s
         other => other,
     };
 
-    if !snap.connected.is_empty() {
+    if !snap.connected.is_empty() || snap.gyro_device.is_some() {
         // Keep the live stick scopes responsive while a controller is attached.
         ui.ctx().request_repaint();
     }
@@ -505,7 +511,8 @@ fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings, pad_s
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         let (dot_rect, _) = ui.allocate_exact_size(vec2(10.0, 14.0), Sense::hover());
-                        let dot_color = if snap.connected.is_empty() {
+                        let any_connected = !snap.connected.is_empty() || snap.gyro_device.is_some();
+                        let dot_color = if !any_connected {
                             Color32::from_rgb(154, 142, 130)
                         } else {
                             Color32::from_rgb(44, 142, 74)
@@ -513,18 +520,22 @@ fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings, pad_s
                         ui.painter().circle_filled(dot_rect.center(), 4.2, dot_color);
                         ui.painter().circle_stroke(dot_rect.center(), 4.2, Stroke::new(1.0, INK));
                         let heading = match snap.connected.as_slice() {
-                            [] => "No controller detected".to_owned(),
+                            [] => snap
+                                .gyro_device
+                                .as_ref()
+                                .map(|g| format!("{g} (HID)"))
+                                .unwrap_or_else(|| "No controller detected".to_owned()),
                             [one] => one.clone(),
                             [first, rest @ ..] => format!("{first} (+{} more)", rest.len()),
                         };
                         ui.label(RichText::new(heading).strong().color(INK));
                     });
                     ui.add_space(2.0);
-                    ui.label(
-                        RichText::new("Both triggers (LT/RT) and LB fire in battle — matching Switch UprisingNX.")
-                            .small()
-                            .color(MUTED_INK),
-                    );
+                    let status_sub = match &snap.gyro_device {
+                        Some(g) => format!("Gyro active ({g}) · Hold R / Y / L3 to pause gyro while ratcheting."),
+                        None => "Both triggers (LT/RT) and LB fire in battle. Supports DualSense, DS4, Switch Pro & Steam Deck gyro.".to_owned(),
+                    };
+                    ui.label(RichText::new(status_sub).small().color(MUTED_INK));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     stick_scope(ui, "R", snap.right_stick, settings.pad_deadzone);
@@ -583,7 +594,7 @@ fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings, pad_s
         });
 
     ui.add_space(12.0);
-    plate(ui, "STICK AIM");
+    plate(ui, "STICK & GYRO AIM");
     egui::Grid::new("kiu_pad_aim")
         .num_columns(2)
         .min_col_width(col_w)
@@ -607,8 +618,25 @@ fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings, pad_s
                         .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
                 )
             });
-            row(ui, "Invert vertical aim", "Aim up when pulling the right stick down.", |ui| {
+            row(ui, "Invert vertical aim", "Aim up when pulling the right stick or tilting down.", |ui| {
                 ui.checkbox(&mut settings.pad_invert_y, "")
+            });
+            row(ui, "Gyro aiming", "Enable motion aiming on DualSense, DualShock 4, Switch Pro, and Steam Deck.", |ui| {
+                ui.checkbox(&mut settings.pad_gyro, "")
+            });
+            row(ui, "Gyro sensitivity", "Motion-aim sensitivity multiplier.", |ui| {
+                ui.add_enabled(
+                    settings.pad_gyro,
+                    egui::Slider::new(&mut settings.pad_gyro_speed, 0.2..=3.0)
+                        .custom_formatter(|v, _| format!("{v:.2}x")),
+                )
+            });
+            row(ui, "Zero-drift calibration", "Recalibrate resting gyro offset if you notice any slow drift.", |ui| {
+                let resp = parchment_button(ui, "Calibrate Gyro", vec2(138.0, 26.0), false);
+                if resp.clicked() {
+                    actions.push(Action::CalibrateGyro);
+                }
+                resp
             });
         });
 

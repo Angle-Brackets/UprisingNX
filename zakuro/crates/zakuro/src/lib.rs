@@ -8,6 +8,7 @@ mod cli;
 mod discord;
 mod gamepad;
 mod gui;
+mod gyro;
 mod input;
 mod kiu_options;
 mod library;
@@ -46,16 +47,21 @@ pub use zakuro_core::recompiled::Linked;
 /// runs the emulator as the command line says, on recompiled code linked
 /// into the program when there is some.
 pub fn run(linked: Option<Linked>) {
-    run_with_mode(linked, false);
+    run_with_mode(linked, false, None);
 }
 
 /// runs Kid Icarus: Uprising Recompiled directly on PC with built-in AOT
 /// compilation/caching and a KIU-first setup flow.
 pub fn run_kiu() {
-    run_with_mode(None, true);
+    run_with_mode(None, true, None);
 }
 
-fn run_with_mode(linked: Option<Linked>, kiu_mode: bool) {
+/// runs Kid Icarus: Uprising Recompiled with an embedded window icon (PNG/JPG/ICO bytes).
+pub fn run_kiu_with_icon(window_icon: Option<&'static [u8]>) {
+    run_with_mode(None, true, window_icon);
+}
+
+fn run_with_mode(linked: Option<Linked>, kiu_mode: bool, window_icon: Option<&'static [u8]>) {
     report::init();
 
     let options = match cli::parse() {
@@ -177,6 +183,7 @@ fn run_with_mode(linked: Option<Linked>, kiu_mode: bool) {
         maximized_before_full_screen: false,
         resize_after_full_screen: false,
         fresh_kiu_defaults,
+        window_icon,
     };
 
     if let Some(frames) = app.options.headless {
@@ -894,6 +901,8 @@ struct App {
     resize_after_full_screen: bool,
     /// true on first launch before hardware-aware KIU quality defaults have been selected.
     fresh_kiu_defaults: bool,
+    /// Optional embedded icon image bytes (JPG/PNG/ICO) for the desktop window.
+    window_icon: Option<&'static [u8]>,
 }
 
 /// Clamps an anisotropy limit to the highest discrete level supported by the UI (`1, 2, 4, 8, 16`).
@@ -1044,7 +1053,17 @@ impl ApplicationHandler for App {
 
         let size = self.window_size();
         let title = if self.kiu_mode { KIU_WINDOW_TITLE } else { "Zakuro" };
-        let attributes = Window::default_attributes().with_title(title).with_inner_size(size);
+        let mut attributes = Window::default_attributes().with_title(title).with_inner_size(size);
+        if let Some(bytes) = self.window_icon {
+            if let Ok(img) = image::load_from_memory(bytes) {
+                let rgba = img.into_rgba8();
+                let (w, h) = rgba.dimensions();
+                if let Ok(icon) = winit::window::Icon::from_rgba(rgba.into_raw(), w, h) {
+                    attributes = attributes.with_window_icon(Some(icon));
+                }
+            }
+        }
+        self.gamepads.start_gyro();
         let renderer = self.options.renderer.unwrap_or(match self.settings.renderer {
             Renderer::Vulkan => RendererKind::Vulkan,
             Renderer::OpenGl => RendererKind::OpenGl,
@@ -2409,6 +2428,10 @@ impl App {
                     };
                 }
             }
+            Action::CalibrateGyro => {
+                self.gamepads.recalibrate_gyro();
+                self.menus.toast = Some(("Gyro calibrated — hold controller steady for a moment.".into(), Instant::now()));
+            }
             Action::CopyReport => {
                 if let (Some(game), Some(gui)) = (&self.game, &self.gui) {
                     gui.ctx.copy_text(report::text(&game.name, &game.system));
@@ -2710,6 +2733,8 @@ impl App {
                         land_speed: self.settings.pad_land_speed,
                         deadzone: self.settings.pad_deadzone,
                         invert_y: self.settings.pad_invert_y,
+                        gyro: self.settings.pad_gyro,
+                        gyro_speed: self.settings.pad_gyro_speed,
                     },
                     &mut input,
                     &mut game.system.memory.host_mailbox,

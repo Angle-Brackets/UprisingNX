@@ -51,6 +51,8 @@ pub enum Action {
     ChangeRom,
     /// rebuild the native AOT code cache for the active Kid Icarus: Uprising ROM.
     RebuildAotCache,
+    /// recalibrate the connected PC controller's gyro zero-drift bias.
+    CalibrateGyro,
     /// copy what a report on the game wants.
     CopyReport,
     Quit,
@@ -804,8 +806,197 @@ impl Menus {
                 });
             });
         }
-        // the settings/options page takes the pause menu's place while open
-        if !self.menu_open || self.options_open || (self.kiu_mode && (self.settings_open || self.settings_anim > 0.05)) {
+        if !self.menu_open {
+            return actions;
+        }
+
+        if self.kiu_mode {
+            let eased = self.step_settings_anim(&ctx);
+            let pause_vis = (1.0 - eased * 2.0).clamp(0.0, 1.0);
+            if pause_vis <= 0.01 {
+                return actions;
+            }
+            let screen = ctx.content_rect();
+            let width = (screen.width() - 32.0).clamp(280.0, 390.0);
+            let slide = (screen.width() * 0.24).clamp(120.0, 300.0);
+            let offset_x = -slide * eased;
+            let frame = parchment_frame(18, pause_vis);
+
+            egui::Window::new("Paused")
+                .id(egui::Id::new("kiu paused"))
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .interactable(pause_vis >= 0.95)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::new(offset_x, 0.0))
+                .frame(frame)
+                .min_width(width)
+                .max_width(width)
+                .show(&ctx, |ui| {
+                    ui.multiply_opacity(pause_vis);
+                    setup_parchment_visuals(ui.visuals_mut());
+                    let inner_w = width - 36.0;
+                    ui.set_width(inner_w);
+
+                    let (title_rect, _) = ui.allocate_exact_size(Vec2::new(inner_w, 42.0), egui::Sense::hover());
+                    heavy_title(ui.painter(), "PAUSED", title_rect.center().x, title_rect.min.y, 1.0);
+                    ui.vertical_centered(|ui| {
+                        let subtitle = if recompiled {
+                            format!("{name} · Native AOT")
+                        } else {
+                            format!("{name} · Interpreter")
+                        };
+                        ui.label(RichText::new(subtitle).small().color(Color32::from_rgb(84, 74, 66)));
+                    });
+                    ui.add_space(10.0);
+
+                    if parchment_button(ui, "Resume", Vec2::new(inner_w, 36.0), true).clicked() {
+                        actions.push(Action::Resume);
+                    }
+                    ui.add_space(10.0);
+
+                    let gap = 10.0_f32;
+                    let half = ((inner_w - gap) * 0.5).floor();
+                    let pair = |ui: &mut egui::Ui, a: &str, b: &str| -> (bool, bool) {
+                        let mut res = (false, false);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            res.0 = parchment_button(ui, a, Vec2::new(half, 30.0), false).clicked();
+                            ui.add_space(gap);
+                            res.1 = parchment_button(ui, b, Vec2::new(half, 30.0), false).clicked();
+                        });
+                        res
+                    };
+
+                    let (settings_clicked, fs_clicked) = pair(ui, "Settings", "Fullscreen");
+                    if settings_clicked {
+                        self.settings_open = true;
+                    }
+                    if fs_clicked {
+                        actions.push(Action::Fullscreen);
+                    }
+                    ui.add_space(8.0);
+
+                    // Compact parchment Save / Load State bar with slot selector.
+                    egui::Frame::new()
+                        .fill(PAPER_LINE)
+                        .stroke(egui::Stroke::new(1.0, PAPER_SHADOW))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.add(egui::DragValue::new(&mut self.slot).range(1..=9).prefix("Slot "));
+                                ui.label(
+                                    RichText::new(saved.unwrap_or("Empty slot"))
+                                        .small()
+                                        .color(Color32::from_rgb(84, 74, 66)),
+                                );
+                            });
+                            ui.add_space(6.0);
+                            let slot_half = ((ui.available_width() - 8.0) * 0.5).floor();
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                if parchment_button(ui, "Save State", Vec2::new(slot_half, 28.0), false)
+                                    .on_hover_text("F5 saves to this slot while playing.")
+                                    .clicked()
+                                {
+                                    actions.push(Action::SaveState);
+                                }
+                                ui.add_space(8.0);
+                                let load_enabled = saved.is_some();
+                                ui.add_enabled_ui(load_enabled, |ui| {
+                                    if parchment_button(ui, "Load State", Vec2::new(slot_half, 28.0), false)
+                                        .on_hover_text("F8 loads this slot while playing.")
+                                        .clicked()
+                                    {
+                                        actions.push(Action::LoadState);
+                                    }
+                                });
+                            });
+                        });
+                    ui.add_space(8.0);
+
+                    let (reset_clicked, cheats_clicked) = pair(ui, "Reset Game", "Cheats");
+                    if reset_clicked {
+                        actions.push(Action::Reset);
+                    }
+                    if cheats_clicked {
+                        self.cheats_open = true;
+                    }
+                    ui.add_space(6.0);
+
+                    let (mp_clicked, cam_clicked) = pair(ui, "Multiplayer", "Camera Image");
+                    if mp_clicked {
+                        self.multiplayer_open = true;
+                    }
+                    if cam_clicked {
+                        actions.push(Action::ChooseCameraPicture);
+                    }
+                    ui.add_space(6.0);
+
+                    let (rom_clicked, cache_clicked) = pair(ui, "Change ROM...", "Rebuild Cache");
+                    if rom_clicked {
+                        actions.push(Action::ChangeRom);
+                    }
+                    if cache_clicked {
+                        actions.push(Action::RebuildAotCache);
+                    }
+
+                    ui.add_space(10.0);
+                    let (rule_rect, _) = ui.allocate_exact_size(Vec2::new(inner_w, 2.0), egui::Sense::hover());
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(rule_rect.min.x + 6.0, rule_rect.center().y),
+                            egui::pos2(rule_rect.max.x - 6.0, rule_rect.center().y),
+                        ],
+                        egui::Stroke::new(1.0, PAPER_SHADOW),
+                    );
+                    ui.add_space(8.0);
+
+                    let (report_clicked, quit_clicked) = pair(ui, "Copy Report", "Quit");
+                    if report_clicked {
+                        actions.push(Action::CopyReport);
+                    }
+                    if quit_clicked {
+                        actions.push(Action::Quit);
+                    }
+                    ui.add_space(10.0);
+
+                    // Dark ink footer strip matching the unified Settings page.
+                    let corner = egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 };
+                    egui::Frame::new()
+                        .fill(INK.gamma_multiply(pause_vis))
+                        .corner_radius(corner)
+                        .inner_margin(egui::Margin::symmetric(18, 5))
+                        .outer_margin(egui::Margin { left: -18, right: -18, top: 0, bottom: -18 })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("Esc resumes · F5 Save · F8 Load · F11 Fullscreen")
+                                        .color(Color32::WHITE)
+                                        .small(),
+                                );
+                            });
+                        });
+
+                    let edge = ui.min_rect().expand(18.0);
+                    let painter = ui.painter().with_clip_rect(ctx.content_rect());
+                    vine(&painter, edge.min + Vec2::new(7.0, 7.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0), 34.0);
+                    vine(
+                        &painter,
+                        egui::pos2(edge.max.x - 7.0, edge.min.y + 7.0),
+                        Vec2::new(-1.0, 0.0),
+                        Vec2::new(0.0, 1.0),
+                        34.0,
+                    );
+                });
+            return actions;
+        }
+
+        // Legacy non-KIU Zakuro pause menu.
+        if self.options_open {
             return actions;
         }
         egui::Window::new("Paused")
@@ -820,7 +1011,7 @@ impl Menus {
                 if wide(ui, "Resume") {
                     actions.push(Action::Resume);
                 }
-                if !self.kiu_mode && wide(ui, "Options") {
+                if wide(ui, "Options") {
                     self.options_open = true;
                 }
                 if wide(ui, "Reset") {
@@ -866,14 +1057,7 @@ impl Menus {
                 if wide(ui, "Copy info for a report") {
                     actions.push(Action::CopyReport);
                 }
-                if self.kiu_mode {
-                    if wide(ui, "Change ROM...") {
-                        actions.push(Action::ChangeRom);
-                    }
-                    if wide(ui, "Rebuild Code Cache") {
-                        actions.push(Action::RebuildAotCache);
-                    }
-                } else if wide(ui, "Back to the library") {
+                if wide(ui, "Back to the library") {
                     actions.push(Action::Library);
                 }
                 if wide(ui, "Quit") {

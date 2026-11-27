@@ -14,6 +14,11 @@ const AIM_LINEAR_GAIN: f32 = 0.35;
 const AIR_PX_PER_FRAME: f32 = 6.0;
 const LAND_X_PX_PER_FRAME: f32 = 10.0;
 const LAND_Y_PX_PER_FRAME: f32 = 7.0;
+/// Gyro sensitivity in bottom-screen pixels per `1.0` turn/sec at 60 Hz (matching Switch `aim.rs`).
+const AIR_GYRO_PX_PER_TURN_RATE: f32 = 50.0;
+const LAND_GYRO_X_PX_PER_TURN_RATE: f32 = 64.0;
+const LAND_GYRO_Y_PX_PER_TURN_RATE: f32 = 44.0;
+const RECENTER_GRACE_FRAMES: u8 = 4;
 const STALE_FRAMES: u8 = 4;
 const QUIET_FRAMES: u8 = 10;
 
@@ -36,6 +41,8 @@ pub struct PadAimSettings {
     pub land_speed: f32,
     pub deadzone: f32,
     pub invert_y: bool,
+    pub gyro: bool,
+    pub gyro_speed: f32,
 }
 
 impl Default for PadAimSettings {
@@ -45,15 +52,18 @@ impl Default for PadAimSettings {
             land_speed: 1.0,
             deadzone: DEFAULT_DEADZONE,
             invert_y: false,
+            gyro: true,
+            gyro_speed: 1.0,
         }
     }
 }
 
-/// Snapshot of connected controllers and live stick deflection for the settings UI.
+/// Snapshot of connected controllers, gyro status, and live stick deflection for the settings UI.
 #[derive(Debug, Clone, Default)]
 pub struct GamepadSnapshot {
     pub connected: Vec<String>,
     pub detected_style: ButtonLabels,
+    pub gyro_device: Option<String>,
     pub left_stick: (f32, f32),
     pub right_stick: (f32, f32),
 }
@@ -120,6 +130,7 @@ pub fn detect_button_style(name: &str) -> ButtonLabels {
 pub struct Gamepads {
     /// none when the system could not be asked for controllers.
     gilrs: Option<Gilrs>,
+    gyro: Option<crate::gyro::GyroReader>,
     buttons: PadButtons,
     deadzone: f32,
     /// whether the player last aimed/played with a controller rather than KBM.
@@ -127,6 +138,7 @@ pub struct Gamepads {
     game: u32,
     quiet: u8,
     untaken: u8,
+    recenter_grace: u8,
     /// Edge-tracking for analog triggers so `poll()` reports trigger pulls cleanly for rebinding.
     lt_analog_held: bool,
     rt_analog_held: bool,
@@ -148,12 +160,14 @@ impl Gamepads {
             .ok();
         Gamepads {
             gilrs,
+            gyro: None,
             buttons,
             deadzone: DEFAULT_DEADZONE,
             active: false,
             game: 0,
             quiet: 0,
             untaken: 0,
+            recenter_grace: 0,
             lt_analog_held: false,
             rt_analog_held: false,
             recenter_held: false,
@@ -165,6 +179,20 @@ impl Gamepads {
             vehicle_a_held: false,
             vehicle_b_held: false,
             vehicle_tap: None,
+        }
+    }
+
+    /// Starts the background HID gyro reader for DualSense / DualShock 4 / Switch Pro / Steam Deck.
+    pub fn start_gyro(&mut self) {
+        if self.gyro.is_none() {
+            self.gyro = Some(crate::gyro::GyroReader::start());
+        }
+    }
+
+    /// Resets the gyro zero-drift calibration bias immediately.
+    pub fn recalibrate_gyro(&self) {
+        if let Some(gyro) = &self.gyro {
+            gyro.recalibrate();
         }
     }
 
@@ -193,10 +221,11 @@ impl Gamepads {
         self.vehicle_tap = None;
     }
 
-    /// Live connected controller info and stick deflections for the Controller settings UI.
+    /// Live connected controller info, gyro availability, and stick deflections for the settings UI.
     pub fn snapshot(&self) -> GamepadSnapshot {
+        let gyro_device = self.gyro.as_ref().and_then(|g| g.active_device());
         let Some(gilrs) = &self.gilrs else {
-            return GamepadSnapshot { detected_style: ButtonLabels::Generic, ..Default::default() };
+            return GamepadSnapshot { detected_style: ButtonLabels::Generic, gyro_device, ..Default::default() };
         };
         let mut connected = Vec::new();
         let mut left_stick = (0.0f32, 0.0f32);
@@ -222,8 +251,9 @@ impl Gamepads {
         let detected_style = connected
             .first()
             .map(|name| detect_button_style(name))
+            .or_else(|| gyro_device.as_deref().map(detect_button_style))
             .unwrap_or(ButtonLabels::Generic);
-        GamepadSnapshot { connected, detected_style, left_stick, right_stick }
+        GamepadSnapshot { connected, detected_style, gyro_device, left_stick, right_stick }
     }
 
     /// takes in what the controllers did since the last call, and returns the
@@ -315,15 +345,20 @@ impl Gamepads {
             }
         }
 
+        let gyro_delta = self.gyro.as_ref().map(|g| g.take_delta()).unwrap_or_default();
         let dz = aim.deadzone.clamp(0.03, 0.30);
         let (rx, ry) = self.right_stick(dz);
         if rx != 0.0 || ry != 0.0 {
+            self.active = true;
+        }
+        if aim.gyro && (gyro_delta.yaw_right_turns.abs() > 1e-4 || gyro_delta.pitch_up_turns.abs() > 1e-4) {
             self.active = true;
         }
         if !self.active || self.game == 0 {
             self.recenter_held = false;
             self.center_held = false;
             self.reticle_center_held = false;
+            self.recenter_grace = 0;
             self.vehicle_a_held = false;
             self.vehicle_b_held = false;
             self.vehicle_tap = None;
@@ -342,6 +377,11 @@ impl Gamepads {
         }
         if y_now && !self.reticle_center_held {
             self.reticle_center_pending = true;
+        }
+        if r_now || l3_now || y_now {
+            self.recenter_grace = RECENTER_GRACE_FRAMES;
+        } else {
+            self.recenter_grace = self.recenter_grace.saturating_sub(1);
         }
         self.recenter_held = r_now;
         self.center_held = l3_now;
@@ -379,9 +419,15 @@ impl Gamepads {
         let sign_y = if aim.invert_y { 1.0 } else { -1.0 };
         let air_mult = aim.air_speed.clamp(0.2, 3.0);
         let land_mult = aim.land_speed.clamp(0.2, 3.0);
+        let gyro_mult = aim.gyro_speed.clamp(0.2, 3.0);
+        // Pause gyro while holding R/Y/L3 (+ brief settle grace) for comfortable hand ratcheting.
+        let use_gyro = aim.gyro && self.recenter_grace == 0;
+        let gyro_yaw_rate = if use_gyro { gyro_delta.yaw_right_turns * 60.0 } else { 0.0 };
+        let gyro_pitch_rate = if use_gyro { gyro_delta.pitch_up_turns * 60.0 } else { 0.0 };
         let (dx, dy, mark) = if self.game == kiu_common::GAME_FLYING {
-            let dx = cx * AIR_PX_PER_FRAME * air_mult;
-            let dy = cy * sign_y * AIR_PX_PER_FRAME * air_mult;
+            let dx = cx * AIR_PX_PER_FRAME * air_mult + gyro_yaw_rate * AIR_GYRO_PX_PER_TURN_RATE * gyro_mult;
+            let dy = cy * sign_y * AIR_PX_PER_FRAME * air_mult
+                + gyro_pitch_rate * sign_y * AIR_GYRO_PX_PER_TURN_RATE * gyro_mult;
             let mark = if std::mem::take(&mut self.recenter_pending)
                 || std::mem::take(&mut self.center_pending)
                 || std::mem::take(&mut self.reticle_center_pending)
@@ -392,8 +438,9 @@ impl Gamepads {
             };
             (dx, dy, mark)
         } else {
-            let dx = cx * LAND_X_PX_PER_FRAME * land_mult;
-            let dy = cy * sign_y * LAND_Y_PX_PER_FRAME * land_mult;
+            let dx = cx * LAND_X_PX_PER_FRAME * land_mult + gyro_yaw_rate * LAND_GYRO_X_PX_PER_TURN_RATE * gyro_mult;
+            let dy = cy * sign_y * LAND_Y_PX_PER_FRAME * land_mult
+                + gyro_pitch_rate * sign_y * LAND_GYRO_Y_PX_PER_TURN_RATE * gyro_mult;
             let mark = if std::mem::take(&mut self.recenter_pending) {
                 MOUSE_LOOK_RECENTER
             } else if std::mem::take(&mut self.center_pending) {

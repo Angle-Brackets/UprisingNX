@@ -609,6 +609,10 @@ pub struct Settings {
     pub pad_deadzone: f32,
     /// Invert vertical right-stick aiming.
     pub pad_invert_y: bool,
+    /// Enable native HID gyro aiming on DualSense / DualShock 4 / Switch Pro / Steam Deck.
+    pub pad_gyro: bool,
+    /// Gyro aim sensitivity multiplier (0.2..=3.0).
+    pub pad_gyro_speed: f32,
     /// the enhancements turned on, by name, for each game by its title id.
     pub enhancements: std::collections::BTreeMap<String, Vec<String>>,
     /// what the console's cameras see, and the picture when it is one.
@@ -667,6 +671,8 @@ impl Default for Settings {
             pad_land_speed: 1.0,
             pad_deadzone: 0.10,
             pad_invert_y: false,
+            pad_gyro: true,
+            pad_gyro_speed: 1.0,
             enhancements: std::collections::BTreeMap::new(),
             camera: CameraSource::Webcam,
             camera_picture: None,
