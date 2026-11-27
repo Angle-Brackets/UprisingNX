@@ -916,7 +916,8 @@ mod tests {
     #[test]
     fn objdump_verifies_every_instruction_family() {
         let Some(objdump) = find_objdump() else {
-            panic!("objdump not found in environment");
+            eprintln!("skipping x64 GNU objdump test: GNU objdump not found");
+            return;
         };
         let mut c = CaseCollector::new();
 
@@ -1173,7 +1174,8 @@ mod tests {
     #[test]
     fn branch_patching_forward_and_backward() {
         let Some(objdump) = find_objdump() else {
-            panic!("objdump not found in environment");
+            eprintln!("skipping x64 GNU objdump test: GNU objdump not found");
+            return;
         };
         let mut b = X64Buf::default();
         let entry = b.pos();
@@ -1204,7 +1206,8 @@ mod tests {
     #[test]
     fn r8_operands_never_encode_high_byte_regs() {
         let Some(objdump) = find_objdump() else {
-            panic!("objdump not found in environment");
+            eprintln!("skipping x64 GNU objdump test: GNU objdump not found");
+            return;
         };
         let mut b = X64Buf::default();
         for r in 0..16 {
