@@ -22,12 +22,12 @@ pub fn installed(program_id: u64) -> Option<std::path::PathBuf> {
 
 /// recompiled code, and how much of its work it handed back.
 pub struct Library {
-    backend: Backend,
+    pub(crate) backend: Backend,
     /// instructions the code handed to the interpreter one at a time.
     fallbacks: Cell<u64>,
 }
 
-enum Backend {
+pub(crate) enum Backend {
     Abi {
         code: recomp_abi::Library,
         /// the code found for addresses lately, each in a slot its address
@@ -62,7 +62,7 @@ fn slot(address: u32) -> usize {
 /// guest's FPSCR while recompiled ARMv6 VFP code runs, restoring the host
 /// thread's FPCR on exit.
 #[cfg(target_arch = "aarch64")]
-struct FpcrGuard {
+pub(crate) struct FpcrGuard {
     saved: u64,
     current: u64,
 }
@@ -72,7 +72,7 @@ impl FpcrGuard {
     const MASK: u64 = 0x03C0_0000;
 
     #[inline(always)]
-    fn new(guest_fpscr: u32) -> Self {
+    pub(crate) fn new(guest_fpscr: u32) -> Self {
         let saved: u64;
         // SAFETY: FPCR is an unprivileged EL0 floating-point control register on AArch64.
         unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) saved, options(nomem, nostack, preserves_flags)) };
@@ -82,7 +82,7 @@ impl FpcrGuard {
     }
 
     #[inline(always)]
-    fn sync(&mut self, guest_fpscr: u32) {
+    pub(crate) fn sync(&mut self, guest_fpscr: u32) {
         let wanted = (self.current & !Self::MASK) | ((guest_fpscr as u64) & Self::MASK);
         if wanted != self.current {
             // SAFETY: Only standard IEEE/ARMv6-compatible DN, FZ, and RMode bits [25:22] change.
@@ -106,7 +106,7 @@ impl Drop for FpcrGuard {
 /// Syncs x86_64 SSE MXCSR control bits (FTZ, DAZ, RC) with guest `FPSCR[25:22]`
 /// while recompiled ARMv6 VFP code runs, restoring the host thread's MXCSR on drop.
 #[cfg(target_arch = "x86_64")]
-struct MxcsrGuard {
+pub(crate) struct MxcsrGuard {
     saved: u32,
     current: u32,
 }
@@ -158,7 +158,7 @@ impl MxcsrGuard {
     }
 
     #[inline(always)]
-    fn new(guest_fpscr: u32) -> Self {
+    pub(crate) fn new(guest_fpscr: u32) -> Self {
         let saved = Self::read_mxcsr();
         let mut guard = Self { saved, current: saved };
         guard.sync(guest_fpscr);
@@ -166,7 +166,7 @@ impl MxcsrGuard {
     }
 
     #[inline(always)]
-    fn sync(&mut self, guest_fpscr: u32) {
+    pub(crate) fn sync(&mut self, guest_fpscr: u32) {
         let wanted = (self.current & !Self::MASK) | Self::map_fpscr(guest_fpscr);
         if wanted != self.current {
             Self::write_mxcsr(wanted);
@@ -186,6 +186,7 @@ impl Drop for MxcsrGuard {
 }
 
 /// why a run of recompiled code ended.
+#[derive(Debug)]
 pub enum Stop {
     /// an svc, the cpu is already past it.
     Svc(u32),
@@ -197,12 +198,12 @@ pub enum Stop {
 }
 
 /// what the callbacks reach through the context.
-struct Machine<'a> {
-    cpu: &'a mut Cpu,
-    memory: &'a mut Memory,
-    library: &'a Library,
+pub(crate) struct Machine<'a> {
+    pub cpu: &'a mut Cpu,
+    pub memory: &'a mut Memory,
+    pub library: &'a Library,
     /// what the interpreter stopped with inside a callback.
-    pending: Option<Exit>,
+    pub pending: Option<Exit>,
 }
 
 /// # Safety
@@ -260,9 +261,9 @@ unsafe extern "C" fn lookup(ctx: *mut Context, address: u32) -> Option<Code> {
     unsafe { machine(ctx).library.lookup(address) }
 }
 
-static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup };
+pub(crate) static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup };
 
-fn load(ctx: &Context, cpu: &mut Cpu) {
+pub(crate) fn load(ctx: &Context, cpu: &mut Cpu) {
     cpu.regs = ctx.r;
     cpu.cpsr.n = ctx.n != 0;
     cpu.cpsr.z = ctx.z != 0;
@@ -274,7 +275,7 @@ fn load(ctx: &Context, cpu: &mut Cpu) {
     cpu.exclusive_addr = (ctx.exclusive != 0).then_some(ctx.exclusive_address);
 }
 
-fn store(cpu: &Cpu, ctx: &mut Context) {
+pub(crate) fn store(cpu: &Cpu, ctx: &mut Context) {
     ctx.r = cpu.regs;
     ctx.n = cpu.cpsr.n as u8;
     ctx.z = cpu.cpsr.z as u8;
@@ -442,6 +443,20 @@ impl Library {
     /// runs recompiled code from the cpu's pc for about budget instructions,
     /// returning how many ran and why it stopped.
     pub fn run(&self, cpu: &mut Cpu, memory: &mut Memory, budget: u64) -> (u64, Stop) {
+        #[cfg(not(target_os = "horizon"))]
+        let stride = crate::lockstep::stride();
+        #[cfg(target_os = "horizon")]
+        let stride = 0u64;
+        self.run_with_stride(cpu, memory, budget, stride)
+    }
+
+    pub(crate) fn run_with_stride(
+        &self,
+        cpu: &mut Cpu,
+        memory: &mut Memory,
+        budget: u64,
+        stride: u64,
+    ) -> (u64, Stop) {
         let cycles = cpu.cycles;
         let (read_pages, write_pages) = memory.page_tables();
         let mut ctx = Context {
@@ -505,30 +520,44 @@ impl Library {
                     _ => {}
                 }
             },
-            Backend::Aot(aot) => loop {
-                if ctx.budget <= 0 {
-                    break Stop::Left;
+            Backend::Aot(aot) => {
+                #[cfg(not(target_os = "horizon"))]
+                if stride != 0 {
+                    run_aot_lockstep(
+                        aot,
+                        &mut ctx,
+                        &mut machine,
+                        stride,
+                        #[cfg(target_arch = "aarch64")]
+                        &mut fpcr,
+                        #[cfg(target_arch = "x86_64")]
+                        &mut mxcsr,
+                    )
+                } else {
+                    run_aot_fast(
+                        aot,
+                        &mut ctx,
+                        &mut machine,
+                        #[cfg(target_arch = "aarch64")]
+                        &mut fpcr,
+                        #[cfg(target_arch = "x86_64")]
+                        &mut mxcsr,
+                    )
                 }
-                let Some(target_rx) = aot.lookup(ctx.r[15] | ctx.thumb as u32) else {
-                    break Stop::Left;
-                };
-                ctx.exit = 0;
-                ctx.depth = 0;
-                #[cfg(target_arch = "aarch64")]
-                fpcr.sync(unsafe { *ctx.fpscr });
-                #[cfg(target_arch = "x86_64")]
-                mxcsr.sync(unsafe { *ctx.fpscr });
-                // SAFETY: `target_rx` came from `aot.lookup`, and `ctx.user` points at `machine`.
-                unsafe { aot.enter(&mut ctx, target_rx) };
-                if let Some(exit) = machine.pending.take() {
-                    break Stop::Exit(exit);
+                #[cfg(target_os = "horizon")]
+                {
+                    let _ = stride;
+                    run_aot_fast(
+                        aot,
+                        &mut ctx,
+                        &mut machine,
+                        #[cfg(target_arch = "aarch64")]
+                        &mut fpcr,
+                        #[cfg(target_arch = "x86_64")]
+                        &mut mxcsr,
+                    )
                 }
-                match ctx.exit {
-                    EXIT_SVC => break Stop::Svc(ctx.svc),
-                    EXIT_BUDGET => break Stop::Left,
-                    _ => {}
-                }
-            },
+            }
             Backend::Empty => Stop::Left,
         };
 
@@ -538,6 +567,90 @@ impl Library {
         // the budget already has
         machine.cpu.cycles = cycles + ran;
         (ran, stop)
+    }
+}
+
+#[inline(always)]
+fn run_aot_fast(
+    aot: &zakuro_aot::LoadedAot,
+    ctx: &mut Context,
+    machine: &mut Machine<'_>,
+    #[cfg(target_arch = "aarch64")] fpcr: &mut FpcrGuard,
+    #[cfg(target_arch = "x86_64")] mxcsr: &mut MxcsrGuard,
+) -> Stop {
+    ctx.vfp = machine.cpu.vfp.regs.as_mut_ptr();
+    ctx.fpscr = &mut machine.cpu.vfp.fpscr;
+    ctx.user = machine as *mut Machine<'_> as *mut c_void;
+    loop {
+        if ctx.budget <= 0 {
+            break Stop::Left;
+        }
+        let Some(target_rx) = aot.lookup(ctx.r[15] | ctx.thumb as u32) else {
+            break Stop::Left;
+        };
+        ctx.exit = 0;
+        ctx.depth = 0;
+        #[cfg(target_arch = "aarch64")]
+        fpcr.sync(unsafe { *ctx.fpscr });
+        #[cfg(target_arch = "x86_64")]
+        mxcsr.sync(unsafe { *ctx.fpscr });
+        // SAFETY: `target_rx` came from `aot.lookup`, and `ctx.user` points at `machine`.
+        unsafe { aot.enter(ctx, target_rx) };
+        if let Some(exit) = machine.pending.take() {
+            break Stop::Exit(exit);
+        }
+        match ctx.exit {
+            EXIT_SVC => break Stop::Svc(ctx.svc),
+            EXIT_BUDGET => break Stop::Left,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+fn run_aot_lockstep(
+    aot: &zakuro_aot::LoadedAot,
+    ctx: &mut Context,
+    machine: &mut Machine<'_>,
+    stride: u64,
+    #[cfg(target_arch = "aarch64")] fpcr: &mut FpcrGuard,
+    #[cfg(target_arch = "x86_64")] mxcsr: &mut MxcsrGuard,
+) -> Stop {
+    let verify_all = stride == 1;
+    let verify_first = !verify_all && crate::lockstep::take_invocation(stride);
+    if !verify_all && !verify_first {
+        return run_aot_fast(
+            aot,
+            ctx,
+            machine,
+            #[cfg(target_arch = "aarch64")]
+            fpcr,
+            #[cfg(target_arch = "x86_64")]
+            mxcsr,
+        );
+    }
+    loop {
+        if ctx.budget <= 0 {
+            break Stop::Left;
+        }
+        let Some(target_rx) = aot.lookup(ctx.r[15] | ctx.thumb as u32) else {
+            break Stop::Left;
+        };
+        let outcome = crate::lockstep::verify_block(aot, ctx, machine, target_rx);
+        if let Some(stop) = outcome.stop {
+            break stop;
+        }
+        if outcome.switch_to_fast || !verify_all {
+            break run_aot_fast(
+                aot,
+                ctx,
+                machine,
+                #[cfg(target_arch = "aarch64")]
+                fpcr,
+                #[cfg(target_arch = "x86_64")]
+                mxcsr,
+            );
+        }
     }
 }
 

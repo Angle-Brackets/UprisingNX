@@ -309,29 +309,38 @@ impl Cpu {
     /// compiler's choice flips with unrelated changes to its callers.
     #[inline(always)]
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> Option<Exit> {
+        self.step_with_branch(bus).0
+    }
+
+    /// Executes one instruction and returns `(exit, took_branch)` where
+    /// `took_branch` reports whether the instruction explicitly wrote `R15`.
+    #[inline(always)]
+    pub fn step_with_branch<B: Bus>(&mut self, bus: &mut B) -> (Option<Exit>, bool) {
         self.cycles += 1;
         if self.cpsr.thumb {
             let addr = self.regs[PC];
             let opcode = bus.fetch16(addr) as u32;
             self.regs[PC] = addr.wrapping_add(4);
             let exit = thumb::execute(self, bus, opcode);
+            let took_branch = self.branched;
             if self.branched {
                 self.branched = false;
             } else {
                 self.regs[PC] = addr.wrapping_add(2);
             }
-            exit
+            (exit, took_branch)
         } else {
             let addr = self.regs[PC];
             let opcode = bus.fetch32(addr);
             self.regs[PC] = addr.wrapping_add(8);
             let exit = arm::execute(self, bus, opcode);
+            let took_branch = self.branched;
             if self.branched {
                 self.branched = false;
             } else {
                 self.regs[PC] = addr.wrapping_add(4);
             }
-            exit
+            (exit, took_branch)
         }
     }
 

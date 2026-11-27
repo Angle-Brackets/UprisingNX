@@ -12,6 +12,8 @@ pub mod hints;
 pub mod idle;
 pub mod kernel;
 pub mod loader;
+#[cfg(not(target_os = "horizon"))]
+pub mod lockstep;
 pub mod memory;
 pub mod mods;
 pub mod replay;
@@ -396,6 +398,16 @@ impl System {
     pub fn set_aot(&mut self, aot: zakuro_aot::LoadedAot) {
         let mut library = recompiled::Library::from_aot(aot);
         if !self.config.aot_overrides.is_empty() || self.config.aot_plugin_state.is_some() {
+            #[cfg(not(target_os = "horizon"))]
+            if lockstep::is_enabled() {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    log::warn!("lockstep verification enabled: skipping AOT native overrides in System::set_aot");
+                });
+            } else {
+                library.set_aot_overrides(&self.config.aot_overrides, self.config.aot_plugin_state);
+            }
+            #[cfg(target_os = "horizon")]
             library.set_aot_overrides(&self.config.aot_overrides, self.config.aot_plugin_state);
         }
         let stale = library.check(&mut self.memory);

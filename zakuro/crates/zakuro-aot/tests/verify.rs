@@ -3618,3 +3618,78 @@ fn torture_depth_overflow_null_override_and_callback_mxcsr() {
         assert_eq!(vfp_regs[2], (-1.0f32).next_down().to_bits(), "RMode=-Inf not restored after OverrideFn");
     }
 }
+
+#[test]
+fn torture_fuzz_regressions_smmla_f64_rmode_fz_and_fmrdh() {
+    use asm::*;
+
+    // Regression test covering all findings discovered by `fuzz_isa`:
+    // 1. SMMLA / SMMLS / SMMLAR signed 64-bit accumulator overflow wrapping in `zakuro-cpu`.
+    // 2. f64 VADD / VSUB / VMUL / VDIV / VSQRT obeying `FPSCR.RMode` (01=+Inf, 10=-Inf, 11=RZ).
+    // 3. f32 VDIV / VADD / VMUL / VCVT.F32.F64 pre-rounding tininess flush under `FPSCR.FZ=1`.
+    // 4. FMRDH / FMDHR (`coproc=11, opc1=1`) lowered natively with zero fallbacks.
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+
+    // SMMLA R4, R0, R2, R1 (`0xE754_1210` with R0=0x55107A5D, R2=0x7C4AEAF0, R1=0x7F7F7F7F)
+    b.emit_arm(0xE754_1210);
+    // SMMLS R5, R0, R2, R3
+    b.emit_arm(0xE755_32D0);
+    // SMMLAR R6, R0, R2, R1
+    b.emit_arm(0xE756_1230);
+
+    // FMDHR D15, R7 (0xEE2F_7B10) + FMRDH R8, D15 (0xEE3F_8B10)
+    b.emit_arm(0xEE2F_7B10);
+    b.emit_arm(0xEE3F_8B10);
+
+    // Switch FPSCR = FZ=1 | RMode=+Inf (held in R9), test f32 VDIV tininess + f64 RMode=+Inf
+    b.emit_arm(vmsr_fpscr(AL, 9));
+    // VDIV.F32 S2, S0, S1 (`(2 - 2^-23)*2^-126 / 2.0` -> pre-rounding tiny -> 0x0000_0000!)
+    b.emit_arm(vfp_dp(AL, false, 0b1000, false, 2, 0, 1));
+    // VADD.F64 D2, D2, D3 (inexact positive sum rounded toward +Inf)
+    b.emit_arm(vfp_dp(AL, true, 0b0011, false, 2, 2, 3));
+    // VMUL.F64 D4, D4, D5
+    b.emit_arm(vfp_dp(AL, true, 0b0010, false, 4, 4, 5));
+    // VDIV.F64 D6, D6, D7
+    b.emit_arm(vfp_dp(AL, true, 0b1000, false, 6, 6, 7));
+    // VSQRT.F64 D8, D8
+    b.emit_arm(vfp_unary(AL, true, 0b0001, true, 8, 8));
+
+    // Switch FPSCR = FZ=1 | RMode=-Inf (held in R10), test f64 VSUB + VMLA
+    b.emit_arm(vmsr_fpscr(AL, 10));
+    b.emit_arm(vfp_dp(AL, true, 0b0011, true, 9, 2, 3));
+    b.emit_arm(vfp_dp(AL, true, 0b0000, false, 10, 4, 5));
+    b.emit_arm(bx(AL, 14));
+
+    let words = b.finish();
+    let (text, aot) = compile_snippet(&words, &[(entry, Source::Entry)]);
+    verify_compiled("fuzz_regressions_smmla_f64_rmode_fz_and_fmrdh", &text, &aot, true, |cpu, _| {
+        cpu.regs[0] = 0x5510_7A5D;
+        cpu.regs[1] = 0x7F7F_7F7F;
+        cpu.regs[2] = 0x7C4A_EAF0;
+        cpu.regs[3] = 0x8000_0000;
+        cpu.regs[7] = 0xDEAD_BEEF;
+        cpu.regs[9] = (1 << 24) | (0b01 << 22);  // FZ=1, RMode=+Inf
+        cpu.regs[10] = (1 << 24) | (0b10 << 22); // FZ=1, RMode=-Inf
+
+        // S0 = (2 - 2^-23)*2^-126, S1 = 2.0f32 (ratio < 2^-126 before rounding)
+        cpu.vfp.regs[0] = 0x00FF_FFFF;
+        cpu.vfp.regs[1] = 2.0f32.to_bits();
+
+        // Populate D2..D10 with exact bit-inexact double operands
+        let set_d = |vfp: &mut [u32; 32], d: usize, val: f64| {
+            let b = val.to_bits();
+            vfp[d * 2] = b as u32;
+            vfp[d * 2 + 1] = (b >> 32) as u32;
+        };
+        set_d(&mut cpu.vfp.regs, 2, 1.0);
+        set_d(&mut cpu.vfp.regs, 3, 1e-18);
+        set_d(&mut cpu.vfp.regs, 4, 1.0 + 1e-12);
+        set_d(&mut cpu.vfp.regs, 5, 1.0 + 3e-12);
+        set_d(&mut cpu.vfp.regs, 6, 1.0);
+        set_d(&mut cpu.vfp.regs, 7, 3.0);
+        set_d(&mut cpu.vfp.regs, 8, 2.0);
+        set_d(&mut cpu.vfp.regs, 9, 5.0);
+        set_d(&mut cpu.vfp.regs, 10, 0.25);
+    });
+}

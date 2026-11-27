@@ -256,6 +256,23 @@ impl Memory {
         (addr >= HOST_MAILBOX_VADDR && addr % 4 == 0 && index < HOST_MAILBOX_WORDS).then_some(index)
     }
 
+    #[cfg(not(target_os = "horizon"))]
+    pub(crate) fn shadow_mailbox_word(addr: VAddr) -> Option<usize> {
+        Self::mailbox_word(addr)
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    pub(crate) fn shadow_read_ptr(&mut self, addr: VAddr) -> Option<*const u8> {
+        self.cpu_page_read(addr, 1)
+            .map(|page| unsafe { page.as_ptr().add((addr & PAGE_MASK) as usize) })
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    pub(crate) fn shadow_write_ptr(&mut self, addr: VAddr) -> Option<*mut u8> {
+        self.cpu_page_write(addr, 1)
+            .map(|page| unsafe { page.as_mut_ptr().add((addr & PAGE_MASK) as usize) })
+    }
+
     /// starts noting what the CPU's writes write over, forgetting what was
     /// noted before.
     pub(crate) fn log_writes(&mut self) {

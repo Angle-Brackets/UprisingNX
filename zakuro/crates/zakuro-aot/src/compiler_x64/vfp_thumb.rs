@@ -113,8 +113,11 @@ impl FnEmitter<'_> {
                 }
                 true
             }
-            (10 | 11, 0) if rt != 15 => {
-                let sn = sreg((op >> 16) & 0xF, (op & (1 << 7)) != 0);
+            (10 | 11, 0) | (11, 1) if rt != 15 => {
+                let sn = sreg(
+                    (op >> 16) & 0xF,
+                    (coproc == 11 && ((op >> 21) & 7) == 1) || (op & (1 << 7)) != 0,
+                );
                 self.buf.ldr_r64_mem(RCX, RBX, offsets::CTX_VFP as i32);
                 if load {
                     self.buf.ldr_r32_mem(RAX, RCX, (sn as i32) * 4);

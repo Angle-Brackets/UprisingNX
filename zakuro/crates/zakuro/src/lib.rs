@@ -172,7 +172,7 @@ fn run_with_mode(linked: Option<Linked>, kiu_mode: bool) {
             app.start();
         }
         if let Some(game) = &mut app.game {
-            run_headless(&mut game.system, frames);
+            run_headless(game, frames);
         }
         return;
     }
@@ -325,12 +325,17 @@ fn paint_test_pattern(config: Config) -> System {
     system
 }
 
-fn run_headless(system: &mut System, frames: u64) {
+fn run_headless(game: &mut Running, frames: u64) {
     let start = Instant::now();
     let mut outcome = FrameOutcome::Completed;
     let mut ran = 0;
     for _ in 0..frames {
-        outcome = system.run_frame();
+        if let Some(replay) = &mut game.replay {
+            let input = replay.input(game.frame);
+            game.system.set_input(input);
+        }
+        game.frame += 1;
+        outcome = game.system.run_frame();
         ran += 1;
         if outcome != FrameOutcome::Completed {
             break;
@@ -340,13 +345,18 @@ fn run_headless(system: &mut System, frames: u64) {
     println!("{outcome:?} after {ran} frames in {elapsed:.2?}");
     println!(
         "{:.1} MIPS, {}",
-        system.cpu.cycles as f64 / elapsed.as_secs_f64() / 1e6,
-        system.status_line()
+        game.system.cpu.cycles as f64 / elapsed.as_secs_f64() / 1e6,
+        game.system.status_line()
     );
-    if !system.fatal_errors.is_empty() {
-        println!("fatal errors: {}", system.fatal_errors.join("; "));
+    #[cfg(not(target_os = "horizon"))]
+    if zakuro_core::lockstep::is_enabled() {
+        let (blocks, insns) = zakuro_core::lockstep::stats();
+        println!("lockstep: verified {blocks} blocks ({insns} guest insns), 0 mismatches");
     }
-    for (thread, pc, hits) in system.hot_spots(10) {
+    if !game.system.fatal_errors.is_empty() {
+        println!("fatal errors: {}", game.system.fatal_errors.join("; "));
+    }
+    for (thread, pc, hits) in game.system.hot_spots(10) {
         println!("  hot {thread:<8} 0x{pc:08X} {hits}");
     }
 }
@@ -518,6 +528,14 @@ fn attach_kiu_overrides(
     program_id: u64,
     text_hash: u64,
 ) -> zakuro_core::zakuro_aot::LoadedAot {
+    #[cfg(not(target_os = "horizon"))]
+    if zakuro_core::lockstep::is_enabled() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            log::warn!("lockstep verification enabled: skipping KIU native AOT overrides");
+        });
+        return loaded;
+    }
     loaded
         .with_overrides(kiu_common::overrides_for(program_id, text_hash))
         .with_plugin_state(kiu_common::default_plugin_state())
@@ -1002,18 +1020,33 @@ impl App {
         let interpret = self.options.interpreter || !self.settings.recompiled;
         let hardware_renderer = self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer);
         let (aot_overrides, aot_plugin_state, aot_hints) = if self.kiu_mode && !interpret {
-            (
-                kiu_common::overrides_for(
-                    kiu_common::KIU_USA_PROGRAM_ID,
-                    kiu_common::KIU_USA_TEXT_HASH,
+            #[cfg(not(target_os = "horizon"))]
+            let skip_overrides = zakuro_core::lockstep::is_enabled();
+            #[cfg(target_os = "horizon")]
+            let skip_overrides = false;
+            if skip_overrides {
+                (
+                    Vec::new(),
+                    None,
+                    kiu_common::builtin_hints(
+                        kiu_common::KIU_USA_PROGRAM_ID,
+                        kiu_common::KIU_USA_TEXT_HASH,
+                    ),
                 )
-                .to_vec(),
-                Some(kiu_common::default_plugin_state()),
-                kiu_common::builtin_hints(
-                    kiu_common::KIU_USA_PROGRAM_ID,
-                    kiu_common::KIU_USA_TEXT_HASH,
-                ),
-            )
+            } else {
+                (
+                    kiu_common::overrides_for(
+                        kiu_common::KIU_USA_PROGRAM_ID,
+                        kiu_common::KIU_USA_TEXT_HASH,
+                    )
+                    .to_vec(),
+                    Some(kiu_common::default_plugin_state()),
+                    kiu_common::builtin_hints(
+                        kiu_common::KIU_USA_PROGRAM_ID,
+                        kiu_common::KIU_USA_TEXT_HASH,
+                    ),
+                )
+            }
         } else {
             (Vec::new(), None, Vec::new())
         };
@@ -1325,8 +1358,21 @@ impl App {
         let mut config = self.config();
         config.wireless_reboot = self.wireless_reboot.take();
         if !self.options.interpreter && self.settings.recompiled {
-            config.aot_overrides = kiu_common::overrides_for(program_id, text_hash).to_vec();
-            config.aot_plugin_state = Some(kiu_common::default_plugin_state());
+            #[cfg(not(target_os = "horizon"))]
+            let skip_overrides = zakuro_core::lockstep::is_enabled();
+            #[cfg(target_os = "horizon")]
+            let skip_overrides = false;
+            if skip_overrides {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    log::warn!("lockstep verification enabled: skipping KIU native AOT overrides");
+                });
+                config.aot_overrides.clear();
+                config.aot_plugin_state = None;
+            } else {
+                config.aot_overrides = kiu_common::overrides_for(program_id, text_hash).to_vec();
+                config.aot_plugin_state = Some(kiu_common::default_plugin_state());
+            }
             config.aot_hints = kiu_common::builtin_hints(program_id, text_hash);
         }
         let (record, clock, replay) = self.replay_and_clock(&mut config)?;
@@ -2223,9 +2269,16 @@ impl App {
             self.shown += 1;
         }
 
-        if let Some(limit) = std::env::var("ZAKURO_STOP_FRAME").ok().and_then(|v| v.parse::<u64>().ok()) {
-            if self.game.as_ref().is_some_and(|game| game.frame >= limit) {
-                self.stop = true;
+        if !self.stop {
+            if let Some(limit) = std::env::var("ZAKURO_STOP_FRAME").ok().and_then(|v| v.parse::<u64>().ok()) {
+                if self.game.as_ref().is_some_and(|game| game.frame >= limit) {
+                    #[cfg(not(target_os = "horizon"))]
+                    if zakuro_core::lockstep::is_enabled() {
+                        let (blocks, insns) = zakuro_core::lockstep::stats();
+                        log::info!("lockstep: verified {blocks} blocks ({insns} guest insns), 0 mismatches");
+                    }
+                    self.stop = true;
+                }
             }
         }
 

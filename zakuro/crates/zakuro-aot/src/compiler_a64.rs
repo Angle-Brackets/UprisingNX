@@ -3147,8 +3147,11 @@ impl FnEmitter<'_> {
                 }
                 true
             }
-            (10 | 11, 0) if rt != 15 => {
-                let sn = Self::sreg((op >> 16) & 0xF, (op & (1 << 7)) != 0);
+            (10 | 11, 0) | (11, 1) if rt != 15 => {
+                let sn = Self::sreg(
+                    (op >> 16) & 0xF,
+                    (coproc == 11 && ((op >> 21) & 7) == 1) || (op & (1 << 7)) != 0,
+                );
                 if load {
                     self.buf.emit(a64::fmov_w_from_s(rt as u8, sn));
                 } else {

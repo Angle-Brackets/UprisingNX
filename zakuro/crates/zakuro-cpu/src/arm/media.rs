@@ -391,7 +391,7 @@ fn dual_multiply(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
             let sum = if ra == 15 {
                 dual
             } else {
-                dual + cpu.regs[ra] as i32 as i64
+                dual.wrapping_add(cpu.regs[ra] as i32 as i64)
             };
             cpu.regs[rd] = sum as u32;
             cpu.cpsr.q |= sum != sum as i32 as i64;
@@ -414,12 +414,12 @@ fn dual_multiply(cpu: &mut Cpu, op: u32, op1: u32) -> Option<Exit> {
                 (cpu.regs[ra] as i32 as i64) << 32
             };
             let mut total = if subtract {
-                acc - product
+                acc.wrapping_sub(product)
             } else {
-                acc + product
+                acc.wrapping_add(product)
             };
             if round {
-                total += 0x8000_0000;
+                total = total.wrapping_add(0x8000_0000);
             }
             cpu.regs[rd] = (total >> 32) as u32;
         }

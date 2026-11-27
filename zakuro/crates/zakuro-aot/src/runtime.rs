@@ -926,6 +926,10 @@ impl LoadedAot {
         }
     }
 
+    pub fn has_active_overrides(&self) -> bool {
+        self.overrides.iter().any(|&fn_ptr| fn_ptr != 0)
+    }
+
     pub fn with_overrides(mut self, overrides: &[(u32, OverrideFn)]) -> Self {
         self.set_overrides(overrides);
         self
