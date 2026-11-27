@@ -1473,6 +1473,8 @@ pub struct Resources {
     pub(crate) hardware: Option<hardware::Hardware>,
     /// dialogue portraits drawn again on the top screen, see mirror_portrait.
     pub(crate) portraits: Portraits,
+    /// dynamic self-sampling chunk count (`0` falls back to 1 unless env overrides).
+    pub(crate) self_chunks: u8,
 }
 
 /// what mirror_portrait needs to put the bottom screen's portraits on the
@@ -9308,8 +9310,9 @@ fn rasterize_now<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mu
             // ZAKURO_SELF_CHUNKS=N: a draw reading the buffer it draws into
             // goes in N runs of triangles, each reading what the one before
             // drew, as the console's tile by tile drawing does (a test)
-            static CHUNKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-            let chunks = *CHUNKS.get_or_init(|| std::env::var("ZAKURO_SELF_CHUNKS").ok().and_then(|v| v.parse().ok()).unwrap_or(1));
+            static CHUNKS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+            let env_chunks = *CHUNKS.get_or_init(|| std::env::var("ZAKURO_SELF_CHUNKS").ok().and_then(|v| v.parse().ok()));
+            let chunks = env_chunks.unwrap_or_else(|| (resources.self_chunks as usize).max(1));
             let own = chunks > 1
                 && state.textures[0].as_ref().and_then(|t| t.drawn).is_some_and(|d| d.addr & 0x00FF_FFFF == (registers[REG_COLOR_BUFFER_ADDRESS] << 3) & 0x00FF_FFFF);
             let drawn_on_gpu = if own {

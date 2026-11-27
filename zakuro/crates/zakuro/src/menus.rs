@@ -691,15 +691,32 @@ impl Menus {
                 ui.checkbox(&mut settings.hardware_rasterizer, "Draw the 3D on the GPU");
                 ui.add_enabled(
                     settings.hardware_rasterizer,
-                    egui::Slider::new(&mut settings.resolution, 1..=8).text("Resolution").suffix("x"),
+                    egui::Slider::new(&mut settings.resolution, 1..=zakuro_gpu::MAX_SCALE)
+                        .text("Resolution")
+                        .custom_formatter(|v, _| {
+                            let s = v.round() as u32;
+                            format!("{s}x ({}p)", s * 240)
+                        }),
                 )
-                .on_hover_text("How many times the console's resolution the 3D is drawn at. Past what the window shows, the extra pixels smooth the edges, at a cost to the GPU that grows fast.");
+                .on_hover_text("How many times the console's resolution the 3D is drawn at (changes live, up to 16x = 6400x3840).");
+                let af_label = |v: u32| if v <= 1 { "Off".to_owned() } else { format!("{v}x") };
+                ui.add_enabled_ui(settings.hardware_rasterizer && settings.renderer == Renderer::Vulkan, |ui| {
+                    egui::ComboBox::from_label("Anisotropic filtering")
+                        .selected_text(af_label(settings.anisotropy))
+                        .show_ui(ui, |ui| {
+                            for level in [1u32, 2, 4, 8, 16] {
+                                ui.selectable_value(&mut settings.anisotropy, level, af_label(level));
+                            }
+                        });
+                });
+                ui.checkbox(&mut settings.vsync, "VSync")
+                    .on_hover_text("Waits for the display refresh. Uncheck for minimum input lag on high-refresh monitors.");
                 ui.add_enabled(settings.hardware_rasterizer, egui::Checkbox::new(&mut settings.texture_packs, "Texture packs"))
                     .on_hover_text("Draw a game's texture pack, made for Citra or Azahar, put in the textures folder of the game's mods folder.");
                 let interpolates = settings.hardware_rasterizer && settings.renderer == Renderer::Vulkan;
                 ui.add_enabled(interpolates, egui::Checkbox::new(&mut settings.frame_interpolation, "Frame interpolation"))
                     .on_hover_text("A game at 30 frames a second gets a picture drawn in between each two of its own, with everything halfway between where it was in both, so it moves at 60. The screens show a 60th of a second late. It takes the 3D drawn on the GPU and the Vulkan presenter.");
-                ui.add(egui::Slider::new(&mut settings.scale, 1..=6).text("Window scale"));
+                ui.add(egui::Slider::new(&mut settings.scale, 1..=9).text("Window scale"));
                 egui::ComboBox::from_label("Screens").selected_text(settings.layout.name()).show_ui(ui, |ui| {
                     for layout in Screens::ALL {
                         ui.selectable_value(&mut settings.layout, layout, layout.name());

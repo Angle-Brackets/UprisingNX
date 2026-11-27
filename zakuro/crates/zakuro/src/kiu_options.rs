@@ -83,12 +83,33 @@ fn picture(ui: &mut Ui, settings: &mut Settings) {
     plate(ui, "PICTURE");
     egui::Grid::new("kiu picture").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
         let gpu = settings.hardware_rasterizer;
-        row(ui, "Resolution", "How many times the console's resolution the 3D is drawn at. It changes with Reset or the next start.", |ui| {
-            ui.add_enabled(gpu, egui::Slider::new(&mut settings.resolution, 1..=8).suffix("x"))
+        row(ui, "Resolution", "Internal 3D rendering resolution (changes live immediately; up to 16x = 6400x3840).", |ui| {
+            ui.add_enabled(
+                gpu,
+                egui::Slider::new(&mut settings.resolution, 1..=zakuro_gpu::MAX_SCALE)
+                    .custom_formatter(|v, _| {
+                        let s = v.round() as u32;
+                        format!("{s}x ({}p)", s * 240)
+                    }),
+            )
+        });
+        row(ui, "Anisotropic filtering", "Sharpens 3D textures viewed at shallow angles with negligible cost on desktop GPUs.", |ui| {
+            let label = |v: u32| if v <= 1 { "Off".to_owned() } else { format!("{v}x") };
+            egui::ComboBox::from_id_salt("kiu af")
+                .selected_text(label(settings.anisotropy))
+                .show_ui(ui, |ui| {
+                    for level in [1u32, 2, 4, 8, 16] {
+                        ui.selectable_value(&mut settings.anisotropy, level, label(level));
+                    }
+                })
+                .response
         });
         let interpolates = gpu && settings.renderer == Renderer::Vulkan;
         row(ui, "Smoother motion", "A picture drawn between each two of the game's 30 a second, so it moves at 60. It shows a 60th of a second late.", |ui| {
             ui.add_enabled(interpolates, egui::Checkbox::without_text(&mut settings.frame_interpolation))
+        });
+        row(ui, "VSync", "Locks frame pacing to your display refresh rate; disable for lowest mouse-aim latency on high-Hz monitors.", |ui| {
+            ui.checkbox(&mut settings.vsync, "")
         });
         row(ui, "Screens", "Where the two screens go. F9 switches them while playing.", |ui| {
             egui::ComboBox::from_id_salt("kiu screens")

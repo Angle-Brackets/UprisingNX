@@ -137,6 +137,7 @@ pub struct VulkanPresenter {
     shared: Option<Arc<SharedDevice>>,
     /// whether a present waits for the display, as FIFO does.
     waits: bool,
+    vsync: bool,
 
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -495,6 +496,7 @@ impl VulkanPresenter {
             gpu_sets,
             shared: ManuallyDrop::into_inner(shared),
             waits: true,
+            vsync: true,
             command_pool,
             command_buffers,
             image_available,
@@ -568,7 +570,8 @@ impl VulkanPresenter {
             Ok("fifo") => vec![vk::PresentModeKHR::FIFO],
             Ok("immediate") => vec![vk::PresentModeKHR::IMMEDIATE],
             Ok("mailbox") => vec![vk::PresentModeKHR::MAILBOX],
-            _ => vec![vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO],
+            _ if self.vsync => vec![vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO],
+            _ => vec![vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO],
         };
         let present_mode = wanted.into_iter().find(|mode| present_modes.contains(mode)).unwrap_or(vk::PresentModeKHR::FIFO);
         self.waits = present_mode == vk::PresentModeKHR::FIFO;
@@ -1455,6 +1458,13 @@ impl Presenter for VulkanPresenter {
         self.stereo = stereo;
     }
 
+    fn set_vsync(&mut self, vsync: bool) {
+        if self.vsync != vsync {
+            self.vsync = vsync;
+            self.stale = true;
+        }
+    }
+
     fn set_cauldron_state(&mut self, cursor_x: f32, opacity: f32, hud_flags: u32) {
         self.cauldron_state = (cursor_x, opacity, hud_flags);
     }
@@ -2174,6 +2184,8 @@ impl FrameCapture {
                 "60",
                 "-i",
                 "-",
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
                 "-c:v",
                 "libx264",
                 "-pix_fmt",

@@ -97,6 +97,9 @@ pub struct Config {
     /// the interpreter skips to the next event past loops that change
     /// nothing, see idle.
     pub skip_idle_loops: bool,
+    /// run GPU command lists on a dedicated worker thread (`None` respects
+    /// `ZAKURO_GPU_THREAD`, `Some` provides a default when env is unset).
+    pub gpu_thread: Option<bool>,
 }
 
 impl Default for Config {
@@ -126,6 +129,7 @@ impl Default for Config {
             dlp_child: None,
             wireless_reboot: None,
             skip_idle_loops: true,
+            gpu_thread: None,
         }
     }
 }
@@ -291,12 +295,17 @@ impl System {
         if let Some(dir) = &config.data_dir {
             services.fs.user_dir = dir.join("user");
         }
+        let threaded = std::env::var("ZAKURO_GPU_THREAD")
+            .ok()
+            .map(|v| v != "0")
+            .or(config.gpu_thread)
+            .unwrap_or(false);
         System {
             cpu: Cpu::new(),
             memory: Memory::new(config.new3ds, app_bytes),
             kernel: Kernel::new(0, memory::MemoryRegion::Application, linear_heap_base(0)),
             services,
-            gpu: gpu_thread::GpuCell::new(Gpu::new(), gpu_thread_wanted()),
+            gpu: gpu_thread::GpuCell::new(Gpu::new(), threaded),
             renderer: Box::new(SoftwareRenderer::default()),
             title: None,
             dlc: Vec::new(),
@@ -1495,10 +1504,6 @@ unsafe fn sync_for_cpu_write(gpu: *mut (), linear_base: u32, memory: &mut Memory
 /// as sync_for_cpu.
 unsafe fn wait_for_gpu(gpu: *mut ()) {
     unsafe { &*(gpu as *mut gpu_thread::GpuCell) }.wait_idle_as(1);
-}
-
-fn gpu_thread_wanted() -> bool {
-    std::env::var("ZAKURO_GPU_THREAD").is_ok_and(|value| value != "0")
 }
 
 impl Drop for System {

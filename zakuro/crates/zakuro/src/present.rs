@@ -110,6 +110,21 @@ impl Backend {
         }
     }
 
+    pub fn set_vsync(&mut self, vsync: bool) {
+        match self {
+            Backend::OpenGl { context, surface, .. } => {
+                let interval = if vsync {
+                    SwapInterval::Wait(std::num::NonZeroU32::new(1).unwrap())
+                } else {
+                    SwapInterval::DontWait
+                };
+                let _ = surface.set_swap_interval(context, interval);
+            }
+            Backend::Vulkan(presenter) => presenter.set_vsync(vsync),
+            Backend::None => {}
+        }
+    }
+
     pub fn set_layout(&mut self, arrangement: ScreenLayout) {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.set_layout(arrangement),

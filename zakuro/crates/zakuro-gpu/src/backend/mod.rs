@@ -673,6 +673,9 @@ pub trait Presenter {
     /// fraction (`0.80..=1.0`) of the window/swapchain used for the active
     /// display area, centering it inside black overscan borders on TVs.
     fn set_safe_area(&mut self, _factor: f32) {}
+
+    /// whether presentation waits for vertical sync (FIFO / Mailbox) or unlocks immediately.
+    fn set_vsync(&mut self, _vsync: bool) {}
 }
 
 #[cfg(test)]

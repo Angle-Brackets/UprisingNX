@@ -648,12 +648,18 @@ fn configured_twin_scale(scale: u32, mixed: bool) -> u32 {
             Some("0") | Some("same") => Mode::Same,
             Some(other) => match other.parse::<u32>() {
                 Ok(0) => Mode::Same,
-                Ok(n) => Mode::Fixed(n.clamp(1, 8)),
+                Ok(n) => Mode::Fixed(n.clamp(1, crate::MAX_SCALE)),
                 Err(_) => Mode::Auto,
             },
         });
         match mode {
-            Mode::Auto => (scale - 1).max(1),
+            Mode::Auto => {
+                if cfg!(target_os = "horizon") {
+                    (scale - 1).max(1)
+                } else {
+                    scale
+                }
+            }
             Mode::Same => scale,
             Mode::Fixed(n) => n.min(scale).max(1),
         }
@@ -2298,8 +2304,11 @@ pub struct Hardware {
     /// the same writing an image, made the first time it is needed.
     upright_image: Option<Compute>,
     samples: Option<Local>,
-    samplers: QuickMap<(u8, Wrap, Wrap, u32, i16), vk::Sampler>,
+    samplers: QuickMap<(u8, Wrap, Wrap, u32, i16, u8), vk::Sampler>,
     default_sampler: vk::Sampler,
+    anisotropy: u8,
+    max_anisotropy: f32,
+    skip_screen_sync: bool,
     ring: Buffer,
     used: u64,
     readback: Option<Buffer>,
@@ -2419,6 +2428,7 @@ impl Hardware {
         let (instance, device, physical, family) = (shared.instance.clone(), shared.device.clone(), shared.physical, shared.family);
         let (logic_ops, statistics, dynamic) = (shared.logic_ops, shared.statistics, shared.dynamic);
         let unrestricted_depth = shared.unrestricted_depth;
+        let max_anisotropy = shared.max_anisotropy;
         // SAFETY: the physical device came from this instance
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let name = properties.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2593,6 +2603,9 @@ impl Hardware {
                 samples: None,
                 samplers: QuickMap::default(),
                 default_sampler: vk::Sampler::null(),
+                anisotropy: 1,
+                max_anisotropy,
+                skip_screen_sync: false,
                 used: 0,
                 readback: None,
                 surfaces: Vec::new(),
@@ -2785,15 +2798,23 @@ impl Hardware {
         self.scale
     }
 
+    pub(crate) fn set_anisotropy(&mut self, anisotropy: u8) {
+        self.anisotropy = anisotropy.clamp(1, 16);
+    }
+
+    pub(crate) fn set_skip_screen_sync(&mut self, skip: bool) {
+        self.skip_screen_sync = skip;
+    }
+
     /// draws at a multiple of the console's resolution from now on, when
     /// the GPU can scale surfaces, and says the one it took.
     pub fn set_scale(&mut self, scale: u32) -> u32 {
         if !self.blits {
             return self.scale;
         }
-        // up to 8, and no more than keeps the largest buffers, 1024
+        // up to MAX_SCALE, and no more than keeps the largest buffers, 1024
         // pixels across, within what the GPU makes
-        let next = scale.clamp(1, 8).min((self.max_image_size / 1024).max(1));
+        let next = scale.clamp(1, crate::MAX_SCALE).min((self.max_image_size / 1024).max(1));
         if next == self.scale {
             return self.scale;
         }
@@ -2840,7 +2861,7 @@ impl Hardware {
         if !self.blits {
             return self.scale;
         }
-        let next = scale.clamp(1, 8).min((self.max_image_size / 1024).max(1));
+        let next = scale.clamp(1, crate::MAX_SCALE).min((self.max_image_size / 1024).max(1));
         if next == self.scale {
             return self.scale;
         }
@@ -4142,7 +4163,16 @@ impl Hardware {
     /// a sampler for a unit, which goes between an image's sizes down to
     /// smallest, as guest mipmaps and texture pack pictures have them.
     fn sampler(&mut self, filters: u8, s: Wrap, t: Wrap, smallest: u32, lod_bias: i16) -> Result<vk::Sampler, String> {
-        if let Some(&sampler) = self.samplers.get(&(filters, s, t, smallest, lod_bias)) {
+        let (mag, min, mip) = (filters & 1 != 0, filters & 2 != 0, filters & 4 != 0);
+        // Apply anisotropic filtering only to mipmapped linear-minified 3D textures so
+        // 2D UI quads, fonts, and nearest sprites never sample neighboring atlas texels.
+        let eff_aniso = if self.anisotropy > 1 && smallest > 0 && min && self.max_anisotropy > 1.0 {
+            (self.anisotropy as f32).min(self.max_anisotropy)
+        } else {
+            1.0
+        };
+        let aniso_key = eff_aniso.round() as u8;
+        if let Some(&sampler) = self.samplers.get(&(filters, s, t, smallest, lod_bias, aniso_key)) {
             return Ok(sampler);
         }
         // the border is the shader's to draw, past the edge it clamps
@@ -4151,7 +4181,6 @@ impl Hardware {
             Wrap::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
             _ => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         };
-        let (mag, min, mip) = (filters & 1 != 0, filters & 2 != 0, filters & 4 != 0);
         let filter = |linear: bool| if linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
         let between = if smallest > 0 && (min || mip) { vk::SamplerMipmapMode::LINEAR } else { vk::SamplerMipmapMode::NEAREST };
         let mut bias = if smallest > 0 { lod_bias as f32 / 256.0 } else { 0.0 };
@@ -4163,7 +4192,7 @@ impl Hardware {
             bias = value;
         }
         let smallest_lod = if *NO_MIPS.get_or_init(|| std::env::var_os("ZAKURO_NO_MIPS").is_some()) { 0 } else { smallest };
-        let info = vk::SamplerCreateInfo::default()
+        let mut info = vk::SamplerCreateInfo::default()
             .mag_filter(filter(mag))
             .min_filter(filter(min))
             .mipmap_mode(between)
@@ -4172,9 +4201,12 @@ impl Hardware {
             .address_mode_v(mode(t))
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .max_lod(smallest_lod as f32);
+        if eff_aniso > 1.0 {
+            info = info.anisotropy_enable(true).max_anisotropy(eff_aniso);
+        }
         // SAFETY: plain object creation on our device
         let sampler = unsafe { self.device.create_sampler(&info, None) }.map_err(vk_error("create a sampler"))?;
-        self.samplers.insert((filters, s, t, smallest, lod_bias), sampler);
+        self.samplers.insert((filters, s, t, smallest, lod_bias, aniso_key), sampler);
         Ok(sampler)
     }
 
@@ -5836,7 +5868,8 @@ impl Hardware {
             }
         }
         static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dirty = if len == 0x5dc00 && *SKIP.get_or_init(|| std::env::var_os("ZAKURO_SKIP_SCREEN_SYNC").is_some()) { Vec::new() } else { dirty };
+        let skip_sync = self.skip_screen_sync || *SKIP.get_or_init(|| std::env::var_os("ZAKURO_SKIP_SCREEN_SYNC").is_some());
+        let dirty = if len == 0x5dc00 && skip_sync { Vec::new() } else { dirty };
         self.write_back(memory, dirty)?;
         for i in overlapping {
             self.surfaces[i].checked = cfg!(target_os = "horizon");
@@ -7755,12 +7788,20 @@ pub(crate) fn render_device(
     }
     log::info!("depth ranges past 0..1 in the viewport: {unrestricted_depth}");
     // SAFETY: the physical device came from this instance
-    let supported = unsafe { instance.get_physical_device_features(physical) };
+    let (supported, properties) = unsafe {
+        (
+            instance.get_physical_device_features(physical),
+            instance.get_physical_device_properties(physical),
+        )
+    };
     let logic_ops = supported.logic_op == vk::TRUE;
+    let has_aniso = supported.sampler_anisotropy == vk::TRUE;
+    let max_anisotropy = if has_aniso { properties.limits.max_sampler_anisotropy } else { 1.0 };
     log::info!(
-        "device features: geometry shaders {}, shader clip distance {}",
+        "device features: geometry shaders {}, shader clip distance {}, max anisotropy {:.0}x",
         supported.geometry_shader == vk::TRUE,
-        supported.shader_clip_distance == vk::TRUE
+        supported.shader_clip_distance == vk::TRUE,
+        max_anisotropy
     );
     let mut dynamic = dynamic_state(instance, physical, logic_ops);
     dynamic.libraries = links_libraries(instance, physical);
@@ -7786,6 +7827,7 @@ pub(crate) fn render_device(
     let features = vk::PhysicalDeviceFeatures::default()
         .depth_clamp(true)
         .logic_op(logic_ops)
+        .sampler_anisotropy(has_aniso)
         .pipeline_statistics_query(statistics);
     // the cache control, to make a pipeline only when the cache on disk
     // has it, every Vulkan 1.3 device does
@@ -7812,7 +7854,7 @@ pub(crate) fn render_device(
     // SAFETY: a queue the device was made with
     let queue = unsafe { device.get_device_queue(family, 0) };
     let (_entry, instance) = (entry.clone(), instance.clone());
-    Ok(SharedDevice { _entry, instance, physical, family, device, queue, queue_lock: Default::default(), logic_ops, statistics, unrestricted_depth, dynamic })
+    Ok(SharedDevice { _entry, instance, physical, family, device, queue, queue_lock: Default::default(), logic_ops, statistics, unrestricted_depth, dynamic, max_anisotropy })
 }
 
 /// which of the blend state the device lets draws set as they go, none

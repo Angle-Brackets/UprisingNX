@@ -26,6 +26,8 @@ pub struct SharedDevice {
     pub(crate) unrestricted_depth: bool,
     /// the blend state draws set as they go.
     pub(crate) dynamic: crate::raster::hardware::Dynamic,
+    /// maximum supported sampler anisotropy (`1.0` when unsupported).
+    pub(crate) max_anisotropy: f32,
 }
 
 impl SharedDevice {

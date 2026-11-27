@@ -11,6 +11,8 @@ pub struct Options {
     /// window scale relative to the console's 400x480 combined screens, the
     /// settings' when not given.
     pub scale: Option<u32>,
+    /// internal 3D rendering resolution scale (`1..=16`), the settings' when not given.
+    pub resolution: Option<u32>,
     /// run without a window for this many frames, then report.
     pub headless: Option<u64>,
     pub profile: bool,
@@ -47,6 +49,7 @@ options:
                                    the host GPU through Vulkan, or software
                                    where that does not start)
   --scale <n>                      window scale factor (default: 2)
+  --resolution <1-16>              internal 3D resolution scale (up to 16x = 6400x3840)
   (Esc opens the menu over a game, F1 pauses, F11 goes fullscreen)
   --headless <frames>              run without a window and print a report
   --new3ds                         emulate a New 3DS
@@ -77,6 +80,7 @@ pub fn parse() -> Result<Options, String> {
         rom: None,
         renderer: None,
         scale: None,
+        resolution: None,
         headless: None,
         profile: false,
         new3ds: false,
@@ -105,6 +109,11 @@ pub fn parse() -> Result<Options, String> {
             "--scale" => {
                 let value = args.next().ok_or("--scale needs a value")?;
                 options.scale = Some(value.parse().map_err(|_| format!("'{value}' is not a scale"))?);
+            }
+            "--resolution" => {
+                let value = args.next().ok_or("--resolution needs a value")?;
+                let res: u32 = value.parse().map_err(|_| format!("'{value}' is not a resolution"))?;
+                options.resolution = Some(res.clamp(1, zakuro_gpu::MAX_SCALE));
             }
             "--headless" => {
                 let value = args.next().ok_or("--headless needs a frame count")?;

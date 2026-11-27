@@ -42,6 +42,9 @@ pub use raster::{power_label_mode, set_power_label_mode, PowerLabelMode};
 #[cfg(feature = "vulkan")]
 pub use device::SharedDevice;
 
+/// Maximum internal 3D resolution scale factor supported (`16x` = 6400x3840).
+pub const MAX_SCALE: u32 = 16;
+
 /// how the GPU reaches guest memory.
 pub trait GpuMemory {
     fn read(&mut self, addr: u32, out: &mut [u8]);
@@ -178,6 +181,10 @@ pub struct Flags {
     pub cauldron_room_rgb: std::sync::atomic::AtomicU32,
     pub menu_override: std::sync::atomic::AtomicBool,
     pub bottom_blank: std::sync::atomic::AtomicBool,
+    pub skip_right_eye: std::sync::atomic::AtomicBool,
+    pub skip_screen_sync: std::sync::atomic::AtomicBool,
+    pub self_chunks: std::sync::atomic::AtomicU8,
+    pub anisotropy: std::sync::atomic::AtomicU8,
 }
 
 pub struct Gpu {
@@ -426,7 +433,7 @@ impl Gpu {
         output_dimensions: u32,
         flags: u32,
     ) {
-        if skip_right_eye() {
+        if self.should_skip_right_eye() {
             let top = self.framebuffers[0];
             let right = output_paddr != 0 && (output_paddr == top.address_a_right || output_paddr == top.address_b_right);
             if right {
@@ -437,6 +444,8 @@ impl Gpu {
                 return;
             }
             self.right_eye_age = self.right_eye_age.saturating_add(1);
+        } else {
+            self.right_eye_source = None;
         }
         self.take_flags();
         self.flush_draws(memory);
@@ -846,6 +855,12 @@ impl Gpu {
         self.resources.portraits.active_battle = self.flags.active_battle.load(Relaxed);
         self.resources.portraits.pause_active = self.flags.on_pause.load(Relaxed);
         self.resources.portraits.menu_override = self.flags.menu_override.load(Relaxed);
+        self.resources.self_chunks = self.flags.self_chunks.load(Relaxed);
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            hardware.set_anisotropy(self.flags.anisotropy.load(Relaxed));
+            hardware.set_skip_screen_sync(self.flags.skip_screen_sync.load(Relaxed));
+        }
     }
 
     /// hands what the GPU noted for the frontend over, after a command.
@@ -1339,7 +1354,17 @@ impl Gpu {
     /// title copies to the right eye's framebuffer, while the top screen is
     /// in 3D and that copy was seen lately (a title draws both eyes even
     /// with the slider down, the same picture twice).
+    fn should_skip_right_eye(&self) -> bool {
+        match env_skip_right_eye() {
+            Some(on) => on,
+            None => self.flags.skip_right_eye.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
     fn right_eye_draw(&self) -> bool {
+        if !self.should_skip_right_eye() {
+            return false;
+        }
         let Some(source) = self.right_eye_source else { return false };
         if self.right_eye_age > 6 || self.framebuffers[0].format & 0x60 != 0x20 {
             return false;
@@ -2738,9 +2763,13 @@ mod tests {
 
 
 /// ZAKURO_SKIP_RIGHT_EYE=1: the right eye of the top screen in 3D is not
-/// drawn, for frontends that show no 3D.
-fn skip_right_eye() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ZAKURO_SKIP_RIGHT_EYE").is_ok_and(|v| v == "1"))
+/// drawn, for frontends that show no 3D (ZAKURO_SKIP_RIGHT_EYE=0 forces it on).
+fn env_skip_right_eye() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ZAKURO_SKIP_RIGHT_EYE")
+            .ok()
+            .map(|v| v.trim() != "0")
+    })
 }
 

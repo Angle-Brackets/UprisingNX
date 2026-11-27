@@ -72,6 +72,8 @@ pub fn run(linked: Option<Linked>) {
     // settings file exists yet.
     if linked.is_some() && !settings::exists() {
         settings.layout = Screens::Auto;
+        settings.resolution = 6;
+        settings.anisotropy = 16;
         settings.scale = 3;
         settings.frame_interpolation = true;
         settings.show_controls = false;
@@ -598,6 +600,7 @@ impl ApplicationHandler for App {
                 backend.set_top_width(self.settings.top_shape.width());
                 backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
                 backend.set_stereo(self.settings.stereo());
+                backend.set_vsync(self.settings.vsync);
                 self.gui = Some(Gui::new(&window));
                 self.window = Some(window);
                 self.backend = Some(backend);
@@ -736,6 +739,7 @@ impl App {
     /// settings.
     fn config(&self) -> Config {
         let interpret = self.options.interpreter || !self.settings.recompiled;
+        let hardware_renderer = self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer);
         Config {
             new3ds: self.options.new3ds,
             data_dir: self.data_dir.clone(),
@@ -743,7 +747,8 @@ impl App {
             recompiled: self.options.recompiled.clone().filter(|_| !interpret).map(Into::into),
             linked: self.linked.filter(|_| !interpret),
             find_recompiled: !interpret,
-            hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
+            hardware_renderer,
+            gpu_thread: Some(hardware_renderer),
             texture_packs: self.settings.texture_packs,
             interpolate: self.settings.frame_interpolation,
             enhancements: self
@@ -752,7 +757,7 @@ impl App {
                 .iter()
                 .filter_map(|(id, names)| Some((u64::from_str_radix(id, 16).ok()?, names.clone())))
                 .collect(),
-            resolution: self.settings.resolution,
+            resolution: self.options.resolution.unwrap_or(self.settings.resolution).clamp(1, zakuro_gpu::MAX_SCALE),
             device: self.backend.as_ref().and_then(Backend::shared_device),
             username: self.nickname(),
             console_id: self.settings.console_id,
@@ -856,6 +861,7 @@ impl App {
             ));
         }
         self.game = Some(game);
+        self.sync_gpu_flags();
         let screens = self.screens();
         if let Some(backend) = &mut self.backend {
             backend.set_layout(screens);
@@ -1109,20 +1115,40 @@ impl App {
         }
     }
 
+    /// pushes dynamic PC quality & KIU GPU fast-path flags into `zakuro-gpu`.
+    fn sync_gpu_flags(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(game) = &self.game else { return };
+        let flags = game.system.gpu.flags();
+        flags.anisotropy.store(self.settings.anisotropy.clamp(1, 16) as u8, Relaxed);
+        flags.skip_right_eye.store(self.settings.stereo == settings::Stereo3d::Off, Relaxed);
+        let is_vulkan = self.backend.as_ref().is_some_and(Backend::is_vulkan);
+        flags.skip_screen_sync.store(game.is_kiu && is_vulkan, Relaxed);
+        flags.self_chunks.store(if game.is_kiu { 8 } else { 1 }, Relaxed);
+    }
+
     /// saves the settings and puts to use what can change right away.
     fn apply_settings(&mut self) {
         self.settings.save();
+        let wanted_res = self.settings.resolution.clamp(1, zakuro_gpu::MAX_SCALE);
+        let cli_res_pinned = self.options.resolution.is_some();
+        let slider = self.settings.slider_3d();
+        let interp = self.settings.frame_interpolation;
         if let Some(game) = &mut self.game {
-            if !game.is_kiu && game.system.gpu.interpolates() != self.settings.frame_interpolation {
-                let on = game.system.set_interpolation(self.settings.frame_interpolation);
+            if !cli_res_pinned && game.system.gpu.scale() != wanted_res {
+                let actual = game.system.set_resolution(wanted_res);
+                log::info!("internal resolution -> {actual}x");
+            }
+            if !game.is_kiu && game.system.gpu.interpolates() != interp {
+                let on = game.system.set_interpolation(interp);
                 log::info!("frame interpolation {}", if on { "on" } else { "off" });
             }
             // games read the 3D slider every frame
-            let slider = self.settings.slider_3d();
             if game.system.config.slider_3d != slider {
                 game.system.set_slider_3d(slider);
             }
         }
+        self.sync_gpu_flags();
         self.apply_camera();
         self.keyboard.set_keys(self.settings.keys.clone());
         self.gamepads.set_buttons(self.settings.pad.clone());
@@ -1174,6 +1200,7 @@ impl App {
             backend.set_top_width(self.settings.top_shape.width());
             backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
             backend.set_stereo(self.settings.stereo());
+            backend.set_vsync(self.settings.vsync);
         }
         let scale = if self.options.scale.is_none() { self.settings.scale.max(1) } else { self.scale };
         if scale != self.scale || self.settings.layout != self.layout || self.settings.top_shape != self.top_shape {
