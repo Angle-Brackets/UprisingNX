@@ -20,8 +20,27 @@ pub type OverrideFn = unsafe extern "C" fn(*mut AotExecContext, *const u8);
 #[derive(Clone, Copy, Default)]
 pub struct PluginState(pub [u64; 4]);
 
-pub const CACHE_MAGIC: &[u8; 8] = b"UNXAOT01";
+#[cfg(target_arch = "aarch64")]
+pub const CACHE_MAGIC: &[u8; 8] = b"UNXAOTA2";
+#[cfg(target_arch = "x86_64")]
+pub const CACHE_MAGIC: &[u8; 8] = b"UNXAOTX2";
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub const CACHE_MAGIC: &[u8; 8] = b"UNXAOT00";
 pub const FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CompileOptions {
+    /// Fold PC-relative loads from immutable `.text` literal pools into immediate moves.
+    pub fold_text_literals: bool,
+    /// Emit `FPSCR.LEN != 0` short-vector checks on VFP arithmetic.
+    pub emit_vfp_vectors: bool,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self { fold_text_literals: true, emit_vfp_vectors: true }
+    }
+}
 
 pub const ICACHE_SLOTS: usize = 8192;
 
@@ -58,8 +77,9 @@ pub struct AotExecContext {
     pub fn_interpret: usize,         // 248
     pub fn_media_parallel: usize,    // 256
     pub fn_vfp_vector: usize,        // 264
-    pub overrides: [usize; 8],       // 272..336
-    pub plugin_state: PluginState,   // 336..368
+    pub fn_vfp_to_int: usize,        // 272
+    pub overrides: [usize; 8],       // 280..344
+    pub plugin_state: PluginState,   // 344..376
 }
 
 pub mod offsets {
@@ -97,7 +117,8 @@ pub mod offsets {
     pub const FN_INTERPRET: u16 = 248;
     pub const FN_MEDIA_PARALLEL: u16 = 256;
     pub const FN_VFP_VECTOR: u16 = 264;
-    pub const OVERRIDES_BASE: u16 = 272;
+    pub const FN_VFP_TO_INT: u16 = 272;
+    pub const OVERRIDES_BASE: u16 = 280;
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -137,6 +158,7 @@ const _: () = {
     assert!(offset_of!(AotExecContext, fn_interpret) == offsets::FN_INTERPRET as usize);
     assert!(offset_of!(AotExecContext, fn_media_parallel) == offsets::FN_MEDIA_PARALLEL as usize);
     assert!(offset_of!(AotExecContext, fn_vfp_vector) == offsets::FN_VFP_VECTOR as usize);
+    assert!(offset_of!(AotExecContext, fn_vfp_to_int) == offsets::FN_VFP_TO_INT as usize);
     assert!(offset_of!(AotExecContext, overrides) == offsets::OVERRIDES_BASE as usize);
 };
 
@@ -206,39 +228,48 @@ pub unsafe fn mem_write32(ctx: &mut Context, addr: u32, val: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// C-ABI slow-path & ISA helpers called from AOT machine code
+// ABI-uniform slow-path & ISA helpers called from AOT machine code
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn slow_read8(ec: *mut AotExecContext, addr: u32) -> u32 {
+macro_rules! aot_helper_fn {
+    (unsafe fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)? $body:block) => {
+        #[cfg(target_arch = "x86_64")]
+        unsafe extern "sysv64" fn $name($($arg: $ty),*) $(-> $ret)? $body
+        #[cfg(not(target_arch = "x86_64"))]
+        unsafe extern "C" fn $name($($arg: $ty),*) $(-> $ret)? $body
+    };
+}
+
+aot_helper_fn!(unsafe fn slow_read8(ec: *mut AotExecContext, addr: u32) -> u32 {
     unsafe { ((*(*ec).ctx.host).read8)(&mut (*ec).ctx, addr) as u32 }
-}
+});
 
-unsafe extern "C" fn slow_read16(ec: *mut AotExecContext, addr: u32) -> u32 {
+aot_helper_fn!(unsafe fn slow_read16(ec: *mut AotExecContext, addr: u32) -> u32 {
     unsafe { ((*(*ec).ctx.host).read16)(&mut (*ec).ctx, addr) as u32 }
-}
+});
 
-unsafe extern "C" fn slow_read32(ec: *mut AotExecContext, addr: u32) -> u32 {
+aot_helper_fn!(unsafe fn slow_read32(ec: *mut AotExecContext, addr: u32) -> u32 {
     unsafe { ((*(*ec).ctx.host).read32)(&mut (*ec).ctx, addr) }
-}
+});
 
-unsafe extern "C" fn slow_write8(ec: *mut AotExecContext, addr: u32, val: u32) {
+aot_helper_fn!(unsafe fn slow_write8(ec: *mut AotExecContext, addr: u32, val: u32) {
     unsafe { ((*(*ec).ctx.host).write8)(&mut (*ec).ctx, addr, val as u8) };
-}
+});
 
-unsafe extern "C" fn slow_write16(ec: *mut AotExecContext, addr: u32, val: u32) {
+aot_helper_fn!(unsafe fn slow_write16(ec: *mut AotExecContext, addr: u32, val: u32) {
     unsafe { ((*(*ec).ctx.host).write16)(&mut (*ec).ctx, addr, val as u16) };
-}
+});
 
-unsafe extern "C" fn slow_write32(ec: *mut AotExecContext, addr: u32, val: u32) {
+aot_helper_fn!(unsafe fn slow_write32(ec: *mut AotExecContext, addr: u32, val: u32) {
     unsafe { ((*(*ec).ctx.host).write32)(&mut (*ec).ctx, addr, val) };
-}
+});
 
 #[inline(always)]
 pub fn icache_slot(address: u32) -> usize {
     (address.wrapping_mul(0x9E37_79B1) >> (32 - ICACHE_SLOTS.trailing_zeros())) as usize
 }
 
-unsafe extern "C" fn lookup_body(ec: *mut AotExecContext, key: u32) -> *const u8 {
+aot_helper_fn!(unsafe fn lookup_body(ec: *mut AotExecContext, key: u32) -> *const u8 {
     let ec = unsafe { &mut *ec };
     let loaded = unsafe { &*ec.loaded_ptr };
     let ptr = loaded.lookup_uncached(key).unwrap_or(std::ptr::null());
@@ -249,11 +280,11 @@ unsafe extern "C" fn lookup_body(ec: *mut AotExecContext, key: u32) -> *const u8
         }
     }
     ptr
-}
+});
 
-unsafe extern "C" fn do_interpret(ec: *mut AotExecContext, addr: u32, opcode: u32) {
+aot_helper_fn!(unsafe fn do_interpret(ec: *mut AotExecContext, addr: u32, opcode: u32) {
     unsafe { ((*(*ec).ctx.host).interpret)(&mut (*ec).ctx, addr, opcode) };
-}
+});
 
 fn saturate_signed(value: i64, bits: u32) -> i64 {
     let max = (1i64 << (bits - 1)) - 1;
@@ -304,7 +335,7 @@ fn media_lane(
     ((val as u32) & mask, ge)
 }
 
-unsafe extern "C" fn media_parallel_helper(
+aot_helper_fn!(unsafe fn media_parallel_helper(
     ec: *mut AotExecContext,
     packed: u32,
     a: u32,
@@ -351,10 +382,10 @@ unsafe extern "C" fn media_parallel_helper(
         unsafe { (*ec).ctx.ge = ge };
     }
     result
-}
+});
 
-/// Short-vector VFPv2 helper (`packed`: `wide << 20 | op << 16 | d << 10 | n << 5 | m`).
-unsafe extern "C" fn vfp_vector_helper(ec: *mut AotExecContext, packed: u32, _unused: u32) {
+// Short-vector VFPv2 helper (`packed`: `wide << 20 | op << 16 | d << 10 | n << 5 | m`).
+aot_helper_fn!(unsafe fn vfp_vector_helper(ec: *mut AotExecContext, packed: u32, _unused: u32) {
     let ctx = unsafe { &mut (*ec).ctx };
     let wide = ((packed >> 20) & 1) != 0;
     let op = (packed >> 16) & 0xF;
@@ -447,7 +478,79 @@ unsafe extern "C" fn vfp_vector_helper(ec: *mut AotExecContext, packed: u32, _un
             unsafe { *ctx.vfp.add(dd) = flush_s(res) };
         }
     }
-}
+});
+
+// Exact ARM VFPv2 float-to-integer conversion matching `zakuro-cpu/src/vfp.rs`
+// (`NaN -> 0`, rounding mode from `FPSCR[23:22]` or `trunc()` when `round_zero`,
+// saturating to `i32` / `u32`).
+//
+// `packed`: `(double << 12) | (signed << 11) | (round_zero << 10) | (sd << 5) | rm`
+aot_helper_fn!(unsafe fn vfp_to_int_helper(ec: *mut AotExecContext, packed: u32, _unused: u32) {
+    let ctx = unsafe { &mut (*ec).ctx };
+    let double = ((packed >> 12) & 1) != 0;
+    let signed = ((packed >> 11) & 1) != 0;
+    let round_zero = ((packed >> 10) & 1) != 0;
+    let sd = ((packed >> 5) & 31) as usize;
+    let rm = (packed & 31) as usize;
+    let fpscr = unsafe { *ctx.fpscr };
+    let fz = (fpscr & (1 << 24)) != 0;
+
+    let source = if double {
+        let lo = unsafe { *ctx.vfp.add((rm & 15) * 2) } as u64;
+        let hi = unsafe { *ctx.vfp.add((rm & 15) * 2 + 1) } as u64;
+        let mut bits = lo | (hi << 32);
+        if fz && (bits & 0x7FF0_0000_0000_0000) == 0 {
+            bits &= 0x8000_0000_0000_0000;
+        }
+        f64::from_bits(bits)
+    } else {
+        let mut bits = unsafe { *ctx.vfp.add(rm) };
+        if fz && (bits & 0x7F80_0000) == 0 {
+            bits &= 0x8000_0000;
+        }
+        f32::from_bits(bits) as f64
+    };
+
+    let rounded = if round_zero {
+        source.trunc()
+    } else {
+        match (fpscr >> 22) & 3 {
+            0b00 => {
+                let r = source.round();
+                if (source - source.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
+                    r - source.signum()
+                } else {
+                    r
+                }
+            }
+            0b01 => source.ceil(),
+            0b10 => source.floor(),
+            _ => source.trunc(),
+        }
+    };
+
+    let bits_out = if signed {
+        let val = if rounded.is_nan() {
+            0
+        } else if rounded >= i32::MAX as f64 {
+            i32::MAX
+        } else if rounded <= i32::MIN as f64 {
+            i32::MIN
+        } else {
+            rounded as i32
+        };
+        val as u32
+    } else if rounded.is_nan() {
+        0
+    } else if rounded >= u32::MAX as f64 {
+        u32::MAX
+    } else if rounded <= 0.0 {
+        0
+    } else {
+        rounded as u32
+    };
+    unsafe { *ctx.vfp.add(sd) = bits_out };
+});
 
 // ---------------------------------------------------------------------------
 // Serializable AOT Image & Executable Loader
@@ -457,7 +560,7 @@ pub struct AotImage {
     pub program_id: u64,
     pub text_hash: u64,
     pub enter_offset: u32,
-    pub code: Vec<u32>,
+    pub code: Vec<u8>,
     /// Sorted by `address` (`guest_pc | thumb`). `offset` is byte offset in `code`.
     pub entries: Vec<(u32, u32)>,
     pub origins: OriginData,
@@ -478,7 +581,7 @@ pub struct CacheHeader {
 
 impl AotImage {
     pub fn code_bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.code.as_ptr() as *const u8, self.code.len() * 4) }
+        &self.code
     }
 
     pub fn write_to(&self, mut w: impl Write) -> std::io::Result<()> {
@@ -488,7 +591,7 @@ impl AotImage {
         w.write_all(&self.program_id.to_le_bytes())?;
         w.write_all(&self.text_hash.to_le_bytes())?;
         w.write_all(&self.enter_offset.to_le_bytes())?;
-        let code_bytes_len = (self.code.len() * 4) as u32;
+        let code_bytes_len = self.code.len() as u32;
         w.write_all(&code_bytes_len.to_le_bytes())?;
         w.write_all(&(self.entries.len() as u32).to_le_bytes())?;
         w.write_all(&(self.origins.pieces.len() as u32).to_le_bytes())?;
@@ -553,9 +656,9 @@ impl AotImage {
         })
     }
 
-    #[cfg(all(unix, not(target_os = "horizon")))]
-    pub fn into_loaded_mmap(self) -> Result<LoadedAot, String> {
-        let exec = ExecBuffer::mmap_copy(self.code_bytes())?;
+    #[cfg(not(target_os = "horizon"))]
+    pub fn into_loaded_exec(self) -> Result<LoadedAot, String> {
+        let exec = ExecBuffer::exec_copy(self.code_bytes())?;
         Ok(LoadedAot::new(
             self.program_id,
             self.text_hash,
@@ -564,6 +667,11 @@ impl AotImage {
             self.entries,
             self.origins,
         ))
+    }
+
+    #[cfg(all(unix, not(target_os = "horizon")))]
+    pub fn into_loaded_mmap(self) -> Result<LoadedAot, String> {
+        self.into_loaded_exec()
     }
 }
 
@@ -587,6 +695,29 @@ impl ExecBuffer {
         drop_fn: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
         Self { rx_ptr, len, drop_fn }
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    pub fn exec_copy(bytes: &[u8]) -> Result<Self, String> {
+        Self::exec_stream(bytes.len(), |dst| {
+            dst.copy_from_slice(bytes);
+            Ok(())
+        })
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    pub fn exec_stream(
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            Self::mmap_stream(len, fill)
+        }
+        #[cfg(windows)]
+        {
+            Self::win_alloc_stream(len, fill)
+        }
     }
 
     #[cfg(all(unix, not(target_os = "horizon")))]
@@ -636,6 +767,60 @@ impl ExecBuffer {
             len,
             drop_fn: Some(Box::new(move || unsafe {
                 libc::munmap(addr as *mut libc::c_void, alloc_len);
+            })),
+        })
+    }
+
+    #[cfg(windows)]
+    pub fn win_alloc_stream(
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        extern "system" {
+            fn VirtualAlloc(
+                addr: *mut core::ffi::c_void,
+                size: usize,
+                fl_allocation_type: u32,
+                fl_protect: u32,
+            ) -> *mut core::ffi::c_void;
+            fn VirtualProtect(
+                addr: *mut core::ffi::c_void,
+                size: usize,
+                fl_new_protect: u32,
+                lpfl_old_protect: *mut u32,
+            ) -> i32;
+            fn VirtualFree(
+                addr: *mut core::ffi::c_void,
+                size: usize,
+                dw_free_type: u32,
+            ) -> i32;
+        }
+        const MEM_COMMIT_RESERVE: u32 = 0x3000;
+        const MEM_RELEASE: u32 = 0x8000;
+        const PAGE_READWRITE: u32 = 0x04;
+        const PAGE_EXECUTE_READ: u32 = 0x20;
+
+        let alloc_len = len.max(4096).next_multiple_of(4096);
+        let ptr = unsafe { VirtualAlloc(core::ptr::null_mut(), alloc_len, MEM_COMMIT_RESERVE, PAGE_READWRITE) };
+        if ptr.is_null() {
+            return Err("VirtualAlloc failed for AOT executable buffer".to_owned());
+        }
+        let rw = ptr as *mut u8;
+        if let Err(e) = fill(unsafe { core::slice::from_raw_parts_mut(rw, len) }) {
+            unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
+            return Err(e);
+        }
+        let mut old_protect = 0u32;
+        if unsafe { VirtualProtect(ptr, alloc_len, PAGE_EXECUTE_READ, &mut old_protect) } == 0 {
+            unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
+            return Err("VirtualProtect(PAGE_EXECUTE_READ) failed".to_owned());
+        }
+        let addr = ptr as usize;
+        Ok(Self {
+            rx_ptr: rw as *const u8,
+            len,
+            drop_fn: Some(Box::new(move || unsafe {
+                VirtualFree(addr as *mut core::ffi::c_void, 0, MEM_RELEASE);
             })),
         })
     }
@@ -829,14 +1014,20 @@ impl LoadedAot {
         ))
     }
 
+    #[cfg(not(target_os = "horizon"))]
+    pub fn read_exec<R: Read>(r: R) -> Result<Self, String> {
+        Self::read_streaming(r, |len, fill| ExecBuffer::exec_stream(len, fill))
+    }
+
     #[cfg(all(unix, not(target_os = "horizon")))]
     pub fn read_mmap<R: Read>(r: R) -> Result<Self, String> {
-        Self::read_streaming(r, |len, fill| ExecBuffer::mmap_stream(len, fill))
+        Self::read_exec(r)
     }
 
     pub fn describe(&self) -> String {
+        let arch = if cfg!(target_arch = "x86_64") { "x86_64" } else { "AArch64" };
         format!(
-            "{} entry points, {:.1} MiB native AArch64 AOT",
+            "{} entry points, {:.1} MiB native {arch} AOT",
             self.entries.len(),
             self.exec.len() as f64 / (1024.0 * 1024.0),
         )
@@ -963,12 +1154,12 @@ impl LoadedAot {
             fn_interpret: do_interpret as *const () as usize,
             fn_media_parallel: media_parallel_helper as *const () as usize,
             fn_vfp_vector: vfp_vector_helper as *const () as usize,
+            fn_vfp_to_int: vfp_to_int_helper as *const () as usize,
             overrides: self.overrides,
             plugin_state,
         };
 
-        let enter_fn: unsafe extern "C" fn(*mut AotExecContext, *const u8) =
-            unsafe { std::mem::transmute(enter_ptr) };
+        let enter_fn: OverrideFn = unsafe { std::mem::transmute(enter_ptr) };
         unsafe { enter_fn(&mut ec, target_body_rx) };
 
         unsafe { *self.plugin_state.get() = ec.plugin_state };
@@ -994,7 +1185,10 @@ mod tests {
                 runs: vec![Run { first: 0, end: 1 }],
                 owners: vec![0, 0],
             },
-            code: vec![0xD503_201F, 0xD65F_03C0],
+            code: [0xD503_201Fu32, 0xD65F_03C0u32]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
         };
         let mut buf = Vec::new();
         image.write_to(&mut buf).unwrap();

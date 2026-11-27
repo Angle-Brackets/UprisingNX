@@ -30,25 +30,11 @@ use crate::discover::{
     self, analyze, build_origins, decode_arm, decode_thumb, key, recompiles, Function, Image,
     Mode, Program, Segment,
 };
-use crate::runtime::{offsets, AotImage};
+use crate::runtime::{offsets, AotImage, CompileOptions};
 
 const RECOMP_DEPTH_LIMIT: u16 = 2048;
 
-#[derive(Debug, Clone, Copy)]
-pub struct CompileOptions {
-    /// Fold PC-relative loads from immutable `.text` literal pools into immediate moves.
-    pub fold_text_literals: bool,
-    /// Emit `FPSCR.LEN != 0` short-vector checks on VFP arithmetic.
-    pub emit_vfp_vectors: bool,
-}
-
-impl Default for CompileOptions {
-    fn default() -> Self {
-        Self { fold_text_literals: true, emit_vfp_vectors: true }
-    }
-}
-
-/// Compiles a 3DS title's decompressed `.code` image into a position-independent `AotImage`.
+/// Compiles a 3DS title's decompressed `.code` image into a position-independent AArch64 `AotImage`.
 pub fn compile_title(
     program_id: u64,
     exheader: &ExHeader,
@@ -330,7 +316,7 @@ pub fn compile_program(
         program_id,
         text_hash,
         enter_offset: (stubs.enter * 4) as u32,
-        code: final_buf.words,
+        code: final_buf.into_bytes(),
         entries,
         origins,
     }

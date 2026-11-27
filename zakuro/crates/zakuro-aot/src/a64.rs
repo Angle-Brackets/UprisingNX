@@ -146,6 +146,14 @@ impl CodeBuf {
             self.emit(add32_reg(wd, wn, scratch, Shift::Lsl, 0));
         }
     }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.words.len() * 4);
+        for w in self.words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
