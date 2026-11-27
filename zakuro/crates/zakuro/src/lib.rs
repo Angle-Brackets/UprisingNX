@@ -663,8 +663,9 @@ fn import_kiu_rom(
 fn kiu_cache_path(data_dir: Option<&Path>, program_id: u64, text_hash: u64) -> PathBuf {
     let base = data_dir.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     base.join("cache").join(format!(
-        "aot_v{}_{program_id:016X}_{text_hash:016X}.aot",
-        zakuro_core::zakuro_aot::FORMAT_VERSION
+        "aot_v{}_{}_{program_id:016X}_{text_hash:016X}.aot",
+        zakuro_core::zakuro_aot::FORMAT_VERSION,
+        std::env::consts::ARCH,
     ))
 }
 
@@ -935,6 +936,11 @@ fn apply_hardware_kiu_defaults(
         zakuro_gpu::GpuTier::Discrete => {
             settings.resolution = display_scale.clamp(2, 4);
             settings.anisotropy = snap_anisotropy(profile.max_anisotropy.min(8));
+            settings.frame_interpolation = true;
+        }
+        zakuro_gpu::GpuTier::Integrated if profile.device_local_mb >= 8192 => {
+            settings.resolution = display_scale.clamp(3, 5);
+            settings.anisotropy = snap_anisotropy(profile.max_anisotropy.min(16));
             settings.frame_interpolation = true;
         }
         zakuro_gpu::GpuTier::Integrated => {
@@ -3337,8 +3343,9 @@ mod tests {
         assert_eq!(
             path,
             PathBuf::from(format!(
-                "/tmp/zakuro-data/cache/aot_v{}_0004000000030100_D6E028C6175A2B07.aot",
-                zakuro_core::zakuro_aot::FORMAT_VERSION
+                "/tmp/zakuro-data/cache/aot_v{}_{}_0004000000030100_D6E028C6175A2B07.aot",
+                zakuro_core::zakuro_aot::FORMAT_VERSION,
+                std::env::consts::ARCH,
             ))
         );
     }
@@ -3467,6 +3474,24 @@ mod tests {
             Some(1440),
         );
         assert_eq!((s.resolution, s.anisotropy, s.frame_interpolation), (4, 8, true));
+
+        // Apple Silicon M-series unified memory (>=8 GiB integrated) on Retina display -> 5x, 16x AF, 60fps interp.
+        let mut s = Settings::default();
+        apply_hardware_kiu_defaults(
+            &mut s,
+            &GpuProfile { tier: GpuTier::Integrated, device_local_mb: 16384, max_anisotropy: 16, name: "Apple M2".into() },
+            Some(1800),
+        );
+        assert_eq!((s.resolution, s.anisotropy, s.frame_interpolation), (5, 16, true));
+
+        // Apple Silicon M-series base 8 GiB unified memory on 1080p display -> 4x, 16x AF, 60fps interp.
+        let mut s = Settings::default();
+        apply_hardware_kiu_defaults(
+            &mut s,
+            &GpuProfile { tier: GpuTier::Integrated, device_local_mb: 8192, max_anisotropy: 16, name: "Apple M1".into() },
+            Some(1080),
+        );
+        assert_eq!((s.resolution, s.anisotropy, s.frame_interpolation), (4, 16, true));
 
         // Integrated GPU (e.g. Steam Deck 800p / Ryzen iGPU) -> 3x (720p), 8x AF, interp on.
         let mut s = Settings::default();

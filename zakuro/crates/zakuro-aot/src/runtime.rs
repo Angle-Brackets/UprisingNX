@@ -738,12 +738,82 @@ impl ExecBuffer {
         })
     }
 
-    #[cfg(all(unix, not(target_os = "horizon")))]
+    #[cfg(target_os = "macos")]
     pub fn mmap_stream(
         len: usize,
         fill: impl FnOnce(&mut [u8]) -> Result<(), String>,
     ) -> Result<Self, String> {
-        let alloc_len = len.max(4096).next_multiple_of(4096);
+        #[cfg(target_arch = "aarch64")]
+        struct JitWriteGuard;
+        #[cfg(target_arch = "aarch64")]
+        impl JitWriteGuard {
+            fn enter() -> Self {
+                extern "C" {
+                    fn pthread_jit_write_protect_np(enabled: libc::c_int);
+                }
+                unsafe { pthread_jit_write_protect_np(0) };
+                Self
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        impl Drop for JitWriteGuard {
+            fn drop(&mut self) {
+                extern "C" {
+                    fn pthread_jit_write_protect_np(enabled: libc::c_int);
+                }
+                unsafe { pthread_jit_write_protect_np(1) };
+            }
+        }
+
+        extern "C" {
+            fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
+        }
+
+        let page_size = unix_page_size();
+        let alloc_len = len.max(page_size).next_multiple_of(page_size);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc_len,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_JIT,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err("mmap(MAP_JIT) failed for AOT executable buffer".to_owned());
+        }
+        let rw = ptr as *mut u8;
+        let fill_res = {
+            #[cfg(target_arch = "aarch64")]
+            let _guard = JitWriteGuard::enter();
+            fill(unsafe { std::slice::from_raw_parts_mut(rw, len) })
+        };
+        if let Err(e) = fill_res {
+            unsafe { libc::munmap(ptr, alloc_len) };
+            return Err(e);
+        }
+        unsafe {
+            sys_icache_invalidate(rw as *mut libc::c_void, len);
+        }
+        let addr = ptr as usize;
+        Ok(Self {
+            rx_ptr: rw as *const u8,
+            len,
+            drop_fn: Some(Box::new(move || unsafe {
+                libc::munmap(addr as *mut libc::c_void, alloc_len);
+            })),
+        })
+    }
+
+    #[cfg(all(unix, not(target_os = "horizon"), not(target_os = "macos")))]
+    pub fn mmap_stream(
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let page_size = unix_page_size();
+        let alloc_len = len.max(page_size).next_multiple_of(page_size);
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -859,7 +929,13 @@ impl Drop for ExecBuffer {
     }
 }
 
-#[cfg(all(unix, not(target_os = "horizon"), target_arch = "aarch64"))]
+#[cfg(all(unix, not(target_os = "horizon")))]
+fn unix_page_size() -> usize {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size > 0 { page_size as usize } else { 4096 }
+}
+
+#[cfg(all(unix, not(target_os = "horizon"), not(target_os = "macos"), target_arch = "aarch64"))]
 unsafe fn clear_icache(ptr: *const u8, len: usize) {
     let mut addr = (ptr as usize) & !63;
     let end = (ptr as usize) + len;
@@ -1282,5 +1358,29 @@ mod tests {
         assert_eq!(loaded.origins.pieces.len(), 1);
         assert_eq!(loaded.origins.pieces[0].hash, 0x1234_5678_9ABC_DEF0);
         assert_eq!(captured, image.code_bytes());
+    }
+
+    #[cfg(all(unix, not(target_os = "horizon")))]
+    #[test]
+    fn unix_page_size_is_valid_power_of_two() {
+        let ps = unix_page_size();
+        assert!(ps >= 4096 && ps.is_power_of_two(), "unexpected page size: {ps}");
+    }
+
+    #[cfg(all(unix, not(target_os = "horizon")))]
+    #[test]
+    fn mmap_stream_copies_bytes_and_handles_fill_error() {
+        let payload = [0x90u8, 0xC3, 0x90, 0xC3];
+        let buf = ExecBuffer::mmap_stream(payload.len(), |dst| {
+            dst.copy_from_slice(&payload);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(buf.len(), payload.len());
+        let read_back = unsafe { std::slice::from_raw_parts(buf.rx_ptr(), buf.len()) };
+        assert_eq!(read_back, &payload);
+
+        let err = ExecBuffer::mmap_stream(16, |_| Err("simulated fill failure".to_owned()));
+        assert!(err.is_err());
     }
 }

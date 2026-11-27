@@ -38,7 +38,11 @@ impl Camera for Webcam {
             (true, None) => {
                 let running = Arc::new(AtomicBool::new(true));
                 let (latest, keep) = (self.latest.clone(), running.clone());
-                let started = std::thread::Builder::new().name("camera".into()).spawn(move || read(&latest, &keep));
+                let started = std::thread::Builder::new().name("camera".into()).spawn(move || {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&latest, &keep))).is_err() {
+                        log::warn!("the camera backend panicked; falling back to no camera");
+                    }
+                });
                 match started {
                     Ok(_) => self.running = Some(running),
                     Err(error) => log::warn!("could not start reading the camera, {error}"),
@@ -67,9 +71,48 @@ impl Drop for Webcam {
     }
 }
 
+/// Initializes `nokhwa`'s AVFoundation backend on macOS before touching any
+/// camera APIs and waits (while `running` remains true) for user permission.
+/// Returns `false` if permission was denied or capture stopped before approval.
+#[cfg(target_os = "macos")]
+fn init_macos_camera(running: &AtomicBool) -> bool {
+    if nokhwa::nokhwa_check() {
+        nokhwa::nokhwa_initialize(|_| {});
+        return true;
+    }
+    let state = Arc::new((Mutex::new(None::<bool>), std::sync::Condvar::new()));
+    let signal = Arc::clone(&state);
+    nokhwa::nokhwa_initialize(move |granted| {
+        if let Ok(mut guard) = signal.0.lock() {
+            *guard = Some(granted);
+            signal.1.notify_all();
+        }
+    });
+    let (lock, condvar) = &*state;
+    let Ok(mut guard) = lock.lock() else {
+        return false;
+    };
+    while guard.is_none() {
+        if !running.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Ok((next, _)) = condvar.wait_timeout(guard, std::time::Duration::from_millis(50)) else {
+            return false;
+        };
+        guard = next;
+    }
+    guard.unwrap_or(false)
+}
+
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn read(latest: &Mutex<Option<Arc<Picture>>>, running: &AtomicBool) {
     use nokhwa::utils::{CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
+
+    #[cfg(target_os = "macos")]
+    if !init_macos_camera(running) {
+        log::warn!("no camera access on macOS");
+        return;
+    }
 
     // the formats there is a way to turn into pictures here, the first
     // ones taking least work
