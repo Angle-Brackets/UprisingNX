@@ -450,12 +450,10 @@ impl Default for PadButtons {
 }
 
 impl PadButtons {
-    /// Modern shooter preset: LT/L2 fires (L), RT/R2 recenters/locks (R), bumpers take ZL/ZR.
-    pub fn triggers_fire() -> Self {
+    /// Swaps right bumper and right trigger so RT/R2 Z-targets (R) and RB/R1 fires (ZR).
+    pub fn swap_r_zr() -> Self {
         PadButtons {
-            l: Button::LeftTrigger2,
             r: Button::RightTrigger2,
-            zl: Button::LeftTrigger,
             zr: Button::RightTrigger,
             ..Self::default()
         }
@@ -493,7 +491,9 @@ impl PadButtons {
     /// Action-first Kid Icarus labels with `(index_in_all_mut, label, optional)` for the parchment UI.
     pub const KIU_ACTIONS: [(usize, &'static str, bool); 14] = [
         (4, "Fire / Attack (L)", false),
-        (5, "Recenter / Lock (R)", false),
+        (12, "Fire / Attack Alt (ZL)", true),
+        (13, "Fire / Attack Alt (ZR)", true),
+        (5, "Z-Target / Recenter (R)", false),
         (0, "Confirm / Special (A)", false),
         (1, "Cancel / Dismount (B)", false),
         (2, "Menu / Dodge (X)", false),
@@ -504,8 +504,6 @@ impl PadButtons {
         (8, "D-Pad Up", false),
         (6, "Pause (Start)", false),
         (7, "Select", false),
-        (12, "Optional ZL", true),
-        (13, "Optional ZR", true),
     ];
 
     /// each of the console's buttons and the controller button it is on.

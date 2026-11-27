@@ -2514,7 +2514,7 @@ impl App {
         // while ZR has the trigger, whichever no button of the console's is on
         let is_kiu = self.game.as_ref().is_some_and(|game| game.is_kiu);
         let free = |button: gilrs::Button| {
-            (!is_kiu || button != gilrs::Button::RightThumb)
+            (!is_kiu || !matches!(button, gilrs::Button::RightThumb | gilrs::Button::RightTrigger2))
                 && self.settings.pad.map().iter().all(|&(_, bound)| bound != button)
         };
         let trigger = [gilrs::Button::RightTrigger2, gilrs::Button::RightThumb].into_iter().find(|&button| free(button));

@@ -521,7 +521,7 @@ fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings, pad_s
                     });
                     ui.add_space(2.0);
                     ui.label(
-                        RichText::new("Analog and digital triggers both work for firing & rebinding.")
+                        RichText::new("Both triggers (LT/RT) and LB fire in battle — matching Switch UprisingNX.")
                             .small()
                             .color(MUTED_INK),
                     );
@@ -537,15 +537,15 @@ fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings, pad_s
     ui.add_space(10.0);
     plate(ui, "LAYOUT PRESET");
     let presets = [
-        ("Bumpers Fire", PadButtons::default()),
-        ("Triggers Fire", PadButtons::triggers_fire()),
+        ("Default (All Fire)", PadButtons::default()),
+        ("Swap RB / RT", PadButtons::swap_r_zr()),
         ("No ZL / ZR", PadButtons::no_secondary_triggers()),
     ];
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
         for (name, preset) in presets {
             let active = settings.pad == preset;
-            if parchment_button(ui, name, vec2(124.0, 28.0), active).clicked() {
+            if parchment_button(ui, name, vec2(138.0, 28.0), active).clicked() {
                 settings.pad = preset;
                 menus.rebinding_pad = None;
             }

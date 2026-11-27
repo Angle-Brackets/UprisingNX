@@ -333,6 +333,7 @@ impl Gamepads {
         let r_now = self.holding(self.buttons.r);
         let l3_now = self.holding(Button::LeftThumb);
         let y_now = self.holding(self.buttons.y);
+        input.buttons.remove(PadState::R | PadState::Y);
         if r_now && !self.recenter_held {
             self.recenter_pending = true;
         }
@@ -346,10 +347,17 @@ impl Gamepads {
         self.center_held = l3_now;
         self.reticle_center_held = y_now;
 
+        // Match Switch UprisingNX: both bumpers (L) and triggers (ZL / ZR) fire in battle.
+        if input.buttons.intersects(PadState::ZL | PadState::ZR) {
+            input.buttons.remove(PadState::ZL | PadState::ZR);
+            input.buttons.insert(PadState::L);
+        }
+
         // Vehicle Special Action (A) and Dismount (B) HUD touch pulses.
         if self.game == kiu_common::GAME_VEHICLE {
             let a_now = self.holding(self.buttons.a);
             let b_now = self.holding(self.buttons.b);
+            input.buttons.remove(PadState::A | PadState::B);
             if a_now && !self.vehicle_a_held {
                 self.vehicle_tap = Some((VEHICLE_SPECIAL_TOUCH, VEHICLE_TAP_FRAMES));
             } else if b_now && !self.vehicle_b_held {
@@ -593,5 +601,26 @@ mod tests {
         let (x, y) = stick_curve(0.60, 0.0, 0.15);
         assert!(x > 0.2 && x < 0.7 && y == 0.0);
         assert_eq!(stick_curve(1.0, 0.0, 0.15), (1.0, 0.0));
+    }
+
+    #[test]
+    fn triggers_zl_and_zr_both_fire_in_battle_matching_switch() {
+        let mut pads = Gamepads::new(PadButtons::default());
+        pads.active = true;
+        for trigger in [PadState::ZL, PadState::ZR, PadState::L] {
+            let mut input = InputState {
+                buttons: trigger | PadState::R | PadState::Y,
+                ..InputState::default()
+            };
+            let mut mailbox = [0u32; 4];
+            assert!(pads.feed_kiu_mailbox(
+                kiu_common::GAME_FLYING,
+                PadAimSettings::default(),
+                &mut input,
+                &mut mailbox,
+            ));
+            assert!(input.buttons.contains(PadState::L), "{trigger:?} should fire via PadState::L");
+            assert!(!input.buttons.intersects(PadState::ZL | PadState::ZR | PadState::R | PadState::Y));
+        }
     }
 }
