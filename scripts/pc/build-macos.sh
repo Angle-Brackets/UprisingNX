@@ -23,8 +23,8 @@ Optional environment variables:
   APPLE_ID                Apple ID email (alternative notarization auth)
   APPLE_TEAM_ID           Apple Developer Team ID (alternative notarization auth)
   APPLE_APP_PASSWORD      App-specific password (alternative notarization auth)
-  APPLE_NOTARY_TIMEOUT    Timeout for notarytool --wait (default: 15m)
-  APPLE_SKIP_NOTARIZE     Set to 1/true to sign without submitting to notarytool
+  APPLE_NOTARY_TIMEOUT_SECS Poll timeout in seconds for notarytool (default: 900)
+  APPLE_SKIP_NOTARIZE       Set to 1/true to sign without submitting to notarytool
 EOF
 }
 
@@ -241,6 +241,79 @@ if [[ -n "${APPLE_SIGN_IDENTITY:-}" ]]; then
     --sign "$APPLE_SIGN_IDENTITY" \
     "$APP_DIR"
   codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+
+  # Optionally notarize the .app via ditto .zip (avoids macOS 15 DMG diskimages hangs)
+  # and staple the ticket directly onto the .app before creating the .dmg.
+  NOTARY_AUTH_ARGS=()
+  if [[ "${APPLE_SKIP_NOTARIZE:-}" == "1" || "${APPLE_SKIP_NOTARIZE:-}" == "true" ]]; then
+    echo "APPLE_SKIP_NOTARIZE is set; skipping notarytool submit and stapler."
+  elif [[ -n "${APPLE_NOTARY_KEY_PATH:-}" && -n "${APPLE_NOTARY_KEY_ID:-}" && -n "${APPLE_NOTARY_ISSUER:-}" ]]; then
+    if [[ ! -f "$APPLE_NOTARY_KEY_PATH" ]]; then
+      echo "ERROR: APPLE_NOTARY_KEY_PATH does not exist: $APPLE_NOTARY_KEY_PATH" >&2
+      exit 1
+    fi
+    NOTARY_AUTH_ARGS=(--key "$APPLE_NOTARY_KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER")
+  elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
+    NOTARY_AUTH_ARGS=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD")
+  else
+    echo "Notarization credentials not set; skipping notarytool submit and stapler."
+  fi
+
+  if [[ ${#NOTARY_AUTH_ARGS[@]} -gt 0 ]]; then
+    NOTARY_ZIP="$WORK_TMP/notarize-app.zip"
+    echo "Archiving signed .app for Apple notarization..."
+    ditto -c -k --keepParent "$APP_DIR" "$NOTARY_ZIP"
+    ls -lh "$NOTARY_ZIP"
+
+    NOTARY_TIMEOUT_SECS="${APPLE_NOTARY_TIMEOUT_SECS:-900}"
+    echo "Submitting $NOTARY_ZIP to Apple notary service (poll timeout: ${NOTARY_TIMEOUT_SECS}s)..."
+    SUBMIT_JSON="$(python3 - "$NOTARY_ZIP" "${NOTARY_AUTH_ARGS[@]}" <<'PY'
+import subprocess, sys
+zip_path = sys.argv[1]
+auth = sys.argv[2:]
+proc = subprocess.run(
+    ["xcrun", "notarytool", "submit", zip_path, *auth, "--no-wait", "--output-format", "json"],
+    capture_output=True,
+    text=True,
+    timeout=180,
+)
+if proc.returncode != 0:
+    sys.stderr.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    sys.exit(proc.returncode)
+sys.stdout.write(proc.stdout)
+PY
+)"
+    echo "notarytool submit response: $SUBMIT_JSON"
+    SUB_ID="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["id"])' "$SUBMIT_JSON")"
+    echo "Notarization submission ID: $SUB_ID"
+
+    START_TS="$(date +%s)"
+    NOTARY_STATUS=""
+    while true; do
+      ELAPSED=$(( $(date +%s) - START_TS ))
+      INFO_JSON="$(xcrun notarytool info "$SUB_ID" "${NOTARY_AUTH_ARGS[@]}" --output-format json)"
+      NOTARY_STATUS="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status","Unknown"))' "$INFO_JSON")"
+      echo "[${ELAPSED}s] Notarization status: $NOTARY_STATUS"
+      if [[ "$NOTARY_STATUS" == "Accepted" ]]; then
+        break
+      elif [[ "$NOTARY_STATUS" == "Invalid" || "$NOTARY_STATUS" == "Rejected" ]]; then
+        echo "ERROR: Apple notarization failed ($NOTARY_STATUS). Fetching notary log:" >&2
+        xcrun notarytool log "$SUB_ID" "${NOTARY_AUTH_ARGS[@]}" >&2 || true
+        exit 1
+      fi
+      if (( ELAPSED >= NOTARY_TIMEOUT_SECS )); then
+        echo "ERROR: Apple notarization still '$NOTARY_STATUS' after ${ELAPSED}s (submission ID: $SUB_ID)." >&2
+        echo "Check status later with: xcrun notarytool info $SUB_ID ..." >&2
+        exit 1
+      fi
+      sleep 15
+    done
+
+    echo "Stapling notarization ticket to $APP_DIR..."
+    xcrun stapler staple "$APP_DIR"
+    xcrun stapler validate "$APP_DIR"
+  fi
 else
   echo "APPLE_SIGN_IDENTITY not set; applying ad-hoc signature."
   codesign --force --deep --sign - \
@@ -263,40 +336,8 @@ hdiutil create \
   -format UDZO \
   "$DMG_PATH"
 
-# Sign and optionally notarize + staple the .dmg when Developer ID credentials are present.
 if [[ -n "${APPLE_SIGN_IDENTITY:-}" ]]; then
   codesign --force --timestamp --sign "$APPLE_SIGN_IDENTITY" "$DMG_PATH"
-
-  NOTARY_TIMEOUT="${APPLE_NOTARY_TIMEOUT:-15m}"
-  if [[ "${APPLE_SKIP_NOTARIZE:-}" == "1" || "${APPLE_SKIP_NOTARIZE:-}" == "true" ]]; then
-    echo "APPLE_SKIP_NOTARIZE is set; skipping notarytool submit and stapler."
-  elif [[ -n "${APPLE_NOTARY_KEY_PATH:-}" && -n "${APPLE_NOTARY_KEY_ID:-}" && -n "${APPLE_NOTARY_ISSUER:-}" ]]; then
-    if [[ ! -f "$APPLE_NOTARY_KEY_PATH" ]]; then
-      echo "ERROR: APPLE_NOTARY_KEY_PATH does not exist: $APPLE_NOTARY_KEY_PATH" >&2
-      exit 1
-    fi
-    echo "Submitting $DMG_PATH for notarization via App Store Connect API key (timeout: $NOTARY_TIMEOUT)..."
-    xcrun notarytool submit "$DMG_PATH" \
-      --key "$APPLE_NOTARY_KEY_PATH" \
-      --key-id "$APPLE_NOTARY_KEY_ID" \
-      --issuer "$APPLE_NOTARY_ISSUER" \
-      --wait \
-      --timeout "$NOTARY_TIMEOUT"
-    xcrun stapler staple "$DMG_PATH"
-    xcrun stapler validate "$DMG_PATH"
-  elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
-    echo "Submitting $DMG_PATH for notarization via Apple ID (timeout: $NOTARY_TIMEOUT)..."
-    xcrun notarytool submit "$DMG_PATH" \
-      --apple-id "$APPLE_ID" \
-      --team-id "$APPLE_TEAM_ID" \
-      --password "$APPLE_APP_PASSWORD" \
-      --wait \
-      --timeout "$NOTARY_TIMEOUT"
-    xcrun stapler staple "$DMG_PATH"
-    xcrun stapler validate "$DMG_PATH"
-  else
-    echo "Notarization credentials not set; skipping notarytool submit and stapler."
-  fi
 fi
 
 echo "Built macOS bundle: $APP_DIR"

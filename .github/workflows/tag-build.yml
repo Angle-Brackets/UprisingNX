@@ -324,13 +324,14 @@ jobs:
 
       - name: Build signed macOS arm64 app bundle and DMG
         if: matrix.target_name == 'macos-arm64'
+        timeout-minutes: 25
         env:
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_NOTARY_TIMEOUT: "15m"
+          APPLE_NOTARY_TIMEOUT_SECS: "900"
           APPLE_SKIP_NOTARIZE: ${{ !(startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release' || inputs.notarize_macos) && '1' || '0' }}
         run: |
           ./scripts/pc/build-macos.sh --arch arm64
