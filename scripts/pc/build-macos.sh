@@ -23,6 +23,8 @@ Optional environment variables:
   APPLE_ID                Apple ID email (alternative notarization auth)
   APPLE_TEAM_ID           Apple Developer Team ID (alternative notarization auth)
   APPLE_APP_PASSWORD      App-specific password (alternative notarization auth)
+  APPLE_NOTARY_TIMEOUT    Timeout for notarytool --wait (default: 15m)
+  APPLE_SKIP_NOTARIZE     Set to 1/true to sign without submitting to notarytool
 EOF
 }
 
@@ -265,26 +267,31 @@ hdiutil create \
 if [[ -n "${APPLE_SIGN_IDENTITY:-}" ]]; then
   codesign --force --timestamp --sign "$APPLE_SIGN_IDENTITY" "$DMG_PATH"
 
-  if [[ -n "${APPLE_NOTARY_KEY_PATH:-}" && -n "${APPLE_NOTARY_KEY_ID:-}" && -n "${APPLE_NOTARY_ISSUER:-}" ]]; then
+  NOTARY_TIMEOUT="${APPLE_NOTARY_TIMEOUT:-15m}"
+  if [[ "${APPLE_SKIP_NOTARIZE:-}" == "1" || "${APPLE_SKIP_NOTARIZE:-}" == "true" ]]; then
+    echo "APPLE_SKIP_NOTARIZE is set; skipping notarytool submit and stapler."
+  elif [[ -n "${APPLE_NOTARY_KEY_PATH:-}" && -n "${APPLE_NOTARY_KEY_ID:-}" && -n "${APPLE_NOTARY_ISSUER:-}" ]]; then
     if [[ ! -f "$APPLE_NOTARY_KEY_PATH" ]]; then
       echo "ERROR: APPLE_NOTARY_KEY_PATH does not exist: $APPLE_NOTARY_KEY_PATH" >&2
       exit 1
     fi
-    echo "Submitting $DMG_PATH for notarization via App Store Connect API key..."
+    echo "Submitting $DMG_PATH for notarization via App Store Connect API key (timeout: $NOTARY_TIMEOUT)..."
     xcrun notarytool submit "$DMG_PATH" \
       --key "$APPLE_NOTARY_KEY_PATH" \
       --key-id "$APPLE_NOTARY_KEY_ID" \
       --issuer "$APPLE_NOTARY_ISSUER" \
-      --wait
+      --wait \
+      --timeout "$NOTARY_TIMEOUT"
     xcrun stapler staple "$DMG_PATH"
     xcrun stapler validate "$DMG_PATH"
   elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
-    echo "Submitting $DMG_PATH for notarization via Apple ID..."
+    echo "Submitting $DMG_PATH for notarization via Apple ID (timeout: $NOTARY_TIMEOUT)..."
     xcrun notarytool submit "$DMG_PATH" \
       --apple-id "$APPLE_ID" \
       --team-id "$APPLE_TEAM_ID" \
       --password "$APPLE_APP_PASSWORD" \
-      --wait
+      --wait \
+      --timeout "$NOTARY_TIMEOUT"
     xcrun stapler staple "$DMG_PATH"
     xcrun stapler validate "$DMG_PATH"
   else
