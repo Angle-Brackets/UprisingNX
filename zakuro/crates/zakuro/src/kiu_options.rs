@@ -3,12 +3,14 @@
 
 use egui::{pos2, vec2, Color32, CornerRadius, FontId, Margin, RichText, Sense, Shape, Stroke, Ui};
 
-use crate::gamepad::button_name;
+use crate::gamepad::{button_label, GamepadSnapshot};
 use crate::menus::{
     heavy_title, key_name, parchment_button, parchment_frame, smootherstep, vine, Action, Menus, SettingsTab,
-    CONTROLS_HINT_ENABLED, INK, PAPER_LINE, PAPER_SHADOW, RED,
+    CONTROLS_HINT_ENABLED, INK, PAPER, PAPER_LINE, PAPER_SHADOW, RED,
 };
-use crate::settings::{CameraSource, Filter, Keys, Language, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape};
+use crate::settings::{
+    ButtonLabels, CameraSource, Filter, Keys, Language, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape,
+};
 
 /// Parchment inner margin around the unified settings page.
 const MARGIN: i8 = 18;
@@ -18,7 +20,7 @@ impl Menus {
     /// Unified Kid Icarus parchment settings page with animated horizontal slide navigation.
     /// Shown whenever `options_open` is true, or in KIU mode whenever `settings_open` is true
     /// (and during the brief slide-out transition after closing).
-    pub fn options(&mut self, ctx: &egui::Context, settings: &mut Settings) -> Vec<Action> {
+    pub fn options(&mut self, ctx: &egui::Context, settings: &mut Settings, pad_snapshot: Option<&GamepadSnapshot>) -> Vec<Action> {
         let mut actions = Vec::new();
         let eased = self.step_settings_anim(ctx);
         let vis = ((eased - 0.35) / 0.65).clamp(0.0, 1.0);
@@ -90,7 +92,7 @@ impl Menus {
                                     SettingsTab::Graphics => tab_graphics(ui, settings),
                                     SettingsTab::AudioWindow => tab_audio_window(ui, settings, &mut actions),
                                     SettingsTab::Controls => tab_controls(ui, self, settings),
-                                    SettingsTab::Controller => tab_controller(ui, self, settings),
+                                    SettingsTab::Controller => tab_controller(ui, self, settings, pad_snapshot),
                                     SettingsTab::System => tab_system(ui, self.kiu_mode, settings, &mut actions),
                                 }
                                 ui.add_space(6.0);
@@ -444,36 +446,214 @@ fn tab_controls(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings) {
     );
 }
 
-fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings) {
-    plate(ui, "GAMEPAD BINDINGS");
-    let wide_enough = ui.available_width() >= 470.0;
-    let btn_w = if wide_enough { 112.0 } else { 126.0 };
-    egui::Grid::new("kiu_pad_grid")
-        .num_columns(if wide_enough { 4 } else { 2 })
-        .spacing([12.0, 6.0])
+fn stick_scope(ui: &mut Ui, tag: &str, stick: (f32, f32), deadzone: f32) {
+    let size = 46.0_f32;
+    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = size * 0.5 - 2.0;
+
+    // Outer parchment dial + crosshair.
+    painter.circle_filled(center, radius, PAPER);
+    painter.circle_stroke(center, radius, Stroke::new(1.3, INK));
+    painter.line_segment([pos2(center.x - radius + 3.0, center.y), pos2(center.x + radius - 3.0, center.y)], Stroke::new(0.8, PAPER_SHADOW));
+    painter.line_segment([pos2(center.x, center.y - radius + 3.0), pos2(center.x, center.y + radius - 3.0)], Stroke::new(0.8, PAPER_SHADOW));
+
+    // Live deadzone ring.
+    let dz_r = (deadzone.clamp(0.03, 0.45) * radius).max(2.0);
+    painter.circle_filled(center, dz_r, Color32::from_rgba_unmultiplied(222, 32, 36, 26));
+    painter.circle_stroke(center, dz_r, Stroke::new(1.0, Color32::from_rgba_unmultiplied(222, 32, 36, 140)));
+
+    // Tiny corner tag (`L` / `R`).
+    let label = painter.layout_no_wrap(tag.to_owned(), FontId::proportional(9.5), MUTED_INK);
+    painter.galley(pos2(rect.min.x + 2.0, rect.min.y), label, MUTED_INK);
+
+    // Live stick dot (up is +Y from gilrs -> -Y on screen).
+    let mag = stick.0.hypot(stick.1);
+    let (sx, sy) = if mag > 1.0 { (stick.0 / mag, stick.1 / mag) } else { stick };
+    let dot_pos = center + vec2(sx * (radius - 3.5), -sy * (radius - 3.5));
+    let active = mag > deadzone;
+    painter.circle_filled(dot_pos, 3.6, if active { RED } else { INK });
+    painter.circle_stroke(dot_pos, 3.6, Stroke::new(1.0, Color32::WHITE));
+}
+
+fn tab_controller(ui: &mut Ui, menus: &mut Menus, settings: &mut Settings, pad_snapshot: Option<&GamepadSnapshot>) {
+    let default_snap = GamepadSnapshot::default();
+    let snap = pad_snapshot.unwrap_or(&default_snap);
+    let effective_style = match settings.pad_labels {
+        ButtonLabels::Auto => snap.detected_style,
+        other => other,
+    };
+
+    if !snap.connected.is_empty() {
+        // Keep the live stick scopes responsive while a controller is attached.
+        ui.ctx().request_repaint();
+    }
+
+    // Connected controller banner + live L/R stick & deadzone preview.
+    egui::Frame::new()
+        .fill(PAPER_LINE)
+        .stroke(Stroke::new(1.2, PAPER_SHADOW))
+        .corner_radius(6)
+        .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
-            for (i, (name, button)) in settings.pad.all_mut().into_iter().enumerate() {
-                ui.label(name);
-                let active = menus.rebinding_pad == Some(i);
-                let text = if active { "Press button..." } else { button_name(*button) };
-                if parchment_button(ui, text, vec2(btn_w, 26.0), active).clicked() {
-                    menus.rebinding_pad = Some(i);
-                    menus.rebinding = None;
-                }
-                if !wide_enough || i % 2 == 1 {
-                    ui.end_row();
-                }
-            }
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let (dot_rect, _) = ui.allocate_exact_size(vec2(10.0, 14.0), Sense::hover());
+                        let dot_color = if snap.connected.is_empty() {
+                            Color32::from_rgb(154, 142, 130)
+                        } else {
+                            Color32::from_rgb(44, 142, 74)
+                        };
+                        ui.painter().circle_filled(dot_rect.center(), 4.2, dot_color);
+                        ui.painter().circle_stroke(dot_rect.center(), 4.2, Stroke::new(1.0, INK));
+                        let heading = match snap.connected.as_slice() {
+                            [] => "No controller detected".to_owned(),
+                            [one] => one.clone(),
+                            [first, rest @ ..] => format!("{first} (+{} more)", rest.len()),
+                        };
+                        ui.label(RichText::new(heading).strong().color(INK));
+                    });
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("Analog and digital triggers both work for firing & rebinding.")
+                            .small()
+                            .color(MUTED_INK),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    stick_scope(ui, "R", snap.right_stick, settings.pad_deadzone);
+                    ui.add_space(6.0);
+                    stick_scope(ui, "L", snap.left_stick, settings.pad_deadzone);
+                });
+            });
         });
 
     ui.add_space(10.0);
-    if parchment_button(ui, "Reset Default Controller", vec2(186.0, 28.0), false).clicked() {
-        settings.pad = PadButtons::default();
-        menus.rebinding_pad = None;
-    }
-    ui.add_space(4.0);
+    plate(ui, "LAYOUT PRESET");
+    let presets = [
+        ("Bumpers Fire", PadButtons::default()),
+        ("Triggers Fire", PadButtons::triggers_fire()),
+        ("No ZL / ZR", PadButtons::no_secondary_triggers()),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+        for (name, preset) in presets {
+            let active = settings.pad == preset;
+            if parchment_button(ui, name, vec2(124.0, 28.0), active).clicked() {
+                settings.pad = preset;
+                menus.rebinding_pad = None;
+            }
+        }
+    });
+    ui.add_space(8.0);
+    let col_w = label_col_width(ui);
+    let cw = combo_width(ui);
+    egui::Grid::new("kiu_pad_labels")
+        .num_columns(2)
+        .min_col_width(col_w)
+        .spacing([16.0, 8.0])
+        .show(ui, |ui| {
+            let auto_suffix = if settings.pad_labels == ButtonLabels::Auto {
+                match snap.detected_style {
+                    ButtonLabels::Xbox => "Auto (Xbox / Deck)",
+                    ButtonLabels::PlayStation => "Auto (PlayStation)",
+                    ButtonLabels::Nintendo => "Auto (Nintendo)",
+                    _ => "Auto (Generic)",
+                }
+            } else {
+                settings.pad_labels.name()
+            };
+            row(ui, "Button labels", "Choose button names matching your controller (does not change bindings).", |ui| {
+                egui::ComboBox::from_id_salt("kiu_pad_label_style")
+                    .width(cw)
+                    .selected_text(auto_suffix)
+                    .show_ui(ui, |ui| {
+                        for style in ButtonLabels::ALL {
+                            ui.selectable_value(&mut settings.pad_labels, style, style.name());
+                        }
+                    })
+                    .response
+            });
+        });
+
+    ui.add_space(12.0);
+    plate(ui, "STICK AIM");
+    egui::Grid::new("kiu_pad_aim")
+        .num_columns(2)
+        .min_col_width(col_w)
+        .spacing([16.0, 8.0])
+        .show(ui, |ui| {
+            row(ui, "Aim speed, flying", "Right-stick reticle speed multiplier in air battles.", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut settings.pad_air_speed, 0.3..=2.5)
+                        .custom_formatter(|v, _| format!("{v:.2}x")),
+                )
+            });
+            row(ui, "Aim speed, on foot", "Right-stick camera turn speed multiplier in land battles.", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut settings.pad_land_speed, 0.3..=2.5)
+                        .custom_formatter(|v, _| format!("{v:.2}x")),
+                )
+            });
+            row(ui, "Stick deadzone", "Inner stick radius ignored to prevent drift (shown by red ring above).", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut settings.pad_deadzone, 0.03..=0.30)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                )
+            });
+            row(ui, "Invert vertical aim", "Aim up when pulling the right stick down.", |ui| {
+                ui.checkbox(&mut settings.pad_invert_y, "")
+            });
+        });
+
+    ui.add_space(12.0);
+    plate(ui, "ACTION BINDINGS");
+    let mut all = settings.pad.all_mut();
+    egui::Grid::new("kiu_pad_actions")
+        .num_columns(2)
+        .min_col_width(col_w)
+        .spacing([16.0, 6.0])
+        .show(ui, |ui| {
+            for (idx, action_name, optional) in PadButtons::KIU_ACTIONS {
+                ui.label(action_name);
+                let active = menus.rebinding_pad == Some(idx);
+                let bound = *all[idx].1;
+                let text = if active {
+                    "Press button..."
+                } else {
+                    button_label(bound, effective_style)
+                };
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if parchment_button(ui, text, vec2(138.0, 26.0), active).clicked() {
+                        menus.rebinding_pad = Some(idx);
+                        menus.rebinding = None;
+                    }
+                    if optional && bound != gilrs::Button::Unknown {
+                        if parchment_button(ui, "×", vec2(28.0, 26.0), false)
+                            .on_hover_text("Clear optional binding (leave unbound)")
+                            .clicked()
+                        {
+                            *all[idx].1 = gilrs::Button::Unknown;
+                            if menus.rebinding_pad == Some(idx) {
+                                menus.rebinding_pad = None;
+                            }
+                        }
+                    }
+                });
+                ui.end_row();
+            }
+        });
+
+    ui.add_space(8.0);
     ui.label(
-        RichText::new("Left stick controls the Circle Pad. Home opens the pause menu in-game.")
+        RichText::new("Press Esc to cancel rebinding, or Backspace to unbind. Fixed sticks: Left = Move, Right = Aim, L3 = Center camera, R3 = Bottom screen, Home = Pause.")
             .small()
             .color(MUTED_INK),
     );
@@ -664,7 +844,7 @@ mod tests {
         for _ in 0..3 {
             let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
             ctx.run_ui(input, |ui| {
-                assert!(menus.options(ui.ctx(), &mut settings).is_empty(), "nothing changed, nothing to do");
+                assert!(menus.options(ui.ctx(), &mut settings, None).is_empty(), "nothing changed, nothing to do");
             })
             .drop_without_applying_deltas();
         }
@@ -691,7 +871,7 @@ mod tests {
         let mut menus = Menus::default();
         let mut settings = Settings::default();
         ctx.run_ui(egui::RawInput::default(), |ui| {
-            menus.options(ui.ctx(), &mut settings);
+            menus.options(ui.ctx(), &mut settings, None);
         })
         .drop_without_applying_deltas();
         assert!(ctx.memory(|memory| memory.area_rect(egui::Id::new("kiu options"))).is_none());
@@ -710,7 +890,7 @@ mod tests {
             for _ in 0..3 {
                 let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
                 ctx.run_ui(input, |ui| {
-                    assert!(menus.options(ui.ctx(), &mut settings).is_empty());
+                    assert!(menus.options(ui.ctx(), &mut settings, None).is_empty());
                 })
                 .drop_without_applying_deltas();
             }
@@ -730,7 +910,7 @@ mod tests {
         // Frame 0: settled on setup page (anim == 0.0).
         ctx.run_ui(egui::RawInput { screen_rect: Some(screen), time: Some(0.0), ..Default::default() }, |ui| {
             menus.kiu_setup(ui, &crate::menus::KiuSetupStage::NeedsRom { notice: None, hovered_file: false });
-            menus.options(ui.ctx(), &mut settings);
+            menus.options(ui.ctx(), &mut settings, None);
         })
         .drop_without_applying_deltas();
         assert_eq!(menus.settings_anim, 0.0);
@@ -742,7 +922,7 @@ mod tests {
             let t = step as f64 * 0.025;
             ctx.run_ui(egui::RawInput { screen_rect: Some(screen), time: Some(t), ..Default::default() }, |ui| {
                 menus.kiu_setup(ui, &crate::menus::KiuSetupStage::NeedsRom { notice: None, hovered_file: false });
-                menus.options(ui.ctx(), &mut settings);
+                menus.options(ui.ctx(), &mut settings, None);
             })
             .drop_without_applying_deltas();
             if menus.settings_anim > 0.1 && menus.settings_anim < 0.9 {
@@ -759,7 +939,7 @@ mod tests {
             let t = step as f64 * 0.025;
             ctx.run_ui(egui::RawInput { screen_rect: Some(screen), time: Some(t), ..Default::default() }, |ui| {
                 menus.kiu_setup(ui, &crate::menus::KiuSetupStage::NeedsRom { notice: None, hovered_file: false });
-                menus.options(ui.ctx(), &mut settings);
+                menus.options(ui.ctx(), &mut settings, None);
             })
             .drop_without_applying_deltas();
             if menus.settings_anim > 0.1 && menus.settings_anim < 0.9 {

@@ -373,9 +373,42 @@ impl Keys {
     }
 }
 
+/// Glyph / button-name style shown in the Controller settings UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ButtonLabels {
+    /// Detect from the connected controller's name (falls back to Generic).
+    #[default]
+    Auto,
+    Xbox,
+    PlayStation,
+    Nintendo,
+    Generic,
+}
+
+impl ButtonLabels {
+    pub const ALL: [ButtonLabels; 5] = [
+        ButtonLabels::Auto,
+        ButtonLabels::Xbox,
+        ButtonLabels::PlayStation,
+        ButtonLabels::Nintendo,
+        ButtonLabels::Generic,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ButtonLabels::Auto => "Auto (detect controller)",
+            ButtonLabels::Xbox => "Xbox / Steam Deck",
+            ButtonLabels::PlayStation => "PlayStation",
+            ButtonLabels::Nintendo => "Nintendo Switch",
+            ButtonLabels::Generic => "Generic / Positional",
+        }
+    }
+}
+
 /// the controller buttons the console's buttons are on, the face buttons
 /// where the 3DS has them rather than by their letters. the circle pad is
-/// the left stick and the C-stick the right one.
+/// the left stick and the C-stick the right one. `Button::Unknown` means unbound.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PadButtons {
@@ -417,6 +450,26 @@ impl Default for PadButtons {
 }
 
 impl PadButtons {
+    /// Modern shooter preset: LT/L2 fires (L), RT/R2 recenters/locks (R), bumpers take ZL/ZR.
+    pub fn triggers_fire() -> Self {
+        PadButtons {
+            l: Button::LeftTrigger2,
+            r: Button::RightTrigger2,
+            zl: Button::LeftTrigger,
+            zr: Button::RightTrigger,
+            ..Self::default()
+        }
+    }
+
+    /// Simple preset for controllers without secondary triggers (ZL/ZR left unbound).
+    pub fn no_secondary_triggers() -> Self {
+        PadButtons {
+            zl: Button::Unknown,
+            zr: Button::Unknown,
+            ..Self::default()
+        }
+    }
+
     /// every binding with the name it goes by, to show and change them.
     pub fn all_mut(&mut self) -> [(&'static str, &mut Button); 14] {
         [
@@ -436,6 +489,24 @@ impl PadButtons {
             ("ZR", &mut self.zr),
         ]
     }
+
+    /// Action-first Kid Icarus labels with `(index_in_all_mut, label, optional)` for the parchment UI.
+    pub const KIU_ACTIONS: [(usize, &'static str, bool); 14] = [
+        (4, "Fire / Attack (L)", false),
+        (5, "Recenter / Lock (R)", false),
+        (0, "Confirm / Special (A)", false),
+        (1, "Cancel / Dismount (B)", false),
+        (2, "Menu / Dodge (X)", false),
+        (3, "Recenter Reticle (Y)", false),
+        (10, "Power Left (D-Left)", false),
+        (11, "Power Right (D-Right)", false),
+        (9, "Use Power (D-Down)", false),
+        (8, "D-Pad Up", false),
+        (6, "Pause (Start)", false),
+        (7, "Select", false),
+        (12, "Optional ZL", true),
+        (13, "Optional ZR", true),
+    ];
 
     /// each of the console's buttons and the controller button it is on.
     pub fn map(&self) -> [(PadState, Button); 14] {
@@ -530,6 +601,16 @@ pub struct Settings {
     pub background_opacity: f32,
     pub keys: Keys,
     pub pad: PadButtons,
+    /// Glyph / label style for controller button names.
+    #[serde(deserialize_with = "or_default")]
+    pub pad_labels: ButtonLabels,
+    /// Gamepad right-stick aim speed multipliers (air and land).
+    pub pad_air_speed: f32,
+    pub pad_land_speed: f32,
+    /// Gamepad stick deadzone (0.03..=0.30).
+    pub pad_deadzone: f32,
+    /// Invert vertical right-stick aiming.
+    pub pad_invert_y: bool,
     /// the enhancements turned on, by name, for each game by its title id.
     pub enhancements: std::collections::BTreeMap<String, Vec<String>>,
     /// what the console's cameras see, and the picture when it is one.
@@ -583,6 +664,11 @@ impl Default for Settings {
             background_opacity: 0.35,
             keys: Keys::default(),
             pad: PadButtons::default(),
+            pad_labels: ButtonLabels::Auto,
+            pad_air_speed: 1.0,
+            pad_land_speed: 1.0,
+            pad_deadzone: 0.10,
+            pad_invert_y: false,
             enhancements: std::collections::BTreeMap::new(),
             camera: CameraSource::Webcam,
             camera_picture: None,

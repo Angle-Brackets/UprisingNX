@@ -120,7 +120,11 @@ fn run_with_mode(linked: Option<Linked>, kiu_mode: bool) {
 
     let mut app = App {
         keyboard: Keyboard::new(settings.keys.clone()),
-        gamepads: gamepad::Gamepads::new(settings.pad.clone()),
+        gamepads: {
+            let mut pads = gamepad::Gamepads::new(settings.pad.clone());
+            pads.set_deadzone(settings.pad_deadzone);
+            pads
+        },
         scale: options.scale.unwrap_or(settings.scale).max(1),
         layout: settings.layout,
         top_shape: settings.top_shape,
@@ -1820,9 +1824,21 @@ impl App {
     fn key(&mut self, event: KeyEvent, consumed: bool) {
         let pressed = event.state == ElementState::Pressed;
         let PhysicalKey::Code(code) = event.physical_key else { return };
-        // Escape leaves a controller binding waiting for a button as it was
-        if pressed && code == KeyCode::Escape && self.menus.rebinding_pad.take().is_some() {
-            return;
+        // Escape cancels controller rebinding; Backspace/Delete unbinds the slot.
+        if pressed && self.menus.rebinding_pad.is_some() {
+            if code == KeyCode::Escape {
+                self.menus.rebinding_pad = None;
+                return;
+            }
+            if matches!(code, KeyCode::Backspace | KeyCode::Delete) {
+                if let Some(index) = self.menus.rebinding_pad.take() {
+                    if let Some((_, bound)) = self.settings.pad.all_mut().into_iter().nth(index) {
+                        *bound = gilrs::Button::Unknown;
+                    }
+                    self.apply_settings();
+                }
+                return;
+            }
         }
         // a binding waiting for a key takes it, Escape leaves it as it was
         if let (true, Some(index)) = (pressed, self.menus.rebinding) {
@@ -2075,6 +2091,7 @@ impl App {
         self.apply_camera();
         self.keyboard.set_keys(self.settings.keys.clone());
         self.gamepads.set_buttons(self.settings.pad.clone());
+        self.gamepads.set_deadzone(self.settings.pad_deadzone);
         self.apply_volume();
         self.apply_layout();
     }
@@ -2688,7 +2705,12 @@ impl App {
                 && game.replay.is_none()
                 && self.gamepads.feed_kiu_mailbox(
                     said,
-                    self.settings.invert_aim_y,
+                    gamepad::PadAimSettings {
+                        air_speed: self.settings.pad_air_speed,
+                        land_speed: self.settings.pad_land_speed,
+                        deadzone: self.settings.pad_deadzone,
+                        invert_y: self.settings.pad_invert_y,
+                    },
                     &mut input,
                     &mut game.system.memory.host_mailbox,
                 );
@@ -3058,6 +3080,7 @@ impl App {
             _ => (None, false),
         };
         let kiu_mode = self.kiu_mode;
+        let pad_snapshot = self.gamepads.snapshot();
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();
         let overlay = gui.frame(window, |ui| {
@@ -3101,7 +3124,7 @@ impl App {
                 }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
-            actions.extend(menus.options(ui.ctx(), settings));
+            actions.extend(menus.options(ui.ctx(), settings, Some(&pad_snapshot)));
             actions.extend(menus.settings(ui.ctx(), settings));
             if menus.multiplayer_open {
                 actions.extend(menus.multiplayer(ui.ctx(), settings, room.as_ref()));

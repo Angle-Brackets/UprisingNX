@@ -1,16 +1,15 @@
 //! game controllers, any the system knows, read through gilrs.
 
-use gilrs::{Axis, Button, EventType, Gilrs};
+use gilrs::{Axis, Button, EventType, Gamepad, Gilrs};
 use zakuro_core::services::hid::{InputState, PadState};
 
-use crate::settings::PadButtons;
+use crate::settings::{ButtonLabels, PadButtons};
 
-/// how far a stick has to lean before it counts, some rest a little off
-/// center.
-const DEADZONE: f32 = 0.15;
+/// Analog trigger press threshold so digital and analog triggers behave identically.
+const TRIGGER_THRESHOLD: f32 = 0.40;
 
-/// KIU right-stick aiming curve & speeds (matching Switch `uprising_nx::aim`).
-const AIM_DEADZONE: f32 = 0.10;
+/// KIU right-stick base aiming curve & speeds (matching Switch `uprising_nx::aim`).
+const DEFAULT_DEADZONE: f32 = 0.10;
 const AIM_LINEAR_GAIN: f32 = 0.35;
 const AIR_PX_PER_FRAME: f32 = 6.0;
 const LAND_X_PX_PER_FRAME: f32 = 10.0;
@@ -30,26 +29,107 @@ const VEHICLE_SPECIAL_TOUCH: (u16, u16) = (28, 212);
 const VEHICLE_DISMOUNT_TOUCH: (u16, u16) = (86, 218);
 const VEHICLE_TAP_FRAMES: u8 = 3;
 
-fn stick_curve(x: f32, y: f32) -> (f32, f32) {
+/// Live controller aim tuning passed from user settings.
+#[derive(Debug, Clone, Copy)]
+pub struct PadAimSettings {
+    pub air_speed: f32,
+    pub land_speed: f32,
+    pub deadzone: f32,
+    pub invert_y: bool,
+}
+
+impl Default for PadAimSettings {
+    fn default() -> Self {
+        Self {
+            air_speed: 1.0,
+            land_speed: 1.0,
+            deadzone: DEFAULT_DEADZONE,
+            invert_y: false,
+        }
+    }
+}
+
+/// Snapshot of connected controllers and live stick deflection for the settings UI.
+#[derive(Debug, Clone, Default)]
+pub struct GamepadSnapshot {
+    pub connected: Vec<String>,
+    pub detected_style: ButtonLabels,
+    pub left_stick: (f32, f32),
+    pub right_stick: (f32, f32),
+}
+
+fn stick_curve(x: f32, y: f32, deadzone: f32) -> (f32, f32) {
+    let dz = deadzone.clamp(0.02, 0.45);
     let mag = x.hypot(y);
-    if mag <= AIM_DEADZONE {
+    if mag <= dz {
         return (0.0, 0.0);
     }
-    let norm = ((mag - AIM_DEADZONE) / (1.0 - AIM_DEADZONE)).clamp(0.0, 1.0);
+    let norm = ((mag - dz) / (1.0 - dz)).clamp(0.0, 1.0);
     let curved = AIM_LINEAR_GAIN * norm + (1.0 - AIM_LINEAR_GAIN) * norm * norm;
     let scale = curved / mag;
     (x * scale, y * scale)
+}
+
+/// Checks whether a button (digital OR analog trigger past threshold) is held on `pad`.
+fn holding_on(pad: Gamepad<'_>, button: Button) -> bool {
+    if button == Button::Unknown {
+        return false;
+    }
+    if pad.is_pressed(button) {
+        return true;
+    }
+    if matches!(button, Button::LeftTrigger2 | Button::RightTrigger2) {
+        if let Some(data) = pad.button_data(button) {
+            return data.value() >= TRIGGER_THRESHOLD;
+        }
+    }
+    false
+}
+
+/// Guesses the best button-label style from a controller's reported device name.
+pub fn detect_button_style(name: &str) -> ButtonLabels {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("dualsense")
+        || lower.contains("dualshock")
+        || lower.contains("playstation")
+        || lower.contains("ps4")
+        || lower.contains("ps5")
+        || lower.contains("sony")
+    {
+        ButtonLabels::PlayStation
+    } else if lower.contains("nintendo")
+        || lower.contains("switch")
+        || lower.contains("pro controller")
+        || lower.contains("joy-con")
+        || lower.contains("joycon")
+    {
+        ButtonLabels::Nintendo
+    } else if lower.contains("xbox")
+        || lower.contains("xinput")
+        || lower.contains("x-box")
+        || lower.contains("microsoft")
+        || lower.contains("steam deck")
+        || lower.contains("valve")
+    {
+        ButtonLabels::Xbox
+    } else {
+        ButtonLabels::Generic
+    }
 }
 
 pub struct Gamepads {
     /// none when the system could not be asked for controllers.
     gilrs: Option<Gilrs>,
     buttons: PadButtons,
+    deadzone: f32,
     /// whether the player last aimed/played with a controller rather than KBM.
     active: bool,
     game: u32,
     quiet: u8,
     untaken: u8,
+    /// Edge-tracking for analog triggers so `poll()` reports trigger pulls cleanly for rebinding.
+    lt_analog_held: bool,
+    rt_analog_held: bool,
     recenter_held: bool,
     center_held: bool,
     reticle_center_held: bool,
@@ -69,10 +149,13 @@ impl Gamepads {
         Gamepads {
             gilrs,
             buttons,
+            deadzone: DEFAULT_DEADZONE,
             active: false,
             game: 0,
             quiet: 0,
             untaken: 0,
+            lt_analog_held: false,
+            rt_analog_held: false,
             recenter_held: false,
             center_held: false,
             reticle_center_held: false,
@@ -87,6 +170,10 @@ impl Gamepads {
 
     pub fn set_buttons(&mut self, buttons: PadButtons) {
         self.buttons = buttons;
+    }
+
+    pub fn set_deadzone(&mut self, deadzone: f32) {
+        self.deadzone = deadzone.clamp(0.03, 0.30);
     }
 
     pub fn is_active(&self) -> bool {
@@ -106,16 +193,77 @@ impl Gamepads {
         self.vehicle_tap = None;
     }
 
+    /// Live connected controller info and stick deflections for the Controller settings UI.
+    pub fn snapshot(&self) -> GamepadSnapshot {
+        let Some(gilrs) = &self.gilrs else {
+            return GamepadSnapshot { detected_style: ButtonLabels::Generic, ..Default::default() };
+        };
+        let mut connected = Vec::new();
+        let mut left_stick = (0.0f32, 0.0f32);
+        let mut right_stick = (0.0f32, 0.0f32);
+        for (_, pad) in gilrs.gamepads() {
+            if !pad.is_connected() {
+                continue;
+            }
+            let lower = pad.name().to_ascii_lowercase();
+            if lower.contains("system control") || lower.contains("consumer control") {
+                continue;
+            }
+            connected.push(pad.name().to_owned());
+            let (lx, ly) = (pad.value(Axis::LeftStickX).clamp(-1.0, 1.0), pad.value(Axis::LeftStickY).clamp(-1.0, 1.0));
+            if lx.hypot(ly) > left_stick.0.hypot(left_stick.1) {
+                left_stick = (lx, ly);
+            }
+            let (rx, ry) = (pad.value(Axis::RightStickX).clamp(-1.0, 1.0), pad.value(Axis::RightStickY).clamp(-1.0, 1.0));
+            if rx.hypot(ry) > right_stick.0.hypot(right_stick.1) {
+                right_stick = (rx, ry);
+            }
+        }
+        let detected_style = connected
+            .first()
+            .map(|name| detect_button_style(name))
+            .unwrap_or(ButtonLabels::Generic);
+        GamepadSnapshot { connected, detected_style, left_stick, right_stick }
+    }
+
     /// takes in what the controllers did since the last call, and returns the
-    /// buttons pressed meanwhile.
+    /// buttons pressed meanwhile (including analog trigger pulls past threshold).
     pub fn poll(&mut self) -> Vec<Button> {
         let mut pressed = Vec::new();
         let Some(gilrs) = &mut self.gilrs else { return pressed };
         while let Some(event) = gilrs.next_event() {
             match event.event {
                 EventType::ButtonPressed(button, _) => {
-                    self.active = true;
-                    pressed.push(button);
+                    if button != Button::Unknown {
+                        self.active = true;
+                        if button == Button::LeftTrigger2 {
+                            self.lt_analog_held = true;
+                        } else if button == Button::RightTrigger2 {
+                            self.rt_analog_held = true;
+                        }
+                        pressed.push(button);
+                    }
+                }
+                EventType::ButtonReleased(button, _) => {
+                    if button == Button::LeftTrigger2 {
+                        self.lt_analog_held = false;
+                    } else if button == Button::RightTrigger2 {
+                        self.rt_analog_held = false;
+                    }
+                }
+                EventType::ButtonChanged(button @ (Button::LeftTrigger2 | Button::RightTrigger2), val, _) => {
+                    let held = if button == Button::LeftTrigger2 {
+                        &mut self.lt_analog_held
+                    } else {
+                        &mut self.rt_analog_held
+                    };
+                    if val >= TRIGGER_THRESHOLD && !*held {
+                        *held = true;
+                        self.active = true;
+                        pressed.push(button);
+                    } else if val < TRIGGER_THRESHOLD * 0.6 {
+                        *held = false;
+                    }
                 }
                 EventType::Connected => {
                     log::info!("controller connected, {}", gilrs.gamepad(event.id).name());
@@ -127,17 +275,20 @@ impl Gamepads {
         pressed
     }
 
-    /// whether a controller holds button down.
+    /// whether a controller holds button down (handles both digital and analog triggers).
     pub fn holding(&self, button: Button) -> bool {
-        self.gilrs.as_ref().is_some_and(|gilrs| gilrs.gamepads().any(|(_, pad)| pad.is_pressed(button)))
+        if button == Button::Unknown {
+            return false;
+        }
+        self.gilrs.as_ref().is_some_and(|gilrs| gilrs.gamepads().any(|(_, pad)| holding_on(pad, button)))
     }
 
     /// raw right-stick axes `(x, y)` (up positive) from the first deflected controller.
-    pub fn right_stick(&self) -> (f32, f32) {
+    pub fn right_stick(&self, deadzone: f32) -> (f32, f32) {
         let Some(gilrs) = &self.gilrs else { return (0.0, 0.0) };
         for (_, pad) in gilrs.gamepads() {
             let (x, y) = (pad.value(Axis::RightStickX), pad.value(Axis::RightStickY));
-            if x.hypot(y) > AIM_DEADZONE {
+            if x.hypot(y) > deadzone {
                 return (x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0));
             }
         }
@@ -149,7 +300,7 @@ impl Gamepads {
     pub fn feed_kiu_mailbox(
         &mut self,
         said: u32,
-        invert_y: bool,
+        aim: PadAimSettings,
         input: &mut InputState,
         mailbox: &mut [u32],
     ) -> bool {
@@ -164,7 +315,8 @@ impl Gamepads {
             }
         }
 
-        let (rx, ry) = self.right_stick();
+        let dz = aim.deadzone.clamp(0.03, 0.30);
+        let (rx, ry) = self.right_stick(dz);
         if rx != 0.0 || ry != 0.0 {
             self.active = true;
         }
@@ -215,11 +367,13 @@ impl Gamepads {
             self.vehicle_tap = None;
         }
 
-        let (cx, cy) = stick_curve(rx, ry);
-        let sign_y = if invert_y { 1.0 } else { -1.0 };
+        let (cx, cy) = stick_curve(rx, ry, dz);
+        let sign_y = if aim.invert_y { 1.0 } else { -1.0 };
+        let air_mult = aim.air_speed.clamp(0.2, 3.0);
+        let land_mult = aim.land_speed.clamp(0.2, 3.0);
         let (dx, dy, mark) = if self.game == kiu_common::GAME_FLYING {
-            let dx = cx * AIR_PX_PER_FRAME;
-            let dy = cy * sign_y * AIR_PX_PER_FRAME;
+            let dx = cx * AIR_PX_PER_FRAME * air_mult;
+            let dy = cy * sign_y * AIR_PX_PER_FRAME * air_mult;
             let mark = if std::mem::take(&mut self.recenter_pending)
                 || std::mem::take(&mut self.center_pending)
                 || std::mem::take(&mut self.reticle_center_pending)
@@ -230,8 +384,8 @@ impl Gamepads {
             };
             (dx, dy, mark)
         } else {
-            let dx = cx * LAND_X_PX_PER_FRAME;
-            let dy = cy * sign_y * LAND_Y_PX_PER_FRAME;
+            let dx = cx * LAND_X_PX_PER_FRAME * land_mult;
+            let dy = cy * sign_y * LAND_Y_PX_PER_FRAME * land_mult;
             let mark = if std::mem::take(&mut self.recenter_pending) {
                 MOUSE_LOOK_RECENTER
             } else if std::mem::take(&mut self.center_pending) {
@@ -276,9 +430,10 @@ impl Gamepads {
     /// what the controllers hold down, over what the keyboard does.
     pub fn apply(&self, mut state: InputState) -> InputState {
         let Some(gilrs) = &self.gilrs else { return state };
+        let dz = self.deadzone.max(0.05);
         for (_, pad) in gilrs.gamepads() {
             for (button, bound) in self.buttons.map() {
-                if pad.is_pressed(bound) {
+                if holding_on(pad, bound) {
                     state.buttons.set(button, true);
                 }
             }
@@ -297,12 +452,12 @@ impl Gamepads {
             // the left stick is the circle pad and the right one the
             // C-stick, up positive as the console has it
             let (x, y) = (pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
-            if x.hypot(y) > DEADZONE {
+            if x.hypot(y) > dz {
                 state.circle_x = x.clamp(-1.0, 1.0);
                 state.circle_y = y.clamp(-1.0, 1.0);
             }
             let (x, y) = (pad.value(Axis::RightStickX), pad.value(Axis::RightStickY));
-            if x.hypot(y) > DEADZONE {
+            if x.hypot(y) > dz {
                 state.c_stick_x = x.clamp(-1.0, 1.0);
                 state.c_stick_y = y.clamp(-1.0, 1.0);
             }
@@ -311,7 +466,65 @@ impl Gamepads {
     }
 }
 
-/// a controller button as a person would call it.
+/// Controller button name formatted in the chosen glyph style (`Xbox`, `PlayStation`, `Nintendo`, `Generic`).
+pub fn button_label(button: Button, style: ButtonLabels) -> &'static str {
+    if button == Button::Unknown {
+        return "Unbound";
+    }
+    match style {
+        ButtonLabels::Xbox => match button {
+            Button::South => "A",
+            Button::East => "B",
+            Button::North => "Y",
+            Button::West => "X",
+            Button::LeftTrigger => "LB",
+            Button::RightTrigger => "RB",
+            Button::LeftTrigger2 => "LT",
+            Button::RightTrigger2 => "RT",
+            Button::Select => "View",
+            Button::Start => "Menu",
+            Button::Mode => "Xbox",
+            Button::LeftThumb => "LS",
+            Button::RightThumb => "RS",
+            _ => button_name(button),
+        },
+        ButtonLabels::PlayStation => match button {
+            Button::South => "Cross (×)",
+            Button::East => "Circle (○)",
+            Button::North => "Triangle (△)",
+            Button::West => "Square (□)",
+            Button::LeftTrigger => "L1",
+            Button::RightTrigger => "R1",
+            Button::LeftTrigger2 => "L2",
+            Button::RightTrigger2 => "R2",
+            Button::Select => "Create",
+            Button::Start => "Options",
+            Button::Mode => "PS",
+            Button::LeftThumb => "L3",
+            Button::RightThumb => "R3",
+            _ => button_name(button),
+        },
+        ButtonLabels::Nintendo => match button {
+            Button::South => "B",
+            Button::East => "A",
+            Button::North => "X",
+            Button::West => "Y",
+            Button::LeftTrigger => "L",
+            Button::RightTrigger => "R",
+            Button::LeftTrigger2 => "ZL",
+            Button::RightTrigger2 => "ZR",
+            Button::Select => "Minus (−)",
+            Button::Start => "Plus (+)",
+            Button::Mode => "Home",
+            Button::LeftThumb => "L Stick",
+            Button::RightThumb => "R Stick",
+            _ => button_name(button),
+        },
+        ButtonLabels::Auto | ButtonLabels::Generic => button_name(button),
+    }
+}
+
+/// a controller button as a person would call it (generic positional labels).
 pub fn button_name(button: Button) -> &'static str {
     match button {
         Button::South => "Bottom face",
@@ -333,7 +546,7 @@ pub fn button_name(button: Button) -> &'static str {
         Button::DPadRight => "D-pad right",
         Button::C => "C",
         Button::Z => "Z",
-        Button::Unknown => "unknown",
+        Button::Unknown => "Unbound",
     }
 }
 
@@ -353,5 +566,32 @@ mod tests {
         let applied = gamepads.apply(state);
         assert_eq!(applied.buttons, PadState::A);
         assert_eq!((applied.circle_x, applied.circle_y, applied.touch), (1.0, 0.0, Some((1, 2))));
+    }
+
+    #[test]
+    fn detects_controller_glyph_styles_from_name() {
+        assert_eq!(detect_button_style("DualSense Wireless Controller"), ButtonLabels::PlayStation);
+        assert_eq!(detect_button_style("Nintendo Switch Pro Controller"), ButtonLabels::Nintendo);
+        assert_eq!(detect_button_style("Xbox Wireless Controller"), ButtonLabels::Xbox);
+        assert_eq!(detect_button_style("Valve Steam Deck"), ButtonLabels::Xbox);
+        assert_eq!(detect_button_style("8BitDo SN30"), ButtonLabels::Generic);
+    }
+
+    #[test]
+    fn button_labels_format_unbound_and_styles_cleanly() {
+        assert_eq!(button_label(Button::Unknown, ButtonLabels::Xbox), "Unbound");
+        assert_eq!(button_label(Button::East, ButtonLabels::Nintendo), "A");
+        assert_eq!(button_label(Button::East, ButtonLabels::Xbox), "B");
+        assert_eq!(button_label(Button::East, ButtonLabels::PlayStation), "Circle (○)");
+        assert_eq!(button_label(Button::LeftTrigger2, ButtonLabels::PlayStation), "L2");
+        assert_eq!(button_label(Button::LeftTrigger2, ButtonLabels::Nintendo), "ZL");
+    }
+
+    #[test]
+    fn stick_curve_respects_custom_deadzone() {
+        assert_eq!(stick_curve(0.12, 0.0, 0.15), (0.0, 0.0));
+        let (x, y) = stick_curve(0.60, 0.0, 0.15);
+        assert!(x > 0.2 && x < 0.7 && y == 0.0);
+        assert_eq!(stick_curve(1.0, 0.0, 0.15), (1.0, 0.0));
     }
 }
