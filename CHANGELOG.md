@@ -2,6 +2,27 @@
 
 All notable changes to **UprisingNX** are documented in this file.
 
+## [0.2.0] - 2026-11-27
+
+### Added
+- **Native PC & macOS Port (`uprising-recompiled`):** Self-bootstrapping ahead-of-time (AOT) recompilation of *Kid Icarus: Uprising* now runs natively on **Windows (x64)**, **macOS (Apple Silicon `arm64`)**, and **Linux (x64)** alongside **Nintendo Switch**.
+  - **x86-64 AOT Backend:** Direct ARMv6K / Thumb-1 / VFPv2 → x86-64 compiler (`zakuro/crates/zakuro-aot/src/compiler_x64/`) with 1.0× instruction deduplication, direct-mapped icache, and fast first-launch ROM compilation.
+  - **macOS Apple Silicon Support:** Native `MAP_JIT` + `pthread_jit_write_protect_np` + 16 KiB page support, bundled `MoltenVK >= 1.3.0` (`VK_KHR_portability_enumeration` / `VK_KHR_portability_subset`), `.app` + `.dmg` bundler (`scripts/pc/build-macos.sh`), Hardened Runtime entitlements, and automated Apple Developer ID signing + notarization in CI.
+  - **Up to 16× HD Upscaling & Hardware-Aware Defaults:** Vulkan 1.3 renderer with automatic first-launch quality/resolution profiling based on detected GPU class (dedicated desktop GPU, Apple Silicon unified memory, integrated/handheld).
+  - **Keyboard + Mouse, Twin-Stick & Native HID Gyro Aiming:** Direct mouse aiming (`WASD` + `LMB` fire + `RMB`/scroll powers), Switch-parity twin-stick + Z-targeting (`L`/`ZL`/`ZR` fire, `R` Z-target, `Y`/`L3` recenter), and native HID gyroscope support (`hidapi`) for DualSense, DualShock 4, Switch Pro, and Steam Deck controllers.
+  - **Unified Kid Icarus Parchment UI:** Animated 5-tab Settings screen (`Graphics`, `Audio`, `Controls`, `Controller`, `System`) with live stick/deadzone visualizer, auto-detected button glyph styles (`Xbox` / `PlayStation` / `Nintendo`), first-launch ROM importer, and in-game `Esc` Pause menu.
+- **3-Platform Desktop CI:** GitHub Actions (`tag-build.yml`) now runs native Apple Silicon `zakuro-aot` differential/fuzz tests on `macos-15` and publishes `uprising-recompiled-windows-x64.exe`, `uprising-recompiled-macos-arm64.dmg`, and `uprising-recompiled-linux-x64.tar.gz`.
+
+### Fixed
+- **5 AArch64 AOT compiler correctness fixes (benefits both Nintendo Switch and Apple Silicon):**
+  - `STREX*` now unconditionally clears the exclusive monitor on both pass and fail.
+  - `UMULLS` / `SMULLS` / `UMLALS` / `SMLALS` no longer corrupt guest `CPSR.C` when testing the 64-bit zero flag.
+  - Added `STALE_PTR` checks on function entry so patched/stale direct-called and tail-jumped callees unwind cleanly after `LoadedAot::check()`.
+  - Lowered `VCVTR` natively via `FRINTI` + `FCVTZS`/`FCVTZU` (honoring `FPSCR.RMode` and `FPSCR.FZ` with zero interpreter fallbacks).
+  - Isolated host `FPCR` across `LoadedAot::enter` and Rust helper calls.
+
+---
+
 ## [0.1.3] - 2026-11-26
 
 ### Fixed

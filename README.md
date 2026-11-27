@@ -1,39 +1,62 @@
-# Kid Icarus: Uprising for Nintendo Switch (UprisingNX)
+# Kid Icarus: Uprising Recompiled (UprisingNX)
 
-**UprisingNX** is a self-bootstrapping ahead-of-time (AOT) recompilation and native runtime port of *Kid Icarus: Uprising* (Nintendo 3DS, USA `0004000000030100` / `CTR-P-AKDE`) for the Nintendo Switch.
+**UprisingNX** is a self-bootstrapping ahead-of-time (AOT) recompilation and native runtime port of *Kid Icarus: Uprising* (Nintendo 3DS, USA `0004000000030100` / `CTR-P-AKDE`) for **Windows**, **macOS (Apple Silicon)**, **Linux / Steam Deck**, and **Nintendo Switch**.
 
-`uprising_nx.nro` ships with **zero copyrighted game code or assets**. On first launch, UprisingNX validates your legally dumped, decrypted US ROM and compiles all `12.14 MB` of ARMv6K + VFPv2 game code directly into native AArch64 machine code on your Switch, caching the result to your SD card for fast launches afterward.
+Every release ships with **zero copyrighted game code or assets**. On first launch, the app validates your legally dumped, decrypted US 1.0 ROM and compiles all `12.14 MB` of ARMv6K + Thumb + VFPv2 game code directly into native **x86-64** or **AArch64** machine code on your device, caching the compiled binary for instant launches afterward.
 
 ---
 
 ## Gameplay Demo
 
 **[Watch Gameplay on YouTube →](https://www.youtube.com/watch?v=jP63aGFbcz8)**  
-*(Recorded on an older build, though most things are the same — and please don't make fun of my gameplay :P)*
+*(Recorded on an older Switch build; v0.2.0 brings the full native PC & macOS port alongside Switch.)*
 
 | Title Screen (16:9 Upscaled) | Air Battle & Unified HUD |
 | :---: | :---: |
 | ![Title Screen](docs/screenshots/title_screen.jpg) | ![Air Battle HUD](docs/screenshots/air_battle_hud.jpg) |
 
+| Desktop Settings — Graphics | Desktop Settings — Controller & Gyro |
+| :---: | :---: |
+| ![PC Graphics Settings](docs/screenshots/pc_settings_graphics.png) | ![PC Controller Settings](docs/screenshots/pc_settings_controller.png) |
+
 ---
 
 ## Quick Start
 
-1. **Extract the release** — Download `UprisingNX-vX.Y.Z.zip` from [Releases](https://github.com/Angle-Brackets/UprisingNX/releases) and extract the `switch/` folder to the root of your SD card.
+> **ROM Requirement (All Platforms):** You need a legally dumped, **decrypted USA 1.0** copy of *Kid Icarus: Uprising* (`.cia`, `.3ds`, or `.cci`, Title ID `0004000000030100`). Encrypted dumps must be decrypted on your 3DS with GodMode9 first.
 
-2. **Add your decrypted US ROM** — Copy your decrypted USA 1.0 *Kid Icarus: Uprising* dump (`.cia`, `.3ds`, or `.cci`, Title ID `0004000000030100`) into:
+### Windows, macOS & Linux (PC / Steam Deck)
+
+1. **Download from [Releases](https://github.com/Angle-Brackets/UprisingNX/releases):**
+   - **Windows (x64):** `uprising-recompiled-windows-x64.exe` (requires a Vulkan 1.3 GPU driver)
+   - **macOS (Apple Silicon):** `uprising-recompiled-macos-arm64.dmg` (drag **Kid Icarus Uprising Recompiled.app** to `/Applications`; bundles MoltenVK 1.4+)
+   - **Linux / Steam Deck (x64):** `uprising-recompiled-linux-x64.tar.gz` (extract and run `./uprising-recompiled`)
+2. **Import your ROM on first launch:** Click **Select ROM** (or drag-and-drop your decrypted `.cia` / `.3ds` / `.cci` onto the window). The app imports the ROM, compiles it to native x86-64 or AArch64 in a few seconds, caches it, and boots straight into the game.
+3. **Enjoy:** Press **`Esc`** in-game for the Pause / Settings menu, or **`F11`** to toggle fullscreen.
+
+**Desktop Data Directory** (saves, settings, imported ROM, AOT cache):
+- **Windows:** `%APPDATA%\zakuro\`
+- **macOS:** `~/Library/Application Support/zakuro/`
+- **Linux / Steam Deck:** `~/.local/share/zakuro/` (or `$XDG_DATA_HOME/zakuro/`)
+
+---
+
+### Nintendo Switch
+
+1. **Extract the release** — Download `UprisingNX-vX.Y.Z.zip` from [Releases](https://github.com/Angle-Brackets/UprisingNX/releases) and extract the `switch/` folder to the root of your SD card.
+2. **Add your decrypted US ROM** — Copy your decrypted USA 1.0 *Kid Icarus: Uprising* dump (`.cia`, `.3ds`, or `.cci`) into:
    ```text
    sdmc:/switch/uprisingnx/rom/
    ```
-   Any filename works (e.g., `baserom.cia`). Encrypted dumps must be decrypted on your 3DS with GodMode9 first.
-
+   Any filename works (e.g., `baserom.cia`).
 3. **Launch via Title Override** — Hold **R** while opening any installed Switch game from the HOME Menu to enter Homebrew Menu with full memory and JIT permissions, then launch **UprisingNX**:
    - **First launch:** Compiles your ROM on-console to native AArch64 (~30–60s with a live progress bar) and saves the cache to your SD card.
    - **Subsequent launches:** Streams the cached binary directly into executable memory without recompiling.
 
 ![First-Time On-Switch AOT Setup](docs/screenshots/first_launch_aot.png)
 
-### SD Card Layout
+<details>
+<summary>Switch SD Card Layout</summary>
 
 ```text
 sdmc:/switch/uprisingnx/
@@ -51,13 +74,15 @@ sdmc:/switch/uprisingnx/
     └── user/savedata/0004000000030100/     # Live save data
 ```
 
+</details>
+
 ---
 
 ## Features
 
-### Unified 16:9 Single-Screen UI
+### Unified 16:9 Single-Screen UI & HD Upscaling
 
-Every major screen—Title Screen, Mode Select, Solo Hub, Chapter Select, Fiend's Cauldron, Arms Altar, Gear, Weapon Fusion, and the in-battle HUD & dialogue portraits—has been reworked for a single 16:9 handheld or TV display instead of cramped side-by-side 3DS screens.
+Every major screen—Title Screen, Mode Select, Solo Hub, Chapter Select, Fiend's Cauldron, Arms Altar, Gear, Weapon Fusion, and the in-battle HUD & dialogue portraits—has been reworked for a single 16:9 display instead of cramped side-by-side 3DS screens. On PC & macOS, internal resolution scales up to **16×** with hardware-aware first-launch quality defaults and **Smooth Mode** (up to 60 fps frame interpolation).
 
 | Solo Hub | Chapter Select |
 | :---: | :---: |
@@ -69,41 +94,48 @@ Every major screen—Title Screen, Mode Select, Solo Hub, Chapter Select, Fiend'
 
 <br>
 
-### Dual-Stick, Gyro & Zelda-Style Z-Targeting
+### Keyboard + Mouse, Twin-Stick, Gyro & Zelda-Style Z-Targeting
 
-- **Dual-Stick & Gyro Aiming:** Native analog camera and reticle control with optional gyroscope aiming, independent sensitivity tuning, separate Air and Ground Y-axis inversion, and left-stick aim options.
+- **Direct Mouse + Keyboard (PC/macOS):** Play naturally with `WASD` movement, raw mouse aiming, left-click fire, right-click / middle-click power activation, and mouse-wheel power cycling.
+- **Twin-Stick & Native HID Gyro Aiming:** Full analog camera and reticle control with Switch-parity `L`/`ZL`/`ZR` firing, plus native gyroscope aiming on **Nintendo Switch**, **DualSense**, **DualShock 4**, **Switch Pro**, and **Steam Deck** controllers—complete with independent sensitivity tuning and separate Air / Ground Y-axis inversion.
 - **Z-Targeting (`R`) & Reticle Center (`Y` / `L3`):** Tap or hold **R** on foot to quick-turn / lock directly onto visible enemies up to `160` units away (`±65°` forward cone prioritizing your crosshair, with a `360°` fallback within `80` units if a boss dashes past you) while centering the reticle. Holding **R** maintains a tight 1:1 lock for circle-strafing and flicking the right stick switches targets. Press **Y** on foot to center **only the reticle** (without moving the camera) or click **Left Stick (`L3`)** to center both camera and reticle behind Pit. In Air Battles, **R**, **Y**, and **L3** all recenter the reticle.
 
 <br>
 
 ### Baked-In Shader Warmup
 
-UprisingNX embeds **493 portable *Kid Icarus: Uprising* PICA200 pipeline keys** directly inside `uprising_nx.nro`. On startup, these keys warm up native Switch Vulkan pipelines in the background and persist them to your SD card, cutting down first-playthrough shader compilation hitches.
+UprisingNX embeds **493 portable *Kid Icarus: Uprising* PICA200 pipeline keys** directly inside the executable. On startup, these keys warm up native Vulkan pipelines in the background and cache them to disk, cutting down first-playthrough shader compilation hitches.
 
 <br>
 
-### In-App Auto-Updater
+### 3DS Save Import & Export & Switch OTA Auto-Updater
 
-When Wi-Fi is connected, UprisingNX performs a quiet check against GitHub Releases on the Title Screen (silently skipping when offline) and displays a yellow **`Update Available!`** notice above the version watermark whenever a newer release is out.
-
-Open **Settings → Save & System → Software update** to check on demand, download the verified `uprising_nx.nro` in the background, and atomically swap & relaunch into the new version.
-
-<br>
-
-### 3DS Save Import & Export
-
-Decrypted US saves (`00.SAV`, `01.SAV`, etc.) from Checkpoint, JKSM, Citra, and Azahar are directly compatible:
-
-- **Drop-in auto-import:** Copy your `.SAV` files (or a Checkpoint backup folder) into `sdmc:/switch/uprisingnx/save/import/` before launching. UprisingNX automatically backs up your current Switch save, imports your 3DS save with the required `.format` header, and archives the consumed files.
-- **In-menu import & export:** Open **Settings → Save & System** anytime to import saves or export a clean backup to `sdmc:/switch/uprisingnx/save/export/`.
-
-![Settings — Save & System Tab](docs/screenshots/settings_save_system.png)
+- **3DS Save Compatibility:** Decrypted US saves (`00.SAV`, `01.SAV`, etc.) from Checkpoint, JKSM, Citra, and Azahar work directly. On Switch, drop `.SAV` files into `sdmc:/switch/uprisingnx/save/import/` or manage them in **Settings → Save & System**. On PC/macOS, saves live in `<data_dir>/user/savedata/0004000000030100/`.
+- **Switch In-App Auto-Updater:** When Wi-Fi is connected, UprisingNX checks GitHub Releases / `versions.json` quietly on the Title Screen and lets you update or switch versions directly from **Settings → Save & System → Software update / Version history**.
 
 ---
 
 ## Controls & Settings
 
-### Controls & Hotkeys
+### PC & macOS Controls
+
+| Input | Keyboard + Mouse | Gamepad (Xbox / PlayStation / Nintendo) |
+| --- | --- | --- |
+| **Move / Dash** | `W` `A` `S` `D` | Left Stick |
+| **Aim / Camera** | Mouse (raw aim) | Right Stick + HID Gyro |
+| **Fire / Melee** | `Left Click` (or `Space`) | `LB`/`L1`/`L`, `LT`/`L2`/`ZL`, or `RT`/`R2`/`ZR` |
+| **Z-Target / Quick Turn** | `R` | `RB` / `R1` / `R` |
+| **Center Reticle / Camera** | `T` (reticle) | `Y`/`Triangle`/`X` (reticle) · `L3` (camera + reticle) |
+| **Activate Power** | `Right Click` / `Middle Click` / `F` | D-Pad Down |
+| **Cycle Powers** | `Mouse Wheel` / `Q` `E` | D-Pad Left / Right |
+| **Pause / Settings Menu** | `Esc` (app pause/settings) · `P` (3DS Start) | `Start`/`Options`/`+` (3DS Start) · `Back`/`Share`/`-` (Select) |
+| **Fullscreen / Toggle Aim** | `F11` (fullscreen) · `F1` (release/capture mouse) | — |
+
+All keyboard bindings, controller presets, stick deadzones, button glyph styles (`Auto` / `Xbox` / `PlayStation` / `Nintendo`), and gyro tuning can be configured live in **Settings → Controls / Controller**.
+
+---
+
+### Nintendo Switch Controls & Presets
 
 ![UprisingNX Default Switch Controls](docs/controls.svg)
 
@@ -121,7 +153,8 @@ Decrypted US saves (`00.SAV`, `01.SAV`, etc.) from Checkpoint, JKSM, Citra, and 
 | **Hold `R3` + D-Pad Right** | Toggle Smooth Mode (up to 60 fps frame interpolation) |
 | **`Plus` + `Minus`** | Quit immediately |
 
-### Video Presets & Performance Targets (`settings.ini`)
+<details>
+<summary>Switch Handheld / Docked Video Presets (settings.ini)</summary>
 
 Handheld and Docked configurations are stored independently in `sdmc:/switch/uprisingnx/settings.ini` and switch automatically when docking or undocking:
 
@@ -133,124 +166,106 @@ Handheld and Docked configurations are stored independently in `sdmc:/switch/upr
 | **`quality`** | Docked | `4x` (960p) everywhere | Off | **Locked 30 fps** (native KIU cadence) |
 | **`custom`** | Handheld / Docked | User-defined `1x`–`4x` (`battle_scale`, `menu_scale`) | User-defined | Depends on chosen scale & dynamic resolution |
 
-*Kid Icarus: Uprising* runs its core simulation at 30 fps on 3DS. **Smooth Mode** doubles visual output toward **60 fps** via frame interpolation and automatically backs off temporarily during GPU-heavy bursts so frame pacing stays steady, then re-engages once headroom returns.
-
-![Settings — Video Tab](docs/screenshots/settings_video.png)
+</details>
 
 ---
 
-## Known Limitations (v0.1)
+## Known Limitations (v0.2)
 
-- **Title Override required:** Album (Applet) mode restricts memory and JIT permissions and is not supported.
 - **USA 1.0 ROM only:** Only the decrypted USA 1.0 release (`0004000000030100`) is currently supported. EU/JP releases and encrypted dumps are rejected with a setup notice.
-- **First-launch compilation wait:** Compiling the ROM on-console takes ~30–60 seconds on the very first boot.
+- **Vulkan 1.3 required on PC:** Windows and Linux require a Vulkan 1.3-capable GPU and driver (macOS bundles MoltenVK 1.4+ over Metal on Apple Silicon).
+- **Switch requires Title Override:** Album (Applet) mode restricts memory and JIT permissions and is not supported.
 - **Offline / solo only:** Local single-player only—online multiplayer and StreetPass are not implemented.
-- **Occasional first-time shader hitches:** New visual effects encountered before background warmup finishes may briefly hitch once while their Vulkan pipeline compiles and caches to the SD card.
+- **Occasional first-time shader hitches:** New visual effects encountered before background warmup finishes may briefly hitch once while their Vulkan pipeline compiles and caches to disk.
 
 ---
 
 ## Architecture & Design Decisions
 
-UprisingNX is split into four cooperating layers: an **on-console AOT compiler**, a **Horizon 3DS kernel & runtime**, a **PICA200 → Vulkan GPU pipeline**, and a **Switch-native frontend**.
+UprisingNX is split into four cooperating layers: a **self-bootstrapping AOT compiler (`x86-64` & `AArch64`)**, a **3DS kernel & runtime**, a **PICA200 → Vulkan 1.3 GPU pipeline**, and **platform frontends** (Desktop + Switch).
 
 ```mermaid
 flowchart LR
     classDef aot fill:#b45309,stroke:#f59e0b,stroke-width:2px,color:#ffffff
     classDef core fill:#1d4ed8,stroke:#60a5fa,stroke-width:2px,color:#ffffff
     classDef gpu fill:#6d28d9,stroke:#a78bfa,stroke-width:2px,color:#ffffff
-    classDef nx fill:#0f766e,stroke:#2dd4bf,stroke-width:2px,color:#ffffff
+    classDef fe fill:#0f766e,stroke:#2dd4bf,stroke-width:2px,color:#ffffff
 
-    ROM["Decrypted US ROM\n(.cia / .3ds / .cci)"]:::aot --> AOT["zakuro-aot\nMulti-core ARMv6K -> AArch64\nCompiler (runs once)"]:::aot
-    AOT --> Cache["SD Card Cache\n(~87 MiB AArch64)"]:::aot
-    Cache -->|"Streamed on boot"| CodeMem["Horizon CodeMemory\n(1 slot, +/-128 MiB)"]:::core
+    ROM["Decrypted US ROM\n(.cia / .3ds / .cci)"]:::aot --> AOT["zakuro-aot\nARMv6K -> x86-64 / AArch64\nCompiler (runs once)"]:::aot
+    AOT --> Cache["Local AOT Cache\n(per-arch native code)"]:::aot
+    Cache -->|"mmap / MAP_JIT / CodeMemory"| Core["zakuro-core\n3DS Kernel & HLE Services\n+ kiu_overrides.rs"]:::core
 
-    CodeMem <--> Core["zakuro-core\n3DS Kernel & HLE Services\n+ kiu_overrides.rs"]:::core
-    Core --> GPU["zakuro-gpu\nPICA200 -> Vulkan\n+ AArch64 Vertex Shader JIT"]:::gpu
-    GPU --> Mesa["mesa-switch (NVK)\nVK_NN_vi_surface"]:::gpu
+    Core --> GPU["zakuro-gpu\nPICA200 -> Vulkan 1.3\n+ Cranelift Vertex Shader JIT"]:::gpu
+    GPU --> Vk["Desktop Vulkan / MoltenVK\nor mesa-switch (NVK)"]:::gpu
 
-    Core --> Audio["nx/c/source/audio.c\nDedicated Thread + WSOLA\n-> audren"]:::nx
-    Frontend["nx/rust Frontend\n16:9 UI, Aiming, Settings,\nSaves, Auto-Updater"]:::nx <--> Core
-    Frontend --> Mesa
+    Frontend["Desktop (winit/egui/gilrs/hidapi)\nor Switch (libnx + WSOLA audren)"]:::fe <--> Core
+    Frontend --> Vk
 ```
 
-> **Layer Legend:** **Amber** = ROM & On-Switch AOT Compiler · **Blue** = Horizon CodeMemory & 3DS Core · **Purple** = PICA200 → Vulkan GPU Stack · **Teal** = Switch Frontend & Audio
+> **Layer Legend:** **Amber** = ROM & Self-Bootstrapping AOT Compiler · **Blue** = 3DS Core & Overrides · **Purple** = PICA200 → Vulkan GPU Stack · **Teal** = Desktop & Switch Frontends
 
-### 1. Why On-Switch Self-Bootstrapping AOT?
-Traditional static recompilation (compiling 3DS code to C/AArch64 on a PC and linking it into the binary) either forces users to run a desktop toolchain or embeds copyrighted game code in the release. Pure interpreters are far too slow on the Tegra X1's Cortex-A57 cores, and a full dynamic CPU JIT competes heavily with Horizon's strict executable-memory limits.
-
-UprisingNX takes a middle path—**self-bootstrapping AOT on the Switch itself** (`zakuro/crates/zakuro-aot/`):
-- **Zero game code in `uprising_nx.nro`:** The compiler reads the user's ROM directly on the console, translates ARMv6K, Thumb, and VFPv2 instructions to position-independent AArch64 across CPU cores, and writes a reusable binary cache to the SD card.
-- **Single-`CodeMemory` budget (`~87 MiB`):** Horizon OS caps a process at **10 `CodeMemory` regions**, and AArch64 direct branches (`B`/`BL`) have a `±128 MiB` reach. By using **1.0× single-owner instruction deduplication** (each guest instruction is emitted once rather than duplicated across overlapping CFG paths), all `12.14 MB` of *Kid Icarus: Uprising* compiles into `~87 MiB` of native AArch64. That fits inside **one** `CodeMemory` slot with direct relative branches, leaving the remaining 9 slots free for the GPU vertex shader JIT.
-- **Literal-pool folding & NEON intrinsics:** Constant pools embedded in `.text` are folded directly into AArch64 immediates, and hot MobiClip video-decode routines are lowered to hardware AArch64 ASIMD (NEON) intrinsics.
-
-### 2. Surgical Gameplay Hooks (`kiu_overrides.rs`)
-*Kid Icarus: Uprising* was designed around a touchscreen stylus and two stacked 4:3/5:3 displays. Simple input emulation leaves camera movement sluggish because KIU routes touch deltas through an internal spring-damper and deadzone.
-
-Instead of patching the ROM on disk, `zakuro-aot` binds targeted Rust overrides (`zakuro/crates/zakuro-aot/src/kiu_overrides.rs`) directly at compile/link time to:
-- Bypass the stylus damper during Z-targeting and write camera angles directly for responsive 1:1 lock-on and circle-strafing.
-- Drive unified 16:9 single-screen layouts and HUD positioning without breaking underlying menu state machines.
-- Coordinate 30 → 60 fps interpolation cleanly with the game's frame pacing.
-
-### 3. PICA200 → Vulkan & Portable Shader Warmup
-`zakuro-gpu` translates 3DS PICA200 fixed-function TEV combiners and rasterization state to Vulkan via statically linked `mesa-switch` (Nouveau/NVK on Tegra X1) presenting to `VK_NN_vi_surface`, while PICA200 programmable vertex shaders run on a multi-threaded AArch64 JIT (`zakuro-gpu/src/shader/jit.rs`).
-
-Distributing pre-compiled binary `VkPipelineCache` blobs is brittle across Mesa updates and large. Instead, UprisingNX embeds **493 compact, driver-independent PICA200 pipeline keys** (~67 KB) directly inside the `.nro`. On boot, the background compiler turns those keys into native Tegra pipelines automatically and persists the resulting `VkPipelineCache` to the SD card—giving fast warmup with zero driver coupling.
-
-### 4. Dedicated Audio Thread with WSOLA Time-Stretching
-The 3DS generates audio in emulated time (one 160-sample frame at 32,728 Hz every ~4.9 emulated ms). If a heavy battle frame briefly dips below full speed, a naive audio queue runs dry and crackles.
-
-`nx/c/source/audio.c` decouples playback onto its own thread feeding Horizon's `audren` service through a **WSOLA (Waveform Similarity Overlap-Add)** time-stretcher. The stretcher smoothly adjusts playback tempo to match ring-buffer fill, preventing clicks and pitch drops during brief slowdowns without ever blocking the game thread.
-
-### 5. Hardware-in-the-Loop Development with Kickstand
-Bringing up a 3DS AOT compiler, Vulkan renderer, and custom 16:9 UI directly on retail Switch hardware requires fast iteration—not endless SD card swapping. UprisingNX was developed, profiled, and verified end-to-end on a real Nintendo Switch using **[Kickstand](https://github.com/Angle-Brackets/kickstand)**, an MCP server and Rust Horizon sysmodule built for live Switch homebrew development:
-
-- **One-step hot reload:** Dev builds optionally link `libkickstand` (automatically excluded from public releases via `KICKSTAND=0`) to upload, cleanly relaunch, and inspect `uprising_nx.nro` over the network or USB without leaving the desk.
-- **Live visual & control verification:** Every widescreen UI redesign, shader optimization, and dual-stick/gyro aiming tweak was tested on real Tegra X1 hardware using Kickstand's live screenshot capture, scripted button/stick/gyro input injection, and audio recording.
-- **On-console profiling & crash symbolization:** Stack-sampled CPU profiles (`nx/c/source/prof.c`), live memory inspection, and automatic Atmosphere crash report symbolization made it possible to hunt down hot loops, GPU sync stalls, and AOT edge cases directly on hardware.
-
-### 6. Repository Layout
+### Repository Layout
 
 | Path | Role |
 | --- | --- |
-| `nx/rust/src/` | Switch frontend staticlib: main loop (`lib.rs`), AOT bootstrapper (`bootstrap.rs`), aiming (`aim.rs`), tabbed overlay UI (`menu.rs`), 3DS save manager (`saves.rs`), settings (`settings.rs`), GitHub auto-updater (`updater.rs`) |
-| `nx/c/` | `libnx` C shell, `Makefile` / NRO packaging, `CodeMemory` JIT/AOT allocator (`jit.c`), WSOLA `audren` audio thread (`audio.c`), libcurl/SSL + `nifm` updater helpers (`updater.c`) |
-| `zakuro/crates/zakuro-aot/` | On-Switch ARMv6K/Thumb/VFPv2 → AArch64 AOT compiler, binary cache streamer, and KIU gameplay overrides (`kiu_overrides.rs`) |
-| `zakuro/crates/zakuro-core/` | Horizon-ported 3DS kernel, HLE services, memory bus, and RomFS/mod loader |
-| `zakuro/crates/zakuro-gpu/` | PICA200 → Vulkan renderer (`mesa-switch`), AArch64 vertex shader JIT, and baked KIU pipeline warmup keys |
+| `platforms/pc/` | Desktop entry point (`uprising-recompiled`), Windows icon resource (`build.rs`), macOS `Info.plist` & Hardened Runtime entitlements |
+| `platforms/nx/rust/` | Switch frontend staticlib: main loop, AOT bootstrapper, aiming, tabbed overlay UI, 3DS save manager, settings, GitHub auto-updater |
+| `platforms/nx/c/` | `libnx` C shell, `Makefile` / NRO packaging, `CodeMemory` allocator (`jit.c`), WSOLA `audren` audio thread (`audio.c`), libcurl/SSL updater helpers |
+| `crates/kiu-common/` | Shared *Kid Icarus: Uprising* layouts, UI state detection, aiming math, and baked PICA200 pipeline warmup keys |
+| `zakuro/crates/zakuro/` | Desktop application shell (`winit` + `egui` parchment Settings/Pause/Setup UI, `gilrs` gamepad, `hidapi` gyro, `cpal` audio) |
+| `zakuro/crates/zakuro-aot/` | Self-bootstrapping ARMv6K/Thumb/VFPv2 → `x86-64` & `AArch64` AOT compiler, cache streamer, and KIU gameplay overrides (`kiu_overrides.rs`) |
+| `zakuro/crates/zakuro-core/` | 3DS kernel, HLE services, memory bus, and RomFS/mod loader |
+| `zakuro/crates/zakuro-gpu/` | PICA200 → Vulkan 1.3 renderer (desktop Vulkan, MoltenVK, `mesa-switch`) and Cranelift vertex shader JIT |
 | `zakuro/crates/zakuro-fs/` | `.cia` / `.3ds` / `.cci` / `.cxi` ROM parser and encryption validator |
-| `scripts/` | Switch Rust build wrapper (`cargo-nx.sh`), Horizon `std` setup (`horizon-std-setup.sh`), and verified release builder (`release.sh`) |
-| `patches/` | Patches for Horizon `libc`, `target-lexicon`, and `mesa-switch` cross-compilation |
+| `scripts/pc/` | Desktop build & packaging scripts (`build-pc.sh`, `build-macos.sh`) |
+| `scripts/nx/` | Switch Rust build wrapper (`cargo-nx.sh`) and Horizon `std` setup (`horizon-std-setup.sh`) |
+| `scripts/release/` | Verified release & snapshot publishers (`release.sh`, `snapshot.sh`) |
 
 ---
 
 ## Building & Releasing
 
-Requires **devkitPro (`devkitA64` + `libnx` + Switch `portlibs`)**, nightly Rust with Horizon `std` sources set up via `scripts/horizon-std-setup.sh`, and a built `mesa-switch` `libvulkan.a` in `build/mesa/`.
+### PC (Linux & Windows)
 
-1. **Build the Rust staticlib (runtime, AOT compiler, and Switch frontend):**
-   ```bash
-   cd nx/rust && RUST_MIN_STACK=16777216 ../../scripts/cargo-nx.sh build --release
-   ```
-   *(Pass `UNX_RELEASE_TAG=vX.Y.Z` for tagged release builds so the version watermark and auto-updater match the release tag.)*
+Requires **Rust 1.95+**. On Linux, also install `pkg-config`, `libasound2-dev`, `libudev-dev`, and `libclang-dev`.
 
-2. **Link and package `uprising_nx.nro`:**
-   ```bash
-   make -C nx/c KICKSTAND=0
-   ```
+```bash
+# Linux
+./scripts/pc/build-pc.sh
 
-3. **Cutting a release:**
-   Update `VERSION` and `nx/rust/Cargo.toml` together, commit and push to `main`, then run:
-   ```bash
-   ./scripts/release.sh
-   ```
-   Both `scripts/release.sh` and `.github/workflows/tag-build.yml` enforce that `VERSION` is bumped past the previous release and matches `nx/rust/Cargo.toml` before tagging or publishing.
+# Windows (PowerShell)
+cargo build --release -p uprising-recompiled
+```
+
+### macOS (Apple Silicon)
+
+Requires **Rust 1.95+** and **MoltenVK >= 1.3.0** (`brew install molten-vk`).
+
+```bash
+./scripts/pc/build-macos.sh --arch arm64
+```
+
+Produces `build/pc/Kid Icarus Uprising Recompiled.app` and `build/pc/uprising-recompiled-macos-arm64.dmg`. Set `APPLE_SIGN_IDENTITY` (and `APPLE_NOTARY_KEY_PATH` / `APPLE_NOTARY_KEY_ID` / `APPLE_NOTARY_ISSUER`) to Developer-ID-sign and notarize automatically.
+
+### Nintendo Switch
+
+Requires **devkitPro (`devkitA64` + `libnx` + Switch `portlibs`)**, nightly Rust with Horizon `std` sources set up via `scripts/nx/horizon-std-setup.sh`, and a built `mesa-switch` `libvulkan.a` in `build/mesa/`.
+
+```bash
+cd platforms/nx/rust && RUST_MIN_STACK=16777216 ../../../scripts/nx/cargo-nx.sh build --release
+make -C platforms/nx/c clean && make -C platforms/nx/c KICKSTAND=0
+```
+
+### Cutting a Release
+
+Update `VERSION` and `platforms/nx/rust/Cargo.toml` together, commit and push to `main`, then run `./scripts/release/release.sh` (or push tag `vX.Y.Z`, which triggers `.github/workflows/tag-build.yml` to build and attach Windows, macOS, and Linux artifacts automatically).
 
 ---
 
 ## Credits & License
 
 - **License:** UprisingNX is released under the [MIT License](LICENSE). Built on **Zakuro** (`zakuro/LICENSE`, MIT License, Copyright © 2026 fearkov).
-- **Hardware Tooling:** Built, profiled, and verified on real Switch hardware with **[Kickstand](https://github.com/Angle-Brackets/kickstand)**.
+- **Hardware Tooling:** Switch bring-up profiled and verified on real hardware with **[Kickstand](https://github.com/Angle-Brackets/kickstand)**.
 - **3D Switch Tutorial Assets** ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), modified with articulated controls for UprisingNX):
   - *"Nintendo Switch"* console mesh by **gabrieljuan0322** ([Sketchfab](https://sketchfab.com/3d-models/nintendo-switch-19f3d13edffd4e85acfbbe8adefb72fb))
   - *"Joy-con Switch"* controllers by **Wevensson** ([Sketchfab](https://sketchfab.com/3d-models/joy-con-switch-f8cf0fb92ac544d38079e8d294a5330a))
