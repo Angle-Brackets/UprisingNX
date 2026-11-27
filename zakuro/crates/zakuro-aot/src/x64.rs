@@ -811,14 +811,11 @@ mod tests {
     use super::*;
 
     fn find_objdump() -> Option<&'static str> {
-        for candidate in ["/usr/bin/objdump", "objdump"] {
-            if std::process::Command::new(candidate)
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                return Some(candidate);
+        for candidate in ["/usr/bin/objdump", "objdump", "gobjdump"] {
+            if let Ok(out) = std::process::Command::new(candidate).arg("--version").output() {
+                if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("GNU objdump") {
+                    return Some(candidate);
+                }
             }
         }
         None
