@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Kid Icarus: Uprising Recompiled</string>
+	<key>CFBundleDisplayName</key>
+	<string>Kid Icarus: Uprising Recompiled</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.anglebrackets.uprising-recompiled</string>
+	<key>CFBundleExecutable</key>
+	<string>uprising-recompiled</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Kid Icarus: Uprising Recompiled uses the camera when scanning AR Idol Cards.</string>
+</dict>
+</plist>
