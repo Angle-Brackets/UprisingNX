@@ -189,7 +189,7 @@ impl VulkanPresenter {
     }
 
     fn create(source: SurfaceSource, size: (u32, u32)) -> Result<VulkanPresenter, PresentError> {
-        let entry = crate::raster::hardware::vulkan_entry().map_err(fail)?;
+        let entry = crate::device::load_vulkan_entry().map_err(fail)?;
 
         // 1.3, which the renderer needs to share the device
         let application = vk::ApplicationInfo::default()
@@ -198,17 +198,19 @@ impl VulkanPresenter {
             .engine_name(c"Zakuro")
             .api_version(vk::API_VERSION_1_3);
 
-        let extensions = match source {
+        let mut extensions = match source {
             SurfaceSource::Window(display, _) => ash_window::enumerate_required_extensions(display)
                 .map_err(vk_fail("querying surface extensions"))?
                 .to_vec(),
             #[cfg(target_os = "horizon")]
             SurfaceSource::Vi(_) => vec![ash::khr::surface::NAME.as_ptr(), ash::nn::vi_surface::NAME.as_ptr()],
         };
+        let instance_flags = crate::device::enable_portability_enumeration(&entry, &mut extensions);
 
         let instance_info = vk::InstanceCreateInfo::default()
             .application_info(&application)
-            .enabled_extension_names(&extensions);
+            .enabled_extension_names(&extensions)
+            .flags(instance_flags);
         let instance = unsafe { entry.create_instance(&instance_info, None) }
             .map_err(vk_fail("creating the instance"))?;
 
@@ -257,9 +259,11 @@ impl VulkanPresenter {
                 let queue_info = [vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(queue_family)
                     .queue_priorities(&priorities)];
+                let mut device_extensions = swapchain_extension.to_vec();
+                crate::device::enable_portability_subset(&instance, physical_device, &mut device_extensions);
                 let device_info = vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queue_info)
-                    .enabled_extension_names(&swapchain_extension);
+                    .enabled_extension_names(&device_extensions);
                 unsafe { instance.create_device(physical_device, &device_info, None) }
                     .map_err(vk_fail("creating the device"))?
             }

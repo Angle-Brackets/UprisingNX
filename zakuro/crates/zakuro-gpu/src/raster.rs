@@ -1355,15 +1355,20 @@ pub(crate) struct DrawnTexture {
     pub(crate) format: ColorFormat,
 }
 
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+fn feedback_loop_enabled(env: Option<&str>, is_test: bool, is_macos: bool) -> bool {
+    env.map(|v| v.trim() != "0")
+        .unwrap_or(!is_test && !is_macos)
+}
+
 /// whether a draw reading its own target samples it directly; on by default
-/// (ZAKURO_FEEDBACK_LOOP=0 falls back to a snapshot copy).
+/// on non-macOS targets (off by default on macOS for Apple Silicon TBDR
+/// safety; override with `ZAKURO_FEEDBACK_LOOP=1` or `ZAKURO_FEEDBACK_LOOP=0`).
 pub(crate) fn feedback_loop() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("ZAKURO_FEEDBACK_LOOP")
-            .ok()
-            .map(|v| v.trim() != "0")
-            .unwrap_or(!cfg!(test))
+        let env = std::env::var("ZAKURO_FEEDBACK_LOOP").ok();
+        feedback_loop_enabled(env.as_deref(), cfg!(test), cfg!(target_os = "macos"))
     })
 }
 
@@ -13101,5 +13106,24 @@ mod tests {
         note_title_draw(&top_tex_regs(128, 128, TextureFormat::Etc1A4), &mut chap_uncleared);
         note_title_draw(&top_tex_regs(256, 64, TextureFormat::Etc1), &mut chap_uncleared);
         assert!(chap_uncleared.chapter_active && chap_uncleared.chapter_top_seen, "uncleared Chapter Select detected");
+    }
+
+    #[test]
+    fn feedback_loop_defaults_off_on_macos_and_respects_env_override() {
+        // Non-macOS runtime defaults to enabled; `0` disables it.
+        assert!(feedback_loop_enabled(None, false, false));
+        assert!(!feedback_loop_enabled(Some("0"), false, false));
+        assert!(feedback_loop_enabled(Some("1"), false, false));
+
+        // macOS runtime defaults to disabled for Apple Silicon TBDR safety;
+        // `ZAKURO_FEEDBACK_LOOP=1` re-enables it.
+        assert!(!feedback_loop_enabled(None, false, true));
+        assert!(feedback_loop_enabled(Some("1"), false, true));
+        assert!(!feedback_loop_enabled(Some("0"), false, true));
+
+        // Test builds default to disabled unless overridden.
+        assert!(!feedback_loop_enabled(None, true, false));
+        assert!(!feedback_loop_enabled(None, true, true));
+        assert!(feedback_loop_enabled(Some("1"), true, true));
     }
 }

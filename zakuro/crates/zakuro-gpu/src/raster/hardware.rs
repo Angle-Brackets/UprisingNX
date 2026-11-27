@@ -7774,6 +7774,7 @@ pub(crate) fn render_device(
     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
     let mut extensions = vec![ash::khr::push_descriptor::NAME.as_ptr()];
     extensions.extend_from_slice(extra);
+    crate::device::enable_portability_subset(instance, physical, &mut extensions);
     // a viewport depth range past 0..1, for the depth maps that need one:
     // without it those draws work their depth out in the fragment shader,
     // which turns the early depth test off for them. ZAKURO_DEPTH_IN_SHADER=1
@@ -7923,27 +7924,18 @@ fn links_libraries(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bo
     links
 }
 
-/// the Vulkan entry points: the system's loader, or on Horizon the driver
-/// linked into the program.
-pub(crate) fn vulkan_entry() -> Result<ash::Entry, String> {
-    #[cfg(target_os = "horizon")]
-    {
-        Ok(ash::Entry::linked())
-    }
-    #[cfg(not(target_os = "horizon"))]
-    {
-        // SAFETY: loads the system's Vulkan library, which has no other
-        // requirements
-        unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan loader, {e}"))
-    }
-}
-
 /// a device of the renderer's own, on the GPU pick chooses.
 pub(crate) fn own_device() -> Result<SharedDevice, String> {
-    let entry = vulkan_entry()?;
+    let entry = crate::device::load_vulkan_entry()?;
     let app = vk::ApplicationInfo::default().application_name(c"zakuro").api_version(vk::API_VERSION_1_3);
-    // SAFETY: a plain instance with no layers or extensions
-    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
+    let mut extensions = Vec::new();
+    let flags = crate::device::enable_portability_enumeration(&entry, &mut extensions);
+    let instance_info = vk::InstanceCreateInfo::default()
+        .application_info(&app)
+        .enabled_extension_names(&extensions)
+        .flags(flags);
+    // SAFETY: a plain instance with only loader-supported portability enumeration if present
+    let instance = unsafe { entry.create_instance(&instance_info, None) }
         .map_err(vk_error("create an instance"))?;
     let made = pick(&instance).and_then(|(physical, family)| render_device(&entry, &instance, physical, family, &[]));
     if made.is_err() {
