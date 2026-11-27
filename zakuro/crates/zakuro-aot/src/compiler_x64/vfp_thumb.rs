@@ -99,32 +99,7 @@ impl FnEmitter<'_> {
                     self.load_gpr(RAX, rt, a + 8);
                     self.buf.ldr_r64_mem(RCX, RBX, offsets::CTX_FPSCR as i32);
                     self.buf.str_r32_mem(RAX, RCX, 0);
-
-                    emit_stmxcsr_scratch(self);
-                    self.buf.ldr_r32_mem(RCX, RBX, offsets::SCRATCH_FP as i32);
-                    // Clear FTZ (15), RC (14:13), DAZ (6)
-                    self.buf.alu_r32_imm32(AluOp::And, RCX, !0xE040u32 as i32);
-                    // Set FTZ | DAZ (0x8040) when FPSCR.FZ (bit 24) is set
-                    self.buf.mov_r32_imm32(RDX, 0x8040);
-                    self.buf.mov_r32_imm32(RSI, 0);
-                    self.buf.test_r32_imm32(RAX, 1 << 24);
-                    self.buf.cmovcc_r32_r32(cc::Z, RDX, RSI);
-                    self.buf.alu_r32_r32(AluOp::Or, RCX, RDX);
-                    // Map ARM RMode FPSCR[23:22] (00=RN, 01=RP, 10=RM, 11=RZ)
-                    // to x86 MXCSR RC[14:13]   (00=RN, 01=RM, 10=RP, 11=RZ) by swapping the 2 bits.
-                    self.buf.mov_r32_r32(RDX, RAX);
-                    self.buf.shift_r32_imm(ShiftOp::Shr, RDX, 22);
-                    self.buf.alu_r32_imm32(AluOp::And, RDX, 3);
-                    self.buf.mov_r32_r32(RSI, RDX);
-                    self.buf.alu_r32_imm32(AluOp::And, RDX, 1);
-                    self.buf.shift_r32_imm(ShiftOp::Shl, RDX, 1);
-                    self.buf.shift_r32_imm(ShiftOp::Shr, RSI, 1);
-                    self.buf.alu_r32_r32(AluOp::Or, RDX, RSI);
-                    self.buf.shift_r32_imm(ShiftOp::Shl, RDX, 13);
-                    self.buf.alu_r32_r32(AluOp::Or, RCX, RDX);
-
-                    self.buf.str_r32_mem(RCX, RBX, offsets::SCRATCH_FP as i32);
-                    emit_ldmxcsr_scratch(self);
+                    super::emit_sync_mxcsr_from_eax(&mut self.buf);
                 } else if rt == 15 {
                     // VMRS APSR_nzcv, FPSCR (`FMSTAT`)
                     self.buf.ldr_r64_mem(RCX, RBX, offsets::CTX_FPSCR as i32);
@@ -569,24 +544,6 @@ fn sreg(vd: u32, extra: bool) -> u8 {
 #[inline(always)]
 fn dreg(vd: u32, extra: bool) -> u8 {
     ((((extra as u32) << 4) | vd) & 15) as u8
-}
-
-#[inline(always)]
-fn emit_stmxcsr_scratch(em: &mut FnEmitter<'_>) {
-    // stmxcsr dword ptr [rbx + SCRATCH_FP]
-    em.buf.emit_u8(0x0F);
-    em.buf.emit_u8(0xAE);
-    em.buf.emit_u8(0x9B);
-    em.buf.emit_u32((offsets::SCRATCH_FP as i32) as u32);
-}
-
-#[inline(always)]
-fn emit_ldmxcsr_scratch(em: &mut FnEmitter<'_>) {
-    // ldmxcsr dword ptr [rbx + SCRATCH_FP]
-    em.buf.emit_u8(0x0F);
-    em.buf.emit_u8(0xAE);
-    em.buf.emit_u8(0x93);
-    em.buf.emit_u32((offsets::SCRATCH_FP as i32) as u32);
 }
 
 #[inline(always)]

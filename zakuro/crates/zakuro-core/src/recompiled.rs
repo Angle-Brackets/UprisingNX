@@ -243,12 +243,13 @@ unsafe extern "C" fn interpret(ctx: *mut Context, address: u32, _opcode: u32) {
         let machine = machine(ctx);
         machine.library.fallbacks.set(machine.library.fallbacks.get() + 1);
         let ctx = &mut *ctx;
+        let was_thumb = ctx.thumb != 0;
         load(ctx, machine.cpu);
         machine.cpu.regs[15] = address;
         let exit = machine.cpu.step(machine.memory);
         store(machine.cpu, ctx);
-        let step = if ctx.thumb != 0 { 2 } else { 4 };
-        if exit.is_some() || ctx.r[15] != address.wrapping_add(step) {
+        let step = if was_thumb { 2 } else { 4 };
+        if exit.is_some() || (ctx.thumb != 0) != was_thumb || ctx.r[15] != address.wrapping_add(step) {
             machine.pending = exit;
             ctx.exit = EXIT_UNWIND;
         }

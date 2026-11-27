@@ -80,6 +80,7 @@ pub struct AotExecContext {
     pub fn_vfp_to_int: usize,        // 272
     pub overrides: [usize; 8],       // 280..344
     pub plugin_state: PluginState,   // 344..376
+    pub stale_ptr: *const u8,        // 376..384
 }
 
 pub mod offsets {
@@ -119,6 +120,7 @@ pub mod offsets {
     pub const FN_VFP_VECTOR: u16 = 264;
     pub const FN_VFP_TO_INT: u16 = 272;
     pub const OVERRIDES_BASE: u16 = 280;
+    pub const STALE_PTR: u16 = 376;
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -160,6 +162,7 @@ const _: () = {
     assert!(offset_of!(AotExecContext, fn_vfp_vector) == offsets::FN_VFP_VECTOR as usize);
     assert!(offset_of!(AotExecContext, fn_vfp_to_int) == offsets::FN_VFP_TO_INT as usize);
     assert!(offset_of!(AotExecContext, overrides) == offsets::OVERRIDES_BASE as usize);
+    assert!(offset_of!(AotExecContext, stale_ptr) == offsets::STALE_PTR as usize);
 };
 
 // ---------------------------------------------------------------------------
@@ -879,6 +882,7 @@ pub struct LoadedAot {
     entries: Vec<(u32, u32)>,
     origins: OriginData,
     stale: Vec<u8>,
+    any_stale: bool,
     icache: UnsafeCell<Box<[ICacheSlot]>>,
     overrides: [usize; 8],
     plugin_state: UnsafeCell<PluginState>,
@@ -906,6 +910,7 @@ impl LoadedAot {
             entries,
             origins,
             stale,
+            any_stale: false,
             icache: UnsafeCell::new(icache),
             overrides: [0usize; 8],
             plugin_state: UnsafeCell::new(PluginState::default()),
@@ -1005,6 +1010,46 @@ impl LoadedAot {
         drop(meta);
 
         let code_len = hdr.code_bytes_len as usize;
+        if code_len == 0 || (hdr.enter_offset as usize) >= code_len {
+            return Err(format!(
+                "corrupt AOT image: invalid enter_offset {} for code length {}",
+                hdr.enter_offset, code_len
+            ));
+        }
+        if entries.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err("corrupt AOT image: entry table is not strictly sorted".to_owned());
+        }
+        if let Some(&(addr, off)) = entries.iter().find(|&&(_, off)| (off as usize) >= code_len) {
+            return Err(format!(
+                "corrupt AOT image: entry 0x{addr:08X} offset {off} out of bounds ({code_len})"
+            ));
+        }
+        if owners.iter().any(|&owner| owner != NO_ORIGIN && (owner as usize) >= n_funcs) {
+            return Err("corrupt AOT image: owner index out of bounds".to_owned());
+        }
+        if let (Some(first), Some(last)) = (pieces.first(), pieces.last()) {
+            if pieces.iter().any(|p| p.start > p.end)
+                || pieces.windows(2).any(|w| w[0].end > w[1].start)
+            {
+                return Err("corrupt AOT image: origin piece ranges invalid or unsorted".to_owned());
+            }
+            let span = last.end.checked_sub(first.start).ok_or_else(|| {
+                "corrupt AOT image: origin span underflow".to_owned()
+            })?;
+            if span > 128 * 1024 * 1024 {
+                return Err(format!("corrupt AOT image: origin span {span} exceeds 128 MiB"));
+            }
+        }
+        if functions
+            .iter()
+            .any(|f| f.first.checked_add(f.count).is_none_or(|end| end as usize > n_runs))
+        {
+            return Err("corrupt AOT image: function run range out of bounds".to_owned());
+        }
+        if runs.iter().any(|r| r.first > r.end || (r.end as usize) > n_pieces) {
+            return Err("corrupt AOT image: origin run piece index out of bounds".to_owned());
+        }
+
         let exec = alloc_exec(code_len, &mut |dst| {
             r.read_exact(dst).map_err(|e| e.to_string())
         })?;
@@ -1106,6 +1151,7 @@ impl LoadedAot {
             self.stale[i] = changed as u8;
             stale_count += changed as usize;
         }
+        self.any_stale = stale_count > 0;
         self.clear_icache();
         stale_count
     }
@@ -1113,7 +1159,7 @@ impl LoadedAot {
     /// Enters compiled AOT code starting at `target_body_rx`, mutating `ctx` in place.
     ///
     /// # Safety
-    /// Must only be called on `aarch64` with a valid `Context` and `target_body_rx`
+    /// Must only be called on `aarch64` or `x86_64` with a valid `Context` and `target_body_rx`
     /// returned by `self.lookup(...)`.
     pub unsafe fn enter(&self, ctx: &mut Context, target_body_rx: *const u8) {
         let enter_ptr = unsafe { self.exec.rx_ptr().add(self.enter_offset as usize) };
@@ -1162,6 +1208,7 @@ impl LoadedAot {
             fn_vfp_to_int: vfp_to_int_helper as *const () as usize,
             overrides: self.overrides,
             plugin_state,
+            stale_ptr: if self.any_stale { self.stale.as_ptr() } else { std::ptr::null() },
         };
 
         let enter_fn: OverrideFn = unsafe { std::mem::transmute(enter_ptr) };
@@ -1190,10 +1237,15 @@ mod tests {
                 runs: vec![Run { first: 0, end: 1 }],
                 owners: vec![0, 0],
             },
-            code: [0xD503_201Fu32, 0xD65F_03C0u32]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect(),
+            code: {
+                let mut code = vec![0x90u8; 0x190];
+                let head: Vec<u8> = [0xD503_201Fu32, 0xD65F_03C0u32]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect();
+                code[..head.len()].copy_from_slice(&head);
+                code
+            },
         };
         let mut buf = Vec::new();
         image.write_to(&mut buf).unwrap();

@@ -36,7 +36,9 @@ impl FnEmitter<'_> {
                 if let Some(val) = self.text.read8(lit) {
                     self.folded_spans.push((lit, lit + 1));
                     if rd == 15 {
-                        return self.emit_jump((val as u32) & !3, false);
+                        let v = val as u32;
+                        let thumb = (v & 1) != 0;
+                        return self.emit_jump(v & if thumb { !1 } else { !3 }, thumb);
                     }
                     self.buf.mov_r32_imm32(RAX, val as u32);
                     self.store_gpr(rd, RAX);

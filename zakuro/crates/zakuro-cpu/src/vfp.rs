@@ -184,12 +184,13 @@ pub fn data_processing(cpu: &mut Cpu, op: u32) -> Option<Exit> {
             }
             cpu.vfp.set_f64(d, result);
         } else {
+            let rmode = bits(cpu.vfp.fpscr, 22, 23);
             let (a, b, acc) = (
                 cpu.vfp.read_f32(n),
                 cpu.vfp.read_f32(m),
                 cpu.vfp.read_f32(d),
             );
-            let result = operation.apply(a, b, acc, |v| cpu.vfp.flush(v));
+            let result = operation.apply_f32(a, b, acc, rmode, |v| cpu.vfp.flush(v));
             if result.is_nan() && !(a.is_nan() || b.is_nan() || acc.is_nan()) {
                 trace_nan(cpu, op, operation, [a as f64, b as f64, acc as f64]);
             }
@@ -247,6 +248,27 @@ impl Arithmetic {
             Arithmetic::Add => a + b,
             Arithmetic::Subtract => a - b,
             Arithmetic::Divide => a / b,
+        }
+    }
+
+    fn apply_f32(self, a: f32, b: f32, acc: f32, rmode: u32, flush: impl Fn(f32) -> f32) -> f32 {
+        if rmode == 0 {
+            return self.apply(a, b, acc, flush);
+        }
+        match self {
+            Arithmetic::MultiplyAccumulate => add_f32_rmode(acc, flush(mul_f32_rmode(a, b, rmode)), rmode),
+            Arithmetic::MultiplySubtract => sub_f32_rmode(acc, flush(mul_f32_rmode(a, b, rmode)), rmode),
+            Arithmetic::NegateMultiplyAccumulate => {
+                sub_f32_rmode(-acc, flush(mul_f32_rmode(a, b, rmode)), rmode)
+            }
+            Arithmetic::NegateMultiplySubtract => {
+                add_f32_rmode(-acc, flush(mul_f32_rmode(a, b, rmode)), rmode)
+            }
+            Arithmetic::Multiply => mul_f32_rmode(a, b, rmode),
+            Arithmetic::NegateMultiply => -flush(mul_f32_rmode(a, b, rmode)),
+            Arithmetic::Add => add_f32_rmode(a, b, rmode),
+            Arithmetic::Subtract => sub_f32_rmode(a, b, rmode),
+            Arithmetic::Divide => div_f32_rmode(a, b, rmode),
         }
     }
 }
@@ -328,7 +350,7 @@ fn extension(cpu: &mut Cpu, op: u32, double: bool, rd: usize, rm: usize) -> Opti
             if double {
                 cpu.vfp.set_f64(rd, value);
             } else {
-                cpu.vfp.set_f32(rd, value as f32);
+                cpu.vfp.set_f32(rd, f64_to_f32_rmode(value, bits(cpu.vfp.fpscr, 22, 23)));
             }
         }
         // VCVT to integer.
@@ -393,7 +415,7 @@ fn monadic(cpu: &mut Cpu, double: bool, second: bool, top: bool, rd: usize, rm: 
             (true, false) => cpu.vfp.regs[rd] = raw ^ 0x8000_0000,
             (true, true) => {
                 let in_val = cpu.vfp.read_f32(rm);
-                let v = in_val.sqrt();
+                let v = sqrt_f32_rmode(in_val, bits(cpu.vfp.fpscr, 22, 23));
                 if v.is_nan() && !in_val.is_nan() {
                     log::trace!(
                         target: "zakuro_cpu::vfp::nan",
@@ -437,6 +459,114 @@ fn compare(cpu: &mut Cpu, double: bool, rd: usize, rm: Option<usize>) {
     cpu.vfp.fpscr = (cpu.vfp.fpscr & !FPSCR_FLAG_MASK) | (flags << 28);
 }
 
+fn adjust_f32_rmode(rn: f32, diff: f64, positive_exact: bool, rmode: u32) -> f32 {
+    match rmode {
+        0b01 => {
+            if diff > 0.0 {
+                rn.next_up()
+            } else {
+                rn
+            }
+        }
+        0b10 => {
+            if diff < 0.0 {
+                rn.next_down()
+            } else {
+                rn
+            }
+        }
+        0b11 => {
+            if positive_exact && diff < 0.0 {
+                rn.next_down()
+            } else if !positive_exact && diff > 0.0 {
+                rn.next_up()
+            } else {
+                rn
+            }
+        }
+        _ => rn,
+    }
+}
+
+fn add_f32_rmode(a: f32, b: f32, rmode: u32) -> f32 {
+    if rmode == 0 || a.is_nan() || b.is_nan() || a.is_infinite() || b.is_infinite() {
+        return a + b;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() && b.is_sign_negative() {
+            -0.0
+        } else if !a.is_sign_negative() && !b.is_sign_negative() {
+            0.0
+        } else if rmode == 0b10 {
+            -0.0
+        } else {
+            0.0
+        };
+    }
+    let (a64, b64) = (a as f64, b as f64);
+    let s = a64 + b64;
+    let bb = s - a64;
+    let err = (a64 - (s - bb)) + (b64 - bb);
+    if s == 0.0 && err == 0.0 {
+        return if rmode == 0b10 { -0.0 } else { 0.0 };
+    }
+    let rn = s as f32;
+    if rn.is_infinite() {
+        return f64_to_f32_rmode(s, rmode);
+    }
+    let diff = (s - rn as f64) + err;
+    let positive_exact = s > 0.0 || (s == 0.0 && err > 0.0);
+    adjust_f32_rmode(rn, diff, positive_exact, rmode)
+}
+
+fn sub_f32_rmode(a: f32, b: f32, rmode: u32) -> f32 {
+    if b.is_nan() {
+        a - b
+    } else {
+        add_f32_rmode(a, f32::from_bits(b.to_bits() ^ 0x8000_0000), rmode)
+    }
+}
+
+fn mul_f32_rmode(a: f32, b: f32, rmode: u32) -> f32 {
+    if rmode == 0 || a.is_nan() || b.is_nan() || a.is_infinite() || b.is_infinite() || a == 0.0 || b == 0.0 {
+        a * b
+    } else {
+        f64_to_f32_rmode((a as f64) * (b as f64), rmode)
+    }
+}
+
+fn div_f32_rmode(a: f32, b: f32, rmode: u32) -> f32 {
+    if rmode == 0
+        || a.is_nan()
+        || b.is_nan()
+        || a.is_infinite()
+        || b.is_infinite()
+        || a == 0.0
+        || b == 0.0
+    {
+        return a / b;
+    }
+    let (a64, b64) = (a as f64, b as f64);
+    let q64 = a64 / b64;
+    let rn = q64 as f32;
+    if rn.is_infinite() {
+        return f64_to_f32_rmode(q64, rmode);
+    }
+    let rem = a64 - (rn as f64) * b64;
+    let diff = if b64 > 0.0 { rem } else { -rem };
+    adjust_f32_rmode(rn, diff, q64 > 0.0, rmode)
+}
+
+fn sqrt_f32_rmode(a: f32, rmode: u32) -> f32 {
+    if rmode == 0 || a.is_nan() || a.is_infinite() || a <= 0.0 {
+        return a.sqrt();
+    }
+    let a64 = a as f64;
+    let rn = a64.sqrt() as f32;
+    let diff = a64 - (rn as f64) * (rn as f64);
+    adjust_f32_rmode(rn, diff, true, rmode)
+}
+
 fn f64_to_f32_rmode(d: f64, rmode: u32) -> f32 {
     let rn = d as f32;
     if rmode == 0 || d.is_nan() || d == 0.0 || d.is_infinite() {
@@ -456,32 +586,7 @@ fn f64_to_f32_rmode(d: f64, rmode: u32) -> f32 {
             f32::MAX
         };
     }
-    let exact = rn as f64;
-    match rmode {
-        0b01 => {
-            if d > exact {
-                rn.next_up()
-            } else {
-                rn
-            }
-        }
-        0b10 => {
-            if d < exact {
-                rn.next_down()
-            } else {
-                rn
-            }
-        }
-        _ => {
-            if d > 0.0 && exact > d {
-                rn.next_down()
-            } else if d < 0.0 && exact < d {
-                rn.next_up()
-            } else {
-                rn
-            }
-        }
-    }
+    adjust_f32_rmode(rn, d - rn as f64, d > 0.0, rmode)
 }
 
 fn round_to_mode(value: f64, mode: u32) -> f64 {

@@ -163,6 +163,7 @@ pub(crate) struct FnEmitter<'a> {
     pub epilogue_patches: Vec<usize>,
     pub depth_overflow_patches: Vec<usize>,
     pub budget_exits: Vec<BudgetExit>,
+    pub stale_check: Option<(usize, usize, u32, u32)>,
     pub interpreted_addrs: Vec<u32>,
     pub folded_spans: Vec<(u32, u32)>,
 }
@@ -267,8 +268,8 @@ pub fn compile_program(
             .copied()
             .filter(|&a| global_labels.contains(&key(a, f.mode)))
             .collect();
-        for &lbl in &labels {
-            known_targets.insert(key(lbl, f.mode));
+        if labels.contains(&entry) {
+            known_targets.insert(f_key);
         }
         dedup_funcs.push((
             entry,
@@ -280,10 +281,18 @@ pub fn compile_program(
     let done_funcs = AtomicUsize::new(0);
 
     const CHUNK: usize = 256;
-    let compile_slice = |slice: &[(u32, Function)]| -> Vec<CompiledFunc> {
+    let compile_slice = |(chunk_idx, slice): (usize, &[(u32, Function)])| -> Vec<CompiledFunc> {
+        let base_idx = chunk_idx * CHUNK;
         let mut out = Vec::with_capacity(slice.len());
-        for (entry, func) in slice {
-            out.push(compile_one_function(program, &known_targets, *entry, func, options));
+        for (i, (entry, func)) in slice.iter().enumerate() {
+            out.push(compile_one_function(
+                program,
+                &known_targets,
+                (base_idx + i) as u32,
+                *entry,
+                func,
+                options,
+            ));
         }
         let prev = done_funcs.fetch_add(slice.len(), Ordering::Relaxed) + slice.len();
         let pct = 10 + (prev * 82) / total_funcs;
@@ -297,8 +306,8 @@ pub fn compile_program(
         .thread_name(|i| format!("aot-{i}"))
         .build();
     let compiled_chunks: Vec<Vec<CompiledFunc>> = match pool {
-        Ok(pool) => pool.install(|| dedup_funcs.par_chunks(CHUNK).map(compile_slice).collect()),
-        Err(_) => dedup_funcs.chunks(CHUNK).map(compile_slice).collect(),
+        Ok(pool) => pool.install(|| dedup_funcs.par_chunks(CHUNK).enumerate().map(compile_slice).collect()),
+        Err(_) => dedup_funcs.chunks(CHUNK).enumerate().map(compile_slice).collect(),
     };
     let compiled_funcs: Vec<CompiledFunc> = compiled_chunks.into_iter().flatten().collect();
 
@@ -354,24 +363,6 @@ pub fn compile_program(
         functions_spans.push((cf.entry, cf.spans));
     }
 
-    // Emit call veneers for absorbed functions lacking a standalone prologue.
-    let mut call_veneers: BTreeMap<u32, usize> = BTreeMap::new();
-    for (_, relocs) in &func_relocs {
-        for rel in relocs {
-            if let RelocKind::DirectCall(target_key) = rel.kind {
-                if !prologue_bytes.contains_key(&target_key) && !call_veneers.contains_key(&target_key) {
-                    if let Some(&(target_body_byte, _)) = entries_map.get(&target_key) {
-                        let veneer_byte = final_buf.pos();
-                        final_buf.push_r64(RBP);
-                        final_buf.mov_r64_r64(RBP, RSP);
-                        final_buf.jmp_to(target_body_byte as usize);
-                        call_veneers.insert(target_key, veneer_byte);
-                    }
-                }
-            }
-        }
-    }
-
     for (base_byte, relocs) in func_relocs {
         for rel in relocs {
             let disp_pos = base_byte + rel.local_disp_pos as usize;
@@ -379,13 +370,11 @@ pub fn compile_program(
                 RelocKind::StubJmp(s) | RelocKind::StubCall(s) => stubs.byte_of(s),
                 RelocKind::DirectCall(t_key) => prologue_bytes
                     .get(&t_key)
-                    .or_else(|| call_veneers.get(&t_key))
                     .copied()
                     .unwrap_or(stubs.indirect_call),
                 RelocKind::DirectTailJump(t_key) => body_bytes
                     .get(&t_key)
                     .copied()
-                    .or_else(|| entries_map.get(&t_key).map(|&(b, _)| b as usize))
                     .unwrap_or(stubs.indirect_jump),
             };
             final_buf.patch_rel32(disp_pos, target_byte);
@@ -417,6 +406,57 @@ pub fn compile_program(
 // ---------------------------------------------------------------------------
 // Shared Runtime Stubs Emitter
 // ---------------------------------------------------------------------------
+
+#[inline(always)]
+pub(crate) fn emit_stmxcsr_scratch_buf(buf: &mut X64Buf) {
+    // stmxcsr dword ptr [rbx + SCRATCH_FP]
+    buf.emit_u8(0x0F);
+    buf.emit_u8(0xAE);
+    buf.emit_u8(0x9B);
+    buf.emit_u32((offsets::SCRATCH_FP as i32) as u32);
+}
+
+#[inline(always)]
+pub(crate) fn emit_ldmxcsr_scratch_buf(buf: &mut X64Buf) {
+    // ldmxcsr dword ptr [rbx + SCRATCH_FP]
+    buf.emit_u8(0x0F);
+    buf.emit_u8(0xAE);
+    buf.emit_u8(0x93);
+    buf.emit_u32((offsets::SCRATCH_FP as i32) as u32);
+}
+
+/// Syncs x86_64 MXCSR FTZ/DAZ/RC from guest `FPSCR` held in `eax` (clobbers `rcx`, `rdx`, `rsi`).
+pub(crate) fn emit_sync_mxcsr_from_eax(buf: &mut X64Buf) {
+    emit_stmxcsr_scratch_buf(buf);
+    buf.ldr_r32_mem(RCX, RBX, offsets::SCRATCH_FP as i32);
+    buf.alu_r32_imm32(AluOp::And, RCX, !0xE040u32 as i32);
+    buf.mov_r32_imm32(RDX, 0x8040);
+    buf.mov_r32_imm32(RSI, 0);
+    buf.test_r32_imm32(RAX, 1 << 24);
+    buf.cmovcc_r32_r32(cc::Z, RDX, RSI);
+    buf.alu_r32_r32(AluOp::Or, RCX, RDX);
+    // Map ARM RMode FPSCR[23:22] (00=RN, 01=+Inf, 10=-Inf, 11=RZ)
+    // to x86 MXCSR RC[14:13]   (00=RN, 01=-Inf, 10=+Inf, 11=RZ) by swapping the 2 bits.
+    buf.mov_r32_r32(RDX, RAX);
+    buf.shift_r32_imm(ShiftOp::Shr, RDX, 22);
+    buf.alu_r32_imm32(AluOp::And, RDX, 3);
+    buf.mov_r32_r32(RSI, RDX);
+    buf.alu_r32_imm32(AluOp::And, RDX, 1);
+    buf.shift_r32_imm(ShiftOp::Shl, RDX, 1);
+    buf.shift_r32_imm(ShiftOp::Shr, RSI, 1);
+    buf.alu_r32_r32(AluOp::Or, RDX, RSI);
+    buf.shift_r32_imm(ShiftOp::Shl, RDX, 13);
+    buf.alu_r32_r32(AluOp::Or, RCX, RDX);
+    buf.str_r32_mem(RCX, RBX, offsets::SCRATCH_FP as i32);
+    emit_ldmxcsr_scratch_buf(buf);
+}
+
+/// Syncs x86_64 MXCSR FTZ/DAZ/RC from `*ctx.fpscr` (clobbers `rax`, `rcx`, `rdx`, `rsi`).
+pub(crate) fn emit_sync_mxcsr_from_fpscr(buf: &mut X64Buf) {
+    buf.ldr_r64_mem(RAX, RBX, offsets::CTX_FPSCR as i32);
+    buf.ldr_r32_mem(RAX, RAX, 0);
+    emit_sync_mxcsr_from_eax(buf);
+}
 
 fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     // 1. sync_out: flushes r15d (NZCV) and r14d (budget) into AotExecContext.
@@ -482,9 +522,18 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     buf.alu_r64_imm32(AluOp::Sub, RSP, 8); // 6 pushes (48B) + 8B -> RSP % 16 == 0
     buf.mov_r64_r64(RBX, RDI);
     buf.mov_r64_r64(R11, RSI);
+    // Preserve host MXCSR across AOT execution and sync MXCSR from `*ctx.fpscr`.
+    emit_stmxcsr_scratch_buf(buf);
+    buf.ldr_r32_mem(RAX, RBX, offsets::SCRATCH_FP as i32);
+    buf.str_r32_mem(RAX, RSP, 0);
+    emit_sync_mxcsr_from_fpscr(buf);
     buf.call_to(sync_in);
     buf.call_to(invoke_r11);
     buf.call_to(sync_out);
+    // Always restore caller host MXCSR on return (even after guest `VMSR FPSCR`).
+    buf.ldr_r32_mem(RAX, RSP, 0);
+    buf.str_r32_mem(RAX, RBX, offsets::SCRATCH_FP as i32);
+    emit_ldmxcsr_scratch_buf(buf);
     buf.alu_r64_imm32(AluOp::Add, RSP, 8);
     buf.pop_r64(R15);
     buf.pop_r64(R14);
@@ -521,7 +570,7 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     let slow_read32 = emit_slow_read(buf, offsets::FN_SLOW_READ32);
 
     // 5. Slow write / interpret / VFP helper stubs (input: r10d = arg1, r11d = arg2; preserves R8, R9, RBX, R12..R15)
-    let emit_slow_write = |buf: &mut X64Buf, fn_off: u16| -> usize {
+    let emit_slow_write = |buf: &mut X64Buf, fn_off: u16, sync_mxcsr: bool| -> usize {
         let start = buf.pos();
         buf.push_r64(RBP);
         buf.mov_r64_r64(RBP, RSP);
@@ -534,6 +583,9 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
         buf.mov_r32_r32(RDX, R11);
         buf.call_mem64(RBX, fn_off as i32);
         buf.call_to(sync_in);
+        if sync_mxcsr {
+            emit_sync_mxcsr_from_fpscr(buf);
+        }
         buf.ldr_r64_mem(R8, RSP, 0);
         buf.ldr_r64_mem(R9, RSP, 8);
         buf.alu_r64_imm32(AluOp::Add, RSP, 16);
@@ -541,9 +593,9 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
         buf.ret();
         start
     };
-    let slow_write8 = emit_slow_write(buf, offsets::FN_SLOW_WRITE8);
-    let slow_write16 = emit_slow_write(buf, offsets::FN_SLOW_WRITE16);
-    let slow_write32 = emit_slow_write(buf, offsets::FN_SLOW_WRITE32);
+    let slow_write8 = emit_slow_write(buf, offsets::FN_SLOW_WRITE8, false);
+    let slow_write16 = emit_slow_write(buf, offsets::FN_SLOW_WRITE16, false);
+    let slow_write32 = emit_slow_write(buf, offsets::FN_SLOW_WRITE32, false);
 
     // 6. Indirect call & indirect jump (uses 8192-slot direct-mapped icache)
     let indirect_call = buf.pos();
@@ -591,7 +643,7 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     buf.ret();
 
     // 7. Interpret stub (input: r10d = addr, r11d = op)
-    let interpret = emit_slow_write(buf, offsets::FN_INTERPRET);
+    let interpret = emit_slow_write(buf, offsets::FN_INTERPRET, true);
 
     // 8. Media parallel helper stub (input: eax = packed, r10d = a, r11d = b -> eax = res; preserves R8, R9)
     let media_parallel = buf.pos();
@@ -617,8 +669,8 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     buf.ret();
 
     // 9. VFP vector & float-to-int helper stubs (input: r10d = packed)
-    let vfp_vector = emit_slow_write(buf, offsets::FN_VFP_VECTOR);
-    let vfp_to_int = emit_slow_write(buf, offsets::FN_VFP_TO_INT);
+    let vfp_vector = emit_slow_write(buf, offsets::FN_VFP_VECTOR, false);
+    let vfp_to_int = emit_slow_write(buf, offsets::FN_VFP_TO_INT, false);
 
     // 10. Pure-scratch register-shift-with-carry subroutines.
     //     Input: eax = val, ecx = raw Rs, r15d = NZCV<<28.
@@ -739,6 +791,7 @@ fn emit_override_wrapper(
 
     let s2 = buf.call_rel32();
     relocs.push(Reloc { local_disp_pos: s2 as u32, kind: RelocKind::StubCall(StubId::SyncIn) });
+    emit_sync_mxcsr_from_fpscr(buf);
 
     buf.pop_r64(RBP);
     buf.ret();
@@ -752,11 +805,12 @@ fn emit_override_wrapper(
 fn compile_one_function(
     program: &Program,
     known_targets: &BTreeSet<u32>,
+    func_idx: u32,
     entry: u32,
     func: &Function,
     options: CompileOptions,
 ) -> CompiledFunc {
-    let first_pass = emit_function_pass(program, known_targets, entry, func, &func.labels, options);
+    let first_pass = emit_function_pass(program, known_targets, func_idx, entry, func, &func.labels, options);
     if first_pass.1.is_empty() {
         first_pass.0
     } else {
@@ -768,13 +822,14 @@ fn compile_one_function(
                 }
             }
         }
-        emit_function_pass(program, known_targets, entry, func, &resumable, options).0
+        emit_function_pass(program, known_targets, func_idx, entry, func, &resumable, options).0
     }
 }
 
 fn emit_function_pass(
     program: &Program,
     known_targets: &BTreeSet<u32>,
+    func_idx: u32,
     entry: u32,
     func: &Function,
     labels: &BTreeSet<u32>,
@@ -792,6 +847,7 @@ fn emit_function_pass(
         epilogue_patches: Vec::new(),
         depth_overflow_patches: Vec::new(),
         budget_exits: Vec::new(),
+        stale_check: None,
         interpreted_addrs: Vec::new(),
         folded_spans: Vec::new(),
     };
@@ -813,6 +869,13 @@ fn emit_function_pass(
     for (i, &address) in insns.iter().enumerate() {
         if em.labels.contains(&address) {
             label_map.insert(address, em.buf.pos() as u32);
+            if address == entry {
+                em.buf.ldr_r64_mem(RAX, RBX, offsets::STALE_PTR as i32);
+                em.buf.test_r64_r64(RAX, RAX);
+                let j_stale = em.buf.jcc_rel32(cc::NZ);
+                let resume_entry = em.buf.pos();
+                em.stale_check = Some((j_stale, resume_entry, entry, func_idx));
+            }
             let run = insns[i + 1..].iter().take_while(|a| !em.labels.contains(a)).count() as u32 + 1;
             em.emit_block_budget(address, run);
         }
@@ -836,6 +899,20 @@ fn emit_function_pass(
         if continues && insns.get(i + 1) != Some(&next) {
             em.emit_jump(next, thumb);
         }
+    }
+
+    // Cold stale-function unwind stub (triggers when guest text patched a directly-called callee):
+    if let Some((j_stale, resume_entry, entry_addr, f_idx)) = em.stale_check {
+        em.buf.patch_rel32(j_stale, em.buf.pos());
+        em.buf.ldr_u8_mem(RAX, RAX, f_idx as i32);
+        em.buf.test_r32_r32(RAX, RAX);
+        let j_ok = em.buf.jcc_rel32(cc::Z);
+        em.buf.str_imm32_mem(RBX, (offsets::CTX_R0 + 15 * 4) as i32, entry_addr);
+        em.buf.str_imm8_mem(RBX, offsets::CTX_THUMB as i32, thumb as u8);
+        em.buf.str_imm32_mem(RBX, offsets::CTX_EXIT as i32, EXIT_UNWIND);
+        let j_epi = em.buf.jmp_rel32();
+        em.epilogue_patches.push(j_epi);
+        em.buf.patch_rel32(j_ok, resume_entry);
     }
 
     // Cold depth-overflow stub:

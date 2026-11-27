@@ -225,13 +225,14 @@ unsafe extern "C" fn cb_interpret(ctx: *mut Context, address: u32, _opcode: u32)
     unsafe {
         let run = run_of(ctx);
         let ctx = &mut *ctx;
+        let was_thumb = ctx.thumb != 0;
         load_ctx(ctx, &mut run.cpu);
         run.cpu.regs[15] = address;
         let exit = run.cpu.step(&mut run.memory);
         store_ctx(&run.cpu, ctx);
         run.fallbacks += 1;
-        let step = if ctx.thumb != 0 { 2 } else { 4 };
-        if exit.is_some() || ctx.r[15] != address.wrapping_add(step) {
+        let step = if was_thumb { 2 } else { 4 };
+        if exit.is_some() || (ctx.thumb != 0) != was_thumb || ctx.r[15] != address.wrapping_add(step) {
             run.pending = exit;
             ctx.exit = EXIT_UNWIND;
         }
@@ -2377,3 +2378,1056 @@ fn pure_image_starts(aot: &LoadedAot, code: &[u8], exh: &zakuro_fs::ExHeader) ->
     }
     out
 }
+
+#[cfg(target_arch = "x86_64")]
+fn read_mxcsr() -> u32 {
+    let mut mxcsr: u32 = 0;
+    unsafe {
+        core::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack, preserves_flags));
+    }
+    mxcsr
+}
+
+#[cfg(target_arch = "x86_64")]
+struct RestoreHostMxcsr(u32);
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for RestoreHostMxcsr {
+    fn drop(&mut self) {
+        unsafe {
+            core::arch::asm!("ldmxcsr [{}]", in(reg) &self.0, options(nostack, preserves_flags));
+        }
+    }
+}
+
+#[test]
+fn torture_adversarial_mxcsr_leak_and_unsynced_entry() {
+    use asm::*;
+
+    // Subtest A: Enter LoadedAot::enter directly with pre-set FPSCR.FZ = 1 (bit 24) and
+    // execute VADD.F32 s0, s0, s1 where s0 = 0x0040_0000 (subnormal), s1 = 0.0.
+    // ARMv6K with FZ=1 MUST flush s0 to 0.0 before adding -> result 0x0000_0000.
+    // Subtest B: Guest executes VMSR FPSCR, r0 setting FZ=1 | RMode=-Inf (0x0180_0000)
+    // and returns via BX LR. LoadedAot::enter MUST NOT leave host MXCSR mutated!
+    let words_a = [
+        vfp_dp(AL, false, 0b0011, false, 0, 0, 1), // VADD.F32 s0, s0, s1
+        bx(AL, 14),
+    ];
+    let (_bytes_a, aot_a) = compile_snippet(&words_a, &[(BASE, Source::Entry)]);
+    let words_b = [
+        vmsr_fpscr(AL, 0),
+        bx(AL, 14),
+    ];
+    let (_bytes_b, aot_b) = compile_snippet(&words_b, &[(BASE, Source::Entry)]);
+
+    let make_ctx = |mem: &mut TestMemory, vfp_regs: &mut [u32; 32], fpscr: &mut u32| -> Context {
+        let mut r = [0u32; 16];
+        r[13] = STACK_TOP - 0x1000;
+        r[14] = RETURN;
+        r[15] = BASE;
+        Context {
+            r,
+            n: 0,
+            z: 0,
+            c: 0,
+            v: 0,
+            q: 0,
+            thumb: 0,
+            ge: 0,
+            exclusive: 0,
+            budget: LIMIT,
+            exit: EXIT_NONE,
+            svc: 0,
+            depth: 0,
+            exclusive_address: 0,
+            tls: TLS,
+            read_pages: mem.read_pages.as_ptr(),
+            write_pages: mem.write_pages.as_ptr(),
+            vfp: vfp_regs.as_mut_ptr(),
+            fpscr,
+            host: &HOST,
+            user: null_mut(),
+        }
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let saved = read_mxcsr();
+        let _guard = RestoreHostMxcsr(saved);
+
+        // Subtest A: pre-set FPSCR.FZ = 1 before LoadedAot::enter (no external sync_host_fpcr).
+        let mut mem_a = TestMemory::new(vec![
+            Region { base: BASE, bytes: vec![0; PAGE_SIZE], writable: false, direct_page: true },
+            Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true, direct_page: true },
+        ]);
+        let mut vfp_a = [0u32; 32];
+        vfp_a[0] = 0x0040_0000; // subnormal 2^-127
+        vfp_a[1] = 0x0000_0000; // +0.0
+        let mut fpscr_a = 1u32 << 24; // FZ = 1
+        let mut ctx_a = make_ctx(&mut mem_a, &mut vfp_a, &mut fpscr_a);
+        let body_a = aot_a.lookup(BASE).expect("compiled body");
+        unsafe { aot_a.enter(&mut ctx_a, body_a) };
+        let subnormal_flushed_a = vfp_a[0];
+
+        // Subtest B: VMSR FPSCR mutates MXCSR inside AOT; check host MXCSR on return from LoadedAot::enter!
+        let mut mem_b = TestMemory::new(vec![
+            Region { base: BASE, bytes: vec![0; PAGE_SIZE], writable: false, direct_page: true },
+            Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true, direct_page: true },
+        ]);
+        let mut vfp_b = [0u32; 32];
+        let mut fpscr_b = 0u32;
+        let mut ctx_b = make_ctx(&mut mem_b, &mut vfp_b, &mut fpscr_b);
+        ctx_b.r[0] = (1 << 24) | (0b10 << 22); // FZ=1, RMode=-Inf
+        let body_b = aot_b.lookup(BASE).expect("compiled body");
+        unsafe { aot_b.enter(&mut ctx_b, body_b) };
+        let mxcsr_after = read_mxcsr();
+
+        // Check both failures clearly in one panic message if either breaks.
+        let mxcsr_ctrl_mask = (1 << 15) | (0b11 << 13) | (1 << 6);
+        let mut errs: Vec<String> = Vec::new();
+        if subnormal_flushed_a != 0x0000_0000 {
+            errs.push(format!(
+                "LoadedAot::enter did not sync host MXCSR from *ctx.fpscr (FZ=1 subnormal stayed {subnormal_flushed_a:#010x})"
+            ));
+        }
+        if (mxcsr_after & mxcsr_ctrl_mask) != (saved & mxcsr_ctrl_mask) {
+            errs.push(format!(
+                "LoadedAot::enter leaked guest VMSR FPSCR into host MXCSR (saved={saved:#06x}, after={mxcsr_after:#06x})"
+            ));
+        }
+        assert!(errs.is_empty(), "{}", errs.join("; "));
+    }
+}
+
+#[test]
+fn torture_adversarial_vfp_rmode_and_fz_subnormals() {
+    use asm::*;
+
+    // Differential test against zakuro-cpu across all 4 FPSCR.RMode values (RN, +Inf, -Inf, RZ)
+    // and FPSCR.FZ=1 for scalar arithmetic, float<->int VCVT/VCVTR, f64<->f32 VCVT, and VCMP.
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+
+    // Scratch results written sequentially to [R12] so every intermediate survives!
+    // R0..R3 hold FPSCR values for RMode 0..3 with FZ=1
+    let rmodes = [0u32, 1u32, 2u32, 3u32];
+    for (idx, _rm) in rmodes.iter().enumerate() {
+        b.emit_arm(vmsr_fpscr(AL, idx as u32));
+        // s20 = 1.0f, s21 = 2^-24f (0x3380_0000), s22 = -1.0f, s23 = -2^-24f (0xB380_0000)
+        // s24 = int 0x0100_0001, s25 = 1.5f, s26 = -1.5f, s27 = subnormal 0x0040_0000
+        // d14 = f64 2^-127 (0x3800_0000_0000_0000, subnormal in f32!)
+        b.emit_arm(vfp_dp(AL, false, 0b0011, false, 0, 20, 21)); // VADD.F32 s0, s20, s21
+        b.emit_arm(vfp_dp(AL, false, 0b0011, false, 1, 22, 23)); // VADD.F32 s1, s22, s23
+        b.emit_arm(vcvt_from_int(AL, false, true, 2, 24));       // VCVT.F32.S32 s2, s24
+        b.emit_arm(vcvt_to_int(AL, false, true, false, 3, 25));  // VCVTR.S32.F32 s3, s25
+        b.emit_arm(vcvt_to_int(AL, false, true, false, 4, 26));  // VCVTR.S32.F32 s4, s26
+        b.emit_arm(vcvt_to_int(AL, false, true, true, 5, 25));   // VCVT.S32.F32 (RZ) s5, s25
+        b.emit_arm(vcvt_f32_f64(AL, 6, 14));                     // VCVT.F32.F64 s6, d14 (FZ=1!)
+        b.emit_arm(vcvt_f64_f32(AL, 7, 27));                     // VCVT.F64.F32 d7, s27 (FZ=1!)
+        // Store s0..s6, s14, s15 to [R12], #4 each via vmov_s_rt
+        for s in [0u32, 1, 2, 3, 4, 5, 6, 14, 15] {
+            b.emit_arm(vmov_s_rt(AL, true, s, 9));
+            b.emit_arm(ldr_str_imm(AL, false, false, false, true, true, 12, 9, 4));
+        }
+        // VCMP subnormal s27 vs 0.0 under FZ=1
+        b.emit_arm(vcmp(AL, false, false, 27, None));
+        b.emit_arm(fmstat(AL));
+        b.emit_arm(mrs_cpsr(AL, 9));
+        b.emit_arm(ldr_str_imm(AL, false, false, false, true, true, 12, 9, 4));
+    }
+    b.emit_arm(bx(AL, 14));
+    let words = b.finish();
+    let (text, aot) = compile_snippet(&words, &[(entry, Source::Entry)]);
+    verify_compiled("vfp_rmode_and_fz_subnormals", &text, &aot, true, |cpu, _| {
+        cpu.regs[0] = (1 << 24) | (0 << 22);
+        cpu.regs[1] = (1 << 24) | (1 << 22);
+        cpu.regs[2] = (1 << 24) | (2 << 22);
+        cpu.regs[3] = (1 << 24) | (3 << 22);
+        cpu.regs[12] = HEAP;
+        cpu.vfp.regs[20] = 1.0f32.to_bits();
+        cpu.vfp.regs[21] = 0x3380_0000; // 2^-24
+        cpu.vfp.regs[22] = (-1.0f32).to_bits();
+        cpu.vfp.regs[23] = 0xB380_0000; // -2^-24
+        cpu.vfp.regs[24] = 0x0100_0001; // 16777217
+        cpu.vfp.regs[25] = 1.5f32.to_bits();
+        cpu.vfp.regs[26] = (-1.5f32).to_bits();
+        cpu.vfp.regs[27] = 0x0040_0000; // subnormal 2^-127
+        let d14 = 0x3800_0000_0000_0000u64; // f64 2^-127 (subnormal in f32)
+        cpu.vfp.regs[28] = d14 as u32;
+        cpu.vfp.regs[29] = (d14 >> 32) as u32;
+    });
+}
+
+#[test]
+fn torture_adversarial_vfp_short_vectors_stride_wrap() {
+    use asm::*;
+
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+
+    // Case 1: LEN=4 (encoding 3 => 4 regs), STRIDE=1 (encoding 0 => stride 1), FZ=0
+    // Start at s14 => wraps bank 1 (s8..s15): s14, s15, s8, s9!
+    // Source Rm = s1 (bank 0 scalar!) broadcast, Rn = s22.. -> wraps bank 2: s22, s23, s16, s17
+    b.emit_arm(vmsr_fpscr(AL, 0));
+    b.emit_arm(vfp_dp(AL, false, 0b0011, false, 14, 22, 1));  // VADD.F32 (vec wrap + scalar Rm)
+    b.emit_arm(vfp_dp(AL, false, 0b0000, false, 14, 22, 15)); // VMLA.F32 (vec Rd==s14..s9, Vm==s15..s10 overlap!)
+    b.emit_arm(vfp_dp(AL, false, 0b0001, true, 14, 22, 1));   // VNMLS.F32
+
+    // Case 2: LEN=4 (encoding 3), STRIDE=2 (encoding 3 => stride 2), FZ=1 (subnormals!)
+    // Start at s14 => stride 2 wraps within bank 1: s14, s8, s10, s12!
+    b.emit_arm(vmsr_fpscr(AL, 1));
+    b.emit_arm(vfp_dp(AL, false, 0b0011, false, 14, 22, 2)); // VADD.F32 with subnormal lane under FZ=1
+    b.emit_arm(vfp_dp(AL, false, 0b0000, false, 14, 22, 2)); // VMLA.F32 with FZ=1
+    // Scalar dest bank (s4 in s0..s7) MUST execute as scalar (1 element only!) even with LEN=4
+    b.emit_arm(vfp_dp(AL, false, 0b0011, false, 4, 20, 2));
+    // Double precision vector wrap: d6 with LEN=3 (encoding 2), STRIDE=1 -> d6, d7, d4 (bank 1 d4..d7)
+    b.emit_arm(vmsr_fpscr(AL, 2));
+    b.emit_arm(vfp_dp(AL, true, 0b0011, false, 6, 8, 1));    // VADD.F64 vec wrap + scalar d1
+    // Reset FPSCR LEN=0
+    b.emit_arm(vmsr_fpscr(AL, 3));
+    b.emit_arm(bx(AL, 14));
+
+    let words = b.finish();
+    let (text, aot) = compile_snippet(&words, &[(entry, Source::Entry)]);
+    verify_compiled("vfp_short_vectors_stride_wrap", &text, &aot, true, |cpu, _| {
+        cpu.regs[0] = 3 << 16; // LEN=4, STRIDE=1
+        cpu.regs[1] = (1 << 24) | (3 << 20) | (3 << 16); // FZ=1, STRIDE=2, LEN=4
+        cpu.regs[2] = 2 << 16; // LEN=3, STRIDE=1
+        cpu.regs[3] = 0;       // scalar
+        for i in 0..32 {
+            cpu.vfp.regs[i] = ((i as f32) + 0.5).to_bits();
+        }
+        // Inject subnormals into s22 and s2 (scalar broadcast) for Case 2 FZ=1
+        cpu.vfp.regs[22] = 0x0040_0000;
+        cpu.vfp.regs[2] = 0x0020_0000;
+        // Clean double values in d4..d11 (s8..s23) except keep Case 2 test after Case 1
+        cpu.vfp.set_f64(1, 1.25);
+        cpu.vfp.set_f64(8, 2.5);
+        cpu.vfp.set_f64(9, 3.5);
+        cpu.vfp.set_f64(10, 4.5);
+    });
+}
+
+#[test]
+fn torture_adversarial_smc_direct_call_and_tail_jump_bypass() {
+    use asm::*;
+
+    // Function A (caller at BASE) saves LR in R4, calls B via BL (DirectCall),
+    // saves R0 in R3, restores LR = R4, and tail-jumps to C via B (DirectTailJump).
+    // Give fn_b and fn_c >= 128 instructions (OWN_FUNCTION) so discover::containers
+    // does NOT absorb them into fn_a!
+    let mut b = CodeBuilder::new();
+    let fn_a = b.addr();
+    b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 4, 14, LSL, 0)); // MOV R4, LR
+    let bl_pos = b.emit_arm(0); // placeholder BL fn_b
+    b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 3, 0, LSL, 0)); // MOV R3, R0
+    b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 14, 4, LSL, 0)); // MOV LR, R4
+    let b_pos = b.emit_arm(0);  // placeholder B fn_c
+    while b.addr() < BASE + 0x20 {
+        b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 0, 0, LSL, 0));
+    }
+    let fn_b = b.addr();
+    b.emit_arm(mov_imm(AL, false, 0, 0x11, 0)); // patched later to 0x77!
+    for _ in 0..130 {
+        b.emit_arm(add_imm(AL, false, 5, 5, 1, 0));
+    }
+    b.emit_arm(bx(AL, 14));
+
+    let fn_c = b.addr();
+    b.emit_arm(mov_imm(AL, false, 2, 0x22, 0)); // patched later to 0x88!
+    for _ in 0..130 {
+        b.emit_arm(add_imm(AL, false, 6, 6, 1, 0));
+    }
+    b.emit_arm(bx(AL, 14));
+
+    b.patch_arm(bl_pos, bl_cond(AL, bl_pos, fn_b));
+    b.patch_arm(b_pos, b_cond(AL, b_pos, fn_c));
+    let words = b.finish();
+    let (mut text, mut aot) = compile_snippet(&words, &[(fn_a, Source::Entry), (fn_c, Source::Entry)]);
+
+    // Patch guest text in-place (SMC / cheat patch) for fn_b and fn_c:
+    let off_b = (fn_b - BASE) as usize;
+    let off_c = (fn_c - BASE) as usize;
+    text[off_b..off_b + 4].copy_from_slice(&mov_imm(AL, false, 0, 0x77, 0).to_le_bytes());
+    text[off_c..off_c + 4].copy_from_slice(&mov_imm(AL, false, 2, 0x88, 0).to_le_bytes());
+
+    let invalidated = aot.check(|addr, out| {
+        let start = (addr - BASE) as usize;
+        out.copy_from_slice(&text[start..start + out.len()]);
+    });
+    assert!(invalidated >= 2, "expected fn_b and fn_c marked stale, got {invalidated}");
+    assert!(aot.lookup(fn_a).is_some(), "unchanged caller fn_a unexpectedly marked stale");
+    assert!(aot.lookup(fn_b).is_none() && aot.lookup(fn_c).is_none(), "check() failed to hide stale callees");
+
+    let mem = TestMemory::new(vec![
+        Region { base: BASE, bytes: text.clone(), writable: true, direct_page: true },
+        Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true, direct_page: true },
+    ]);
+    let mut cpu = Cpu::new();
+    cpu.regs[13] = STACK_TOP - 0x1000;
+    cpu.regs[14] = RETURN;
+    cpu.regs[15] = fn_a;
+
+    let mut interp_run = Run { memory: mem.duplicate(), cpu: cpu.clone(), pending: None, interpreted: 0, fallbacks: 0 };
+    let exp = run_interpreted(&mut interp_run, LIMIT);
+    assert_eq!(exp, Stop::Returned);
+
+    let mut aot_run = Run { memory: mem.duplicate(), cpu: cpu.clone(), pending: None, interpreted: 0, fallbacks: 0 };
+    let mut ctx = Context {
+        r: [0; 16],
+        n: 0, z: 0, c: 0, v: 0, q: 0, thumb: 0, ge: 0, exclusive: 0,
+        budget: 0, exit: 0, svc: 0, depth: 0, exclusive_address: 0, tls: TLS,
+        read_pages: aot_run.memory.read_pages.as_ptr(),
+        write_pages: aot_run.memory.write_pages.as_ptr(),
+        vfp: aot_run.cpu.vfp.regs.as_mut_ptr(),
+        fpscr: &mut aot_run.cpu.vfp.fpscr,
+        host: &HOST,
+        user: &mut aot_run as *mut Run as *mut c_void,
+    };
+    store_ctx(&cpu, &mut ctx);
+    let got = unsafe { run_aot(&aot, &mut aot_run, &mut ctx, LIMIT, LIMIT) };
+    assert_eq!(got, Stop::Returned);
+    assert_eq!(
+        (ctx.r[3], ctx.r[2]),
+        (0x77, 0x88),
+        "SMC stale-code bypass: caller ran stale compiled fn_b/fn_c ({:#x}, {:#x}) via DirectCall/DirectTailJump even after LoadedAot::check()!",
+        ctx.r[3],
+        ctx.r[2]
+    );
+}
+
+#[test]
+fn torture_adversarial_interpret_mode_switch_plus_2_or_4() {
+    use asm::*;
+
+    // Reproduce cb_interpret / zakuro-core/src/recompiled.rs:250 bug inside COMPILED code:
+    // Compute `step = if ctx.thumb != 0 { 2 } else { 4 }` AFTER cpu.step!
+    // In compiled ARM code, MOVSNE PC, R0 (`a + 2`, with SPSR.thumb=1) calls `emit_interpret`.
+    // Because `ctx.thumb` becomes `1` after `cpu.step`, `step` is computed as `2` -> `ctx.r[15] == a + 2`
+    // matches `a + step` and FAILS to trigger EXIT_UNWIND, so AOT falls through to ARM `a + 4`!
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+    b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 4, 14, LSL, 0)); // MOV R4, LR (save RETURN)
+    b.emit_arm(mov_imm(AL, false, 1, 0x3F, 0));                    // R1 = System | Thumb
+    b.emit_arm(0xE16F_F001);                                        // MSR SPSR_cxsf, R1 (emit_interpret)
+    b.emit_arm(mov_imm(AL, true, 2, 1, 0));                         // MOVS R2, #1 -> Z=0 (NE true)
+    let set_r0 = b.emit_arm(add_imm(AL, false, 0, 15, 2, 0));       // R0 = (set_r0+8)+2 == a+2
+    b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 5, 5, LSL, 0));     // NOP
+    let a = b.addr();
+    assert_eq!(a, set_r0 + 8);
+    b.emit_arm(dp_reg_imm(NE, OP_MOV, true, 0, 15, 0, LSL, 0));     // MOVSNE PC, R0 (0x11B0_F000; upper halfword Thumb ASRS R0, R6, #6)
+    // a + 4: ARM executes MOV LR, R4; Thumb at (a+4) executes `B (a + 16)`!
+    let a4 = b.addr();
+    b.emit_arm(0xE1A0_E004);
+    b.emit_arm(mov_imm(AL, false, 0, 0xEE, 0));                     // a + 8: AOT fallthrough trap
+    b.emit_arm(bx(AL, 4));                                          // a + 12
+    let t_ok = b.addr();
+    assert_eq!(t_ok, a4 + 12);
+    assert_eq!(t_b(a4, t_ok), 0xE004);
+    b.emit_thumb(t_movs_imm8(0, 0x42));
+    b.emit_thumb(t_bx(4));
+
+    let words = b.finish();
+    let (text, aot) = compile_snippet(&words, &[(entry, Source::Entry)]);
+    assert!(aot.lookup(entry).is_some(), "entry must be compiled for emit_interpret test");
+    verify_compiled("interpret_mode_switch_plus_2_or_4", &text, &aot, false, |cpu, _| {
+        cpu.regs[6] = 0;
+    });
+}
+
+#[test]
+fn torture_adversarial_arm_ldrb_pc_literal_fold() {
+    use asm::*;
+
+    // mem_media.rs:39: folded LDRB PC, [PC, #imm] calls emit_jump((val as u32) & !3, false),
+    // ignoring bit 0 Thumb interworking! zakuro-cpu arm/loadstore.rs:51 calls branch_exchange(val).
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+    let ldrb_pc = b.emit_arm(0); // placeholder LDRB PC, [PC, #off]
+    b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 0, 0, LSL, 0)); // padding so pool == ldrb_pc + 8
+    let pool = b.addr();
+    b.emit_arm(0x0000_0041); // literal byte = 0x41 -> 0x40 in Thumb mode!
+    let imm = pool - (ldrb_pc + 8);
+    b.patch_arm(ldrb_pc, ldr_str_imm(AL, true, true, true, true, false, 15, 15, imm));
+    let words = b.finish();
+    let (text, aot) = compile_snippet(&words, &[(entry, Source::Entry)]);
+
+    // Construct page at 0x0000_0000:
+    // At 0x40: Thumb bytes [t_movs_imm8(0, 0x33), t_b(0x42, 0x4C)] = 0xE003_2033 (in ARM = harmless AND R2, R3, R3, LSR #32)
+    // At 0x44: ARM MOV R0, #0x99; BX LR (executed only if wrongly entered in ARM mode!)
+    // At 0x4C: Thumb BX LR
+    let mut low_page = vec![0u8; PAGE_SIZE];
+    let thumb_pair = ((t_b(0x42, 0x4C) as u32) << 16) | (t_movs_imm8(0, 0x33) as u32);
+    low_page[0x40..0x44].copy_from_slice(&thumb_pair.to_le_bytes());
+    low_page[0x44..0x48].copy_from_slice(&mov_imm(AL, false, 0, 0x99, 0).to_le_bytes());
+    low_page[0x48..0x4C].copy_from_slice(&bx(AL, 14).to_le_bytes());
+    low_page[0x4C..0x4E].copy_from_slice(&t_bx(14).to_le_bytes());
+
+    let mem = TestMemory::new(vec![
+        Region { base: 0x0000_0000, bytes: low_page, writable: false, direct_page: true },
+        Region { base: BASE, bytes: text, writable: false, direct_page: true },
+        Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true, direct_page: true },
+    ]);
+    let mut cpu = Cpu::new();
+    cpu.regs[13] = STACK_TOP - 0x1000;
+    cpu.regs[14] = RETURN;
+    cpu.regs[15] = BASE;
+
+    let mut a = Run { memory: mem.duplicate(), cpu: cpu.clone(), pending: None, interpreted: 0, fallbacks: 0 };
+    let mut b_run = Run { memory: mem.duplicate(), cpu: cpu.clone(), pending: None, interpreted: 0, fallbacks: 0 };
+    let mut ctx = Context {
+        r: [0; 16],
+        n: 0, z: 0, c: 0, v: 0, q: 0, thumb: 0, ge: 0, exclusive: 0,
+        budget: 0, exit: 0, svc: 0, depth: 0, exclusive_address: 0, tls: TLS,
+        read_pages: b_run.memory.read_pages.as_ptr(),
+        write_pages: b_run.memory.write_pages.as_ptr(),
+        vfp: b_run.cpu.vfp.regs.as_mut_ptr(),
+        fpscr: &mut b_run.cpu.vfp.fpscr,
+        host: &HOST,
+        user: &mut b_run as *mut Run as *mut c_void,
+    };
+    store_ctx(&cpu, &mut ctx);
+    let exp = run_interpreted(&mut a, LIMIT);
+    let got = unsafe { run_aot(&aot, &mut b_run, &mut ctx, LIMIT, LIMIT) };
+    assert_eq!(exp, got);
+    let diffs = compare_runs(&a, &b_run, &ctx);
+    assert!(diffs.is_empty(), "LDRB PC literal fold Thumb-bit mismatch: {diffs:?}");
+}
+
+#[test]
+fn torture_adversarial_dynamic_shifts_and_carry_corner_cases() {
+    use asm::*;
+
+    // Exhaustively test ARM and Thumb register-controlled shifts (0, 1, 31, 32, 33, 64, 255, 0x100, 0x120)
+    // across initial C=0 and C=1, plus RRX, TEQ/TST/MOV/ADCS/SBCS carry preservation.
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+
+    // Pointer R12 collects (Rd, CPSR) pairs on heap for every operation!
+    let counts: [u32; 11] = [0, 1, 15, 31, 32, 33, 63, 64, 255, 0x100, 0x120];
+    // Test with C=0 then C=1
+    for &c_init in &[false, true] {
+        for (idx, &_cnt) in counts.iter().enumerate() {
+            // Load count into R3 from R11[idx*4]
+            b.emit_arm(ldr_str_imm(AL, true, false, true, true, false, 11, 3, (idx as u32) * 4));
+            for &op in &[OP_MOV, OP_TEQ, OP_TST, OP_ADC, OP_SBC] {
+                for &sty in &[LSL, LSR, ASR, ROR] {
+                    // Reset flags (N=0, Z=0, C=c_init, V=1)
+                    b.emit_arm(msr_cpsr_f_imm(AL, if c_init { 0x30 } else { 0x10 }, 2)); // 0x3<<28=CV, 0x1<<28=V
+                    b.emit_arm(dp_reg_reg(AL, op, true, 1, 4, 2, sty, 3));
+                    b.emit_arm(mrs_cpsr(AL, 5));
+                    b.emit_arm(ldr_str_imm(AL, false, false, false, true, true, 12, 4, 4));
+                    b.emit_arm(ldr_str_imm(AL, false, false, false, true, true, 12, 5, 4));
+                }
+            }
+        }
+        // RRX (ROR #0) with C=0 / C=1
+        b.emit_arm(msr_cpsr_f_imm(AL, if c_init { 0x30 } else { 0x10 }, 2));
+        b.emit_arm(dp_reg_imm(AL, OP_MOV, true, 0, 4, 2, ROR, 0));
+        b.emit_arm(mrs_cpsr(AL, 5));
+        b.emit_arm(ldr_str_imm(AL, false, false, false, true, true, 12, 4, 4));
+        b.emit_arm(ldr_str_imm(AL, false, false, false, true, true, 12, 5, 4));
+    }
+
+    // Switch to Thumb via LDR R6, [PC, #0]; BX R6; .word t_start|1
+    let bx_ldr = b.emit_arm(0);
+    b.emit_arm(bx(AL, 6));
+    let t_pool = b.addr();
+    b.emit_arm(0);
+    b.align4();
+    let t_start = b.addr();
+    b.patch_arm(bx_ldr, ldr_str_imm(AL, true, false, true, true, false, 15, 6, t_pool - (bx_ldr + 8)));
+    b.patch_arm(t_pool, t_start | 1);
+
+    // In Thumb, R7 holds heap out ptr (copy R12 -> R7 via t_hi_mov)
+    b.emit_thumb(t_hi_mov(7, 12));
+    for &c_init in &[0u16, 1u16] {
+        for (idx, _) in counts.iter().enumerate() {
+            b.emit_thumb(t_hi_mov(5, 11));
+            b.emit_thumb(0x6800 | ((idx as u16) << 6) | (5 << 3) | 3); // LDR R3, [R5, #idx*4]
+            for &alu_op in &[2u16, 3, 4, 7] {
+                // Prepare C in Thumb via MOVS R4, #1; LSRS R4, R4, #1 -> C=1, R4=0
+                b.emit_thumb(t_movs_imm8(4, 1));
+                b.emit_thumb(0x0840 | (4 << 3) | 4); // LSRS R4, R4, #1 -> R4=0, C=1
+                if c_init == 0 {
+                    b.emit_thumb(t_lsls_imm(4, 4, 1)); // LSLS R4, R4, #1 -> R4=0, C=0
+                }
+                b.emit_thumb(t_hi_mov(4, 2)); // MOV R4, R2 (high mov preserves NZCV!)
+                b.emit_thumb(t_alu(alu_op, 4, 3));
+                b.emit_thumb(t_movs_imm8(5, 0)); // MOVS R5, #0 (preserves C!)
+                b.emit_thumb(t_alu(5, 5, 5));    // ADCS R5, R5 (bit 0 = C)
+                b.emit_thumb(0xC700 | (1 << 4) | (1 << 5)); // STMIA R7!, {R4, R5}
+            }
+        }
+    }
+    b.emit_thumb(t_bx(14));
+
+    let words = b.finish();
+    let (text, aot) = compile_snippet(&words, &[(entry, Source::Entry), (t_start | 1, Source::Entry)]);
+    verify_compiled("dynamic_shifts_and_carry_corner_cases", &text, &aot, true, |cpu, mem| {
+        cpu.regs[1] = 0x7FFF_FFFF;
+        cpu.regs[2] = 0x8000_0005;
+        cpu.regs[11] = HEAP + 0x20000;
+        cpu.regs[12] = HEAP;
+        for (i, &c) in counts.iter().enumerate() {
+            mem.write32(HEAP + 0x20000 + (i as u32) * 4, c);
+        }
+    });
+}
+
+#[test]
+fn torture_adversarial_exclusives_aliasing_and_sizes() {
+    use asm::*;
+
+    // LDREX/STREX/LDREXB/STREXB/LDREXH/STREXH/LDREXD/STREXD/CLREX + SWP/SWPB aliasing:
+    // - Rd == Rn, Rd == Rm
+    // - mismatched address STREX must fail (Rd=1) AND clear monitor so next STREX on original addr ALSO fails!
+    // - slow-path UNMAPPED_SCRATCH exclusives & swaps!
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+
+    // Use R0 = HEAP + 0x100, R1 = HEAP + 0x104, R2 = UNMAPPED_SCRATCH + 0x100, R12 = output log
+    let ldrex = |rn: u32, rd: u32| 0xE190_0F9F | (rn << 16) | (rd << 12);
+    let strex = |rn: u32, rd: u32, rm: u32| 0xE180_0F90 | (rn << 16) | (rd << 12) | rm;
+    let ldrexb = |rn: u32, rd: u32| 0xE1D0_0F9F | (rn << 16) | (rd << 12);
+    let strexb = |rn: u32, rd: u32, rm: u32| 0xE1C0_0F90 | (rn << 16) | (rd << 12) | rm;
+    let ldrexh = |rn: u32, rd: u32| 0xE1F0_0F9F | (rn << 16) | (rd << 12);
+    let strexh = |rn: u32, rd: u32, rm: u32| 0xE1E0_0F90 | (rn << 16) | (rd << 12) | rm;
+    let ldrexd = |rn: u32, rd: u32| 0xE1B0_0F9F | (rn << 16) | (rd << 12);
+    let strexd = |rn: u32, rd: u32, rm: u32| 0xE1A0_0F90 | (rn << 16) | (rd << 12) | rm;
+    let clrex = 0xF57F_F01F;
+    let swp = |rn: u32, rd: u32, rm: u32| 0xE100_0090 | (rn << 16) | (rd << 12) | rm;
+    let swpb = |rn: u32, rd: u32, rm: u32| 0xE140_0090 | (rn << 16) | (rd << 12) | rm;
+
+    // 1. Mismatch STREX clears monitor:
+    b.emit_arm(ldrex(0, 4));      // reserve R0
+    b.emit_arm(strex(1, 5, 3));   // wrong addr R1 -> R5 = 1, clears monitor!
+    b.emit_arm(strex(0, 6, 3));   // retry R0 -> MUST fail R6 = 1!
+    // 2. Rd == Rm in STREX (stores R7 into [R0], writes status 0 into R7!):
+    b.emit_arm(ldrex(0, 4));
+    b.emit_arm(strex(0, 7, 7));
+    // 3. Rd == Rn in STREX (copy R0 -> R8 first so R0 isn't lost):
+    b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 8, 0, LSL, 0));
+    b.emit_arm(ldrex(8, 4));
+    b.emit_arm(strex(8, 8, 3));   // status overwrites R8 = 0!
+    // 4. CLREX + byte/halfword/doubleword exclusives + slow-path UNMAPPED_SCRATCH:
+    b.emit_arm(ldrexb(2, 9));
+    b.emit_arm(clrex);
+    b.emit_arm(strexb(2, 10, 3)); // fail -> R10 = 1
+    b.emit_arm(ldrexh(2, 9));
+    b.emit_arm(strexh(2, 11, 3)); // succeed -> R11 = 0
+    // LDREXD / STREXD into even pair (R4, R5) from R0, storing (R6, R7) with Rd=R8
+    b.emit_arm(ldrexd(0, 4));
+    b.emit_arm(strexd(0, 8, 6));
+    // 5. SWP/SWPB with Rd == Rm and Rd == Rn (on R9 = HEAP + 0x200 and slow-path R2):
+    b.emit_arm(swp(9, 10, 10));   // Rd == Rm
+    b.emit_arm(swp(9, 9, 3));     // Rd == Rn
+    b.emit_arm(swpb(2, 3, 3));    // slow-path SWPB Rd == Rm
+    b.emit_arm(bx(AL, 14));
+
+    let words = b.finish();
+    let (text, aot) = compile_snippet(&words, &[(entry, Source::Entry)]);
+    verify_compiled("exclusives_aliasing_and_sizes", &text, &aot, true, |cpu, mem| {
+        cpu.regs[0] = HEAP + 0x100;
+        cpu.regs[1] = HEAP + 0x104;
+        cpu.regs[2] = UNMAPPED_SCRATCH + 0x100;
+        cpu.regs[3] = 0x1234_5678;
+        cpu.regs[6] = 0xCAFE_0001;
+        cpu.regs[7] = 0xDEAD_BEEF;
+        cpu.regs[9] = HEAP + 0x200;
+        cpu.regs[10] = 0xAABB_CCDD;
+        mem.write32(HEAP + 0x100, 0x1111_2222);
+        mem.write32(HEAP + 0x104, 0x3333_4444);
+        mem.write32(HEAP + 0x200, 0x5555_6666);
+    });
+}
+
+#[test]
+fn torture_adversarial_pc_plus_offset_and_ldrd_aliasing() {
+    use asm::*;
+
+    // Zero-fallback test for PC read offsets (a+8 vs a+12), STR PC, cross-page & slow-path LDRD/STRD,
+    // ARM LDM/STM base-in-list (lowest vs non-lowest), and Thumb LDMIA/STMIA/PUSH/POP/MOV PC.
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+
+    // 1. ARM PC read offsets:
+    b.emit_arm(add_imm(AL, false, 1, 15, 0, 0));                     // ADD R1, PC, #0 (a+8)
+    b.emit_arm(dp_reg_reg(AL, OP_MOV, false, 0, 2, 15, LSL, 3));     // MOV R2, PC, LSL R3 (a+12!)
+    b.emit_arm(ldr_str_imm(AL, false, false, true, true, false, 0, 15, 0)); // STR PC, [R0] (a+12!)
+    // Indexed PC load: R1 = LDR [PC, R3, LSL #2]
+    let ldr_pc_idx = b.emit_arm(0);
+    // LDR R4, [R0, R5, ROR #0] (RRX shifted offset!)
+    b.emit_arm(msr_cpsr_f_imm(AL, 0x20, 2)); // C=1
+    b.emit_arm(0xE790_4065); // LDR R4, [R0, R5, RRX]
+    // Cross-page & slow-path LDRD/STRD:
+    b.emit_arm(extra_imm(AL, false, 3, true, true, false, 7, 4, 0)); // STRD R4, [R7] (cross-page!)
+    b.emit_arm(extra_imm(AL, true, 2, false, false, true, 8, 4, 8)); // LDRD R4, [R8], #-8 (slow-path!)
+    // ARM STMIA / LDMIA base-in-list:
+    b.emit_arm(ldm_stm(AL, false, false, true, true, 9, (1 << 9) | (1 << 10))); // Rn lowest -> old R9!
+    b.emit_arm(ldm_stm(AL, false, false, true, true, 9, (1 << 8) | (1 << 9)));  // Rn NOT lowest -> written-back R9!
+    b.emit_arm(ldm_stm(AL, true, false, true, true, 9, (1 << 9) | (1 << 10)));  // LDMIA Rn! with Rn in list -> no wb!
+
+    // Jump to Thumb via LDR R6, [PC, #pool]; BX R6
+    let to_thumb = b.emit_arm(0);
+    b.emit_arm(bx(AL, 6));
+    let pool_val = b.addr();
+    b.emit_arm(0xDEAD_C0DE);
+    let pool_thumb = b.addr();
+    b.emit_arm(0);
+    let pc_idx_word = (pool_val - (ldr_pc_idx + 8)) / 4;
+    b.patch_arm(ldr_pc_idx, 0xE79F_1103); // LDR R1, [PC, R3, LSL #2] -> reads pool_val when R3 == pc_idx_word!
+
+    b.align4();
+    let t_start = b.addr();
+    b.patch_arm(to_thumb, ldr_str_imm(AL, true, false, true, true, false, 15, 6, pool_thumb - (to_thumb + 8)));
+    b.patch_arm(pool_thumb, t_start | 1);
+    b.emit_thumb(t_hi_mov(5, 11)); // R5 = HEAP + 0x400
+    // Thumb STMIA R5!, {R4, R5} (R5 NOT lowest -> ARMv4/thumb.rs writes old R5!)
+    b.emit_thumb(0xC500 | (1 << 4) | (1 << 5));
+    // Thumb LDMIA R5!, {R5, R6} (R5 in list -> suppresses writeback)
+    b.emit_thumb(t_ldmia(5, (1 << 5) | (1 << 6)));
+    // Thumb ADD R0, PC, #4 (PC aligned down to 4 + 4)
+    b.emit_thumb(0xA001);
+    b.emit_thumb(t_bx(14));
+
+    let words = b.finish();
+    let (text, aot) = compile_snippet(&words, &[(entry, Source::Entry), (t_start | 1, Source::Entry)]);
+    verify_compiled("pc_plus_offset_and_ldrd_aliasing", &text, &aot, true, |cpu, mem| {
+        cpu.regs[0] = HEAP + 0x100;
+        cpu.regs[3] = pc_idx_word;
+        cpu.regs[5] = 8;
+        cpu.regs[7] = HEAP + PAGE_SIZE as u32 - 4; // cross-page STRD!
+        cpu.regs[8] = UNMAPPED_SCRATCH + 0x40;
+        cpu.regs[9] = HEAP + 0x300;
+        cpu.regs[10] = 0x7777_8888;
+        cpu.regs[11] = HEAP + 0x400;
+        mem.write32(HEAP + 0x100 + 4, 0x1122_3344);
+        mem.write32(UNMAPPED_SCRATCH + 0x40, 0xAAAA_BBBB);
+        mem.write32(UNMAPPED_SCRATCH + 0x44, 0xCCCC_DDDD);
+    });
+}
+
+#[test]
+fn torture_adversarial_override_wrapper_abi_and_nested_reentry() {
+    use asm::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use zakuro_aot::runtime::{AotExecContext, OverrideFn};
+
+    static OVERRIDE_HITS: AtomicUsize = AtomicUsize::new(0);
+    static ENTRY_RSP_MOD16: AtomicU64 = AtomicU64::new(0xFF);
+    static BAD_RSP_MOD16: AtomicU64 = AtomicU64::new(0xFF);
+
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "sysv64" fn naked_override_probe(_ec: *mut AotExecContext, _orig_body: *const u8) {
+        core::arch::naked_asm!(
+            "mov rax, rsp",
+            "and rax, 15",
+            "mov qword ptr [rip + {mod16}], rax",
+            "cmp rax, 8",
+            "je 2f",
+            "mov qword ptr [rip + {bad}], rax",
+            "2:",
+            "jmp {inner}",
+            mod16 = sym ENTRY_RSP_MOD16,
+            bad = sym BAD_RSP_MOD16,
+            inner = sym test_override,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe extern "sysv64" fn test_override(ec: *mut AotExecContext, orig_body: *const u8) {
+        OVERRIDE_HITS.fetch_add(1, Ordering::Relaxed);
+
+        let ret_lr = unsafe { (*ec).ctx.r[14] };
+        let r0_arg = unsafe { (*ec).ctx.r[0] };
+        if r0_arg > 0 {
+            // Clobber EVERY caller-saved GPR and ALL XMM0..15, then re-enter orig_body via aot_enter_ptr!
+            unsafe {
+                core::arch::asm!(
+                    "mov rax, 0xDEAD0001",
+                    "mov rcx, 0xDEAD0002",
+                    "mov rdx, 0xDEAD0003",
+                    "mov rsi, 0xDEAD0004",
+                    "mov rdi, 0xDEAD0005",
+                    "mov r8,  0xDEAD0008",
+                    "mov r9,  0xDEAD0009",
+                    "mov r10, 0xDEAD000A",
+                    "mov r11, 0xDEAD000B",
+                    "pcmpeqd xmm0, xmm0",
+                    "pcmpeqd xmm1, xmm1",
+                    "pcmpeqd xmm2, xmm2",
+                    "pcmpeqd xmm3, xmm3",
+                    "pcmpeqd xmm4, xmm4",
+                    "pcmpeqd xmm5, xmm5",
+                    "pcmpeqd xmm6, xmm6",
+                    "pcmpeqd xmm7, xmm7",
+                    "pcmpeqd xmm8, xmm8",
+                    "pcmpeqd xmm9, xmm9",
+                    "pcmpeqd xmm10, xmm10",
+                    "pcmpeqd xmm11, xmm11",
+                    "pcmpeqd xmm12, xmm12",
+                    "pcmpeqd xmm13, xmm13",
+                    "pcmpeqd xmm14, xmm14",
+                    "pcmpeqd xmm15, xmm15",
+                    out("rax") _, out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
+                    out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+                    out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+                    out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
+                    out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+                    out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+                );
+            }
+            let enter: OverrideFn = unsafe { std::mem::transmute((*ec).aot_enter_ptr) };
+            unsafe {
+                (*ec).ctx.r[0] = r0_arg + 10;
+                (*ec).ctx.r[15] = ret_lr & !1;
+                (*ec).ctx.thumb = 0;
+                (*ec).ctx.depth += 1;
+                enter(ec, orig_body);
+                (*ec).ctx.depth -= 1;
+                (*ec).ctx.r[15] = ret_lr & !1;
+                (*ec).ctx.thumb = (ret_lr & 1) as u8;
+            }
+        } else {
+            unsafe {
+                (*ec).ctx.r[0] = 999;
+                (*ec).ctx.r[15] = ret_lr & !1;
+                (*ec).ctx.thumb = (ret_lr & 1) as u8;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        OVERRIDE_HITS.store(0, Ordering::Relaxed);
+        ENTRY_RSP_MOD16.store(0xFF, Ordering::Relaxed);
+        BAD_RSP_MOD16.store(0xFF, Ordering::Relaxed);
+
+        let mut b = CodeBuilder::new();
+        let outer = b.addr();
+        b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 4, 14, LSL, 0)); // MOV R4, LR (save RETURN)
+        b.emit_arm(mov_imm(AL, false, 0, 5, 0));
+        let bl_pos = b.emit_arm(0);
+        b.emit_arm(add_imm(AL, false, 0, 0, 1, 0));
+        b.emit_arm(bx(AL, 4));
+        while b.addr() < BASE + 0x20 {
+            b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 0, 0, LSL, 0));
+        }
+        let target_fn = b.addr();
+        b.emit_arm(add_imm(AL, false, 0, 0, 100, 0)); // orig_body: R0 += 100
+        b.emit_arm(bx(AL, 14));
+        b.patch_arm(bl_pos, bl_cond(AL, bl_pos, target_fn));
+        let words = b.finish();
+        let text: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let program = Program {
+            text: Segment { base: BASE, bytes: text.clone() },
+            seeds: vec![(outer, Source::Entry)],
+            slots: None,
+        };
+        let image = compile_program(0, 0x1234, &program, &[target_fn], CompileOptions::default(), |_, _| {});
+        let mut buf = Vec::new();
+        image.write_to(&mut buf).unwrap();
+        let aot = LoadedAot::read_exec(buf.as_slice())
+            .unwrap()
+            .with_overrides(&[(target_fn, naked_override_probe)]);
+
+        let mem = TestMemory::new(vec![
+            Region { base: BASE, bytes: text, writable: false, direct_page: true },
+            Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true, direct_page: true },
+        ]);
+        let mut cpu = Cpu::new();
+        cpu.regs[13] = STACK_TOP - 0x1000;
+        cpu.regs[14] = RETURN;
+        cpu.regs[15] = outer;
+        let mut run = Run { memory: mem.duplicate(), cpu: cpu.clone(), pending: None, interpreted: 0, fallbacks: 0 };
+        let mut ctx = Context {
+            r: [0; 16],
+            n: 0, z: 0, c: 0, v: 0, q: 0, thumb: 0, ge: 0, exclusive: 0,
+            budget: 0, exit: 0, svc: 0, depth: 0, exclusive_address: 0, tls: TLS,
+            read_pages: run.memory.read_pages.as_ptr(),
+            write_pages: run.memory.write_pages.as_ptr(),
+            vfp: run.cpu.vfp.regs.as_mut_ptr(),
+            fpscr: &mut run.cpu.vfp.fpscr,
+            host: &HOST,
+            user: &mut run as *mut Run as *mut c_void,
+        };
+        store_ctx(&cpu, &mut ctx);
+        let stop = unsafe { run_aot(&aot, &mut run, &mut ctx, LIMIT, LIMIT) };
+        assert_eq!(stop, Stop::Returned);
+        assert_eq!(OVERRIDE_HITS.load(Ordering::Relaxed), 1);
+        assert_eq!(ENTRY_RSP_MOD16.load(Ordering::Relaxed), 8, "OverrideFn entry via DirectCall saw misaligned RSP!");
+        assert_eq!(BAD_RSP_MOD16.load(Ordering::Relaxed), 0xFF);
+        assert_eq!(ctx.r[0], 5 + 10 + 100 + 1, "override + nested orig_body + caller continuation failed");
+
+        // Also enter overridden target_fn directly via LoadedAot::enter -> invoke_r11 -> override body!
+        cpu.regs[0] = 5;
+        cpu.regs[15] = target_fn;
+        store_ctx(&cpu, &mut ctx);
+        let stop2 = unsafe { run_aot(&aot, &mut run, &mut ctx, LIMIT, LIMIT) };
+        assert_eq!(stop2, Stop::Returned);
+        assert_eq!(OVERRIDE_HITS.load(Ordering::Relaxed), 2);
+        assert_eq!(ENTRY_RSP_MOD16.load(Ordering::Relaxed), 8, "OverrideFn entry via invoke_r11 saw misaligned RSP!");
+        assert_eq!(BAD_RSP_MOD16.load(Ordering::Relaxed), 0xFF);
+        assert_eq!(ctx.r[0], 5 + 10 + 100, "direct invoke_r11 override + nested orig_body failed");
+
+        // Also test recursion depth cap (infinite BL loop)
+        let mut b2 = CodeBuilder::new();
+        let loop_fn = b2.addr();
+        b2.emit_arm(bl_cond(AL, loop_fn, loop_fn)); // infinite BL recursion -> hits depth > 2048!
+        b2.emit_arm(bx(AL, 14));
+        let (_t2, aot2) = compile_snippet(&b2.finish(), &[(loop_fn, Source::Entry)]);
+        store_ctx(&cpu, &mut ctx);
+        ctx.budget = 100_000;
+        ctx.exit = EXIT_NONE;
+        ctx.depth = 0;
+        let body2 = aot2.lookup(loop_fn).unwrap();
+        unsafe { aot2.enter(&mut ctx, body2) };
+        assert_eq!(ctx.exit, EXIT_UNWIND, "infinite BL recursion did not cleanly stop with EXIT_UNWIND");
+    }
+}
+
+#[test]
+fn torture_adversarial_cond_flag_preservation_and_high_regs() {
+    use asm::*;
+
+    // Conditional instructions whose condition FAILS must NEVER modify N/Z/C/V/Q/GE/FPSCR/exclusive/mem/faults!
+    // Plus ADC/SBC/RSC long carry chains across all R0..R14 and Q/GE edge cases.
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+
+    // Pre-set known N=0, Z=1, C=1, V=0, Q=1, GE=0xA, VFP FPSCR flags = 0x2000_0000
+    b.emit_arm(msr_cpsr_f_imm(AL, 0x68, 2)); // Z=1, C=1, Q=1? wait msr_cpsr_f_imm writes [31:24] -> bit 27=Q (0x0800_0000), bit 30=Z, bit 29=C => 0x68<<24!
+    // Verify failing NE predicate across every instruction class (R11 = unmapped bad ptr 0xDEAD_0000!):
+    b.emit_arm(mov_imm(NE, true, 0, 0xAA, 0));
+    b.emit_arm(dp_imm(NE, OP_ADC, true, 1, 2, 1, 0));
+    b.emit_arm(dp_imm(NE, OP_SBC, true, 1, 2, 1, 0));
+    b.emit_arm(dp_imm(NE, OP_RSC, true, 1, 2, 1, 0));
+    b.emit_arm(mul(NE, true, true, 2, 3, 4, 5));
+    b.emit_arm(mul_long(NE, true, true, true, 2, 3, 4, 5));
+    b.emit_arm(q_arith(NE, 0, 1, 2, 3));
+    b.emit_arm(media_parallel(NE, 0b00101, 0b000, 1, 2, 3)); // UADD8cc
+    b.emit_arm(sel(NE, 1, 2, 3));
+    b.emit_arm(usad8(NE, 2, 3, 4));
+    b.emit_arm(vfp_dp(NE, false, 0b0011, false, 0, 1, 2));
+    b.emit_arm(vcmp(NE, false, true, 0, Some(1)));
+    b.emit_arm(ldr_str_imm(NE, true, false, true, true, false, 11, 2, 0));  // unmapped LDRNE -> MUST NOT fault!
+    b.emit_arm(ldr_str_imm(NE, false, false, true, true, false, 11, 2, 0)); // unmapped STRNE -> MUST NOT fault!
+    b.emit_arm(0x119B_2F9F); // LDREXNE R2, [R11] -> MUST NOT touch exclusive!
+    b.emit_arm(0x118B_2F93); // STREXNE R2, R3, [R11] -> MUST NOT touch exclusive!
+    b.emit_arm(0x110B_2093); // SWPNE R2, R3, [R11] -> MUST NOT fault!
+
+    // Now test executed ADC/SBC/RSC borrow chains + Q + GE:
+    b.emit_arm(dp_imm(AL, OP_ADD, true, 0, 1, 0, 0));       // clear/update flags
+    b.emit_arm(dp_reg_imm(AL, OP_ADC, true, 4, 5, 6, LSL, 0));
+    b.emit_arm(dp_reg_imm(AL, OP_SBC, true, 5, 6, 7, LSL, 0));
+    b.emit_arm(dp_reg_imm(AL, OP_RSC, true, 6, 7, 8, LSL, 0));
+    b.emit_arm(q_arith(AL, 2, 9, 10, 12));                  // QDADD
+    b.emit_arm(media_parallel(AL, 0b00101, 0b000, 9, 10, 12)); // UADD8 -> GE
+    b.emit_arm(sel(AL, 9, 11, 12));
+    b.emit_arm(bx(AL, 14));
+
+    let words = b.finish();
+    let (text, aot) = compile_snippet(&words, &[(entry, Source::Entry)]);
+    verify_compiled("cond_flag_preservation_and_high_regs", &text, &aot, true, |cpu, _| {
+        cpu.regs[0] = 0x1122_3344;
+        cpu.regs[1] = 0xFFFF_FFFF;
+        cpu.regs[2] = 0x5566_7788;
+        cpu.regs[3] = 0x99AA_BBCC;
+        cpu.regs[4] = 0x7FFF_FFFF;
+        cpu.regs[5] = 0x8000_0000;
+        cpu.regs[6] = 0x0000_0001;
+        cpu.regs[7] = 0xFFFF_FFFE;
+        cpu.regs[8] = 0x4000_0000;
+        cpu.regs[9] = 0x80FF_01FF;
+        cpu.regs[10] = 0x7FFF_FFFE;
+        cpu.regs[11] = 0xDEAD_0000; // unmapped!
+        cpu.regs[12] = 0x8002_FF02;
+        cpu.cpsr.ge = 0b0101;
+        cpu.exclusive_addr = Some(HEAP + 0x40);
+        cpu.vfp.regs[0] = 1.0f32.to_bits();
+        cpu.vfp.regs[1] = 2.0f32.to_bits();
+        cpu.vfp.regs[2] = 3.0f32.to_bits();
+        cpu.vfp.fpscr = 0x2000_0000;
+    });
+}
+
+#[test]
+fn torture_adversarial_corrupt_truncated_wrong_arch_aot_cache() {
+    use asm::*;
+    use zakuro_aot::runtime::{AotImage, CACHE_MAGIC, FORMAT_VERSION};
+
+    let words = [mov_imm(AL, false, 0, 7, 0), bx(AL, 14)];
+    let text_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let program = Program {
+        text: Segment { base: BASE, bytes: text_bytes },
+        seeds: vec![(BASE, Source::Entry)],
+        slots: None,
+    };
+    let image = compile_program(0, 0x1234, &program, &[], CompileOptions::default(), |_, _| {});
+    let mut valid = Vec::new();
+    image.write_to(&mut valid).unwrap();
+
+    // 1. Empty / truncated headers
+    assert!(AotImage::read_header(&valid[..0]).is_err());
+    assert!(AotImage::read_header(&valid[..20]).is_err());
+    assert!(LoadedAot::read_exec(&valid[..51]).is_err());
+    assert!(LoadedAot::read_exec(&valid[..53]).is_err());
+
+    // 2. Wrong-arch magic (AArch64 UNXAOTA2 & fallback UNXAOT00)
+    for bad_magic in [b"UNXAOTA2", b"UNXAOT00", b"BADMAGIC"] {
+        if bad_magic != CACHE_MAGIC {
+            let mut bad = valid.clone();
+            bad[0..8].copy_from_slice(bad_magic);
+            assert!(AotImage::read_header(bad.as_slice()).is_err());
+            assert!(LoadedAot::read_exec(bad.as_slice()).is_err());
+        }
+    }
+
+    // 3. Bad format version
+    for bad_ver in [0u32, FORMAT_VERSION + 1, u32::MAX] {
+        let mut bad = valid.clone();
+        bad[8..12].copy_from_slice(&bad_ver.to_le_bytes());
+        assert!(AotImage::read_header(bad.as_slice()).is_err());
+        assert!(LoadedAot::read_exec(bad.as_slice()).is_err());
+    }
+
+    let mut errs: Vec<String> = Vec::new();
+
+    // 4. Out-of-bounds enter_offset (>= code_bytes_len): MUST fail cleanly, never load an OOB RX jump target!
+    {
+        let mut bad = valid.clone();
+        bad[28..32].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        let res = LoadedAot::read_exec(bad.as_slice());
+        if res.is_ok() {
+            errs.push("LoadedAot::read_exec accepted out-of-bounds enter_offset 0xDEAD_BEEF".into());
+        }
+    }
+
+    // 5. Out-of-bounds entries[0].1 (code byte offset >= code_bytes_len): MUST fail cleanly!
+    {
+        let mut bad = valid.clone();
+        // Header is 52 bytes; entry 0 is (addr @ 52..56, off @ 56..60)
+        bad[56..60].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        let res = LoadedAot::read_exec(bad.as_slice());
+        if res.is_ok() {
+            errs.push("LoadedAot::read_exec accepted out-of-bounds entry offset 0x7FFF_FFFF".into());
+        }
+    }
+
+    // 6. Corrupt OriginData (piece.start > piece.end, or out-of-bounds function/run indices):
+    // Calling LoadedAot::check() MUST NOT panic on corrupt/tampered cache!
+    {
+        let mut bad = valid.clone();
+        let entry_count = u32::from_le_bytes(bad[36..40].try_into().unwrap()) as usize;
+        let piece_count = u32::from_le_bytes(bad[40..44].try_into().unwrap()) as usize;
+        assert!(piece_count > 0);
+        let pieces_off = 52 + entry_count * 8 + entry_count * 4;
+        // Flip piece[0].start = 0xFFFF_0000 > piece[0].end
+        bad[pieces_off..pieces_off + 4].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut aot = LoadedAot::read_exec(bad.as_slice())?;
+            let _ = aot.check(|_, buf| buf.fill(0));
+            Ok::<_, String>(())
+        }));
+        match res {
+            Ok(Ok(())) => errs.push("corrupt OriginData piece (start > end) was accepted silently by read_exec + check".into()),
+            Ok(Err(_)) => {}
+            Err(_) => errs.push("corrupt OriginData piece (start > end) caused a PANIC instead of returning Err".into()),
+        }
+    }
+    assert!(errs.is_empty(), "{}", errs.join("; "));
+}
+
+#[test]
+fn torture_adversarial_indirect_icache_collisions_and_budget_unwind() {
+    use asm::*;
+    use zakuro_aot::runtime::{icache_slot, ICACHE_SLOTS};
+
+    // Place fn_a at BASE + 0x100, and search for another 4-aligned address fn_b >= BASE + 0x200
+    // with identical icache_slot(fn_a) == icache_slot(fn_b | 1) (ARM vs Thumb collision!),
+    // plus callee mutating LR before returning (emit_post_call_guard -> IndirectJump),
+    // deep BL/BLX recursion unwinding with slice=1, and SVC #0x2A mid-Thumb!
+    let mut b = CodeBuilder::new();
+    let entry = b.addr();
+    b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 8, 14, LSL, 0)); // MOV R8, LR (save RETURN)
+    let ldr_a = b.emit_arm(0);
+    let ldr_b = b.emit_arm(0);
+    b.emit_arm(mov_imm(AL, false, 6, 4, 0)); // loop count = 4
+    let loop_top = b.addr();
+    b.emit_arm(blx_reg(AL, 4));              // indirect call fn_a (ARM)
+    b.emit_arm(blx_reg(AL, 5));              // indirect call fn_b (Thumb) -> collides same icache slot!
+    b.emit_arm(dp_imm(AL, OP_SUB, true, 6, 6, 1, 0));
+    b.emit_arm(b_cond(NE, loop_top + 12, loop_top));
+
+    let blx_svc = b.emit_arm(0);
+    b.emit_arm(bx(AL, 8));
+
+    // Inline literal pool right after entry (so imm12 offsets stay tiny!):
+    let pool_a = b.addr();
+    b.emit_arm(0);
+    let pool_b = b.addr();
+    b.emit_arm(0);
+
+    while b.addr() < BASE + 0x100 {
+        b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 0, 0, LSL, 0));
+    }
+    let fn_a = b.addr();
+    b.emit_arm(add_imm(AL, false, 0, 0, 3, 0));
+    b.emit_arm(bx(AL, 14));
+
+    let slot_a = icache_slot(fn_a);
+    let mut fn_b = BASE + 0x200;
+    while icache_slot(fn_b | 1) != slot_a {
+        fn_b += 4;
+        assert!((fn_b - BASE) < (ICACHE_SLOTS as u32) * 16);
+    }
+    while b.addr() < fn_b {
+        b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 0, 0, LSL, 0));
+    }
+    assert_eq!(icache_slot(fn_b | 1), slot_a);
+    b.emit_thumb(t_adds_imm8(0, 5));
+    b.emit_thumb(t_bx(14));
+    b.align4();
+
+    let t_svc = b.addr();
+    b.emit_thumb(t_adds_imm8(1, 9));
+    b.emit_thumb(0xDF2A); // Thumb SVC #0x2A
+    b.emit_thumb(t_bx(14));
+    b.align4();
+
+    b.patch_arm(pool_a, fn_a);
+    b.patch_arm(pool_b, fn_b | 1);
+    b.patch_arm(ldr_a, ldr_str_imm(AL, true, false, true, true, false, 15, 4, pool_a - (ldr_a + 8)));
+    b.patch_arm(ldr_b, ldr_str_imm(AL, true, false, true, true, false, 15, 5, pool_b - (ldr_b + 8)));
+    b.patch_arm(blx_svc, blx_thumb(blx_svc, t_svc));
+
+    let words = b.finish();
+    let (text, aot) = compile_snippet(
+        &words,
+        &[(entry, Source::Entry), (fn_a, Source::Entry), (fn_b | 1, Source::Entry), (t_svc | 1, Source::Entry)],
+    );
+    verify_compiled("indirect_icache_collisions_and_budget_unwind", &text, &aot, true, |cpu, _| {
+        cpu.regs[0] = 10;
+        cpu.regs[1] = 20;
+    });
+
+    // Also test emit_post_call_guard mismatch when callee mutates LR (+4) to skip a word!
+    let mut b2 = CodeBuilder::new();
+    let e2 = b2.addr();
+    b2.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 8, 14, LSL, 0));
+    let bl_mut = b2.emit_arm(0);
+    b2.emit_arm(mov_imm(AL, false, 7, 0xEE, 0)); // skipped!
+    b2.emit_arm(mov_imm(AL, false, 7, 0x77, 0)); // landed!
+    b2.emit_arm(bx(AL, 8));
+    let lr_mutator = b2.addr();
+    b2.emit_arm(add_imm(AL, false, 14, 14, 4, 0));
+    b2.emit_arm(bx(AL, 14));
+    b2.patch_arm(bl_mut, bl_cond(AL, bl_mut, lr_mutator));
+    let (text2, aot2) = compile_snippet(&b2.finish(), &[(e2, Source::Entry)]);
+    verify_compiled("post_call_guard_lr_mutation", &text2, &aot2, false, |cpu, _| {
+        cpu.regs[7] = 0;
+    });
+}
+
