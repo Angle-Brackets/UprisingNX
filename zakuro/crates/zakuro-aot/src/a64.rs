@@ -418,6 +418,10 @@ pub const fn eor64_reg(rd: u8, rn: u8, rm: u8, shift: Shift, amount: u8) -> u32 
     logical_reg(1, 0b10, 0, rd, rn, rm, shift, amount)
 }
 #[inline(always)]
+pub const fn ands64_reg(rd: u8, rn: u8, rm: u8, shift: Shift, amount: u8) -> u32 {
+    logical_reg(1, 0b11, 0, rd, rn, rm, shift, amount)
+}
+#[inline(always)]
 pub const fn mov64(rd: u8, rm: u8) -> u32 {
     orr64_reg(rd, ZR, rm, Shift::Lsl, 0)
 }

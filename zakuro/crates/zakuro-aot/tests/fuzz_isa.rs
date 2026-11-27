@@ -879,6 +879,7 @@ fn run_fuzz_suite_raw(
     let total_fallbacks = AtomicUsize::new(0);
     let total_interpreted = AtomicUsize::new(0);
     let seen_kinds: Mutex<BTreeSet<(&'static str, bool, u32)>> = Mutex::new(BTreeSet::new());
+    let mismatch_logs: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     // Compile in parallel-friendly chunks so `compile_program` uses its own thread pool
     // cleanly without oversubscribing N^2 nested threads, then execute batches in parallel
@@ -968,7 +969,7 @@ fn run_fuzz_suite_raw(
                         .unwrap()
                         .insert((slot.desc, is_double, rmode));
                     if count < MAX_PRINT_FAILS || is_new_kind {
-                        eprintln!(
+                        let line = format!(
                             "MISMATCH #{}: test={test_name} batch={} idx={} seed=0x{:016X} addr=0x{addr:08X} opcodes={} pre=({}) diffs={:?}",
                             count + 1,
                             batch.batch_idx,
@@ -978,6 +979,7 @@ fn run_fuzz_suite_raw(
                             slot.format_pre_state(),
                             diffs,
                         );
+                        mismatch_logs.lock().unwrap().push(line);
                     }
                     let _ = &mut diffs;
                 }
@@ -990,6 +992,9 @@ fn run_fuzz_suite_raw(
     let interpreted = total_interpreted.load(Ordering::Relaxed) as u64;
     let fails = mismatches.load(Ordering::Relaxed);
 
+    for line in mismatch_logs.into_inner().unwrap() {
+        println!("{line}");
+    }
     println!(
         "[{test_name}] execs={execs} batches={num_batches} fallbacks={fallbacks} uncompiled={interpreted} mismatches={fails} elapsed={:.2?}",
         t0.elapsed()

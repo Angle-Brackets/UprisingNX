@@ -2251,6 +2251,9 @@ impl FnEmitter<'_> {
             }
         } else {
             self.buf.emit(a64::ldrb_uoff(16, 19, offsets::CTX_EXCLUSIVE));
+            // ARMv6K: executing STREX* always clears the local exclusive monitor,
+            // whether the store succeeds or fails due to an address mismatch.
+            self.buf.emit(a64::strb_uoff(ZR, 19, offsets::CTX_EXCLUSIVE));
             let j_fail1 = self.buf.emit(a64::nop()); // cbz w16, fail
             self.buf.emit(a64::ldr32_uoff(17, 19, offsets::CTX_EXCL_ADDR));
             self.buf.emit(a64::sub32_reg(17, 17, 27, Shift::Lsl, 0));
@@ -2267,7 +2270,6 @@ impl FnEmitter<'_> {
                 0b10 => self.emit_write8(rm as u8),
                 _ => self.emit_write16(rm as u8),
             }
-            self.buf.emit(a64::strb_uoff(ZR, 19, offsets::CTX_EXCLUSIVE));
             self.buf.mov_imm32(rd as u8, 0);
             let j_done = self.buf.emit(a64::nop());
 
@@ -2338,8 +2340,8 @@ impl FnEmitter<'_> {
         self.buf.emit(a64::mov32(lo as u8, 25));
         self.buf.emit(a64::lsr64_imm(hi as u8, 25, 32));
         if kind != 0b010 && (op & (1 << 20)) != 0 {
-            // 64-bit N and Z:
-            self.buf.emit(a64::subs64_imm(ZR, 25, 0, false));
+            // 64-bit N and Z (`tst x25, x25` clears C=0, V=0 for `update_logical_flags`):
+            self.buf.emit(a64::ands64_reg(ZR, 25, 25, Shift::Lsl, 0));
             self.update_logical_flags(None);
         }
         true
