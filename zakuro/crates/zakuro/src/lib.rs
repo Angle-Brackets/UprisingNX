@@ -1771,9 +1771,12 @@ impl App {
         }
         if pressed && !event.repeat {
             match code {
-                // the options go back to the menu they came from
-                KeyCode::Escape if self.menus.options_open => {
+                // the settings/options page goes back to the menu or setup page it came from
+                KeyCode::Escape if self.menus.options_open || (self.kiu_mode && self.menus.settings_open) => {
                     self.menus.options_open = false;
+                    self.menus.settings_open = false;
+                    self.menus.rebinding = None;
+                    self.menus.rebinding_pad = None;
                     return;
                 }
                 KeyCode::Escape if self.game.is_some() => {
@@ -1843,6 +1846,9 @@ impl App {
             } else if button == gilrs::Button::Mode && self.game.is_some() {
                 self.menus.menu_open = !self.menus.menu_open;
                 self.menus.options_open = false;
+                if self.kiu_mode {
+                    self.menus.settings_open = false;
+                }
                 self.set_mouse_aim(None);
                 self.keyboard.release();
             } else if button == gilrs::Button::RightThumb {

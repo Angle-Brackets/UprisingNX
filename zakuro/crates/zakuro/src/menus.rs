@@ -68,6 +68,41 @@ pub enum Action {
     CheatsFolder,
 }
 
+/// Category tabs for the unified Kid Icarus parchment settings page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsTab {
+    #[default]
+    Graphics,
+    AudioWindow,
+    Controls,
+    Controller,
+    System,
+}
+
+impl SettingsTab {
+    pub const ALL: [SettingsTab; 5] = [
+        SettingsTab::Graphics,
+        SettingsTab::AudioWindow,
+        SettingsTab::Controls,
+        SettingsTab::Controller,
+        SettingsTab::System,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Graphics => "Graphics",
+            SettingsTab::AudioWindow => "Audio & Window",
+            SettingsTab::Controls => "Controls",
+            SettingsTab::Controller => "Controller",
+            SettingsTab::System => "System",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&t| t == self).unwrap_or(0)
+    }
+}
+
 #[derive(Default)]
 pub struct Menus {
     /// true when running in KIU-first PC launcher mode (`uprising-recompiled`).
@@ -81,6 +116,14 @@ pub struct Menus {
     pub settings_open: bool,
     /// Kid Icarus' own options, over the menu of the running game.
     pub options_open: bool,
+    /// Active tab in the unified parchment settings page.
+    pub settings_tab: SettingsTab,
+    /// Page navigation animation progress: 0.0 = Setup/Pause, 1.0 = Settings page.
+    pub(crate) settings_anim: f32,
+    settings_anim_time: Option<f64>,
+    /// Tab switch animation progress (0.0 -> 1.0) and direction (-1.0 or +1.0).
+    pub(crate) tab_anim: f32,
+    pub(crate) tab_dir: f32,
     /// the binding waiting for a key, by its place in Keys::all_mut.
     pub rebinding: Option<usize>,
     /// the controller binding waiting for a button, by its place in
@@ -242,7 +285,139 @@ fn setup_parchment_visuals(visuals: &mut egui::Visuals) {
     widgets.hovered.weak_bg_fill = PAPER_LINE;
 }
 
+pub(crate) fn smootherstep(t: f32) -> f32 {
+    let x = t.clamp(0.0, 1.0);
+    x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+}
+
+pub(crate) fn parchment_frame(margin: i8, alpha: f32) -> egui::Frame {
+    let a = alpha.clamp(0.0, 1.0);
+    egui::Frame::new()
+        .fill(PAPER.gamma_multiply(a))
+        .stroke(egui::Stroke::new(1.5, INK.gamma_multiply(a)))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(margin))
+        .shadow(egui::Shadow {
+            offset: [3, 4],
+            blur: 0,
+            spread: 0,
+            color: SHADOW.gamma_multiply(a),
+        })
+}
+
+pub(crate) fn parchment_button(ui: &mut egui::Ui, label: &str, size: Vec2, primary: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered();
+        let active = response.is_pointer_button_down_on();
+        let round = egui::CornerRadius::same(6);
+        let painter = ui.painter();
+
+        // Subtle parchment drop shadow matching the game's pill buttons; presses down on click.
+        let press_y = if active { 1.5 } else { 0.0 };
+        let btn_rect = rect.translate(Vec2::new(0.0, press_y));
+        if !active {
+            painter.rect_filled(
+                rect.translate(Vec2::new(0.0, 2.5)),
+                round,
+                if primary { Color32::from_rgb(138, 22, 24) } else { PAPER_SHADOW },
+            );
+        }
+
+        let (fill, stroke, text_color) = if primary {
+            let fill = if active {
+                Color32::from_rgb(184, 24, 28)
+            } else if hovered {
+                Color32::from_rgb(236, 46, 48)
+            } else {
+                RED
+            };
+            let stroke = if hovered || active {
+                egui::Stroke::new(2.0, ORANGE)
+            } else {
+                egui::Stroke::new(1.5, INK)
+            };
+            (fill, stroke, Color32::WHITE)
+        } else {
+            let fill = if active {
+                PAPER_SHADOW
+            } else if hovered {
+                PAPER_LINE
+            } else {
+                Color32::from_rgb(252, 248, 240)
+            };
+            let stroke = if hovered || active {
+                egui::Stroke::new(1.6, RED)
+            } else {
+                egui::Stroke::new(1.4, INK)
+            };
+            (fill, stroke, INK)
+        };
+
+        painter.rect_filled(btn_rect, round, fill);
+        painter.rect_stroke(btn_rect, round, stroke, egui::StrokeKind::Inside);
+
+        let galley = painter.layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::proportional(if primary { 14.0 } else { 13.5 }),
+            text_color,
+        );
+        let text_pos = btn_rect.center() - galley.size() / 2.0;
+        painter.galley(text_pos, galley.clone(), text_color);
+        if primary {
+            // Slight ink boldness matching `heavy_title`.
+            painter.galley(text_pos + Vec2::new(0.5, 0.0), galley, text_color);
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 impl Menus {
+    /// Whether the unified Kid Icarus parchment settings page is open (or requested).
+    pub(crate) fn parchment_settings_target(&self) -> bool {
+        self.options_open || (self.kiu_mode && self.settings_open)
+    }
+
+    /// Advances the page-navigation and tab-switch animations once per frame and returns
+    /// the eased page progress `0.0` (setup/pause) .. `1.0` (settings page).
+    pub(crate) fn step_settings_anim(&mut self, ctx: &egui::Context) -> f32 {
+        const PAGE_SECS: f32 = 0.28;
+        const TAB_SECS: f32 = 0.16;
+        let target = if self.parchment_settings_target() { 1.0 } else { 0.0 };
+        let now = ctx.input(|i| i.time);
+        match self.settings_anim_time {
+            None => {
+                // First frame: settle directly onto the initial state so tests / initial opens don't lag.
+                self.settings_anim = target;
+                self.tab_anim = 1.0;
+                self.settings_anim_time = Some(now);
+            }
+            Some(prev) => {
+                let dt = (now - prev).clamp(0.0, 0.05) as f32;
+                if dt > 0.0 {
+                    self.settings_anim_time = Some(now);
+                    if (self.settings_anim - target).abs() > 1e-4 {
+                        let step = dt / PAGE_SECS;
+                        if target > self.settings_anim {
+                            self.settings_anim = (self.settings_anim + step).min(target);
+                        } else {
+                            self.settings_anim = (self.settings_anim - step).max(target);
+                        }
+                    } else {
+                        self.settings_anim = target;
+                    }
+                    if self.tab_anim < 1.0 {
+                        self.tab_anim = (self.tab_anim + dt / TAB_SECS).min(1.0);
+                    }
+                }
+            }
+        }
+        if (self.settings_anim - target).abs() > 1e-4 || self.tab_anim < 1.0 {
+            ctx.request_repaint();
+        }
+        smootherstep(self.settings_anim)
+    }
+
     /// Centered KIU-first setup and AOT cache builder UI (replaces generic ROM library).
     pub fn kiu_setup(&mut self, ui: &mut egui::Ui, stage: &KiuSetupStage<'_>) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -251,135 +426,166 @@ impl Menus {
             .frame(egui::Frame::new().fill(Color32::from_rgb(18, 16, 22)))
             .show(ui, |_ui| {});
 
+        let eased = self.step_settings_anim(&ctx);
+        let setup_vis = (1.0 - eased * 2.0).clamp(0.0, 1.0);
+        if setup_vis <= 0.01 {
+            return actions;
+        }
+
         let screen = ctx.content_rect();
         let margin = 16.0_f32;
         let width = (screen.width() - margin * 2.0).clamp(280.0, 560.0);
-        let frame = egui::Frame::new()
-            .fill(PAPER)
-            .stroke(egui::Stroke::new(1.5, INK))
-            .corner_radius(8)
-            .inner_margin(egui::Margin::same(20))
-            .shadow(egui::Shadow { offset: [3, 4], blur: 0, spread: 0, color: SHADOW });
+        let max_inner_height = (screen.height() - margin * 2.0 - 40.0).max(180.0);
+        let slide = (screen.width() * 0.24).clamp(120.0, 300.0);
+        let offset_x = -slide * eased;
+        let frame = parchment_frame(20, setup_vis);
 
         egui::Window::new("Kid Icarus: Uprising Recompiled Setup")
             .id(egui::Id::new("kiu setup"))
             .title_bar(false)
             .resizable(false)
             .collapsible(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .interactable(setup_vis >= 0.95)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::new(offset_x, 0.0))
             .frame(frame)
             .min_width(width)
             .max_width(width)
-            .vscroll(true)
-            .max_height((screen.height() - margin * 2.0).max(200.0))
             .show(&ctx, |ui| {
+                ui.multiply_opacity(setup_vis);
                 setup_parchment_visuals(ui.visuals_mut());
-                let (title_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), egui::Sense::hover());
-                heavy_title(ui.painter(), "KID ICARUS: UPRISING", title_rect.center().x, title_rect.min.y, 1.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Kid Icarus: Uprising Recompiled Setup").strong().size(15.0).color(INK));
-                });
-                ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .max_height(max_inner_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let (title_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), egui::Sense::hover());
+                        heavy_title(ui.painter(), "KID ICARUS: UPRISING", title_rect.center().x, title_rect.min.y, 1.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("Kid Icarus: Uprising Recompiled Setup").strong().size(15.0).color(INK));
+                        });
+                        ui.add_space(12.0);
 
-                match stage {
-                    KiuSetupStage::NeedsRom { notice, hovered_file } => {
-                        ui.label(
-                            RichText::new(
-                                "Provide a decrypted USA copy of Kid Icarus: Uprising (.3ds, .cci, or .cia) to import and launch.",
-                            )
-                            .color(INK),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(
-                                "Drag and drop your ROM onto this window or choose a file below. It will be copied into app data once so you don't need to keep the original file around.",
-                            )
-                            .color(Color32::from_rgb(76, 68, 62)),
-                        );
-                        ui.add_space(10.0);
+                        match stage {
+                            KiuSetupStage::NeedsRom { notice, hovered_file } => {
+                                ui.label(
+                                    RichText::new(
+                                        "Provide a decrypted USA copy of Kid Icarus: Uprising (.3ds, .cci, or .cia) to import and launch.",
+                                    )
+                                    .color(INK),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Drag and drop your ROM onto this window or choose a file below. It will be copied into app data once so you don't need to keep the original file around.",
+                                    )
+                                    .color(Color32::from_rgb(76, 68, 62)),
+                                );
+                                ui.add_space(14.0);
 
-                        if let Some(notice) = notice {
-                            egui::Frame::new()
-                                .fill(Color32::from_rgb(252, 232, 232))
-                                .stroke(egui::Stroke::new(1.5, RED))
-                                .corner_radius(6)
-                                .inner_margin(egui::Margin::same(10))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.label(RichText::new(&notice.heading).strong().size(14.0).color(RED));
-                                    ui.add_space(4.0);
-                                    for paragraph in &notice.paragraphs {
-                                        if paragraph.is_empty() {
+                                if let Some(notice) = notice {
+                                    egui::Frame::new()
+                                        .fill(Color32::from_rgb(252, 232, 232))
+                                        .stroke(egui::Stroke::new(1.5, RED))
+                                        .corner_radius(6)
+                                        .inner_margin(egui::Margin::same(10))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.label(RichText::new(&notice.heading).strong().size(14.0).color(RED));
                                             ui.add_space(4.0);
-                                        } else {
-                                            ui.label(RichText::new(paragraph).color(INK));
-                                        }
+                                            for paragraph in &notice.paragraphs {
+                                                if paragraph.is_empty() {
+                                                    ui.add_space(4.0);
+                                                } else {
+                                                    ui.label(RichText::new(paragraph).color(INK));
+                                                }
+                                            }
+                                        });
+                                    ui.add_space(12.0);
+                                }
+
+                                if *hovered_file {
+                                    egui::Frame::new()
+                                        .fill(Color32::from_rgb(232, 244, 255))
+                                        .stroke(egui::Stroke::new(1.5, BLUE))
+                                        .corner_radius(6)
+                                        .inner_margin(egui::Margin::same(8))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.vertical_centered(|ui| {
+                                                ui.label(RichText::new("Drop ROM file to import and launch").strong().color(INK));
+                                            });
+                                        });
+                                    ui.add_space(12.0);
+                                }
+
+                                let btn_width = ui.available_width().min(390.0);
+                                let lead = ((ui.available_width() - btn_width) * 0.5).max(0.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(lead);
+                                    if parchment_button(
+                                        ui,
+                                        "Select Decrypted USA ROM (.3ds / .cci / .cia)...",
+                                        Vec2::new(btn_width, 38.0),
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        actions.push(Action::SelectKiuRom);
                                     }
                                 });
-                            ui.add_space(10.0);
-                        }
 
-                        if *hovered_file {
-                            egui::Frame::new()
-                                .fill(Color32::from_rgb(232, 244, 255))
-                                .stroke(egui::Stroke::new(1.5, BLUE))
-                                .corner_radius(6)
-                                .inner_margin(egui::Margin::same(8))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(RichText::new("Drop ROM file to import and launch").strong().color(INK));
-                                    });
+                                ui.add_space(18.0);
+                                // Subtle parchment rule separating primary setup from bottom actions.
+                                let (rule_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 2.0), egui::Sense::hover());
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(rule_rect.min.x + 12.0, rule_rect.center().y),
+                                        egui::pos2(rule_rect.max.x - 12.0, rule_rect.center().y),
+                                    ],
+                                    egui::Stroke::new(1.0, PAPER_SHADOW),
+                                );
+                                ui.add_space(12.0);
+
+                                let sub_width = 128.0_f32;
+                                let gap = 14.0_f32;
+                                let row_width = sub_width * 2.0 + gap;
+                                let row_lead = ((ui.available_width() - row_width) * 0.5).max(0.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.add_space(row_lead);
+                                    if parchment_button(ui, "Settings", Vec2::new(sub_width, 32.0), false).clicked() {
+                                        self.settings_open = true;
+                                    }
+                                    ui.add_space(gap);
+                                    if parchment_button(ui, "Quit", Vec2::new(sub_width, 32.0), false).clicked() {
+                                        actions.push(Action::Quit);
+                                    }
                                 });
-                            ui.add_space(10.0);
-                        }
-
-                        ui.vertical_centered(|ui| {
-                            let btn_width = ui.available_width().min(360.0);
-                            if ui
-                                .add_sized(
-                                    [btn_width, 34.0],
-                                    egui::Button::new(
-                                        RichText::new("Select Decrypted USA ROM (.3ds / .cci / .cia)...").strong(),
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                actions.push(Action::SelectKiuRom);
+                                ui.add_space(4.0);
                             }
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                if ui.button("Settings").clicked() {
-                                    self.settings_open = true;
-                                }
-                                if ui.button("Quit").clicked() {
-                                    actions.push(Action::Quit);
-                                }
-                            });
-                        });
-                    }
-                    KiuSetupStage::Compiling { stage, fraction, detail } => {
-                        ui.label(RichText::new(*stage).strong().size(14.0).color(INK));
-                        ui.add_space(8.0);
-                        ui.add(
-                            egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-                                .desired_width(ui.available_width())
-                                .show_percentage()
-                                .animate(true),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(*detail).color(INK));
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(
-                                "This one-time setup compiles the native PC executable cache; future launches boot straight into the game.",
-                            )
-                            .small()
-                            .color(Color32::from_rgb(76, 68, 62)),
-                        );
-                        ctx.request_repaint();
-                    }
-                }
+                            KiuSetupStage::Compiling { stage, fraction, detail } => {
+                                ui.label(RichText::new(*stage).strong().size(14.0).color(INK));
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                                        .desired_width(ui.available_width())
+                                        .show_percentage()
+                                        .animate(true),
+                                );
+                                ui.add_space(8.0);
+                                ui.label(RichText::new(*detail).color(INK));
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(
+                                        "This one-time setup compiles the native PC executable cache; future launches boot straight into the game.",
+                                    )
+                                    .small()
+                                    .color(Color32::from_rgb(76, 68, 62)),
+                                );
+                                ui.add_space(4.0);
+                                ctx.request_repaint();
+                            }
+                        }
+                    });
 
                 let edge = ui.min_rect().expand(20.0);
                 let painter = ui.painter().with_clip_rect(ctx.content_rect());
@@ -598,8 +804,8 @@ impl Menus {
                 });
             });
         }
-        // the options take the menu's place while open
-        if !self.menu_open || self.options_open {
+        // the settings/options page takes the pause menu's place while open
+        if !self.menu_open || self.options_open || (self.kiu_mode && (self.settings_open || self.settings_anim > 0.05)) {
             return actions;
         }
         egui::Window::new("Paused")
@@ -614,7 +820,7 @@ impl Menus {
                 if wide(ui, "Resume") {
                     actions.push(Action::Resume);
                 }
-                if wide(ui, "Options") {
+                if !self.kiu_mode && wide(ui, "Options") {
                     self.options_open = true;
                 }
                 if wide(ui, "Reset") {
@@ -852,8 +1058,11 @@ impl Menus {
         actions
     }
 
-    /// the settings window, when open.
+    /// the settings window, when open (non-KIU Zakuro library mode; KIU mode uses the unified parchment settings page).
     pub fn settings(&mut self, ctx: &egui::Context, settings: &mut Settings) -> Vec<Action> {
+        if self.kiu_mode {
+            return Vec::new();
+        }
         let mut actions = Vec::new();
         let before = settings.clone();
         let mut open = self.settings_open;
