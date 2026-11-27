@@ -152,10 +152,11 @@ pub fn compile_program(
     // Compile functions in parallel chunks using a temporary scoped pool (explicit 2 MiB stacks
     // and 3 cores on Horizon Switch, freeing all worker stacks as soon as bootstrap finishes).
     const CHUNK: usize = 256;
-    let compile_slice = |slice: &[(u32, Function)]| -> Vec<CompiledFunc> {
+    let compile_slice = |(chunk_idx, slice): (usize, &[(u32, Function)])| -> Vec<CompiledFunc> {
         let mut out = Vec::with_capacity(slice.len());
-        for (entry, func) in slice {
-            out.push(compile_one_function(program, &known_targets, *entry, func, options));
+        let base_idx = chunk_idx * CHUNK;
+        for (i, (entry, func)) in slice.iter().enumerate() {
+            out.push(compile_one_function(program, &known_targets, *entry, func, base_idx + i, options));
         }
         let prev = done_funcs.fetch_add(slice.len(), Ordering::Relaxed) + slice.len();
         let pct = 10 + (prev * 82) / total_funcs;
@@ -173,8 +174,8 @@ pub fn compile_program(
         .thread_name(|i| format!("aot-{i}"))
         .build();
     let compiled_chunks: Vec<Vec<CompiledFunc>> = match pool {
-        Ok(pool) => pool.install(|| dedup_funcs.par_chunks(CHUNK).map(compile_slice).collect()),
-        Err(_) => dedup_funcs.chunks(CHUNK).map(compile_slice).collect(),
+        Ok(pool) => pool.install(|| dedup_funcs.par_chunks(CHUNK).enumerate().map(compile_slice).collect()),
+        Err(_) => dedup_funcs.chunks(CHUNK).enumerate().map(compile_slice).collect(),
     };
 
     let compiled_funcs: Vec<CompiledFunc> = compiled_chunks.into_iter().flatten().collect();
@@ -413,6 +414,9 @@ fn emit_runtime_stubs(buf: &mut CodeBuf) -> RuntimeStubs {
     for i in 0..16u8 {
         buf.emit(a64::stp_s_off(i * 2, i * 2 + 1, 17, (i as i16) * 8));
     }
+    // Restore caller host FPCR before calling any Rust helper or returning from `enter`.
+    buf.emit(a64::ldr64_uoff(16, 19, offsets::HOST_FPCR));
+    buf.emit(a64::msr_fpcr(16));
     buf.emit(a64::ret());
 
     // 2. sync_in (uses ONLY x16, x17 so x25, x26, x27 are preserved, and sets hardware NZCV = w23!)
@@ -437,6 +441,15 @@ fn emit_runtime_stubs(buf: &mut CodeBuf) -> RuntimeStubs {
     for i in 0..16u8 {
         buf.emit(a64::ldp_s_off(i * 2, i * 2 + 1, 17, (i as i16) * 8));
     }
+    // Sync hardware FPCR[25:22] (DN, FZ, RMode) from `*ctx.fpscr` using only x16/x17.
+    buf.emit(a64::mrs_fpcr(17));
+    buf.mov_imm32(16, 0x03C0_0000);
+    buf.emit(a64::bic64_reg(17, 17, 16, Shift::Lsl, 0));
+    buf.emit(a64::ldr64_uoff(16, 19, offsets::CTX_FPSCR));
+    buf.emit(a64::ldr32_uoff(16, 16, 0));
+    buf.emit(a64::and32_imm(16, 16, 0x03C0_0000).unwrap());
+    buf.emit(a64::orr64_reg(17, 17, 16, Shift::Lsl, 0));
+    buf.emit(a64::msr_fpcr(17));
     buf.emit(a64::msr_nzcv(23));
     buf.emit(a64::ret());
 
@@ -467,6 +480,8 @@ fn emit_runtime_stubs(buf: &mut CodeBuf) -> RuntimeStubs {
     buf.emit(a64::stp_d_off(14, 15, SP, 144));
     buf.emit(a64::mov64(19, 0));
     buf.emit(a64::mov64(27, 1));
+    buf.emit(a64::mrs_fpcr(16));
+    buf.emit(a64::str64_uoff(16, 19, offsets::HOST_FPCR));
     bl_to(buf, sync_in);
     bl_to(buf, invoke_x27);
     bl_to(buf, sync_out);
@@ -783,6 +798,7 @@ struct FnEmitter<'a> {
     epilogue_patches: Vec<usize>,
     depth_overflow_patches: Vec<(usize, u32)>,
     budget_exits: Vec<BudgetExit>,
+    stale_check: Option<(usize, usize, u32, usize)>,
     interpreted_addrs: Vec<u32>,
     folded_spans: Vec<(u32, u32)>,
     /// True iff hardware `NZCV` is guaranteed to equal `w23` on all paths reaching `buf.pos()`.
@@ -794,10 +810,11 @@ fn compile_one_function(
     known_targets: &BTreeSet<u32>,
     entry: u32,
     func: &Function,
+    func_idx: usize,
     options: CompileOptions,
 ) -> CompiledFunc {
     // Pass 1: find any instructions handed to `interpret()`, whose successor becomes a resumable label.
-    let first_pass = emit_function_pass(program, known_targets, entry, func, &func.labels, options);
+    let first_pass = emit_function_pass(program, known_targets, entry, func, func_idx, &func.labels, options);
     let final_compiled = if first_pass.1.is_empty() {
         first_pass.0
     } else {
@@ -809,7 +826,7 @@ fn compile_one_function(
                 }
             }
         }
-        emit_function_pass(program, known_targets, entry, func, &resumable, options).0
+        emit_function_pass(program, known_targets, entry, func, func_idx, &resumable, options).0
     };
     final_compiled
 }
@@ -819,6 +836,7 @@ fn emit_function_pass(
     known_targets: &BTreeSet<u32>,
     entry: u32,
     func: &Function,
+    func_idx: usize,
     labels: &BTreeSet<u32>,
     options: CompileOptions,
 ) -> (CompiledFunc, Vec<u32>) {
@@ -834,6 +852,7 @@ fn emit_function_pass(
         epilogue_patches: Vec::new(),
         depth_overflow_patches: Vec::new(),
         budget_exits: Vec::new(),
+        stale_check: None,
         interpreted_addrs: Vec::new(),
         folded_spans: Vec::new(),
         flags_live: false,
@@ -860,6 +879,12 @@ fn emit_function_pass(
         if em.labels.contains(&address) {
             em.flags_live = false;
             label_map.insert(address, em.buf.pos() as u32);
+            if address == entry {
+                em.buf.emit(a64::ldr64_uoff(16, 19, offsets::STALE_PTR));
+                let j_stale = em.buf.emit(a64::nop());
+                let resume_entry = em.buf.pos();
+                em.stale_check = Some((j_stale, resume_entry, entry, func_idx));
+            }
             let run = insns[i + 1..].iter().take_while(|a| !em.labels.contains(a)).count() as u32 + 1;
             em.emit_block_budget(address, run);
         }
@@ -883,6 +908,30 @@ fn emit_function_pass(
         if continues && insns.get(i + 1) != Some(&next) {
             em.emit_jump(next, thumb);
         }
+    }
+
+    // Cold stale-function unwind stub (triggers when guest text patched a directly-called callee):
+    if let Some((j_stale, resume_entry, entry_addr, f_idx)) = em.stale_check {
+        let here = em.buf.pos();
+        em.buf.patch(j_stale, a64::cbnz64(16, here as i32 - j_stale as i32));
+        if f_idx <= 4095 {
+            em.buf.emit(a64::ldrb_uoff(16, 16, f_idx as u16));
+        } else {
+            em.buf.mov_imm32(17, f_idx as u32);
+            em.buf.emit(a64::add64_uxtw(16, 16, 17, 0));
+            em.buf.emit(a64::ldrb_uoff(16, 16, 0));
+        }
+        let j_ok = em.buf.pos();
+        em.buf.emit(a64::cbz32(16, resume_entry as i32 - j_ok as i32));
+        em.buf.mov_imm32(15, entry_addr);
+        if thumb {
+            em.buf.mov_imm32(16, 1);
+            em.buf.emit(a64::strb_uoff(16, 19, offsets::CTX_THUMB));
+        } else {
+            em.buf.emit(a64::strb_uoff(ZR, 19, offsets::CTX_THUMB));
+        }
+        em.buf.mov_imm32(28, EXIT_UNWIND);
+        em.emit_epilogue_jump();
     }
 
     // Cold depth-overflow stub (if this function contains any calls):
@@ -3092,19 +3141,28 @@ impl FnEmitter<'_> {
                 }
                 true
             }
-            (0b1100 | 0b1101, true) => {
-                // VCVT to integer rounding toward zero
+            (0b1100 | 0b1101, round_zero) => {
+                // VCVT (round toward zero) / VCVTR (round using FPSCR.RMode) to integer
                 let signed = ((op >> 16) & 1) != 0;
                 let dst = Self::sreg((op >> 12) & 0xF, (op & (1 << 22)) != 0);
                 if !double {
-                    if signed {
-                        self.buf.emit(a64::fcvtzs_s_asimd(dst, rm));
+                    let src = if !round_zero {
+                        self.buf.emit(a64::frinti_s(dst, rm));
+                        dst
                     } else {
-                        self.buf.emit(a64::fcvtzu_s_asimd(dst, rm));
+                        rm
+                    };
+                    if signed {
+                        self.buf.emit(a64::fcvtzs_s_asimd(dst, src));
+                    } else {
+                        self.buf.emit(a64::fcvtzu_s_asimd(dst, src));
                     }
                 } else {
                     self.buf.emit(a64::stp_s_off(30, 31, 19, offsets::SCRATCH_FP));
                     self.emit_load_vfp_d(30, rm);
+                    if !round_zero {
+                        self.buf.emit(a64::frinti_d(30, 30));
+                    }
                     if signed {
                         self.buf.emit(a64::fcvtzs_w_from_d(16, 30));
                     } else {

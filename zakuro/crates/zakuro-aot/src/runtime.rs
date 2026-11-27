@@ -105,6 +105,7 @@ pub mod offsets {
     pub const CTX_FPSCR: u16 = 120;
     pub const SCRATCH_FP: i16 = 144;
     pub const HOST_MXCSR: i16 = 148;
+    pub const HOST_FPCR: u16 = 152;
     pub const ICACHE_PTR: u16 = 160;
     pub const AOT_ENTER_PTR: u16 = 168;
     pub const RX_BASE: u16 = 176;
@@ -148,6 +149,7 @@ const _: () = {
     assert!(offset_of!(Context, fpscr) == offsets::CTX_FPSCR as usize);
     assert!(offset_of!(AotExecContext, scratch_fp) == offsets::SCRATCH_FP as usize);
     assert!(offset_of!(AotExecContext, scratch_fp) + 4 == offsets::HOST_MXCSR as usize);
+    assert!(offset_of!(AotExecContext, scratch_fp) + 8 == offsets::HOST_FPCR as usize);
     assert!(offset_of!(AotExecContext, icache_ptr) == offsets::ICACHE_PTR as usize);
     assert!(offset_of!(AotExecContext, aot_enter_ptr) == offsets::AOT_ENTER_PTR as usize);
     assert!(offset_of!(AotExecContext, rx_base) == offsets::RX_BASE as usize);

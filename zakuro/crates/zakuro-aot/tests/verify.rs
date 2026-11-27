@@ -2400,6 +2400,27 @@ impl Drop for RestoreHostMxcsr {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn read_fpcr() -> u64 {
+    let val: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, fpcr", out(reg) val, options(nostack, preserves_flags));
+    }
+    val
+}
+
+#[cfg(target_arch = "aarch64")]
+struct RestoreHostFpcr(u64);
+
+#[cfg(target_arch = "aarch64")]
+impl Drop for RestoreHostFpcr {
+    fn drop(&mut self) {
+        unsafe {
+            core::arch::asm!("msr fpcr, {}", in(reg) self.0, options(nostack, preserves_flags));
+        }
+    }
+}
+
 #[test]
 fn torture_adversarial_mxcsr_leak_and_unsynced_entry() {
     use asm::*;
@@ -2408,7 +2429,7 @@ fn torture_adversarial_mxcsr_leak_and_unsynced_entry() {
     // execute VADD.F32 s0, s0, s1 where s0 = 0x0040_0000 (subnormal), s1 = 0.0.
     // ARMv6K with FZ=1 MUST flush s0 to 0.0 before adding -> result 0x0000_0000.
     // Subtest B: Guest executes VMSR FPSCR, r0 setting FZ=1 | RMode=-Inf (0x0180_0000)
-    // and returns via BX LR. LoadedAot::enter MUST NOT leave host MXCSR mutated!
+    // and returns via BX LR. LoadedAot::enter MUST NOT leave host MXCSR/FPCR mutated!
     let words_a = [
         vfp_dp(AL, false, 0b0011, false, 0, 0, 1), // VADD.F32 s0, s0, s1
         bx(AL, 14),
@@ -2493,6 +2514,53 @@ fn torture_adversarial_mxcsr_leak_and_unsynced_entry() {
         if (mxcsr_after & mxcsr_ctrl_mask) != (saved & mxcsr_ctrl_mask) {
             errs.push(format!(
                 "LoadedAot::enter leaked guest VMSR FPSCR into host MXCSR (saved={saved:#06x}, after={mxcsr_after:#06x})"
+            ));
+        }
+        assert!(errs.is_empty(), "{}", errs.join("; "));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let saved = read_fpcr();
+        let _guard = RestoreHostFpcr(saved);
+
+        // Subtest A: pre-set FPSCR.FZ = 1 before LoadedAot::enter.
+        let mut mem_a = TestMemory::new(vec![
+            Region { base: BASE, bytes: vec![0; PAGE_SIZE], writable: false, direct_page: true },
+            Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true, direct_page: true },
+        ]);
+        let mut vfp_a = [0u32; 32];
+        vfp_a[0] = 0x0040_0000; // subnormal 2^-127
+        vfp_a[1] = 0x0000_0000; // +0.0
+        let mut fpscr_a = 1u32 << 24; // FZ = 1
+        let mut ctx_a = make_ctx(&mut mem_a, &mut vfp_a, &mut fpscr_a);
+        let body_a = aot_a.lookup(BASE).expect("compiled body");
+        unsafe { aot_a.enter(&mut ctx_a, body_a) };
+        let subnormal_flushed_a = vfp_a[0];
+
+        // Subtest B: VMSR FPSCR mutates FPCR inside AOT; check host FPCR on return from LoadedAot::enter!
+        let mut mem_b = TestMemory::new(vec![
+            Region { base: BASE, bytes: vec![0; PAGE_SIZE], writable: false, direct_page: true },
+            Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true, direct_page: true },
+        ]);
+        let mut vfp_b = [0u32; 32];
+        let mut fpscr_b = 0u32;
+        let mut ctx_b = make_ctx(&mut mem_b, &mut vfp_b, &mut fpscr_b);
+        ctx_b.r[0] = (1 << 24) | (0b10 << 22); // FZ=1, RMode=-Inf
+        let body_b = aot_b.lookup(BASE).expect("compiled body");
+        unsafe { aot_b.enter(&mut ctx_b, body_b) };
+        let fpcr_after = read_fpcr();
+
+        let fpcr_ctrl_mask = 0x03C0_0000u64;
+        let mut errs: Vec<String> = Vec::new();
+        if subnormal_flushed_a != 0x0000_0000 {
+            errs.push(format!(
+                "LoadedAot::enter did not sync host FPCR from *ctx.fpscr (FZ=1 subnormal stayed {subnormal_flushed_a:#010x})"
+            ));
+        }
+        if (fpcr_after & fpcr_ctrl_mask) != (saved & fpcr_ctrl_mask) {
+            errs.push(format!(
+                "LoadedAot::enter leaked guest VMSR FPSCR into host FPCR (saved={saved:#010x}, after={fpcr_after:#010x})"
             ));
         }
         assert!(errs.is_empty(), "{}", errs.join("; "));
@@ -3008,6 +3076,7 @@ fn torture_adversarial_pc_plus_offset_and_ldrd_aliasing() {
     });
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn torture_adversarial_override_wrapper_abi_and_nested_reentry() {
     use asm::*;
@@ -3435,7 +3504,9 @@ fn torture_adversarial_indirect_icache_collisions_and_budget_unwind() {
 #[test]
 fn torture_depth_overflow_null_override_and_callback_mxcsr() {
     use asm::*;
+    #[cfg(target_arch = "x86_64")]
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    #[cfg(target_arch = "x86_64")]
     use zakuro_aot::runtime::{AotExecContext, OverrideFn};
 
     // 1. [HIGH-1] DirectCall depth overflow (`depth > 2048`) switching from `fn_a` to `fn_b`

@@ -1091,6 +1091,10 @@ pub const fn fsqrt_s(sd: u8, sn: u8) -> u32 {
 pub const fn fcvt_d_from_s(dd: u8, sn: u8) -> u32 {
     fp_1src(0, 0b101, dd, sn)
 }
+#[inline(always)]
+pub const fn frinti_s(sd: u8, sn: u8) -> u32 {
+    fp_1src(0, 0b1111, sd, sn)
+}
 
 #[inline(always)]
 pub const fn fmov_d(dd: u8, dn: u8) -> u32 {
@@ -1111,6 +1115,10 @@ pub const fn fsqrt_d(dd: u8, dn: u8) -> u32 {
 #[inline(always)]
 pub const fn fcvt_s_from_d(sd: u8, dn: u8) -> u32 {
     fp_1src(1, 0b100, sd, dn)
+}
+#[inline(always)]
+pub const fn frinti_d(dd: u8, dn: u8) -> u32 {
+    fp_1src(1, 0b1111, dd, dn)
 }
 
 #[inline(always)]
@@ -1412,6 +1420,8 @@ mod tests {
             (fcmp_d_zero(30), "fcmp\td30, #0.0"),
             (fcvt_d_from_s(30, 5), "fcvt\td30, s5"),
             (fcvt_s_from_d(5, 30), "fcvt\ts5, d30"),
+            (frinti_s(2, 3), "frinti\ts2, s3"),
+            (frinti_d(30, 30), "frinti\td30, d30"),
             (scvtf_s_asimd(2, 3), "scvtf\ts2, s3"),
             (ucvtf_s_asimd(2, 3), "ucvtf\ts2, s3"),
             (fcvtzs_s_asimd(2, 3), "fcvtzs\ts2, s3"),
