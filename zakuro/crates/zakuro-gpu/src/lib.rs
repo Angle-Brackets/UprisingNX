@@ -36,7 +36,7 @@ pub mod texture;
 use format::ColorFormat;
 pub use interpolation::Matches;
 use registers::*;
-pub use backend::{layout, place, GpuScreen, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Shown, Stereo, StereoMode, Viewport};
+pub use backend::{layout, place, GpuProfile, GpuScreen, GpuTier, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Shown, Stereo, StereoMode, Viewport};
 pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
 pub use raster::{power_label_mode, set_power_label_mode, PowerLabelMode};
 #[cfg(feature = "vulkan")]

@@ -94,6 +94,19 @@ impl Backend {
         }
     }
 
+    /// Active presentation GPU profile for selecting hardware-appropriate first-launch defaults.
+    pub fn gpu_profile(&self) -> zakuro_gpu::GpuProfile {
+        match self {
+            Backend::Vulkan(presenter) => presenter.gpu_profile(),
+            Backend::OpenGl { .. } | Backend::None => zakuro_gpu::GpuProfile {
+                tier: zakuro_gpu::GpuTier::Software,
+                device_local_mb: 0,
+                max_anisotropy: 1,
+                name: self.name().to_owned(),
+            },
+        }
+    }
+
     pub fn set_scaling(&mut self, filter: zakuro_gpu::ScreenFilter, integer: bool) {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.set_scaling(filter, integer),

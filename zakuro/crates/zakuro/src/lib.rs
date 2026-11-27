@@ -74,16 +74,17 @@ fn run_with_mode(linked: Option<Linked>, kiu_mode: bool) {
         }
         return;
     }
+    let fresh_kiu_defaults = (linked.is_some() || kiu_mode) && !settings::exists();
     let mut settings = Settings::load();
-    // A dedicated port (Kid Icarus: Uprising Recompiled) boots straight into
-    // 16:9 single-screen Auto layout at 1280x720 with 60 fps interpolation when no
-    // settings file exists yet.
-    if (linked.is_some() || kiu_mode) && !settings::exists() {
+    // A dedicated port (Kid Icarus: Uprising Recompiled) boots into 16:9
+    // single-screen Auto layout at 1280x720; exact GPU/display quality defaults
+    // are selected once the presentation backend probes the active GPU.
+    if fresh_kiu_defaults {
         settings.layout = Screens::Auto;
-        settings.resolution = 6;
-        settings.anisotropy = 16;
+        settings.resolution = 3;
+        settings.anisotropy = 8;
         settings.scale = 3;
-        settings.frame_interpolation = true;
+        settings.frame_interpolation = false;
         settings.show_controls = false;
     }
     let data_dir = options.data.clone().map(PathBuf::from).or_else(default_data_dir);
@@ -171,6 +172,7 @@ fn run_with_mode(linked: Option<Linked>, kiu_mode: bool) {
         wireless_reboot: None,
         maximized_before_full_screen: false,
         resize_after_full_screen: false,
+        fresh_kiu_defaults,
     };
 
     if let Some(frames) = app.options.headless {
@@ -886,6 +888,53 @@ struct App {
     /// the layout or the scale changed while the window was full screen,
     /// which kept its size, so leaving full screen fits the window to them.
     resize_after_full_screen: bool,
+    /// true on first launch before hardware-aware KIU quality defaults have been selected.
+    fresh_kiu_defaults: bool,
+}
+
+/// Clamps an anisotropy limit to the highest discrete level supported by the UI (`1, 2, 4, 8, 16`).
+fn snap_anisotropy(limit: u32) -> u32 {
+    for level in [16u32, 8, 4, 2, 1] {
+        if limit >= level {
+            return level;
+        }
+    }
+    1
+}
+
+/// Selects safe, hardware-appropriate first-launch KIU quality defaults from the active
+/// GPU profile and monitor height. Only called when no `settings.toml` existed on launch.
+fn apply_hardware_kiu_defaults(
+    settings: &mut Settings,
+    profile: &zakuro_gpu::GpuProfile,
+    monitor_height_px: Option<u32>,
+) {
+    let display_scale = monitor_height_px.map(|h| (h / 240).clamp(2, 6)).unwrap_or(4);
+    settings.layout = Screens::Auto;
+    settings.scale = 3;
+    settings.show_controls = false;
+    match profile.tier {
+        zakuro_gpu::GpuTier::Discrete if profile.device_local_mb >= 4096 => {
+            settings.resolution = display_scale.clamp(4, 6);
+            settings.anisotropy = snap_anisotropy(profile.max_anisotropy.min(16));
+            settings.frame_interpolation = true;
+        }
+        zakuro_gpu::GpuTier::Discrete => {
+            settings.resolution = display_scale.clamp(2, 4);
+            settings.anisotropy = snap_anisotropy(profile.max_anisotropy.min(8));
+            settings.frame_interpolation = true;
+        }
+        zakuro_gpu::GpuTier::Integrated => {
+            settings.resolution = display_scale.clamp(2, 3);
+            settings.anisotropy = snap_anisotropy(profile.max_anisotropy.min(8));
+            settings.frame_interpolation = profile.device_local_mb >= 512;
+        }
+        zakuro_gpu::GpuTier::Software => {
+            settings.resolution = 2;
+            settings.anisotropy = 1;
+            settings.frame_interpolation = false;
+        }
+    }
 }
 
 /// how long each step of the loop took, its mean and its longest.
@@ -1008,6 +1057,27 @@ impl ApplicationHandler for App {
         match backend {
             Ok((window, mut backend)) => {
                 log::info!("presenting with the {} backend", backend.name());
+                if self.fresh_kiu_defaults {
+                    self.fresh_kiu_defaults = false;
+                    let profile = backend.gpu_profile();
+                    let monitor_height = window
+                        .current_monitor()
+                        .or_else(|| window.primary_monitor())
+                        .map(|m| m.size().height);
+                    apply_hardware_kiu_defaults(&mut self.settings, &profile, monitor_height);
+                    self.settings.save();
+                    log::info!(
+                        "first-launch KIU defaults for {} ({:?}, {} MiB VRAM, monitor {}): {}x ({}p), {}x AF, 60fps interp={}",
+                        profile.name,
+                        profile.tier,
+                        profile.device_local_mb,
+                        monitor_height.map_or_else(|| "unknown".to_owned(), |h| format!("{h}p")),
+                        self.settings.resolution,
+                        self.settings.resolution * 240,
+                        self.settings.anisotropy,
+                        self.settings.frame_interpolation,
+                    );
+                }
                 backend.set_layout(self.screens());
                 backend.set_top_width(self.settings.top_shape.width());
                 backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
@@ -3317,5 +3387,64 @@ mod tests {
         assert_eq!(find_imported_kiu_rom(&data_dir), Some(imported_3ds));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hardware_kiu_defaults_scale_by_gpu_tier_and_display() {
+        use zakuro_gpu::{GpuProfile, GpuTier};
+
+        // High-VRAM discrete GPU on 1440p monitor -> 6x (1440p), 16x AF, 60fps interp.
+        let mut s = Settings::default();
+        apply_hardware_kiu_defaults(
+            &mut s,
+            &GpuProfile { tier: GpuTier::Discrete, device_local_mb: 8192, max_anisotropy: 16, name: "RTX".into() },
+            Some(1440),
+        );
+        assert_eq!((s.resolution, s.anisotropy, s.frame_interpolation), (6, 16, true));
+
+        // High-VRAM discrete GPU on 1080p monitor -> 4x (960p), 16x AF, 60fps interp.
+        let mut s = Settings::default();
+        apply_hardware_kiu_defaults(
+            &mut s,
+            &GpuProfile { tier: GpuTier::Discrete, device_local_mb: 8192, max_anisotropy: 16, name: "RTX".into() },
+            Some(1080),
+        );
+        assert_eq!((s.resolution, s.anisotropy, s.frame_interpolation), (4, 16, true));
+
+        // Entry-level 2 GiB discrete GPU on 1440p monitor -> capped at 4x, 8x AF.
+        let mut s = Settings::default();
+        apply_hardware_kiu_defaults(
+            &mut s,
+            &GpuProfile { tier: GpuTier::Discrete, device_local_mb: 2048, max_anisotropy: 16, name: "GT 1030".into() },
+            Some(1440),
+        );
+        assert_eq!((s.resolution, s.anisotropy, s.frame_interpolation), (4, 8, true));
+
+        // Integrated GPU (e.g. Steam Deck 800p / Ryzen iGPU) -> 3x (720p), 8x AF, interp on.
+        let mut s = Settings::default();
+        apply_hardware_kiu_defaults(
+            &mut s,
+            &GpuProfile { tier: GpuTier::Integrated, device_local_mb: 1024, max_anisotropy: 16, name: "RADV VANGOGH".into() },
+            Some(800),
+        );
+        assert_eq!((s.resolution, s.anisotropy, s.frame_interpolation), (3, 8, true));
+
+        // Low-VRAM integrated GPU (<512 MiB) -> 3x, interp off.
+        let mut s = Settings::default();
+        apply_hardware_kiu_defaults(
+            &mut s,
+            &GpuProfile { tier: GpuTier::Integrated, device_local_mb: 256, max_anisotropy: 4, name: "Intel UHD".into() },
+            Some(1080),
+        );
+        assert_eq!((s.resolution, s.anisotropy, s.frame_interpolation), (3, 4, false));
+
+        // Software / OpenGL fallback -> conservative 2x (480p), 1x AF, interp off.
+        let mut s = Settings::default();
+        apply_hardware_kiu_defaults(
+            &mut s,
+            &GpuProfile { tier: GpuTier::Software, device_local_mb: 0, max_anisotropy: 1, name: "llvmpipe".into() },
+            Some(1080),
+        );
+        assert_eq!((s.resolution, s.anisotropy, s.frame_interpolation), (2, 1, false));
     }
 }

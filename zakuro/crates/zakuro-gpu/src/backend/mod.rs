@@ -7,6 +7,24 @@ pub mod vulkan;
 #[cfg(feature = "vulkan")]
 mod vulkan_overlay;
 
+/// Coarse hardware class reported by the active presentation backend for
+/// choosing safe, smooth first-launch defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuTier {
+    Discrete,
+    Integrated,
+    Software,
+}
+
+/// Summary of the active presentation GPU's class, VRAM, and anisotropy limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuProfile {
+    pub tier: GpuTier,
+    pub device_local_mb: u64,
+    pub max_anisotropy: u32,
+    pub name: String,
+}
+
 /// one screen's pixels, already converted to straight RGBA8, or where they
 /// are on the GPU, for a presenter sharing the renderer's device.
 pub struct ScreenImage<'a> {

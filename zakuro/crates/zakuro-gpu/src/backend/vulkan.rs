@@ -745,6 +745,38 @@ impl VulkanPresenter {
         self.shared.clone()
     }
 
+    /// Hardware class, device-local memory, and anisotropy limit of the active Vulkan GPU.
+    pub fn gpu_profile(&self) -> super::GpuProfile {
+        let props = unsafe { self.instance.get_physical_device_properties(self.physical_device) };
+        let features = unsafe { self.instance.get_physical_device_features(self.physical_device) };
+        let tier = match props.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => super::GpuTier::Discrete,
+            vk::PhysicalDeviceType::INTEGRATED_GPU => super::GpuTier::Integrated,
+            _ => super::GpuTier::Software,
+        };
+        let mut device_local_bytes = 0u64;
+        for i in 0..self.memory_properties.memory_heap_count as usize {
+            let heap = self.memory_properties.memory_heaps[i];
+            if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                device_local_bytes = device_local_bytes.saturating_add(heap.size);
+            }
+        }
+        let max_anisotropy = if features.sampler_anisotropy != 0 {
+            (props.limits.max_sampler_anisotropy.floor() as u32).clamp(1, 16)
+        } else {
+            1
+        };
+        let name = unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        super::GpuProfile {
+            tier,
+            device_local_mb: device_local_bytes / (1024 * 1024),
+            max_anisotropy,
+            name,
+        }
+    }
+
     /// the window's size in pixels as the swapchain has it, what overlay
     /// positions are in
     pub fn extent(&self) -> (u32, u32) {
