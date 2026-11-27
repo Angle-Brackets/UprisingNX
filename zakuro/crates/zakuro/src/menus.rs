@@ -285,14 +285,16 @@ impl Menus {
                     KiuSetupStage::NeedsRom { notice, hovered_file } => {
                         ui.label(
                             RichText::new(
-                                "Provide a decrypted USA copy of Kid Icarus: Uprising (.3ds, .cci, or .cia) to compile and launch.",
+                                "Provide a decrypted USA copy of Kid Icarus: Uprising (.3ds, .cci, or .cia) to import and launch.",
                             )
                             .color(INK),
                         );
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new("Drag and drop your ROM onto this window, or choose a file below.")
-                                .color(Color32::from_rgb(76, 68, 62)),
+                            RichText::new(
+                                "Drag and drop your ROM onto this window or choose a file below. It will be copied into app data once so you don't need to keep the original file around.",
+                            )
+                            .color(Color32::from_rgb(76, 68, 62)),
                         );
                         ui.add_space(10.0);
 
@@ -326,7 +328,7 @@ impl Menus {
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     ui.vertical_centered(|ui| {
-                                        ui.label(RichText::new("Drop ROM file to verify and compile").strong().color(INK));
+                                        ui.label(RichText::new("Drop ROM file to import and launch").strong().color(INK));
                                     });
                                 });
                             ui.add_space(10.0);

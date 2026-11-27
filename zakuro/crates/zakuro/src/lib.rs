@@ -86,10 +86,19 @@ fn run_with_mode(linked: Option<Linked>, kiu_mode: bool) {
         settings.frame_interpolation = true;
         settings.show_controls = false;
     }
+    let data_dir = options.data.clone().map(PathBuf::from).or_else(default_data_dir);
     // the code and the game into memory before play reaches them
     let warm_rom = options.rom.clone().or_else(|| {
         kiu_mode
-            .then(|| settings.rom_path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+            .then(|| {
+                settings
+                    .rom_path
+                    .as_ref()
+                    .filter(|p| p.is_file())
+                    .cloned()
+                    .or_else(|| data_dir.as_deref().and_then(find_imported_kiu_rom))
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
             .flatten()
     });
     warm::start(warm_rom.as_deref());
@@ -103,7 +112,6 @@ fn run_with_mode(linked: Option<Linked>, kiu_mode: bool) {
         settings.save();
     }
 
-    let data_dir = options.data.clone().map(PathBuf::from).or_else(default_data_dir);
     if let Some(dir) = &data_dir {
         report::to_file(dir);
         bring_saves(dir);
@@ -433,9 +441,19 @@ impl Running {
 }
 
 const KIU_WINDOW_TITLE: &str = "Kid Icarus: Uprising Recompiled";
-const KIU_ROM_HINT: &str = "Select or drag and drop a decrypted .3ds, .cci, or .cia dump onto this window.";
+const KIU_ROM_HINT: &str = "Select or drag and drop a decrypted .3ds, .cci, or .cia dump onto this window. It will be copied into app data once.";
+const KIU_IMPORTED_STEM: &str = "kid_icarus_uprising";
+const KIU_ROM_EXTS: &[&str] = &["cci", "3ds", "cia", "cxi"];
+
+const KIU_STAGE_IMPORTING: u8 = 0;
+const KIU_STAGE_COMPILING: u8 = 1;
+const KIU_STAGE_SAVING_CACHE: u8 = 2;
+const KIU_STAGE_STARTING: u8 = 3;
 
 struct KiuCompileProgress {
+    copy_done: std::sync::atomic::AtomicU64,
+    copy_total: std::sync::atomic::AtomicU64,
+    importing: std::sync::atomic::AtomicBool,
     done: std::sync::atomic::AtomicUsize,
     total: std::sync::atomic::AtomicUsize,
     stage: std::sync::atomic::AtomicU8,
@@ -446,7 +464,7 @@ struct KiuPreparedBoot {
     title: zakuro_fs::Title,
     code_bytes: Vec<u8>,
     modded: bool,
-    loaded: zakuro_core::zakuro_aot::LoadedAot,
+    loaded: Option<zakuro_core::zakuro_aot::LoadedAot>,
 }
 
 struct KiuCompileJob {
@@ -458,23 +476,45 @@ impl KiuCompileJob {
     fn ui_status(&self) -> (String, f32, String) {
         use std::sync::atomic::Ordering::Relaxed;
         let stage = self.progress.stage.load(Relaxed);
+        let importing = self.progress.importing.load(Relaxed);
+        let copy_done = self.progress.copy_done.load(Relaxed);
+        let copy_total = self.progress.copy_total.load(Relaxed);
         let done = self.progress.done.load(Relaxed);
         let total = self.progress.total.load(Relaxed);
         match stage {
-            0 if total == 0 => (
-                "Analyzing Kid Icarus: Uprising...".to_owned(),
-                0.04,
-                "Discovering ARMv6K & Thumb-1 functions and jump tables...".to_owned(),
-            ),
-            0 => {
-                let frac = (done as f32 / total as f32).clamp(0.0, 1.0) * 0.90;
+            KIU_STAGE_IMPORTING => {
+                let frac = if copy_total > 0 {
+                    (copy_done as f32 / copy_total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let done_mib = copy_done as f64 / (1024.0 * 1024.0);
+                let total_mib = copy_total as f64 / (1024.0 * 1024.0);
+                let detail = if copy_total > 0 {
+                    format!("Copying ROM into app data ({done_mib:.0} / {total_mib:.0} MiB)...")
+                } else {
+                    "Copying ROM into app data...".to_owned()
+                };
+                ("Importing Game Data...".to_owned(), (0.02 + frac * 0.43).clamp(0.02, 0.45), detail)
+            }
+            KIU_STAGE_COMPILING if total == 0 => {
+                let base = if importing { 0.46 } else { 0.04 };
+                (
+                    "Analyzing Kid Icarus: Uprising...".to_owned(),
+                    base,
+                    "Discovering ARMv6K & Thumb-1 functions and jump tables...".to_owned(),
+                )
+            }
+            KIU_STAGE_COMPILING => {
+                let (base, span) = if importing { (0.45, 0.45) } else { (0.05, 0.85) };
+                let frac = base + (done as f32 / total as f32).clamp(0.0, 1.0) * span;
                 (
                     "Compiling Native Code Cache...".to_owned(),
-                    frac.max(0.05),
+                    frac.max(base),
                     format!("Compiling ARMv6K & VFPv2 functions ({done} / {total})..."),
                 )
             }
-            1 => (
+            KIU_STAGE_SAVING_CACHE => (
                 "Saving Code Cache...".to_owned(),
                 0.93,
                 "Writing compiled .aot cache to disk...".to_owned(),
@@ -496,6 +536,115 @@ enum KiuLauncher {
     },
     Compiling(KiuCompileJob),
     Playing,
+}
+
+fn kiu_game_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("game")
+}
+
+fn kiu_imported_rom_path(data_dir: &Path, source: &Path) -> PathBuf {
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .filter(|e| KIU_ROM_EXTS.contains(&e.as_str()))
+        .unwrap_or_else(|| "cci".to_owned());
+    kiu_game_dir(data_dir).join(format!("{KIU_IMPORTED_STEM}.{ext}"))
+}
+
+fn find_imported_kiu_rom(data_dir: &Path) -> Option<PathBuf> {
+    let dir = kiu_game_dir(data_dir);
+    KIU_ROM_EXTS
+        .iter()
+        .map(|ext| dir.join(format!("{KIU_IMPORTED_STEM}.{ext}")))
+        .find(|p| p.is_file())
+}
+
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
+fn import_kiu_rom(
+    source: &Path,
+    data_dir: &Path,
+    progress: Option<&KiuCompileProgress>,
+) -> Result<PathBuf, String> {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let dest = kiu_imported_rom_path(data_dir, source);
+    if same_file_path(source, &dest) {
+        return Ok(dest);
+    }
+
+    let game_dir = kiu_game_dir(data_dir);
+    std::fs::create_dir_all(&game_dir)
+        .map_err(|err| format!("could not create {}: {err}", game_dir.display()))?;
+
+    let total_bytes = std::fs::metadata(source)
+        .map_err(|err| format!("could not inspect {}: {err}", source.display()))?
+        .len();
+    if let Some(p) = progress {
+        p.importing.store(true, Relaxed);
+        p.copy_total.store(total_bytes, Relaxed);
+        p.copy_done.store(0, Relaxed);
+        p.stage.store(KIU_STAGE_IMPORTING, Relaxed);
+    }
+
+    let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or("cci");
+    let tmp_path = dest.with_extension(format!("{ext}.tmp"));
+    let started = Instant::now();
+    let copy_res = (|| -> std::io::Result<u64> {
+        let mut reader = std::fs::File::open(source)?;
+        let mut writer = std::fs::File::create(&tmp_path)?;
+        let mut buf = vec![0u8; 4 << 20];
+        let mut copied = 0u64;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+            copied += n as u64;
+            if let Some(p) = progress {
+                p.copy_done.store(copied, Relaxed);
+            }
+        }
+        writer.flush()?;
+        Ok(copied)
+    })();
+
+    let copied = match copy_res {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("could not copy ROM into {}: {err}", dest.display()));
+        }
+    };
+
+    if let Err(err) = std::fs::rename(&tmp_path, &dest) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("could not finalize imported ROM {}: {err}", dest.display()));
+    }
+
+    // Remove any previously imported copy with a different extension so we keep only one copy.
+    for other_ext in KIU_ROM_EXTS {
+        let stale = game_dir.join(format!("{KIU_IMPORTED_STEM}.{other_ext}"));
+        if stale != dest && stale.is_file() {
+            let _ = std::fs::remove_file(&stale);
+        }
+    }
+
+    log::info!(
+        "kiu: imported ROM ({:.1} MiB) to {} in {:.2?}",
+        copied as f64 / (1024.0 * 1024.0),
+        dest.display(),
+        started.elapsed()
+    );
+    Ok(dest)
 }
 
 fn kiu_cache_path(data_dir: Option<&Path>, program_id: u64, text_hash: u64) -> PathBuf {
@@ -617,6 +766,9 @@ fn compile_and_cache_kiu_aot(
         .iter()
         .map(|&(addr, _)| addr)
         .collect();
+    if let Some(p) = progress {
+        p.stage.store(KIU_STAGE_COMPILING, Relaxed);
+    }
     let t0 = Instant::now();
     let image = zakuro_core::zakuro_aot::compile_title(
         program_id,
@@ -638,14 +790,14 @@ fn compile_and_cache_kiu_aot(
         t0.elapsed()
     );
     if let Some(p) = progress {
-        p.stage.store(1, Relaxed);
+        p.stage.store(KIU_STAGE_SAVING_CACHE, Relaxed);
     }
     match save_kiu_aot_cache(cache_path, &image) {
         Ok(()) => log::info!("kiu: saved AOT cache to {}", cache_path.display()),
         Err(err) => log::warn!("kiu: could not save AOT cache {}: {err}", cache_path.display()),
     }
     if let Some(p) = progress {
-        p.stage.store(2, Relaxed);
+        p.stage.store(KIU_STAGE_STARTING, Relaxed);
     }
     let loaded = image.into_loaded_exec()?;
     Ok(attach_kiu_overrides(loaded, program_id, text_hash))
@@ -1152,16 +1304,18 @@ impl App {
     }
 
     fn start_kiu_windowed(&mut self) {
+        let imported = self.data_dir.as_deref().and_then(find_imported_kiu_rom);
         let candidate = self
             .options
             .rom
             .as_deref()
             .map(PathBuf::from)
+            .or_else(|| self.settings.rom_path.as_ref().filter(|p| p.is_file()).cloned())
+            .or(imported)
             .or_else(|| self.settings.rom_path.clone());
         match candidate {
             Some(path) => {
-                let persist = self.options.rom.is_some();
-                self.launch_kiu_path(path, false, persist);
+                self.launch_kiu_path(path, false, true);
             }
             None => {
                 self.kiu_launcher = KiuLauncher::NeedsRom { notice: None, hovered_file: false };
@@ -1191,34 +1345,27 @@ impl App {
         force_rebuild: bool,
         persist_rom_path: bool,
     ) {
-        if persist_rom_path && self.settings.rom_path.as_ref() != Some(&rom_path) {
-            self.settings.rom_path = Some(rom_path.clone());
-            self.settings.save();
-        }
         let interpret = self.options.interpreter || !self.settings.recompiled;
-        if interpret || self.options.recompiled.is_some() {
-            if let Err(err) = self.boot_kiu_system(&rom_path, title, Some((code_bytes, modded)), None) {
-                self.kiu_launcher = KiuLauncher::NeedsRom {
-                    notice: Some(kiu_common::RomNotice::unreadable(
-                        rom_path.file_name().and_then(|n| n.to_str()).unwrap_or("rom"),
-                        &err,
-                    )),
-                    hovered_file: false,
-                };
-            } else {
-                self.kiu_launcher = KiuLauncher::Playing;
-            }
-            return;
-        }
+        let use_aot = !interpret && self.options.recompiled.is_none();
+        let import_dir = self
+            .data_dir
+            .clone()
+            .filter(|dir| !same_file_path(&rom_path, &kiu_imported_rom_path(dir, &rom_path)));
+        let needs_import = import_dir.is_some();
 
         let program_id = title.program_id();
         let cache_path = kiu_cache_path(self.data_dir.as_deref(), program_id, text_hash);
         if force_rebuild {
             let _ = std::fs::remove_file(&cache_path);
-        } else if let Some(loaded) = load_kiu_aot_cache(&cache_path, program_id, text_hash) {
-            match self.boot_kiu_system(&rom_path, title, Some((code_bytes, modded)), Some(loaded)) {
-                Ok(()) => self.kiu_launcher = KiuLauncher::Playing,
-                Err(err) => {
+        }
+
+        if !needs_import {
+            if persist_rom_path && self.settings.rom_path.as_ref() != Some(&rom_path) {
+                self.settings.rom_path = Some(rom_path.clone());
+                self.settings.save();
+            }
+            if !use_aot {
+                if let Err(err) = self.boot_kiu_system(&rom_path, title, Some((code_bytes, modded)), None) {
                     self.kiu_launcher = KiuLauncher::NeedsRom {
                         notice: Some(kiu_common::RomNotice::unreadable(
                             rom_path.file_name().and_then(|n| n.to_str()).unwrap_or("rom"),
@@ -1226,30 +1373,95 @@ impl App {
                         )),
                         hovered_file: false,
                     };
+                } else {
+                    self.kiu_launcher = KiuLauncher::Playing;
+                }
+                return;
+            }
+            if !force_rebuild {
+                if let Some(loaded) = load_kiu_aot_cache(&cache_path, program_id, text_hash) {
+                    match self.boot_kiu_system(&rom_path, title, Some((code_bytes, modded)), Some(loaded)) {
+                        Ok(()) => self.kiu_launcher = KiuLauncher::Playing,
+                        Err(err) => {
+                            self.kiu_launcher = KiuLauncher::NeedsRom {
+                                notice: Some(kiu_common::RomNotice::unreadable(
+                                    rom_path.file_name().and_then(|n| n.to_str()).unwrap_or("rom"),
+                                    &err,
+                                )),
+                                hovered_file: false,
+                            };
+                        }
+                    }
+                    return;
                 }
             }
-            return;
         }
 
+        let initial_stage = if needs_import { KIU_STAGE_IMPORTING } else { KIU_STAGE_COMPILING };
         let progress = std::sync::Arc::new(KiuCompileProgress {
+            copy_done: std::sync::atomic::AtomicU64::new(0),
+            copy_total: std::sync::atomic::AtomicU64::new(0),
+            importing: std::sync::atomic::AtomicBool::new(needs_import),
             done: std::sync::atomic::AtomicUsize::new(0),
             total: std::sync::atomic::AtomicUsize::new(0),
-            stage: std::sync::atomic::AtomicU8::new(0),
+            stage: std::sync::atomic::AtomicU8::new(initial_stage),
         });
         let progress_worker = std::sync::Arc::clone(&progress);
+        let data_dir = self.data_dir.clone();
         let (send, receiver) = std::sync::mpsc::channel();
         let spawn = std::thread::Builder::new()
             .name("kiu-aot-compile".into())
             .stack_size(16 << 20)
             .spawn(move || {
-                let res = compile_and_cache_kiu_aot(
-                    &title,
-                    &code_bytes,
-                    text_hash,
-                    &cache_path,
-                    Some(&progress_worker),
-                )
-                .map(|loaded| KiuPreparedBoot { rom_path, title, code_bytes, modded, loaded });
+                let res = (|| -> Result<KiuPreparedBoot, String> {
+                    let (final_path, final_title) = if let Some(dir) = import_dir {
+                        // Drop the handle to the user's original ROM before re-opening the imported copy
+                        // so the original file can be moved or deleted immediately after import.
+                        drop(title);
+                        let imported_path = import_kiu_rom(&rom_path, &dir, Some(&progress_worker))?;
+                        let mut reopened = zakuro_fs::Title::load(&imported_path)
+                            .map_err(|err| format!("could not open imported ROM {}: {err}", imported_path.display()))?;
+                        zakuro_core::mods::lay(&mut reopened, data_dir.as_deref());
+                        (imported_path, reopened)
+                    } else {
+                        (rom_path, title)
+                    };
+
+                    let loaded = if use_aot {
+                        if !force_rebuild {
+                            if let Some(cached) = load_kiu_aot_cache(&cache_path, program_id, text_hash) {
+                                progress_worker.stage.store(KIU_STAGE_STARTING, std::sync::atomic::Ordering::Relaxed);
+                                Some(cached)
+                            } else {
+                                Some(compile_and_cache_kiu_aot(
+                                    &final_title,
+                                    &code_bytes,
+                                    text_hash,
+                                    &cache_path,
+                                    Some(&progress_worker),
+                                )?)
+                            }
+                        } else {
+                            Some(compile_and_cache_kiu_aot(
+                                &final_title,
+                                &code_bytes,
+                                text_hash,
+                                &cache_path,
+                                Some(&progress_worker),
+                            )?)
+                        }
+                    } else {
+                        progress_worker.stage.store(KIU_STAGE_STARTING, std::sync::atomic::Ordering::Relaxed);
+                        None
+                    };
+                    Ok(KiuPreparedBoot {
+                        rom_path: final_path,
+                        title: final_title,
+                        code_bytes,
+                        modded,
+                        loaded,
+                    })
+                })();
                 let _ = send.send(res);
             });
         match spawn {
@@ -1259,8 +1471,8 @@ impl App {
             Err(err) => {
                 self.kiu_launcher = KiuLauncher::NeedsRom {
                     notice: Some(kiu_common::RomNotice {
-                        heading: "Compiler Thread Error".to_owned(),
-                        paragraphs: vec![format!("Could not start background AOT compiler: {err}")],
+                        heading: "Setup Thread Error".to_owned(),
+                        paragraphs: vec![format!("Could not start background setup worker: {err}")],
                     }),
                     hovered_file: false,
                 };
@@ -1283,7 +1495,7 @@ impl App {
                     &prepared.rom_path,
                     prepared.title,
                     Some((prepared.code_bytes, prepared.modded)),
-                    Some(prepared.loaded),
+                    prepared.loaded,
                 ) {
                     self.kiu_launcher = KiuLauncher::NeedsRom {
                         notice: Some(kiu_common::RomNotice::unreadable(
@@ -1301,7 +1513,7 @@ impl App {
             Ok(Err(err)) => {
                 self.kiu_launcher = KiuLauncher::NeedsRom {
                     notice: Some(kiu_common::RomNotice {
-                        heading: "AOT Compilation Failed".to_owned(),
+                        heading: "Setup Failed".to_owned(),
                         paragraphs: vec![err],
                     }),
                     hovered_file: false,
@@ -3036,6 +3248,68 @@ mod tests {
         // Header mismatch removes stale file and returns None.
         assert!(load_kiu_aot_cache(&cache_path, program_id, text_hash ^ 1).is_none());
         assert!(!cache_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kiu_rom_import_copies_atomically_updates_progress_and_cleans_stale_ext() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let dir = std::env::temp_dir().join(format!("zakuro-kiu-import-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = dir.join("data");
+        let src_dir = dir.join("downloads");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        assert_eq!(
+            kiu_imported_rom_path(&data_dir, Path::new("/any/KIU.3DS")),
+            data_dir.join("game").join("kid_icarus_uprising.3ds")
+        );
+        assert_eq!(
+            kiu_imported_rom_path(&data_dir, Path::new("/any/KIU.unknown")),
+            data_dir.join("game").join("kid_icarus_uprising.cci")
+        );
+        assert!(find_imported_kiu_rom(&data_dir).is_none());
+
+        let src_cci = src_dir.join("kiu_usa.cci");
+        let payload_cci: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src_cci, &payload_cci).unwrap();
+
+        let progress = KiuCompileProgress {
+            copy_done: std::sync::atomic::AtomicU64::new(0),
+            copy_total: std::sync::atomic::AtomicU64::new(0),
+            importing: std::sync::atomic::AtomicBool::new(false),
+            done: std::sync::atomic::AtomicUsize::new(0),
+            total: std::sync::atomic::AtomicUsize::new(0),
+            stage: std::sync::atomic::AtomicU8::new(KIU_STAGE_IMPORTING),
+        };
+        let imported = import_kiu_rom(&src_cci, &data_dir, Some(&progress)).unwrap();
+        assert_eq!(imported, data_dir.join("game").join("kid_icarus_uprising.cci"));
+        assert_eq!(std::fs::read(&imported).unwrap(), payload_cci);
+        assert!(!imported.with_extension("cci.tmp").exists());
+        assert!(progress.importing.load(Relaxed));
+        assert_eq!(progress.copy_total.load(Relaxed), payload_cci.len() as u64);
+        assert_eq!(progress.copy_done.load(Relaxed), payload_cci.len() as u64);
+        assert_eq!(find_imported_kiu_rom(&data_dir), Some(imported.clone()));
+
+        // Deleting the original file leaves the imported copy intact.
+        std::fs::remove_file(&src_cci).unwrap();
+        assert_eq!(std::fs::read(&imported).unwrap(), payload_cci);
+
+        // Re-importing the already-imported file is a fast no-op.
+        let same = import_kiu_rom(&imported, &data_dir, None).unwrap();
+        assert_eq!(same, imported);
+
+        // Importing a replacement dump with a different extension replaces the old copy cleanly.
+        let src_3ds = src_dir.join("kiu_rev1.3ds");
+        let payload_3ds = vec![0xA5u8; 4096];
+        std::fs::write(&src_3ds, &payload_3ds).unwrap();
+        let imported_3ds = import_kiu_rom(&src_3ds, &data_dir, None).unwrap();
+        assert_eq!(imported_3ds, data_dir.join("game").join("kid_icarus_uprising.3ds"));
+        assert_eq!(std::fs::read(&imported_3ds).unwrap(), payload_3ds);
+        assert!(!imported.exists(), "stale previous extension copy should be removed");
+        assert_eq!(find_imported_kiu_rom(&data_dir), Some(imported_3ds));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
