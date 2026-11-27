@@ -595,12 +595,16 @@ fn compile_and_cache_kiu_aot(
     use std::sync::atomic::Ordering::Relaxed;
     let program_id = title.program_id();
     let hints = kiu_common::builtin_hints(program_id, text_hash);
+    let override_addrs: Vec<u32> = kiu_common::overrides_for(program_id, text_hash)
+        .iter()
+        .map(|&(addr, _)| addr)
+        .collect();
     let t0 = Instant::now();
     let image = zakuro_core::zakuro_aot::compile_title(
         program_id,
         &title.exheader,
         code_bytes,
-        &kiu_common::KIU_USA_OVERRIDE_ADDRS,
+        &override_addrs,
         &hints,
         kiu_common::aot_compile_options(program_id),
         |done, total| {

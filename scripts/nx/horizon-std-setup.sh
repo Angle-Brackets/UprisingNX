@@ -9,6 +9,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TOOLCHAIN="${TOOLCHAIN:-nightly-2026-10-20}"
 LIBC_VER=0.2.191
+TARGET_LEXICON_VER=0.13.5
 
 SYSROOT="$(rustc +"$TOOLCHAIN" --print sysroot)"
 LIB="$SYSROOT/lib/rustlib/src/rust/library"
@@ -17,17 +18,21 @@ grep -q "name = \"libc\"" "$LIB/Cargo.lock"
 grep -A1 'name = "libc"' "$LIB/Cargo.lock" | grep -q "version = \"$LIBC_VER\"" \
   || { echo "std on $TOOLCHAIN doesn't use libc $LIBC_VER; regenerate the patch" >&2; exit 1; }
 
-# libc source: from the cargo registry, fetched by any build that needs it
+# libc & target-lexicon sources: from the cargo registry, fetched by any build that needs them
 REG="$(ls -d "$HOME"/.cargo/registry/src/*/libc-$LIBC_VER 2>/dev/null | head -1)"
-if [ -z "$REG" ]; then
+TLEX="$(ls -d "$HOME"/.cargo/registry/src/*/target-lexicon-$TARGET_LEXICON_VER 2>/dev/null | head -1)"
+if [ -z "$REG" ] || [ -z "$TLEX" ]; then
   (cd "$ROOT/platforms/nx/rust" && cargo +"$TOOLCHAIN" fetch >/dev/null)
   REG="$(ls -d "$HOME"/.cargo/registry/src/*/libc-$LIBC_VER | head -1)"
+  TLEX="$(ls -d "$HOME"/.cargo/registry/src/*/target-lexicon-$TARGET_LEXICON_VER | head -1)"
 fi
 
 mkdir -p "$ROOT/build/vendor" "$ROOT/build/rust-src"
-rm -rf "$ROOT/build/vendor/libc"
+rm -rf "$ROOT/build/vendor/libc" "$ROOT/build/vendor/target-lexicon"
 cp -r "$REG" "$ROOT/build/vendor/libc"
 (cd "$ROOT/build/vendor" && patch -s -p1 -d libc < "$ROOT/platforms/nx/patches/libc-$LIBC_VER-horizon-aarch64.patch")
+cp -r "$TLEX" "$ROOT/build/vendor/target-lexicon"
+(cd "$ROOT/build/vendor" && patch -s -p1 -d target-lexicon < "$ROOT/platforms/nx/patches/target-lexicon-switch.patch")
 
 rm -rf "$ROOT/build/rust-src/library"
 cp -r "$LIB" "$ROOT/build/rust-src/library"

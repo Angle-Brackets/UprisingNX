@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kiu_common::{
-    aot_compile_options, builtin_hints, default_plugin_state, overrides_for,
-    KIU_USA_OVERRIDE_ADDRS, KIU_USA_PROGRAM_ID,
+    aot_compile_options, builtin_hints, default_plugin_state, overrides_for, KIU_USA_PROGRAM_ID,
 };
 use zakuro_aot::{compile_title, AotImage, ExecBuffer, LoadedAot, FORMAT_VERSION};
 use zakuro_fs::{FsError, Title};
@@ -337,11 +336,15 @@ pub fn load_or_build_aot(
             move || -> Result<AotImage, String> {
                 let t0 = Instant::now();
                 let hints = builtin_hints(program_id, text_hash);
+                let override_addrs: Vec<u32> = overrides_for(program_id, text_hash)
+                    .iter()
+                    .map(|&(addr, _)| addr)
+                    .collect();
                 let image = compile_title(
                     program_id,
                     &exheader,
                     &code_bytes,
-                    &KIU_USA_OVERRIDE_ADDRS,
+                    &override_addrs,
                     &hints,
                     aot_compile_options(program_id),
                     |done, total| {

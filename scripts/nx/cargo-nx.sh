@@ -4,6 +4,6 @@
 # .cargo/config.toml sets the target and build-std flags).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-[ -d "$ROOT/build/rust-src/library" ] || "$ROOT/scripts/nx/horizon-std-setup.sh"
+[ -d "$ROOT/build/rust-src/library" ] && [ -d "$ROOT/build/vendor/target-lexicon" ] || "$ROOT/scripts/nx/horizon-std-setup.sh"
 export __CARGO_TESTS_ONLY_SRC_ROOT="$ROOT/build/rust-src/library"
 exec cargo "$@"

@@ -702,6 +702,9 @@ fn emit_override_wrapper(
     buf.emit(a64::mov_sp(29, SP));
     let body = buf.pos();
 
+    buf.emit(a64::ldr64_uoff(16, 19, offsets::OVERRIDES_BASE + (ovr_idx as u16) * 8));
+    let j_null = buf.emit(a64::nop());
+
     let s1 = buf.emit(a64::nop());
     relocs.push(Reloc { local_word: s1 as u32, kind: RelocKind::StubBl(StubId::SyncOut) });
 
@@ -717,6 +720,15 @@ fn emit_override_wrapper(
 
     buf.emit(a64::ldp64_post(29, 30, SP, 16));
     buf.emit(a64::ret());
+
+    // Null override slot fallback (e.g. modded `.code` compiled with mismatched hashes):
+    let fallback = buf.pos();
+    buf.patch(j_null, a64::cbz64(16, fallback as i32 - j_null as i32));
+    buf.emit(a64::ldr64_uoff(16, 19, offsets::RX_BASE));
+    buf.mov_imm32(17, raw_body_byte_offset);
+    buf.emit(a64::add64_uxtw(16, 16, 17, 0));
+    buf.emit(a64::br(16));
+
     (prologue, body, relocs)
 }
 
@@ -769,7 +781,7 @@ struct FnEmitter<'a> {
     relocs: Vec<Reloc>,
     local_patches: Vec<LocalPatch>,
     epilogue_patches: Vec<usize>,
-    depth_overflow_patches: Vec<usize>,
+    depth_overflow_patches: Vec<(usize, u32)>,
     budget_exits: Vec<BudgetExit>,
     interpreted_addrs: Vec<u32>,
     folded_spans: Vec<(u32, u32)>,
@@ -875,10 +887,26 @@ fn emit_function_pass(
 
     // Cold depth-overflow stub (if this function contains any calls):
     if !em.depth_overflow_patches.is_empty() {
-        let depth_out = em.buf.pos();
-        for p in &em.depth_overflow_patches {
-            let delta = depth_out as i32 - *p as i32;
-            em.buf.patch(*p, a64::b_cond(cond::HI, delta));
+        let mut by_target: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (site, target) in std::mem::take(&mut em.depth_overflow_patches) {
+            by_target.entry(target).or_default().push(site);
+        }
+        let mut tail_jumps = Vec::new();
+        let count = by_target.len();
+        for (idx, (target, sites)) in by_target.into_iter().enumerate() {
+            let here = em.buf.pos();
+            for site in sites {
+                let delta = here as i32 - site as i32;
+                em.buf.patch(site, a64::b_cond(cond::HI, delta));
+            }
+            em.buf.mov_imm32(15, target);
+            if idx + 1 < count {
+                tail_jumps.push(em.buf.emit(a64::nop()));
+            }
+        }
+        let depth_tail = em.buf.pos();
+        for j in tail_jumps {
+            em.buf.patch(j, a64::b_rel(depth_tail as i32 - j as i32));
         }
         em.buf.emit(a64::sub32_imm(24, 24, 1, false));
         em.buf.mov_imm32(28, EXIT_UNWIND);
@@ -1176,7 +1204,7 @@ impl FnEmitter<'_> {
         self.buf.emit(a64::add32_imm(24, 24, 1, false));
         self.buf.emit(a64::cmp32_imm(24, RECOMP_DEPTH_LIMIT));
         let p_depth = self.buf.emit(a64::nop());
-        self.depth_overflow_patches.push(p_depth);
+        self.depth_overflow_patches.push((p_depth, target));
 
         if is_direct {
             let at = self.buf.emit(a64::nop());

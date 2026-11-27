@@ -161,7 +161,7 @@ pub(crate) struct FnEmitter<'a> {
     pub relocs: Vec<Reloc>,
     pub local_patches: Vec<LocalPatch>,
     pub epilogue_patches: Vec<usize>,
-    pub depth_overflow_patches: Vec<usize>,
+    pub depth_overflow_patches: Vec<(usize, Option<u32>)>,
     pub budget_exits: Vec<BudgetExit>,
     pub stale_check: Option<(usize, usize, u32, u32)>,
     pub interpreted_addrs: Vec<u32>,
@@ -458,6 +458,22 @@ pub(crate) fn emit_sync_mxcsr_from_fpscr(buf: &mut X64Buf) {
     emit_sync_mxcsr_from_eax(buf);
 }
 
+#[inline(always)]
+pub(crate) fn emit_save_host_mxcsr_buf(buf: &mut X64Buf) {
+    emit_stmxcsr_scratch_buf(buf);
+    buf.ldr_r32_mem(RAX, RBX, offsets::SCRATCH_FP as i32);
+    buf.str_r32_mem(RAX, RBX, offsets::HOST_MXCSR as i32);
+}
+
+#[inline(always)]
+pub(crate) fn emit_restore_host_mxcsr_buf(buf: &mut X64Buf) {
+    // ldmxcsr dword ptr [rbx + HOST_MXCSR]
+    buf.emit_u8(0x0F);
+    buf.emit_u8(0xAE);
+    buf.emit_u8(0x93);
+    buf.emit_u32((offsets::HOST_MXCSR as i32) as u32);
+}
+
 fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     // 1. sync_out: flushes r15d (NZCV) and r14d (budget) into AotExecContext.
     //    Uses ONLY RAX so RCX, RDX, RSI, RDI, R8, R9, R10, R11 are preserved.
@@ -522,18 +538,14 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     buf.alu_r64_imm32(AluOp::Sub, RSP, 8); // 6 pushes (48B) + 8B -> RSP % 16 == 0
     buf.mov_r64_r64(RBX, RDI);
     buf.mov_r64_r64(R11, RSI);
-    // Preserve host MXCSR across AOT execution and sync MXCSR from `*ctx.fpscr`.
-    emit_stmxcsr_scratch_buf(buf);
-    buf.ldr_r32_mem(RAX, RBX, offsets::SCRATCH_FP as i32);
-    buf.str_r32_mem(RAX, RSP, 0);
+    // Preserve caller host MXCSR in `ec.HOST_MXCSR` and sync MXCSR from `*ctx.fpscr`.
+    emit_save_host_mxcsr_buf(buf);
     emit_sync_mxcsr_from_fpscr(buf);
     buf.call_to(sync_in);
     buf.call_to(invoke_r11);
     buf.call_to(sync_out);
     // Always restore caller host MXCSR on return (even after guest `VMSR FPSCR`).
-    buf.ldr_r32_mem(RAX, RSP, 0);
-    buf.str_r32_mem(RAX, RBX, offsets::SCRATCH_FP as i32);
-    emit_ldmxcsr_scratch_buf(buf);
+    emit_restore_host_mxcsr_buf(buf);
     buf.alu_r64_imm32(AluOp::Add, RSP, 8);
     buf.pop_r64(R15);
     buf.pop_r64(R14);
@@ -554,9 +566,11 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
         buf.call_to(sync_out);
         buf.mov_r64_r64(RDI, RBX);
         buf.mov_r32_r32(RSI, R10);
+        emit_restore_host_mxcsr_buf(buf);
         buf.call_mem64(RBX, fn_off as i32);
         buf.str_r32_mem(RAX, RSP, 16);
         buf.call_to(sync_in);
+        emit_sync_mxcsr_from_fpscr(buf);
         buf.ldr_r32_mem(RAX, RSP, 16);
         buf.ldr_r64_mem(R8, RSP, 0);
         buf.ldr_r64_mem(R9, RSP, 8);
@@ -570,7 +584,7 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     let slow_read32 = emit_slow_read(buf, offsets::FN_SLOW_READ32);
 
     // 5. Slow write / interpret / VFP helper stubs (input: r10d = arg1, r11d = arg2; preserves R8, R9, RBX, R12..R15)
-    let emit_slow_write = |buf: &mut X64Buf, fn_off: u16, sync_mxcsr: bool| -> usize {
+    let emit_slow_write = |buf: &mut X64Buf, fn_off: u16, use_host_mxcsr: bool| -> usize {
         let start = buf.pos();
         buf.push_r64(RBP);
         buf.mov_r64_r64(RBP, RSP);
@@ -581,9 +595,12 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
         buf.mov_r64_r64(RDI, RBX);
         buf.mov_r32_r32(RSI, R10);
         buf.mov_r32_r32(RDX, R11);
+        if use_host_mxcsr {
+            emit_restore_host_mxcsr_buf(buf);
+        }
         buf.call_mem64(RBX, fn_off as i32);
         buf.call_to(sync_in);
-        if sync_mxcsr {
+        if use_host_mxcsr {
             emit_sync_mxcsr_from_fpscr(buf);
         }
         buf.ldr_r64_mem(R8, RSP, 0);
@@ -593,9 +610,9 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
         buf.ret();
         start
     };
-    let slow_write8 = emit_slow_write(buf, offsets::FN_SLOW_WRITE8, false);
-    let slow_write16 = emit_slow_write(buf, offsets::FN_SLOW_WRITE16, false);
-    let slow_write32 = emit_slow_write(buf, offsets::FN_SLOW_WRITE32, false);
+    let slow_write8 = emit_slow_write(buf, offsets::FN_SLOW_WRITE8, true);
+    let slow_write16 = emit_slow_write(buf, offsets::FN_SLOW_WRITE16, true);
+    let slow_write32 = emit_slow_write(buf, offsets::FN_SLOW_WRITE32, true);
 
     // 6. Indirect call & indirect jump (uses 8192-slot direct-mapped icache)
     let indirect_call = buf.pos();
@@ -626,9 +643,11 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     buf.call_to(sync_out);
     buf.mov_r64_r64(RDI, RBX);
     buf.ldr_r32_mem(RSI, RSP, 0);
+    emit_restore_host_mxcsr_buf(buf);
     buf.call_mem64(RBX, offsets::FN_LOOKUP_BODY as i32);
     buf.str_r64_mem(RAX, RSP, 0);
     buf.call_to(sync_in);
+    emit_sync_mxcsr_from_fpscr(buf);
     buf.ldr_r64_mem(R11, RSP, 0);
     buf.alu_r64_imm32(AluOp::Add, RSP, 16);
     buf.test_r64_r64(R11, R11);
@@ -658,9 +677,11 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
     buf.ldr_r32_mem(RSI, RSP, 16);
     buf.mov_r32_r32(RDX, R10);
     buf.mov_r32_r32(RCX, R11);
+    emit_restore_host_mxcsr_buf(buf);
     buf.call_mem64(RBX, offsets::FN_MEDIA_PARALLEL as i32);
     buf.str_r32_mem(RAX, RSP, 16);
     buf.call_to(sync_in);
+    emit_sync_mxcsr_from_fpscr(buf);
     buf.ldr_r32_mem(RAX, RSP, 16);
     buf.ldr_r64_mem(R8, RSP, 0);
     buf.ldr_r64_mem(R9, RSP, 8);
@@ -670,7 +691,7 @@ fn emit_runtime_stubs(buf: &mut X64Buf) -> RuntimeStubs {
 
     // 9. VFP vector & float-to-int helper stubs (input: r10d = packed)
     let vfp_vector = emit_slow_write(buf, offsets::FN_VFP_VECTOR, false);
-    let vfp_to_int = emit_slow_write(buf, offsets::FN_VFP_TO_INT, false);
+    let vfp_to_int = emit_slow_write(buf, offsets::FN_VFP_TO_INT, true);
 
     // 10. Pure-scratch register-shift-with-carry subroutines.
     //     Input: eax = val, ecx = raw Rs, r15d = NZCV<<28.
@@ -780,6 +801,10 @@ fn emit_override_wrapper(
     buf.mov_r64_r64(RBP, RSP);
     let body = buf.pos();
 
+    buf.ldr_r64_mem(RAX, RBX, (offsets::OVERRIDES_BASE + (ovr_idx as u16) * 8) as i32);
+    buf.test_r64_r64(RAX, RAX);
+    let j_null = buf.jcc_rel32(cc::Z);
+
     let s1 = buf.call_rel32();
     relocs.push(Reloc { local_disp_pos: s1 as u32, kind: RelocKind::StubCall(StubId::SyncOut) });
 
@@ -787,6 +812,7 @@ fn emit_override_wrapper(
     buf.ldr_r64_mem(RSI, RBX, offsets::RX_BASE as i32);
     buf.mov_r32_imm32(RAX, raw_body_byte_offset);
     buf.alu_r64_r64(AluOp::Add, RSI, RAX);
+    emit_restore_host_mxcsr_buf(buf);
     buf.call_mem64(RBX, (offsets::OVERRIDES_BASE + (ovr_idx as u16) * 8) as i32);
 
     let s2 = buf.call_rel32();
@@ -795,6 +821,14 @@ fn emit_override_wrapper(
 
     buf.pop_r64(RBP);
     buf.ret();
+
+    // Null override slot fallback (e.g. modded `.code` without attached override):
+    buf.patch_rel32(j_null, buf.pos());
+    buf.ldr_r64_mem(RAX, RBX, offsets::RX_BASE as i32);
+    buf.mov_r32_imm32(RCX, raw_body_byte_offset);
+    buf.alu_r64_r64(AluOp::Add, RAX, RCX);
+    buf.jmp_r64(RAX);
+
     (prologue, body, relocs)
 }
 
@@ -917,9 +951,33 @@ fn emit_function_pass(
 
     // Cold depth-overflow stub:
     if !em.depth_overflow_patches.is_empty() {
-        let depth_out = em.buf.pos();
-        for p in &em.depth_overflow_patches {
-            em.buf.patch_rel32(*p, depth_out);
+        let mut by_target: BTreeMap<Option<u32>, Vec<usize>> = BTreeMap::new();
+        for (site, target) in std::mem::take(&mut em.depth_overflow_patches) {
+            by_target.entry(target).or_default().push(site);
+        }
+        let mut tail_jumps = Vec::new();
+        let none_sites = by_target.remove(&None);
+        let count = by_target.len();
+        for (idx, (target, sites)) in by_target.into_iter().enumerate() {
+            let here = em.buf.pos();
+            for site in sites {
+                em.buf.patch_rel32(site, here);
+            }
+            if let Some(t) = target {
+                em.buf.str_imm32_mem(RBX, (offsets::CTX_R0 + 15 * 4) as i32, t);
+            }
+            if idx + 1 < count {
+                tail_jumps.push(em.buf.jmp_rel32());
+            }
+        }
+        let depth_tail = em.buf.pos();
+        if let Some(sites) = none_sites {
+            for site in sites {
+                em.buf.patch_rel32(site, depth_tail);
+            }
+        }
+        for j in tail_jumps {
+            em.buf.patch_rel32(j, depth_tail);
         }
         em.buf.ldr_r32_mem(RAX, RBX, offsets::CTX_DEPTH as i32);
         em.buf.alu_r32_imm32(AluOp::Sub, RAX, 1);
@@ -1324,13 +1382,13 @@ impl FnEmitter<'_> {
         self.emit_write_impl(addr_r32, val_r32, 4);
     }
 
-    fn emit_depth_check(&mut self) {
+    fn emit_depth_check(&mut self, unwind_pc: Option<u32>) {
         self.buf.ldr_r32_mem(RAX, RBX, offsets::CTX_DEPTH as i32);
         self.buf.alu_r32_imm32(AluOp::Add, RAX, 1);
         self.buf.str_r32_mem(RAX, RBX, offsets::CTX_DEPTH as i32);
         self.buf.alu_r32_imm32(AluOp::Cmp, RAX, RECOMP_DEPTH_LIMIT as i32);
         let p_depth = self.buf.jcc_rel32(cc::A);
-        self.depth_overflow_patches.push(p_depth);
+        self.depth_overflow_patches.push((p_depth, unwind_pc));
     }
 
     fn emit_post_call_guard(&mut self, expected_pc: u32, caller_thumb: bool) {
@@ -1363,7 +1421,7 @@ impl FnEmitter<'_> {
         if callee_thumb != caller_thumb {
             self.buf.str_imm8_mem(RBX, offsets::CTX_THUMB as i32, callee_thumb as u8);
         }
-        self.emit_depth_check();
+        self.emit_depth_check(is_direct.then_some(target));
 
         if is_direct {
             let disp = self.buf.call_rel32();
@@ -2106,7 +2164,7 @@ impl FnEmitter<'_> {
             self.load_gpr(R10, rm, a + 8);
             self.buf.str_imm32_mem(RBX, (offsets::CTX_R0 + 14 * 4) as i32, a + 4);
             self.write_interworking_pc(R10);
-            self.emit_depth_check();
+            self.emit_depth_check(None);
             self.stub_call(StubId::IndirectCall);
             self.emit_post_call_guard(a + 4, false);
             return true;

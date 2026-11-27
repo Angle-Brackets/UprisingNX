@@ -3431,3 +3431,190 @@ fn torture_adversarial_indirect_icache_collisions_and_budget_unwind() {
     });
 }
 
+
+#[test]
+fn torture_depth_overflow_null_override_and_callback_mxcsr() {
+    use asm::*;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use zakuro_aot::runtime::{AotExecContext, OverrideFn};
+
+    // 1. [HIGH-1] DirectCall depth overflow (`depth > 2048`) switching from `fn_a` to `fn_b`
+    //    (including `BLX fn_b_thumb` interworking!) must unwind with `ctx.r[15] == fn_b`
+    //    (not stale `fn_a`), execute `fn_b` once, and match `zakuro-cpu` completely!
+    {
+        let mut b = CodeBuilder::new();
+        let entry = b.addr();
+        b.emit_arm(0xE92D_4010); // PUSH {R4, LR}
+        let bl_entry = b.emit_arm(0);
+        b.emit_arm(0xE8BD_8010); // POP {R4, PC}
+        while b.addr() < BASE + 0x20 {
+            b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 0, 0, LSL, 0));
+        }
+        let fn_a = b.addr();
+        b.emit_arm(dp_imm(AL, OP_SUB, true, 0, 0, 1, 0)); // SUBS R0, R0, #1
+        let beq_leaf = b.emit_arm(0);
+        b.emit_arm(0xE92D_4010); // PUSH {R4, LR}
+        let bl_self = b.emit_arm(0);
+        b.emit_arm(0xE8BD_8010); // POP {R4, PC}
+        let leaf = b.addr();
+        b.emit_arm(0xE92D_4010); // PUSH {R4, LR}
+        let bl_b = b.emit_arm(0);
+        b.emit_arm(0xE8BD_8010); // POP {R4, PC}
+        while b.addr() < BASE + 0x80 {
+            b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 0, 0, LSL, 0));
+        }
+        let fn_b_thumb = b.addr();
+        b.emit_thumb(0x2055);           // MOVS R0, #0x55
+        b.emit_thumb(t_adds_imm8(3, 1)); // ADDS R3, #1 (verifies fn_b ran exactly once!)
+        b.emit_thumb(t_bx(14));         // BX LR
+        b.align4();
+
+        b.patch_arm(bl_entry, bl_cond(AL, bl_entry, fn_a));
+        b.patch_arm(beq_leaf, b_cond(EQ, beq_leaf, leaf));
+        b.patch_arm(bl_self, bl_cond(AL, bl_self, fn_a));
+        b.patch_arm(bl_b, blx_thumb(bl_b, fn_b_thumb));
+
+        let words = b.finish();
+        let (text, aot) = compile_snippet(
+            &words,
+            &[(entry, Source::Entry), (fn_a, Source::Call), (fn_b_thumb | 1, Source::Call)],
+        );
+        verify_compiled("depth_overflow_cross_fn_blx_unwind", &text, &aot, true, |cpu, _| {
+            cpu.regs[0] = 2048; // entry->fn_a (depth 1) -> ... -> fn_a (depth 2048) -> BLX fn_b (depth 2049 > 2048!)
+            cpu.regs[3] = 10;
+        });
+    }
+
+    // 2. [HIGH-2] Override wrapper compiled with override slot left null (`0`) must fall back to `raw_body`.
+    {
+        let mut b = CodeBuilder::new();
+        let caller = b.addr();
+        b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 4, 14, LSL, 0));
+        b.emit_arm(mov_imm(AL, false, 0, 5, 0));
+        let bl_pos = b.emit_arm(0);
+        b.emit_arm(add_imm(AL, false, 0, 0, 2, 0));
+        b.emit_arm(bx(AL, 4));
+        while b.addr() < BASE + 0x20 {
+            b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 0, 0, LSL, 0));
+        }
+        let target_fn = b.addr();
+        b.emit_arm(add_imm(AL, false, 0, 0, 100, 0));
+        b.emit_arm(bx(AL, 14));
+        b.patch_arm(bl_pos, bl_cond(AL, bl_pos, target_fn));
+        let words = b.finish();
+        let text: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let program = Program {
+            text: Segment { base: BASE, bytes: text.clone() },
+            seeds: vec![(caller, Source::Entry)],
+            slots: None,
+        };
+        let image = compile_program(0, 0x9999, &program, &[target_fn], CompileOptions::default(), |_, _| {});
+        let aot = image.into_loaded_exec().unwrap(); // Intentionally NO `.with_overrides(...)`!
+        verify_compiled("null_override_fallback_to_raw_body", &text, &aot, true, |cpu, _| {
+            cpu.regs[0] = 0;
+        });
+    }
+
+    // 3. [MEDIUM-1] x86_64 SysV64 callbacks observe clean host MXCSR even under guest `FZ=1 | RMode=-Inf`,
+    //    and guest MXCSR is restored when callback returns to AOT.
+    #[cfg(target_arch = "x86_64")]
+    {
+        static OVR_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static OVR_MXCSR: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "sysv64" fn inspect_mxcsr_override(
+            ec: *mut AotExecContext,
+            _orig_body: *const u8,
+        ) {
+            OVR_CALLS.fetch_add(1, Ordering::Relaxed);
+            OVR_MXCSR.store(read_mxcsr(), Ordering::Relaxed);
+            unsafe {
+                let lr = (*ec).ctx.r[14];
+                (*ec).ctx.r[0] = 7;
+                (*ec).ctx.r[15] = lr & !1;
+                (*ec).ctx.thumb = (lr & 1) as u8;
+            }
+        }
+
+        OVR_CALLS.store(0, Ordering::Relaxed);
+        OVR_MXCSR.store(0, Ordering::Relaxed);
+
+        let mut b = CodeBuilder::new();
+        let entry = b.addr();
+        b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 4, 14, LSL, 0));
+        b.emit_arm(vmsr_fpscr(AL, 1)); // FZ=1 | RMode=-Inf
+        let bl_pos = b.emit_arm(0);
+        // After override returns, execute VFP ops relying on FZ=1 (s0 subnormal -> 0) and RMode=-Inf (s2 + s3)!
+        b.emit_arm(vfp_dp(AL, false, 0b0011, false, 0, 0, 5)); // VADD.F32 s0, s0, s5
+        b.emit_arm(vfp_dp(AL, false, 0b0011, false, 2, 2, 3)); // VADD.F32 s2, s2, s3
+        b.emit_arm(bx(AL, 4));
+        while b.addr() < BASE + 0x20 {
+            b.emit_arm(dp_reg_imm(AL, OP_MOV, false, 0, 0, 0, LSL, 0));
+        }
+        let ovr_target = b.addr();
+        b.emit_arm(mov_imm(AL, false, 0, 0xEE, 0));
+        b.emit_arm(bx(AL, 14));
+        b.patch_arm(bl_pos, bl_cond(AL, bl_pos, ovr_target));
+        let words = b.finish();
+        let text: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let program = Program {
+            text: Segment { base: BASE, bytes: text.clone() },
+            seeds: vec![(entry, Source::Entry)],
+            slots: None,
+        };
+        let image = compile_program(0, 0xAAAA, &program, &[ovr_target], CompileOptions::default(), |_, _| {});
+        let aot = image
+            .into_loaded_exec()
+            .unwrap()
+            .with_overrides(&[(ovr_target, inspect_mxcsr_override as OverrideFn)]);
+
+        let saved_mxcsr = read_mxcsr();
+        let _guard = RestoreHostMxcsr(saved_mxcsr);
+
+        let mem = TestMemory::new(vec![
+            Region { base: BASE, bytes: text, writable: false, direct_page: true },
+            Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true, direct_page: true },
+        ]);
+        let mut vfp_regs = [0u32; 32];
+        vfp_regs[0] = 0x0040_0000; // subnormal 2^-127
+        vfp_regs[5] = 0x0000_0000; // +0.0
+        vfp_regs[2] = (-1.0f32).to_bits();
+        vfp_regs[3] = 0xB380_0000; // -2^-24
+        let mut fpscr = 0u32;
+        let mut r = [0u32; 16];
+        r[1] = (1 << 24) | (0b10 << 22); // FZ=1 | RMode=-Inf
+        r[13] = STACK_TOP - 0x1000;
+        r[14] = RETURN;
+        r[15] = entry;
+        let mut ctx = Context {
+            r,
+            n: 0, z: 0, c: 0, v: 0, q: 0, thumb: 0, ge: 0, exclusive: 0,
+            budget: LIMIT, exit: EXIT_NONE, svc: 0, depth: 0, exclusive_address: 0, tls: TLS,
+            read_pages: mem.read_pages.as_ptr(),
+            write_pages: mem.write_pages.as_ptr(),
+            vfp: vfp_regs.as_mut_ptr(),
+            fpscr: &mut fpscr,
+            host: &HOST,
+            user: null_mut(),
+        };
+        let body = aot.lookup(entry).unwrap();
+        unsafe { aot.enter(&mut ctx, body) };
+        let after_mxcsr = read_mxcsr();
+        let ctrl_mask = (1 << 15) | (0b11 << 13) | (1 << 6);
+
+        assert_eq!(OVR_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            OVR_MXCSR.load(Ordering::Relaxed) & ctrl_mask,
+            saved_mxcsr & ctrl_mask,
+            "OverrideFn observed dirty guest MXCSR instead of clean host MXCSR!"
+        );
+        assert_eq!(
+            after_mxcsr & ctrl_mask,
+            saved_mxcsr & ctrl_mask,
+            "LoadedAot::enter leaked MXCSR on return!"
+        );
+        assert_eq!(ctx.r[0], 7);
+        assert_eq!(vfp_regs[0], 0x0000_0000, "FZ=1 not restored after OverrideFn");
+        assert_eq!(vfp_regs[2], (-1.0f32).next_down().to_bits(), "RMode=-Inf not restored after OverrideFn");
+    }
+}
