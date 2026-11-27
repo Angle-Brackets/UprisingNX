@@ -67,6 +67,15 @@ pub fn run(linked: Option<Linked>) {
     // the code and the game into memory before play reaches them
     warm::start(options.rom.as_deref());
     let mut settings = Settings::load();
+    // A dedicated linked port (Kid Icarus: Uprising Recompiled) boots straight into
+    // 16:9 single-screen Auto layout at 1280x720 with 60 fps interpolation when no
+    // settings file exists yet.
+    if linked.is_some() && !settings::exists() {
+        settings.layout = Screens::Auto;
+        settings.scale = 3;
+        settings.frame_interpolation = true;
+        settings.show_controls = false;
+    }
     // the console's own number, made the first time and kept, which tells
     // it apart from others over local wireless
     if settings.console_id == 0 {
@@ -337,12 +346,22 @@ struct Running {
     out_of_play: u32,
     /// the game override last said the player is flying, not on foot.
     flying: bool,
+    /// true when running Kid Icarus: Uprising (USA), enabling the shared 16:9 single-screen UI.
+    is_kiu: bool,
+    /// shared KIU 16:9 merged-hub & pause state machine.
+    kiu: zakuro_kiu::KiuUiState,
+    /// one-shot trigger to toggle classic LargeTop vs merged 16:9 hub (F2 / R3).
+    toggle_bottom_pressed: bool,
     /// when the game started, in seconds since 1970, for Discord.
     started: u64,
 }
 
 impl Running {
     fn new(system: System, path: PathBuf, name: String) -> Running {
+        let is_kiu = system
+            .title
+            .as_ref()
+            .is_some_and(|title| title.program_id() == zakuro_kiu::KIU_USA_PROGRAM_ID);
         Running {
             system,
             path,
@@ -355,6 +374,9 @@ impl Running {
             fps: 0.0,
             out_of_play: u32::MAX,
             flying: false,
+            is_kiu,
+            kiu: zakuro_kiu::KiuUiState::new(),
+            toggle_bottom_pressed: false,
             started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()),
         }
     }
@@ -637,21 +659,35 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => self.key(event, consumed),
             WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                if pressed {
+                    self.gamepads.set_inactive();
+                }
+                let is_kiu = self.game.as_ref().is_some_and(|game| game.is_kiu);
                 if button == MouseButton::Left && self.keyboard.aiming() {
-                    self.keyboard.fire(state == ElementState::Pressed);
+                    self.keyboard.fire(pressed);
                 } else if button == MouseButton::Left {
-                    self.mouse_down = state == ElementState::Pressed && !self.pointer_taken(consumed);
+                    self.mouse_down = pressed && !self.pointer_taken(consumed);
                     self.touch();
                 }
-                // while aiming the middle button uses the power, as the D-pad's down does
+                // while aiming, middle click activates power (D-pad down)
                 if button == MouseButton::Middle {
-                    self.keyboard.mouse_button(PadState::DOWN, state == ElementState::Pressed);
+                    self.keyboard.mouse_button(PadState::DOWN, pressed);
                 }
                 if button == MouseButton::Right && self.keyboard.aiming() {
-                    self.keyboard.stylus(state == ElementState::Pressed);
+                    if is_kiu {
+                        // Direct PC KBM controls: RMB activates the selected Power (D-pad down)
+                        // instead of holding the virtual stylus.
+                        self.keyboard.mouse_button(PadState::DOWN, pressed);
+                    } else {
+                        self.keyboard.stylus(pressed);
+                    }
                 } else if button == MouseButton::Right {
-                    let pressed = state == ElementState::Pressed && !self.pointer_taken(consumed);
-                    self.tilting_from = pressed.then_some(self.cursor);
+                    if is_kiu && !pressed {
+                        self.keyboard.mouse_button(PadState::DOWN, false);
+                    }
+                    let tilt_pressed = pressed && !self.pointer_taken(consumed);
+                    self.tilting_from = tilt_pressed.then_some(self.cursor);
                     self.tilt();
                 }
             }
@@ -676,6 +712,9 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device: DeviceId, event: DeviceEvent) {
         // raw movement, which keeps coming with the pointer locked in place
         if let DeviceEvent::MouseMotion { delta } = event {
+            if self.keyboard.aiming() && (delta.0 != 0.0 || delta.1 != 0.0) {
+                self.gamepads.set_inactive();
+            }
             let speed = match self.keyboard.aim_mode() {
                 Some(AimMode::Air) => self.settings.air_aim_speed,
                 _ => self.settings.land_aim_speed,
@@ -812,6 +851,10 @@ impl App {
             ));
         }
         self.game = Some(game);
+        let screens = self.screens();
+        if let Some(backend) = &mut self.backend {
+            backend.set_layout(screens);
+        }
         // the new game's cameras see what the settings say, and it plays
         // in the room the player is in
         self.camera = None;
@@ -885,6 +928,13 @@ impl App {
                     self.paused = !self.paused;
                     log::info!("{}", if self.paused { "paused" } else { "resumed" });
                 }
+                KeyCode::F2 => {
+                    if let Some(game) = &mut self.game {
+                        if game.is_kiu {
+                            game.toggle_bottom_pressed = true;
+                        }
+                    }
+                }
                 KeyCode::F9 => {
                     self.settings.layout = self.settings.layout.next();
                     self.settings.save();
@@ -935,7 +985,14 @@ impl App {
             } else if button == gilrs::Button::Mode && self.game.is_some() {
                 self.menus.menu_open = !self.menus.menu_open;
                 self.menus.options_open = false;
+                self.set_mouse_aim(None);
                 self.keyboard.release();
+            } else if button == gilrs::Button::RightThumb {
+                if let Some(game) = &mut self.game {
+                    if game.is_kiu && self.layout == Screens::Auto {
+                        game.toggle_bottom_pressed = true;
+                    }
+                }
             }
         }
     }
@@ -975,6 +1032,22 @@ impl App {
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
+        if let Some(game) = &self.game {
+            if game.is_kiu && self.layout == Screens::Auto {
+                let hit = self.mouse_down.then(|| {
+                    game.kiu.touch(
+                        size.width,
+                        size.height,
+                        self.top_shape.width(),
+                        self.settings.integer_scale,
+                        self.cursor.0,
+                        self.cursor.1,
+                    )
+                }).flatten();
+                self.keyboard.touch(hit);
+                return;
+            }
+        }
         let (_, bottom) = layout(size.width, size.height, self.screens(), self.top_shape.width(), self.settings.integer_scale);
         // with the top screen alone there is nothing to touch
         let Some(bottom) = bottom else {
@@ -1082,8 +1155,13 @@ impl App {
     /// the screens shown now, the automatic layout's by whether the game is
     /// in play; before a game runs, as in menus.
     fn screens(&self) -> zakuro_gpu::ScreenLayout {
-        let in_play = self.game.as_ref().is_some_and(|game| game.out_of_play <= IN_PLAY_QUIET);
-        self.layout.screens_in(in_play)
+        if let Some(game) = &self.game {
+            if game.is_kiu && self.layout == Screens::Auto {
+                return game.kiu.layout;
+            }
+            return self.layout.screens_in(game.out_of_play <= IN_PLAY_QUIET);
+        }
+        self.layout.screens_in(false)
     }
 
     fn apply_layout(&mut self) {
@@ -1115,7 +1193,20 @@ impl App {
 
     /// the window size that fits the screens at the chosen scale.
     fn window_size(&self) -> winit::dpi::Size {
-        let (width, height) = self.layout.screens().size(self.top_shape.width());
+        let kiu_16x9 = self.layout == Screens::Auto
+            && (self.linked.is_some() || self.game.as_ref().is_some_and(|game| game.is_kiu));
+        let (width, height) = if kiu_16x9 {
+            let h = 240 * self.scale;
+            let w = (zakuro_gpu::backend::FUSE_DECK_WIDTH * self.scale as f32).round() as u32;
+            if let (true, Some(window)) = (self.settings.integer_scale, &self.window) {
+                let times = (self.scale as f64 * window.scale_factor()).round().max(1.0) as u32;
+                let pw = (zakuro_gpu::backend::FUSE_DECK_WIDTH * times as f32).round() as u32;
+                return winit::dpi::PhysicalSize::new(pw, 240 * times).into();
+            }
+            return winit::dpi::LogicalSize::new(w, h).into();
+        } else {
+            self.layout.screens().size(self.top_shape.width())
+        };
         // scaled by whole numbers, a desktop scaled by 125% say would leave a
         // border, so the window gets whole multiples of the screens' pixels
         if let (true, Some(window)) = (self.settings.integer_scale, &self.window) {
@@ -1380,7 +1471,11 @@ impl App {
             self.game.is_some() && !self.paused && !self.menus.menu_open && !self.menus.settings_open && !typing;
         // Tab or a controller's right trigger, or the right stick's click
         // while ZR has the trigger, whichever no button of the console's is on
-        let free = |button: gilrs::Button| self.settings.pad.map().iter().all(|&(_, bound)| bound != button);
+        let is_kiu = self.game.as_ref().is_some_and(|game| game.is_kiu);
+        let free = |button: gilrs::Button| {
+            (!is_kiu || button != gilrs::Button::RightThumb)
+                && self.settings.pad.map().iter().all(|&(_, bound)| bound != button)
+        };
         let trigger = [gilrs::Button::RightTrigger2, gilrs::Button::RightThumb].into_iter().find(|&button| free(button));
         let fast = playing && (self.fast_forward_key || trigger.is_some_and(|trigger| self.gamepads.holding(trigger)));
         if fast {
@@ -1471,80 +1566,186 @@ impl App {
     fn emulate(&mut self) {
         // what game overrides say the game is doing picks the mouse aim mode,
         // see input::GAME_ON_FOOT; not while the window or a menu has it
-        let said = self.game.as_mut().map_or(0, |game| std::mem::take(&mut game.system.memory.host_mailbox[3]));
-        if self.focused && !self.menus.menu_open {
+        let (said, is_kiu, kiu_pre) = match &mut self.game {
+            Some(game) => {
+                let said = std::mem::take(&mut game.system.memory.host_mailbox[3]);
+                let kiu_pre = if game.is_kiu && self.layout == Screens::Auto {
+                    let toggle = std::mem::take(&mut game.toggle_bottom_pressed);
+                    let flags = game.system.gpu.flags();
+                    let pre = game.kiu.pre_frame(&flags, &mut game.system.memory, said, toggle);
+                    if pre.reset_interpolation {
+                        game.system.reset_interpolation();
+                    }
+                    Some(pre)
+                } else {
+                    None
+                };
+                (said, game.is_kiu, kiu_pre)
+            }
+            None => (0, false, None),
+        };
+
+        let kiu_paused = kiu_pre.is_some_and(|pre| pre.on_pause);
+        if kiu_paused {
+            self.keyboard.clear_game();
+            self.gamepads.clear_kiu_game();
+            if self.keyboard.aiming() {
+                self.set_mouse_aim(None);
+            }
+        } else if is_kiu && self.gamepads.is_active() {
+            if self.keyboard.aiming() {
+                self.set_mouse_aim(None);
+            }
+        } else if self.focused && !self.menus.menu_open {
             if let Some(mode) = self.keyboard.game_mode(said) {
                 self.pick_aim(mode);
             }
         }
-        let Some(game) = &mut self.game else { return };
-        // in play while the overrides say so, see IN_PLAY_QUIET
-        let was_in_play = game.out_of_play <= IN_PLAY_QUIET;
-        game.out_of_play = if said != 0 { 0 } else { game.out_of_play.saturating_add(1) };
-        if said != 0 {
-            game.flying = said == input::GAME_FLYING;
-        }
-        let in_play = game.out_of_play <= IN_PLAY_QUIET;
-        game.system.gpu.set_in_play(in_play);
-        // the automatic layout shows the bottom screen over the top one in
-        // menus, where the game is played on it
-        if in_play != was_in_play && self.layout == Screens::Auto {
-            if let Some(backend) = &mut self.backend {
-                backend.set_layout(self.layout.screens_in(in_play));
+
+        let win_size = self.window.as_ref().map(|w| w.inner_size());
+        let supports_merged = self.backend.as_ref().is_some_and(Backend::is_vulkan);
+        let mut post_paused = false;
+
+        let outcome = {
+            let Some(game) = &mut self.game else { return };
+            // in play while the overrides say so, see IN_PLAY_QUIET
+            let was_in_play = game.out_of_play <= IN_PLAY_QUIET;
+            game.out_of_play = if said != 0 { 0 } else { game.out_of_play.saturating_add(1) };
+            if said != 0 {
+                game.flying = said == input::GAME_FLYING;
             }
-        }
-        let input = match &mut game.replay {
-            Some(replay) => replay.input(game.frame),
-            None => self.gamepads.apply(self.keyboard.state()),
+            if kiu_pre.is_none() {
+                let in_play = game.out_of_play <= IN_PLAY_QUIET;
+                game.system.gpu.set_in_play(in_play);
+                // the automatic layout shows the bottom screen over the top one in
+                // menus, where the game is played on it
+                if in_play != was_in_play && self.layout == Screens::Auto {
+                    if let Some(backend) = &mut self.backend {
+                        backend.set_layout(self.layout.screens_in(in_play));
+                    }
+                }
+            }
+            let mut input = match &mut game.replay {
+                Some(replay) => replay.input(game.frame),
+                None => self.gamepads.apply(self.keyboard.state()),
+            };
+            if kiu_pre.is_some_and(|pre| pre.on_title) && (!input.buttons.is_empty() || self.mouse_down) {
+                input.buttons |= PadState::A;
+            }
+            self.keyboard.frame_done();
+            game.frame += 1;
+            if let Some(recorder) = &mut game.recorder {
+                recorder.record(input);
+            }
+            // Gamepad right-stick / Z-target aiming for KIU, falling back to KBM mouse-look.
+            let pad_drove_mailbox = is_kiu
+                && !kiu_paused
+                && game.replay.is_none()
+                && self.gamepads.feed_kiu_mailbox(
+                    said,
+                    self.settings.invert_aim_y,
+                    &mut input,
+                    &mut game.system.memory.host_mailbox,
+                );
+            game.system.set_input(input);
+            if !pad_drove_mailbox {
+                // mouse look on foot / mouse aim in air, see input::MOUSE_LOOK / MOUSE_AIM
+                self.keyboard.feed_mailbox(&mut game.system.memory.host_mailbox);
+            }
+            let interpreted = |system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
+            let before = interpreted(&game.system);
+            let faults = warm::page_faults();
+            let started = Instant::now();
+            let outcome = game.system.run_frame();
+            // a frame far over its 16.7 ms is a hitch the player feels; the log
+            // around it says what the game was doing
+            let took = started.elapsed();
+            let gpu = zakuro_gpu::stats::take();
+            // and the whole time since the last frame, showing it included, which
+            // catches a stall outside the emulation too; a pause or the menu is no hitch
+            let since = self.last_emulated.replace(started).map(|last| started - last).unwrap_or_default();
+            let menu = self.paused || self.menus.menu_open;
+            if !menu && (took.as_millis() >= 50 || since.as_millis() >= 100) {
+                log::warn!(
+                    "hitch: frame {} took {:.0} ms, {:.0} ms since the last, {} instructions interpreted, \
+                     {} draws in {:.0} ms: vertices {:.0} ms, textures {:.0} ms, waiting for the GPU {:.0} ms; \
+                     recompiled code {:.0} ms, services {:.0} ms, frame end {:.0} ms, sound {:.0} ms, \
+                     {} syncs with the GPU in {:.0} ms, {} pages brought in",
+                    game.frame,
+                    took.as_secs_f64() * 1000.0,
+                    since.as_secs_f64() * 1000.0,
+                    interpreted(&game.system) - before,
+                    gpu.draws,
+                    gpu.drawing,
+                    gpu.shading,
+                    gpu.textures,
+                    gpu.waiting,
+                    gpu.recompiled,
+                    gpu.services,
+                    gpu.frame_end,
+                    gpu.audio,
+                    gpu.syncs,
+                    gpu.sync,
+                    warm::page_faults() - faults
+                );
+            }
+            if let Some(pre) = kiu_pre {
+                let touching_slider = self.mouse_down
+                    && !self.menus.menu_open
+                    && win_size.is_some_and(|size| {
+                        zakuro_kiu::is_touching_cauldron_slider(
+                            size.width,
+                            size.height,
+                            self.top_shape.width(),
+                            self.settings.integer_scale,
+                            self.cursor.0,
+                            self.cursor.1,
+                        )
+                    });
+                let flags = game.system.gpu.flags();
+                let post = game.kiu.post_frame(
+                    &flags,
+                    &mut game.system.memory,
+                    pre,
+                    touching_slider,
+                    supports_merged,
+                );
+                post_paused = post.on_pause;
+                if post.reset_interpolation {
+                    game.system.reset_interpolation();
+                }
+                if let Some(backend) = &mut self.backend {
+                    if let Some(sub) = post.pause_state {
+                        backend.set_pause_state(sub);
+                    }
+                    if let Some(title_r) = post.chapter_title_right {
+                        backend.set_chapter_state(title_r);
+                    }
+                    if let Some(sub) = post.weapon_state {
+                        backend.set_weapon_state(sub);
+                    }
+                    if let Some((cx, opacity, hud_flags)) = post.cauldron_state {
+                        backend.set_cauldron_state(cx, opacity, hud_flags);
+                    }
+                    if post.layout_changed {
+                        log::info!("kiu: layout -> {:?} at frame {}", post.layout, game.frame);
+                        backend.set_layout(post.layout);
+                    }
+                }
+            }
+            game.count_frame();
+            let sound = game.system.take_audio();
+            // fast forward plays no sound, there is too much of it too soon
+            if let (Some(audio), false) = (&self.audio, self.fast_forwarding) {
+                audio.push(&sound);
+            }
+            outcome
         };
-        self.keyboard.frame_done();
-        game.frame += 1;
-        if let Some(recorder) = &mut game.recorder {
-            recorder.record(input);
+
+        if post_paused && self.keyboard.aiming() {
+            self.set_mouse_aim(None);
         }
-        game.system.set_input(input);
-        // mouse look on foot, for a game override to take, see input::MOUSE_LOOK
-        self.keyboard.feed_mailbox(&mut game.system.memory.host_mailbox);
-        let interpreted =|system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
-        let before = interpreted(&game.system);
-        let faults = warm::page_faults();
-        let started = Instant::now();
-        let outcome = game.system.run_frame();
-        // a frame far over its 16.7 ms is a hitch the player feels; the log
-        // around it says what the game was doing
-        let took = started.elapsed();
-        let gpu = zakuro_gpu::stats::take();
-        // and the whole time since the last frame, showing it included, which
-        // catches a stall outside the emulation too; a pause or the menu is no hitch
-        let since = self.last_emulated.replace(started).map(|last| started - last).unwrap_or_default();
-        let menu = self.paused || self.menus.menu_open;
-        if !menu && (took.as_millis() >= 50 || since.as_millis() >= 100) {
-            log::warn!(
-                "hitch: frame {} took {:.0} ms, {:.0} ms since the last, {} instructions interpreted,                  {} draws in {:.0} ms: vertices {:.0} ms, textures {:.0} ms, waiting for the GPU {:.0} ms;                  recompiled code {:.0} ms, services {:.0} ms, frame end {:.0} ms, sound {:.0} ms,                  {} syncs with the GPU in {:.0} ms, {} pages brought in",
-                game.frame,
-                took.as_secs_f64() * 1000.0,
-                since.as_secs_f64() * 1000.0,
-                interpreted(&game.system) - before,
-                gpu.draws,
-                gpu.drawing,
-                gpu.shading,
-                gpu.textures,
-                gpu.waiting,
-                gpu.recompiled,
-                gpu.services,
-                gpu.frame_end,
-                gpu.audio,
-                gpu.syncs,
-                gpu.sync,
-                warm::page_faults() - faults
-            );
-        }
-        game.count_frame();
-        let sound = game.system.take_audio();
-        // fast forward plays no sound, there is too much of it too soon
-        if let (Some(audio), false) = (&self.audio, self.fast_forwarding) {
-            audio.push(&sound);
-        }
+
         match outcome {
             FrameOutcome::Completed => {}
             FrameOutcome::Exited => {
@@ -1553,13 +1754,15 @@ impl App {
             }
             FrameOutcome::Faulted => {
                 log::error!("the title stopped on a fault");
-                let errors = game.system.fatal_errors.join("; ");
-                if !errors.is_empty() {
-                    log::error!("{errors}");
+                if let Some(game) = &self.game {
+                    let errors = game.system.fatal_errors.join("; ");
+                    if !errors.is_empty() {
+                        log::error!("{errors}");
+                    }
+                    let message = format!("The game stopped on a fault. {errors}");
+                    self.menus.report = Some((message.clone(), report::text(&game.name, &game.system)));
+                    self.menus.message = Some(message);
                 }
-                let message = format!("The game stopped on a fault. {errors}");
-                self.menus.report = Some((message.clone(), report::text(&game.name, &game.system)));
-                self.menus.message = Some(message);
                 self.back_to_library();
             }
         }
@@ -1723,6 +1926,7 @@ impl App {
         match loaded {
             Ok(()) => {
                 log::info!("loaded the state from {}", path.display());
+                game.kiu.on_state_loaded();
                 self.menus.toast = Some((format!("Loaded slot {slot}"), Instant::now()));
                 self.menus.menu_open = false;
                 if let Some(audio) = &self.audio {
@@ -1758,6 +1962,7 @@ impl App {
             .flatten()
             .and_then(|path| std::fs::metadata(path).ok()?.modified().ok())
             .map(ago);
+        let screens = self.screens();
         let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
         let show_fps = self.settings.show_fps;
         let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps, game.system.recompiled.is_some()));
@@ -1777,7 +1982,6 @@ impl App {
         });
         // where the controls can go, the window's pixels no screen covers, while
         // a game runs without the 3D, which places the screens otherwise
-        let screens = self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.out_of_play <= IN_PLAY_QUIET));
         let free = (menus::CONTROLS_HINT_ENABLED && self.game.is_some() && self.settings.show_controls &&self.settings.stereo == settings::Stereo3d::Off)
             .then(|| {
                 let size = window.inner_size();

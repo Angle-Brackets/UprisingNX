@@ -989,12 +989,12 @@ fn controls_sections(k: &Keys) -> Vec<(&'static str, Vec<ControlRow>)> {
         ("ATTACK", vec![row(vec![n(k.l), text("Left click")], "Fire, hold for more")]),
         ("POWERS", vec![
             row(vec![n(k.left), n(k.right), text("Wheel")], "Pick a power"),
-            row(vec![n(k.down), text("Middle click")], "Use it"),
+            row(vec![n(k.down), text("Right click")], "Use it"),
         ]),
         ("AIM", vec![
             row(vec![text("1"), text("2"), text("3")], "Off, air, land"),
-            row(vec![text("Mouse")], "Turns the camera on land"),
-            row(vec![text("Right click")], "Hold to drag the stylus on land"),
+            row(vec![text("Mouse")], "Aim in air, turn camera on land"),
+            row(vec![text("F2")], "Toggle classic bottom screen"),
         ]),
         ("MENUS", vec![
             row(vec![n(k.a), n(k.b)], "A, B"),

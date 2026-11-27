@@ -42,7 +42,7 @@ impl Screens {
             Screens::TopOnly => "Top screen only",
             Screens::BottomOnly => "Bottom screen only",
             Screens::LargeTop => "Big top screen, small bottom one",
-            Screens::Auto => "Top screen, the bottom one over it in menus",
+            Screens::Auto => "Automatic 16:9 single-screen (KIU)",
         }
     }
 
@@ -644,6 +644,11 @@ fn write(path: &Path, text: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(path, text)
+}
+
+/// whether a saved settings file already exists on disk.
+pub fn exists() -> bool {
+    path().is_some_and(|path| path.exists())
 }
 
 /// the system's place for a program's settings.

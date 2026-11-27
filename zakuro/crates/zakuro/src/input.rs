@@ -84,8 +84,9 @@ pub const MOUSE_AIM: u32 = u32::from_le_bytes(*b"MAM1");
 
 /// the host mailbox's fourth word, which game overrides set every tick to the
 /// kind of play going on, and the frontend reads and clears every frame.
-pub const GAME_ON_FOOT: u32 = 1;
-pub const GAME_FLYING: u32 = 2;
+pub const GAME_ON_FOOT: u32 = zakuro_kiu::GAME_ON_FOOT;
+pub const GAME_FLYING: u32 = zakuro_kiu::GAME_FLYING;
+pub const GAME_VEHICLE: u32 = zakuro_kiu::GAME_VEHICLE;
 
 /// frames with no word from the game before aim goes off, as in a menu. the
 /// overrides say it once per tick, every second frame for Kid Icarus.
@@ -160,13 +161,19 @@ impl Keyboard {
         std::mem::take(&mut self.look)
     }
 
+    /// clears the game's reported play mode (e.g. when the in-battle pause menu opens).
+    pub fn clear_game(&mut self) {
+        self.game = None;
+        self.quiet = 0;
+    }
+
     /// the aim mode to change to, when what the game says it is doing (a
     /// GAME_ word, 0 for nothing this frame) has changed: on foot, flying,
     /// or off once it has been quiet a while. a mode the player picked stands
     /// until the game changes.
     pub fn game_mode(&mut self, said: u32) -> Option<Option<AimMode>> {
         let mode = match said {
-            GAME_ON_FOOT => Some(AimMode::Land),
+            GAME_ON_FOOT | GAME_VEHICLE => Some(AimMode::Land),
             GAME_FLYING => Some(AimMode::Air),
             _ => None,
         };

@@ -152,6 +152,23 @@ fn recompile(
     let files = |path: &str| changes.as_ref()?.module(path);
     log::info!("recompiling {name} with {}", compiler.describe());
     let mut options = build::Options { cancel: Some(cancel), compiler: Some(compiler), background: true, ..build::Options::default() };
+    let kiu_overrides_dir = if program_id == zakuro_kiu::KIU_USA_PROGRAM_ID {
+        let base = data_dir.map(Path::to_owned).unwrap_or_else(std::env::temp_dir);
+        let dir = base.join("overrides").join(format!("{program_id:016X}"));
+        match zakuro_kiu::write_usa_overrides(&dir) {
+            Ok(()) => {
+                log::info!("applying built-in Kid Icarus: Uprising PC mouse/gamepad overrides from {}", dir.display());
+                Some(dir)
+            }
+            Err(error) => {
+                log::warn!("could not write KIU overrides to {}, {error}", dir.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    options.overrides = kiu_overrides_dir.as_deref();
     if let Some(changes) = &changes {
         log::info!(
             "recompiling {name} with its update or mods, which change {}. the library replaces one made without them, and should they go, the functions they changed run in the interpreter",

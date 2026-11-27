@@ -1,0 +1,10 @@
+[package]
+name = "zakuro-kiu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared Kid Icarus: Uprising 16:9 UI state machine, pause detection, and touch mapping for Switch and PC"
+
+[dependencies]
+zakuro-core.workspace = true
+zakuro-gpu.workspace = true

@@ -4657,6 +4657,7 @@ dependencies = [
  "zakuro-core",
  "zakuro-fs",
  "zakuro-gpu",
+ "zakuro-kiu",
 ]
 
 [[package]]
@@ -4750,6 +4751,14 @@ dependencies = [
  "thiserror 2.0.20",
  "wide",
  "zakuro-common",
+]
+
+[[package]]
+name = "zakuro-kiu"
+version = "0.2.29"
+dependencies = [
+ "zakuro-core",
+ "zakuro-gpu",
 ]
 
 [[package]]

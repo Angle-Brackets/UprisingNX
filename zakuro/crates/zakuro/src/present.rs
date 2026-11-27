@@ -126,6 +126,35 @@ impl Backend {
         }
     }
 
+    /// whether this backend supports the merged 16:9 KIU Vulkan hub shaders.
+    pub fn is_vulkan(&self) -> bool {
+        matches!(self, Backend::Vulkan(_))
+    }
+
+    pub fn set_cauldron_state(&mut self, cursor_x: f32, opacity: f32, hud_flags: u32) {
+        if let Backend::Vulkan(presenter) = self {
+            presenter.set_cauldron_state(cursor_x, opacity, hud_flags);
+        }
+    }
+
+    pub fn set_chapter_state(&mut self, title_right: f32) {
+        if let Backend::Vulkan(presenter) = self {
+            presenter.set_chapter_state(title_right);
+        }
+    }
+
+    pub fn set_weapon_state(&mut self, sub: u8) {
+        if let Backend::Vulkan(presenter) = self {
+            presenter.set_weapon_state(sub);
+        }
+    }
+
+    pub fn set_pause_state(&mut self, sub: u8) {
+        if let Backend::Vulkan(presenter) = self {
+            presenter.set_pause_state(sub);
+        }
+    }
+
     pub fn present(
         &mut self,
         top: ScreenImage<'_>,

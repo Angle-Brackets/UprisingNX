@@ -7,6 +7,7 @@ members = [
     "crates/zakuro-aot",
     "crates/zakuro-gpu",
     "crates/zakuro-core",
+    "crates/zakuro-kiu",
     "crates/zakuro",
 ]
 
@@ -24,6 +25,7 @@ zakuro-cpu    = { path = "crates/zakuro-cpu" }
 zakuro-aot    = { path = "crates/zakuro-aot" }
 zakuro-gpu    = { path = "crates/zakuro-gpu", default-features = false }
 zakuro-core   = { path = "crates/zakuro-core" }
+zakuro-kiu    = { path = "crates/zakuro-kiu" }
 
 log = "0.4"
 thiserror = "2"
