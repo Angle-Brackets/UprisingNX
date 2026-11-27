@@ -834,6 +834,11 @@ impl App {
             .or_else(|| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
             .unwrap_or_default();
         let mut game = Running::new(system, path.to_owned(), name);
+        if game.is_kiu && game.system.gpu.interpolates() {
+            // Keep frame interpolation off in KIU menus; emulate() enables it automatically
+            // during active TopOnly battles so 16:9 merged hubs never flicker.
+            game.system.set_interpolation(false);
+        }
         game.replay = replay;
         if let Some(record) = record {
             match zakuro_core::replay::Recorder::create(&record, clock) {
@@ -1108,7 +1113,7 @@ impl App {
     fn apply_settings(&mut self) {
         self.settings.save();
         if let Some(game) = &mut self.game {
-            if game.system.gpu.interpolates() != self.settings.frame_interpolation {
+            if !game.is_kiu && game.system.gpu.interpolates() != self.settings.frame_interpolation {
                 let on = game.system.set_interpolation(self.settings.frame_interpolation);
                 log::info!("frame interpolation {}", if on { "on" } else { "off" });
             }
@@ -1533,6 +1538,12 @@ impl App {
             self.shown += 1;
         }
 
+        if let Some(limit) = std::env::var("ZAKURO_STOP_FRAME").ok().and_then(|v| v.parse::<u64>().ok()) {
+            if self.game.as_ref().is_some_and(|game| game.frame >= limit) {
+                self.stop = true;
+            }
+        }
+
         if self.last_title_update.elapsed() >= Duration::from_millis(500) {
             let shown = self.shown as f32 / self.last_title_update.elapsed().as_secs_f32();
             self.shown = 0;
@@ -1731,6 +1742,14 @@ impl App {
                         log::info!("kiu: layout -> {:?} at frame {}", post.layout, game.frame);
                         backend.set_layout(post.layout);
                     }
+                }
+                let want_smooth = self.settings.frame_interpolation
+                    && pre.res_battle
+                    && game.kiu.out_of_play <= 2
+                    && !post.on_pause
+                    && post.layout == zakuro_gpu::ScreenLayout::TopOnly;
+                if game.system.gpu.interpolates() != want_smooth {
+                    game.system.set_interpolation(want_smooth);
                 }
             }
             game.count_frame();

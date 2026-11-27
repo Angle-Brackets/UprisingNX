@@ -99,8 +99,11 @@ pub struct VulkanPresenter {
     swapchain: vk::SwapchainKHR,
     surface_format: vk::SurfaceFormatKHR,
     extent: vk::Extent2D,
+    swapchain_images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     framebuffers: Vec<vk::Framebuffer>,
+    #[cfg(not(target_os = "horizon"))]
+    capture: Option<FrameCapture>,
 
     render_pass: vk::RenderPass,
     descriptor_layout: vk::DescriptorSetLayout,
@@ -462,8 +465,11 @@ impl VulkanPresenter {
                 width: size.0,
                 height: size.1,
             },
+            swapchain_images: Vec::new(),
             image_views: Vec::new(),
             framebuffers: Vec::new(),
+            #[cfg(not(target_os = "horizon"))]
+            capture: None,
             render_pass,
             descriptor_layout,
             descriptor_pool,
@@ -579,6 +585,18 @@ impl VulkanPresenter {
         }
 
         let old = self.swapchain;
+        #[cfg(not(target_os = "horizon"))]
+        let want_capture = std::env::var_os("ZAKURO_CAPTURE_MP4").is_some()
+            && capabilities
+                .supported_usage_flags
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC);
+        #[cfg(target_os = "horizon")]
+        let want_capture = false;
+        let usage = if want_capture {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+        } else {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+        };
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(image_count)
@@ -586,7 +604,7 @@ impl VulkanPresenter {
             .image_color_space(self.surface_format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -608,6 +626,7 @@ impl VulkanPresenter {
 
         let images = unsafe { self.swapchain_device.get_swapchain_images(swapchain) }
             .map_err(vk_fail("getting swapchain images"))?;
+        self.swapchain_images = images.clone();
 
         for image in images {
             let view = unsafe {
@@ -647,10 +666,29 @@ impl VulkanPresenter {
 
         self.stale = false;
         self.acquire_timeouts = 0;
+        #[cfg(not(target_os = "horizon"))]
+        if want_capture {
+            if let Some(old_cap) = self.capture.take() {
+                old_cap.finish(&self.device);
+            }
+            if let Some(path) = std::env::var_os("ZAKURO_CAPTURE_MP4") {
+                match FrameCapture::start(
+                    &self.device,
+                    &self.memory_properties,
+                    extent,
+                    self.surface_format.format,
+                    std::path::Path::new(&path),
+                ) {
+                    Ok(cap) => self.capture = Some(cap),
+                    Err(err) => log::warn!("capture: could not start MP4 capture: {err}"),
+                }
+            }
+        }
         Ok(())
     }
 
     fn destroy_swapchain_resources(&mut self) {
+        self.swapchain_images.clear();
         unsafe {
             for framebuffer in self.framebuffers.drain(..) {
                 self.device.destroy_framebuffer(framebuffer, None);
@@ -822,9 +860,10 @@ impl VulkanPresenter {
     }
 
     fn record(
-        &self,
+        &mut self,
         command_buffer: vk::CommandBuffer,
         framebuffer: vk::Framebuffer,
+        swapchain_image: vk::Image,
         painter: &mut OverlayPainter,
         overlay: &Overlay,
         sources: [Source; 3],
@@ -1177,7 +1216,13 @@ impl VulkanPresenter {
 
             painter.draw(device, command_buffer, self.frame, overlay, self.extent);
             device.cmd_end_render_pass(command_buffer);
-            device.end_command_buffer(command_buffer).expect("end command buffer");
+            #[cfg(not(target_os = "horizon"))]
+            if let Some(capture) = &mut self.capture {
+                capture.record_copy(&self.device, command_buffer, swapchain_image, self.frame);
+            }
+            #[cfg(target_os = "horizon")]
+            let _ = swapchain_image;
+            self.device.end_command_buffer(command_buffer).expect("end command buffer");
         }
         Ok(())
     }
@@ -1237,6 +1282,10 @@ impl Presenter for VulkanPresenter {
                 self.defer(overlay);
                 return Err(vk_fail("waiting for a fence")(error));
             }
+        }
+        #[cfg(not(target_os = "horizon"))]
+        if let Some(capture) = &mut self.capture {
+            capture.flush_slot(frame);
         }
 
         let acquired = unsafe {
@@ -1317,7 +1366,15 @@ impl Presenter for VulkanPresenter {
         // both being borrowed
         let mut painter = self.overlay.take().expect("the overlay painter lives as long as the presenter");
         painter.begin_frame(&self.device, frame);
-        let recorded = self.record(command_buffer, self.framebuffers[image_index as usize], &mut painter, overlay, sources, has_right);
+        let recorded = self.record(
+            command_buffer,
+            self.framebuffers[image_index as usize],
+            self.swapchain_images[image_index as usize],
+            &mut painter,
+            overlay,
+            sources,
+            has_right,
+        );
         painter.free(frame, overlay);
         self.overlay = Some(painter);
         recorded?;
@@ -1428,6 +1485,10 @@ impl Drop for VulkanPresenter {
         }
         drop(_queue);
         unsafe {
+            #[cfg(not(target_os = "horizon"))]
+            if let Some(capture) = self.capture.take() {
+                capture.finish(&self.device);
+            }
             for screen in std::mem::replace(&mut self.screens, [Screen::null(), Screen::null(), Screen::null()]) {
                 screen.destroy(&self.device, self.descriptor_pool);
             }
@@ -2038,6 +2099,201 @@ impl Screen {
             device.free_memory(self.staging_memory, None);
         }
         let _ = self.staging_size;
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+struct FrameCapture {
+    extent: vk::Extent2D,
+    buffers: Vec<(vk::Buffer, vk::DeviceMemory, *const u8)>,
+    pending: Vec<bool>,
+    size_bytes: usize,
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+}
+
+#[cfg(not(target_os = "horizon"))]
+impl FrameCapture {
+    fn start(
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        out_path: &std::path::Path,
+    ) -> Result<Self, String> {
+        let pix_fmt = match format {
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => "bgra",
+            _ => "rgba",
+        };
+        let size_bytes = (extent.width as usize) * (extent.height as usize) * 4;
+        let mut buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for _ in 0..FRAMES_IN_FLIGHT {
+            let info = vk::BufferCreateInfo::default()
+                .size(size_bytes as vk::DeviceSize)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = unsafe { device.create_buffer(&info, None) }
+                .map_err(|e| format!("create capture buffer: {e}"))?;
+            let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+            let mem_type = find_memory_type(
+                mem_props,
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .ok_or_else(|| "no host-visible memory for capture".to_owned())?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type);
+            let memory = unsafe { device.allocate_memory(&alloc, None) }
+                .map_err(|e| format!("alloc capture memory: {e}"))?;
+            unsafe {
+                device
+                    .bind_buffer_memory(buffer, memory, 0)
+                    .map_err(|e| format!("bind capture memory: {e}"))?;
+            }
+            let ptr = unsafe {
+                device
+                    .map_memory(memory, 0, size_bytes as vk::DeviceSize, vk::MemoryMapFlags::empty())
+                    .map_err(|e| format!("map capture memory: {e}"))?
+            } as *const u8;
+            buffers.push((buffer, memory, ptr));
+        }
+
+        let mut child = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                pix_fmt,
+                "-s",
+                &format!("{}x{}", extent.width, extent.height),
+                "-r",
+                "60",
+                "-i",
+                "-",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+            ])
+            .arg(out_path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+        let stdin = child.stdin.take();
+        log::info!(
+            "capture: recording {}x{} ({pix_fmt}) Vulkan frames to {}",
+            extent.width,
+            extent.height,
+            out_path.display()
+        );
+        Ok(Self {
+            extent,
+            buffers,
+            pending: vec![false; FRAMES_IN_FLIGHT],
+            size_bytes,
+            child,
+            stdin,
+        })
+    }
+
+    unsafe fn record_copy(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        image: vk::Image,
+        slot: usize,
+    ) {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let to_src = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(image)
+            .subresource_range(range);
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_src],
+        );
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: self.extent.width,
+                height: self.extent.height,
+                depth: 1,
+            });
+        device.cmd_copy_image_to_buffer(
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            self.buffers[slot].0,
+            &[region],
+        );
+        let to_present = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::empty())
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .image(image)
+            .subresource_range(range);
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_present],
+        );
+        self.pending[slot] = true;
+    }
+
+    fn flush_slot(&mut self, slot: usize) {
+        if !self.pending[slot] {
+            return;
+        }
+        self.pending[slot] = false;
+        if let Some(stdin) = &mut self.stdin {
+            use std::io::Write;
+            let bytes = unsafe { std::slice::from_raw_parts(self.buffers[slot].2, self.size_bytes) };
+            let _ = stdin.write_all(bytes);
+        }
+    }
+
+    fn finish(mut self, device: &ash::Device) {
+        let _ = unsafe { device.device_wait_idle() };
+        for slot in 0..self.pending.len() {
+            self.flush_slot(slot);
+        }
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+        unsafe {
+            for (buffer, memory, _) in self.buffers.drain(..) {
+                device.unmap_memory(memory);
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+        }
     }
 }
 
