@@ -431,16 +431,19 @@ aot_helper_fn!(unsafe fn vfp_vector_helper(ec: *mut AotExecContext, packed: u32,
                 *ctx.vfp.add(2 * (dd & 15) + 1) = out_hi;
             }
         } else if wide {
-            let a = get_d(ctx.vfp, nn & 15);
-            let b = get_d(ctx.vfp, mm & 15);
-            let acc = get_d(ctx.vfp, dd & 15);
+            let raw_bits = |vfp: *mut u32, idx: usize| -> f64 { get_d(vfp, idx) };
+            let read_d = |vfp: *mut u32, idx: usize| -> f64 { f64::from_bits(flush_d(raw_bits(vfp, idx))) };
+            let a = read_d(ctx.vfp, nn & 15);
+            let b = read_d(ctx.vfp, mm & 15);
+            let acc = read_d(ctx.vfp, dd & 15);
+            let prod = || f64::from_bits(flush_d(a * b));
             let res = match op {
-                0 => acc + a * b,
-                1 => acc - a * b,
-                2 => -acc + a * b,
-                3 => -acc - a * b,
-                4 => a * b,
-                5 => -(a * b),
+                0 => acc + prod(),
+                1 => acc - prod(),
+                2 => prod() - acc,
+                3 => (-prod()) - acc,
+                4 => prod(),
+                5 => -prod(),
                 6 => a + b,
                 7 => a - b,
                 8 => a / b,
@@ -460,16 +463,18 @@ aot_helper_fn!(unsafe fn vfp_vector_helper(ec: *mut AotExecContext, packed: u32,
             };
             unsafe { *ctx.vfp.add(dd) = out };
         } else {
-            let a = f32::from_bits(unsafe { *ctx.vfp.add(nn) });
-            let b = f32::from_bits(unsafe { *ctx.vfp.add(mm) });
-            let acc = f32::from_bits(unsafe { *ctx.vfp.add(dd) });
+            let read_s = |idx: usize| -> f32 { f32::from_bits(flush_s(f32::from_bits(unsafe { *ctx.vfp.add(idx) }))) };
+            let a = read_s(nn);
+            let b = read_s(mm);
+            let acc = read_s(dd);
+            let prod = || f32::from_bits(flush_s(a * b));
             let res = match op {
-                0 => acc + a * b,
-                1 => acc - a * b,
-                2 => -acc + a * b,
-                3 => -acc - a * b,
-                4 => a * b,
-                5 => -(a * b),
+                0 => acc + prod(),
+                1 => acc - prod(),
+                2 => prod() - acc,
+                3 => (-prod()) - acc,
+                4 => prod(),
+                5 => -prod(),
                 6 => a + b,
                 7 => a - b,
                 8 => a / b,

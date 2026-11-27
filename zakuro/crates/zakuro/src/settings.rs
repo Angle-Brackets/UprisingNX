@@ -463,6 +463,9 @@ impl PadButtons {
 pub struct Settings {
     /// the folder the library lists games from.
     pub games: Option<PathBuf>,
+    /// the Kid Icarus: Uprising (USA) ROM path saved for KIU-first PC mode.
+    #[serde(default)]
+    pub rom_path: Option<PathBuf>,
     /// the console's system language, which titles pick their localised
     /// text and files by.
     #[serde(deserialize_with = "or_default")]
@@ -548,6 +551,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             games: None,
+            rom_path: None,
             language: Language::English,
             renderer: Renderer::Vulkan,
             hardware_rasterizer: true,
@@ -709,5 +713,19 @@ mod tests {
             layout = layout.next();
         }
         assert_eq!(layout, Screens::Stacked);
+    }
+
+    #[test]
+    fn rom_path_roundtrips_and_defaults_to_none() {
+        let missing: Settings = toml::from_str("show_fps = false\n").unwrap();
+        assert_eq!(missing.rom_path, None);
+
+        let settings = Settings {
+            rom_path: Some(PathBuf::from("/roms/kiu_usa.cci")),
+            ..Settings::default()
+        };
+        let text = toml::to_string_pretty(&settings).unwrap();
+        let loaded: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(loaded.rom_path, Some(PathBuf::from("/roms/kiu_usa.cci")));
     }
 }

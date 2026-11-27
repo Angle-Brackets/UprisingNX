@@ -20,6 +20,8 @@ pub mod recompiled;
 pub mod services;
 pub mod state;
 
+pub use zakuro_aot;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use zakuro_common::memory_map::*;
@@ -36,7 +38,7 @@ use services::hid::InputState;
 use services::ServiceState;
 
 /// console settings the frontend can change.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub model: ConsoleModel,
     pub new3ds: bool,
@@ -53,9 +55,15 @@ pub struct Config {
     /// with no library given, run the one 3dsrecomp build installed for the
     /// title, if it did.
     pub find_recompiled: bool,
-    /// compile ARMv6K -> AArch64 AOT code directly in memory at load time
-    /// when running on an `aarch64` host without a prebuilt library.
+    /// compile ARMv6K -> AArch64 / x86_64 AOT code directly in memory at load
+    /// time when running on a desktop host without a prebuilt library.
     pub compile_aot: bool,
+    /// native override functions keyed by guest address for AOT execution.
+    pub aot_overrides: Vec<(u32, zakuro_aot::OverrideFn)>,
+    /// optional opaque game-specific state passed to AOT overrides.
+    pub aot_plugin_state: Option<zakuro_aot::PluginState>,
+    /// extra indirect-branch discovery hints passed to `zakuro_aot::compile_title`.
+    pub aot_hints: Vec<u32>,
     /// where saves and dumped system files live, the working directory
     /// when there is none.
     pub data_dir: Option<std::path::PathBuf>,
@@ -102,6 +110,41 @@ pub struct Config {
     pub gpu_thread: Option<bool>,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("model", &self.model)
+            .field("new3ds", &self.new3ds)
+            .field("region", &self.region)
+            .field("language", &self.language)
+            .field("slider_3d", &self.slider_3d)
+            .field("recompiled", &self.recompiled)
+            .field("linked", &self.linked)
+            .field("find_recompiled", &self.find_recompiled)
+            .field("compile_aot", &self.compile_aot)
+            .field("aot_overrides_len", &self.aot_overrides.len())
+            .field("aot_plugin_state", &self.aot_plugin_state.map(|s| s.0))
+            .field("aot_hints_len", &self.aot_hints.len())
+            .field("data_dir", &self.data_dir)
+            .field("hardware_renderer", &self.hardware_renderer)
+            .field("texture_packs", &self.texture_packs)
+            .field("update", &self.update)
+            .field("dlc", &self.dlc)
+            .field("enhancements", &self.enhancements)
+            .field("resolution", &self.resolution)
+            .field("device", &self.device)
+            .field("clock", &self.clock)
+            .field("interpolate", &self.interpolate)
+            .field("username", &self.username)
+            .field("console_id", &self.console_id)
+            .field("dlp_child", &self.dlp_child)
+            .field("wireless_reboot", &self.wireless_reboot)
+            .field("skip_idle_loops", &self.skip_idle_loops)
+            .field("gpu_thread", &self.gpu_thread)
+            .finish()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -114,6 +157,9 @@ impl Default for Config {
             linked: None,
             find_recompiled: false,
             compile_aot: false,
+            aot_overrides: Vec::new(),
+            aot_plugin_state: None,
+            aot_hints: Vec::new(),
             data_dir: None,
             hardware_renderer: false,
             texture_packs: true,
@@ -345,10 +391,13 @@ impl System {
         }
     }
 
-    /// attaches a loaded AArch64 AOT image directly, checking it against guest
-    /// memory first so any modded or patched functions run in the interpreter.
+    /// attaches a loaded AArch64 / x86_64 AOT image directly, checking it against
+    /// guest memory first so any modded or patched functions run in the interpreter.
     pub fn set_aot(&mut self, aot: zakuro_aot::LoadedAot) {
         let mut library = recompiled::Library::from_aot(aot);
+        if !self.config.aot_overrides.is_empty() || self.config.aot_plugin_state.is_some() {
+            library.set_aot_overrides(&self.config.aot_overrides, self.config.aot_plugin_state);
+        }
         let stale = library.check(&mut self.memory);
         if stale > 0 {
             log::warn!("{stale} functions changed since AOT compilation, they run in the interpreter");

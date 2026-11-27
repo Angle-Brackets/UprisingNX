@@ -36,6 +36,8 @@ enum Backend {
         found: Box<[Found]>,
     },
     Aot(zakuro_aot::LoadedAot),
+    /// Transient placeholder while updating owned `LoadedAot` state in place.
+    Empty,
 }
 
 /// a slot of Library::found, an address and the code found for it.
@@ -97,6 +99,88 @@ impl Drop for FpcrGuard {
         if self.current != self.saved {
             // SAFETY: Restores the exact FPCR value read on entry.
             unsafe { core::arch::asm!("msr fpcr, {}", in(reg) self.saved, options(nomem, nostack, preserves_flags)) };
+        }
+    }
+}
+
+/// Syncs x86_64 SSE MXCSR control bits (FTZ, DAZ, RC) with guest `FPSCR[25:22]`
+/// while recompiled ARMv6 VFP code runs, restoring the host thread's MXCSR on drop.
+#[cfg(target_arch = "x86_64")]
+struct MxcsrGuard {
+    saved: u32,
+    current: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl MxcsrGuard {
+    // MXCSR FTZ (bit 15), RC (bits [14:13]), and DAZ (bit 6).
+    const MASK: u32 = (1 << 15) | (0b11 << 13) | (1 << 6);
+
+    #[inline(always)]
+    fn read_mxcsr() -> u32 {
+        let mut mxcsr: u32 = 0;
+        // SAFETY: SSE is baseline on x86_64; `stmxcsr` stores the 32-bit MXCSR to a stack local.
+        unsafe {
+            core::arch::asm!(
+                "stmxcsr [{ptr}]",
+                ptr = in(reg) &mut mxcsr,
+                options(nostack, preserves_flags),
+            );
+        }
+        mxcsr
+    }
+
+    #[inline(always)]
+    fn write_mxcsr(mxcsr: u32) {
+        // SAFETY: SSE is baseline on x86_64; `ldmxcsr` loads a valid 32-bit MXCSR from a stack local.
+        unsafe {
+            core::arch::asm!(
+                "ldmxcsr [{ptr}]",
+                ptr = in(reg) &mxcsr,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Maps guest ARMv6 `FPSCR[25:22]` into x86_64 MXCSR FTZ/DAZ/RC bits.
+    #[inline(always)]
+    fn map_fpscr(guest_fpscr: u32) -> u32 {
+        let fz = (guest_fpscr >> 24) & 1;
+        let arm_rmode = (guest_fpscr >> 22) & 0b11;
+        // ARM FPSCR[23:22]: 00=RN, 01=+Inf, 10=-Inf, 11=RZ.
+        // x86 MXCSR[14:13]: 00=RN, 01=-Inf, 10=+Inf, 11=RZ (01 and 10 are swapped).
+        let x86_rc = match arm_rmode {
+            0b01 => 0b10,
+            0b10 => 0b01,
+            other => other,
+        };
+        (fz << 15) | (x86_rc << 13) | (fz << 6)
+    }
+
+    #[inline(always)]
+    fn new(guest_fpscr: u32) -> Self {
+        let saved = Self::read_mxcsr();
+        let mut guard = Self { saved, current: saved };
+        guard.sync(guest_fpscr);
+        guard
+    }
+
+    #[inline(always)]
+    fn sync(&mut self, guest_fpscr: u32) {
+        let wanted = (self.current & !Self::MASK) | Self::map_fpscr(guest_fpscr);
+        if wanted != self.current {
+            Self::write_mxcsr(wanted);
+            self.current = wanted;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for MxcsrGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.current != self.saved {
+            Self::write_mxcsr(self.saved);
         }
     }
 }
@@ -204,16 +288,16 @@ fn store(cpu: &Cpu, ctx: &mut Context) {
 }
 
 impl Library {
-    /// a library 3dsrecomp built, or a cached `UNXAOT01` AOT image.
+    /// a library 3dsrecomp built, or a cached `UNXAOT*` AOT image.
     pub fn open(path: &Path) -> Result<Library, String> {
-        #[cfg(all(unix, not(target_os = "horizon")))]
+        #[cfg(not(target_os = "horizon"))]
         if let Ok(mut file) = std::fs::File::open(path) {
             use std::io::{Read, Seek, SeekFrom};
             let mut magic = [0u8; 8];
             if file.read_exact(&mut magic).is_ok() && &magic == zakuro_aot::CACHE_MAGIC {
                 let _ = file.seek(SeekFrom::Start(0));
                 let reader = std::io::BufReader::new(file);
-                return zakuro_aot::LoadedAot::read_mmap(reader).map(Library::from_aot);
+                return zakuro_aot::LoadedAot::read_exec(reader).map(Library::from_aot);
             }
         }
         recomp_abi::Library::open(path).map(Library::new_abi)
@@ -224,9 +308,28 @@ impl Library {
         recomp_abi::Library::linked(linked).map(Library::new_abi)
     }
 
-    /// native AArch64 AOT code compiled by `zakuro-aot`.
+    /// native AArch64 / x86_64 AOT code compiled by `zakuro-aot`.
     pub fn from_aot(aot: zakuro_aot::LoadedAot) -> Library {
         Library { backend: Backend::Aot(aot), fallbacks: Cell::new(0) }
+    }
+
+    /// Attaches native override functions and optional plugin state to an AOT backend.
+    pub fn set_aot_overrides(
+        &mut self,
+        overrides: &[(u32, zakuro_aot::OverrideFn)],
+        plugin_state: Option<zakuro_aot::PluginState>,
+    ) {
+        if !matches!(self.backend, Backend::Aot(_)) {
+            return;
+        }
+        let Backend::Aot(mut aot) = std::mem::replace(&mut self.backend, Backend::Empty) else {
+            unreachable!();
+        };
+        aot.set_overrides(overrides);
+        if let Some(state) = plugin_state {
+            aot = aot.with_plugin_state(state);
+        }
+        self.backend = Backend::Aot(aot);
     }
 
     fn new_abi(code: recomp_abi::Library) -> Library {
@@ -246,7 +349,7 @@ impl Library {
     pub fn outdated(&self) -> bool {
         match &self.backend {
             Backend::Abi { code, .. } => code.generation() < recomp_abi::GENERATION,
-            Backend::Aot(_) => false,
+            Backend::Aot(_) | Backend::Empty => false,
         }
     }
 
@@ -256,6 +359,7 @@ impl Library {
         match &self.backend {
             Backend::Abi { code, .. } => code.origins(0).is_some(),
             Backend::Aot(_) => true,
+            Backend::Empty => false,
         }
     }
 
@@ -269,6 +373,7 @@ impl Library {
         match &self.backend {
             Backend::Abi { code, .. } => code.describe(),
             Backend::Aot(aot) => aot.describe(),
+            Backend::Empty => String::new(),
         }
     }
 
@@ -293,6 +398,7 @@ impl Library {
         match &self.backend {
             Backend::Abi { .. } => self.lookup(address).is_some(),
             Backend::Aot(aot) => aot.has_code(address),
+            Backend::Empty => false,
         }
     }
 
@@ -307,6 +413,7 @@ impl Library {
                 stale
             }
             Backend::Aot(aot) => aot.check(|address, bytes| memory.read_bytes(address, bytes)),
+            Backend::Empty => 0,
         }
     }
 
@@ -368,6 +475,8 @@ impl Library {
         ctx.user = &mut machine as *mut Machine as *mut c_void;
         #[cfg(target_arch = "aarch64")]
         let mut fpcr = FpcrGuard::new(unsafe { *ctx.fpscr });
+        #[cfg(target_arch = "x86_64")]
+        let mut mxcsr = MxcsrGuard::new(unsafe { *ctx.fpscr });
 
         let stop = match &self.backend {
             Backend::Abi { .. } => loop {
@@ -381,6 +490,8 @@ impl Library {
                 ctx.depth = 0;
                 #[cfg(target_arch = "aarch64")]
                 fpcr.sync(unsafe { *ctx.fpscr });
+                #[cfg(target_arch = "x86_64")]
+                mxcsr.sync(unsafe { *ctx.fpscr });
                 // SAFETY: the code came from the library and ctx is set up the
                 // way it expects, with user pointing at machine
                 unsafe { code(&mut ctx) };
@@ -404,6 +515,8 @@ impl Library {
                 ctx.depth = 0;
                 #[cfg(target_arch = "aarch64")]
                 fpcr.sync(unsafe { *ctx.fpscr });
+                #[cfg(target_arch = "x86_64")]
+                mxcsr.sync(unsafe { *ctx.fpscr });
                 // SAFETY: `target_rx` came from `aot.lookup`, and `ctx.user` points at `machine`.
                 unsafe { aot.enter(&mut ctx, target_rx) };
                 if let Some(exit) = machine.pending.take() {
@@ -415,6 +528,7 @@ impl Library {
                     _ => {}
                 }
             },
+            Backend::Empty => Stop::Left,
         };
 
         load(&ctx, machine.cpu);
@@ -436,5 +550,65 @@ mod tests {
         let thumb: std::collections::BTreeSet<usize> = (0..FOUND as u32).map(|i| slot(0x0010_0001 + 2 * i)).collect();
         assert!(arm.len() > FOUND * 3 / 4, "{} of {FOUND}", arm.len());
         assert!(thumb.len() > FOUND * 3 / 4, "{} of {FOUND}", thumb.len());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mxcsr_guard_maps_arm_rounding_and_fz_and_restores_host() {
+        // ARM 00=RN, 01=+Inf, 10=-Inf, 11=RZ; x86 00=RN, 01=-Inf, 10=+Inf, 11=RZ.
+        assert_eq!(MxcsrGuard::map_fpscr(0 << 22), 0 << 13);
+        assert_eq!(MxcsrGuard::map_fpscr(0b01 << 22), 0b10 << 13);
+        assert_eq!(MxcsrGuard::map_fpscr(0b10 << 22), 0b01 << 13);
+        assert_eq!(MxcsrGuard::map_fpscr(0b11 << 22), 0b11 << 13);
+        assert_eq!(
+            MxcsrGuard::map_fpscr((1 << 24) | (0b01 << 22)),
+            (1 << 15) | (0b10 << 13) | (1 << 6)
+        );
+
+        let before = MxcsrGuard::read_mxcsr();
+        {
+            let mut guard = MxcsrGuard::new((1 << 24) | (0b01 << 22));
+            let active = MxcsrGuard::read_mxcsr();
+            assert_eq!(active & MxcsrGuard::MASK, (1 << 15) | (0b10 << 13) | (1 << 6));
+            guard.sync(0b10 << 22);
+            let updated = MxcsrGuard::read_mxcsr();
+            assert_eq!(updated & MxcsrGuard::MASK, 0b01 << 13);
+        }
+        let after = MxcsrGuard::read_mxcsr();
+        assert_eq!(after, before);
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    #[test]
+    fn library_open_reads_aot_cache_and_attaches_overrides() {
+        let image = zakuro_aot::AotImage {
+            program_id: 0x0004_0000_0003_0100,
+            text_hash: 0xD6E0_28C6_175A_2B07,
+            enter_offset: 0,
+            code: vec![0xC3; 16],
+            entries: vec![(0x0010_0000, 0)],
+            origins: zakuro_aot::discover::OriginData {
+                owners: vec![recomp_abi::NO_ORIGIN],
+                ..Default::default()
+            },
+        };
+        let path = std::env::temp_dir().join(format!("zakuro-recompiled-open-{}.aot", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        image.write_to(file).unwrap();
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe extern "sysv64" fn dummy_override(_: *mut zakuro_aot::AotExecContext, _: *const u8) {}
+        #[cfg(not(target_arch = "x86_64"))]
+        unsafe extern "C" fn dummy_override(_: *mut zakuro_aot::AotExecContext, _: *const u8) {}
+
+        let mut lib = Library::open(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(lib.checks_itself());
+        assert!(!lib.outdated());
+        assert!(lib.has_code(0x0010_0000));
+        lib.set_aot_overrides(
+            &[(0x0010_0000, dummy_override)],
+            Some(zakuro_aot::PluginState([1, 2, 3, 4])),
+        );
     }
 }

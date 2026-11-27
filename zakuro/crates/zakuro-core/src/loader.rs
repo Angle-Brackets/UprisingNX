@@ -135,6 +135,12 @@ pub fn load_preloaded(
     );
     system.kernel.shared_device_memory = exheader.shared_device_memory;
 
+    #[allow(unused_variables)]
+    let compile_aot_code = (system.config.compile_aot
+        && system.config.linked.is_none()
+        && system.config.recompiled.is_none())
+    .then(|| preloaded_code.as_ref().map(|(bytes, _)| bytes.clone()))
+    .flatten();
     map_special_pages(&mut system, app_bytes);
     let modded = map_code(&mut system, &title, preloaded_code)?;
     map_stack(&mut system, exheader.stack_size);
@@ -192,6 +198,9 @@ pub fn load_preloaded(
                 path.display()
             ),
             Ok(mut library) => {
+                if !system.config.aot_overrides.is_empty() || system.config.aot_plugin_state.is_some() {
+                    library.set_aot_overrides(&system.config.aot_overrides, system.config.aot_plugin_state);
+                }
                 log::info!("running recompiled code from {}, {}", path.display(), library.describe());
                 if library.outdated() {
                     log::warn!("an older 3dsrecomp made {}, recompiling the game again brings the newest improvements", path.display());
@@ -209,31 +218,35 @@ pub fn load_preloaded(
             Err(error) => log::warn!("could not load {}, {error}, interpreting everything", path.display()),
         }
     } else if system.config.compile_aot {
-        #[cfg(all(unix, not(target_os = "horizon"), target_arch = "aarch64"))]
-        match crate::mods::code(&title, system.config.data_dir.as_deref()) {
-            Ok((code_bytes, _)) => {
+        #[cfg(all(not(target_os = "horizon"), any(target_arch = "aarch64", target_arch = "x86_64")))]
+        match compile_aot_code.map_or_else(
+            || crate::mods::code(&title, system.config.data_dir.as_deref()).map(|(bytes, _)| bytes),
+            Ok,
+        ) {
+            Ok(code_bytes) => {
                 let t_aot = std::time::Instant::now();
+                let override_addrs: Vec<u32> = system.config.aot_overrides.iter().map(|&(addr, _)| addr).collect();
                 let image = zakuro_aot::compile_title(
                     title.program_id(),
                     &title.exheader,
                     &code_bytes,
-                    &[],
-                    &[],
+                    &override_addrs,
+                    &system.config.aot_hints,
                     zakuro_aot::CompileOptions::default(),
                     |_, _| {},
                 );
-                match image.into_loaded_mmap() {
+                match image.into_loaded_exec() {
                     Ok(aot) => {
                         log::info!("compiled AOT in {:.2?}", t_aot.elapsed());
                         system.set_aot(aot);
                     }
-                    Err(e) => log::warn!("could not mmap AOT code, {e}, interpreting everything"),
+                    Err(e) => log::warn!("could not allocate executable AOT memory, {e}, interpreting everything"),
                 }
             }
             Err(e) => log::warn!("could not read code for AOT, {e}"),
         }
-        #[cfg(not(all(unix, not(target_os = "horizon"), target_arch = "aarch64")))]
-        log::warn!("compile_aot is only available on unix aarch64");
+        #[cfg(not(all(not(target_os = "horizon"), any(target_arch = "aarch64", target_arch = "x86_64"))))]
+        log::warn!("compile_aot is only available on desktop aarch64/x86_64");
     }
 
     let mut on_gpu = false;
@@ -294,6 +307,9 @@ pub fn swap_recompiled(system: &mut System, path: &std::path::Path) -> Result<()
     system.hints = None;
     system.recompiled = None;
     let mut library = crate::recompiled::Library::open(path).map_err(|error| format!("could not load {}, {error}", path.display()))?;
+    if !system.config.aot_overrides.is_empty() || system.config.aot_plugin_state.is_some() {
+        library.set_aot_overrides(&system.config.aot_overrides, system.config.aot_plugin_state);
+    }
     if !library.checks_itself() {
         let modded = crate::mods::code(title, system.config.data_dir.as_deref()).is_ok_and(|(_, modded)| modded);
         if modded {

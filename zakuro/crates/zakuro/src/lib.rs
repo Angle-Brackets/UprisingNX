@@ -46,6 +46,16 @@ pub use zakuro_core::recompiled::Linked;
 /// runs the emulator as the command line says, on recompiled code linked
 /// into the program when there is some.
 pub fn run(linked: Option<Linked>) {
+    run_with_mode(linked, false);
+}
+
+/// runs Kid Icarus: Uprising Recompiled directly on PC with built-in AOT
+/// compilation/caching and a KIU-first setup flow.
+pub fn run_kiu() {
+    run_with_mode(None, true);
+}
+
+fn run_with_mode(linked: Option<Linked>, kiu_mode: bool) {
     report::init();
 
     let options = match cli::parse() {
@@ -64,13 +74,11 @@ pub fn run(linked: Option<Linked>) {
         }
         return;
     }
-    // the code and the game into memory before play reaches them
-    warm::start(options.rom.as_deref());
     let mut settings = Settings::load();
-    // A dedicated linked port (Kid Icarus: Uprising Recompiled) boots straight into
+    // A dedicated port (Kid Icarus: Uprising Recompiled) boots straight into
     // 16:9 single-screen Auto layout at 1280x720 with 60 fps interpolation when no
     // settings file exists yet.
-    if linked.is_some() && !settings::exists() {
+    if (linked.is_some() || kiu_mode) && !settings::exists() {
         settings.layout = Screens::Auto;
         settings.resolution = 6;
         settings.anisotropy = 16;
@@ -78,6 +86,13 @@ pub fn run(linked: Option<Linked>) {
         settings.frame_interpolation = true;
         settings.show_controls = false;
     }
+    // the code and the game into memory before play reaches them
+    let warm_rom = options.rom.clone().or_else(|| {
+        kiu_mode
+            .then(|| settings.rom_path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+            .flatten()
+    });
+    warm::start(warm_rom.as_deref());
     // the console's own number, made the first time and kept, which tells
     // it apart from others over local wireless
     if settings.console_id == 0 {
@@ -103,12 +118,19 @@ pub fn run(linked: Option<Linked>) {
         options,
         settings,
         linked,
+        kiu_mode,
+        kiu_launcher: if kiu_mode {
+            KiuLauncher::NeedsRom { notice: None, hovered_file: false }
+        } else {
+            KiuLauncher::Inactive
+        },
         library: Library::new(data_dir.clone()),
         data_dir,
         game: None,
         menus: {
             let mut menus = Menus::default();
             menus.slot = 1;
+            menus.kiu_mode = kiu_mode;
             menus
         },
         jobs: Vec::new(),
@@ -144,15 +166,21 @@ pub fn run(linked: Option<Linked>) {
     };
 
     if let Some(frames) = app.options.headless {
-        app.start();
+        if app.kiu_mode && !app.options.test_pattern {
+            app.start_kiu_headless();
+        } else {
+            app.start();
+        }
         if let Some(game) = &mut app.game {
             run_headless(&mut game.system, frames);
         }
         return;
     }
 
-    if let Some(folder) = app.settings.games.clone() {
-        app.library.scan(&folder);
+    if !kiu_mode {
+        if let Some(folder) = app.settings.games.clone() {
+            app.library.scan(&folder);
+        }
     }
     app.audio = if app.options.mute {
         None
@@ -394,10 +422,219 @@ impl Running {
     }
 }
 
+const KIU_WINDOW_TITLE: &str = "Kid Icarus: Uprising Recompiled";
+const KIU_ROM_HINT: &str = "Select or drag and drop a decrypted .3ds, .cci, or .cia dump onto this window.";
+
+struct KiuCompileProgress {
+    done: std::sync::atomic::AtomicUsize,
+    total: std::sync::atomic::AtomicUsize,
+    stage: std::sync::atomic::AtomicU8,
+}
+
+struct KiuPreparedBoot {
+    rom_path: PathBuf,
+    title: zakuro_fs::Title,
+    code_bytes: Vec<u8>,
+    modded: bool,
+    loaded: zakuro_core::zakuro_aot::LoadedAot,
+}
+
+struct KiuCompileJob {
+    progress: std::sync::Arc<KiuCompileProgress>,
+    receiver: std::sync::mpsc::Receiver<Result<KiuPreparedBoot, String>>,
+}
+
+impl KiuCompileJob {
+    fn ui_status(&self) -> (String, f32, String) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stage = self.progress.stage.load(Relaxed);
+        let done = self.progress.done.load(Relaxed);
+        let total = self.progress.total.load(Relaxed);
+        match stage {
+            0 if total == 0 => (
+                "Analyzing Kid Icarus: Uprising...".to_owned(),
+                0.04,
+                "Discovering ARMv6K & Thumb-1 functions and jump tables...".to_owned(),
+            ),
+            0 => {
+                let frac = (done as f32 / total as f32).clamp(0.0, 1.0) * 0.90;
+                (
+                    "Compiling Native Code Cache...".to_owned(),
+                    frac.max(0.05),
+                    format!("Compiling ARMv6K & VFPv2 functions ({done} / {total})..."),
+                )
+            }
+            1 => (
+                "Saving Code Cache...".to_owned(),
+                0.93,
+                "Writing compiled .aot cache to disk...".to_owned(),
+            ),
+            _ => (
+                "Starting Game...".to_owned(),
+                0.98,
+                "Preparing executable memory and launching...".to_owned(),
+            ),
+        }
+    }
+}
+
+enum KiuLauncher {
+    Inactive,
+    NeedsRom {
+        notice: Option<kiu_common::RomNotice>,
+        hovered_file: bool,
+    },
+    Compiling(KiuCompileJob),
+    Playing,
+}
+
+fn kiu_cache_path(data_dir: Option<&Path>, program_id: u64, text_hash: u64) -> PathBuf {
+    let base = data_dir.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    base.join("cache").join(format!(
+        "aot_v{}_{program_id:016X}_{text_hash:016X}.aot",
+        zakuro_core::zakuro_aot::FORMAT_VERSION
+    ))
+}
+
+fn prepare_kiu_rom(
+    rom_path: &Path,
+    data_dir: Option<&Path>,
+) -> Result<(zakuro_fs::Title, Vec<u8>, bool, u64), kiu_common::RomNotice> {
+    let mut title = kiu_common::validate_kiu_usa_rom(rom_path, KIU_ROM_HINT)?;
+    zakuro_core::mods::lay(&mut title, data_dir);
+    let (code_bytes, modded) = zakuro_core::mods::code(&title, data_dir).map_err(|err| {
+        let name = rom_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("rom");
+        kiu_common::RomNotice::unreadable(name, &err.to_string())
+    })?;
+    let text_hash = zakuro_core::zakuro_aot::discover::Image::text_hash(&title.exheader, &code_bytes);
+    Ok((title, code_bytes, modded, text_hash))
+}
+
+fn attach_kiu_overrides(
+    loaded: zakuro_core::zakuro_aot::LoadedAot,
+    program_id: u64,
+    text_hash: u64,
+) -> zakuro_core::zakuro_aot::LoadedAot {
+    loaded
+        .with_overrides(kiu_common::overrides_for(program_id, text_hash))
+        .with_plugin_state(kiu_common::default_plugin_state())
+}
+
+fn load_kiu_aot_cache(
+    cache_path: &Path,
+    program_id: u64,
+    text_hash: u64,
+) -> Option<zakuro_core::zakuro_aot::LoadedAot> {
+    if !cache_path.is_file() {
+        return None;
+    }
+    let started = Instant::now();
+    let file = match std::fs::File::open(cache_path) {
+        Ok(f) => f,
+        Err(err) => {
+            log::warn!("kiu: could not open AOT cache {}: {err}", cache_path.display());
+            return None;
+        }
+    };
+    let reader = std::io::BufReader::new(file);
+    match zakuro_core::zakuro_aot::LoadedAot::read_exec(reader) {
+        Ok(loaded) if loaded.program_id == program_id && loaded.text_hash == text_hash => {
+            log::info!(
+                "kiu: loaded AOT cache {} in {:.0}ms",
+                cache_path.display(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            Some(attach_kiu_overrides(loaded, program_id, text_hash))
+        }
+        Ok(_) => {
+            log::warn!("kiu: AOT cache {} header mismatch, rebuilding", cache_path.display());
+            let _ = std::fs::remove_file(cache_path);
+            None
+        }
+        Err(err) => {
+            log::warn!("kiu: AOT cache {} load failed ({err}), rebuilding", cache_path.display());
+            let _ = std::fs::remove_file(cache_path);
+            None
+        }
+    }
+}
+
+fn save_kiu_aot_cache(
+    cache_path: &Path,
+    image: &zakuro_core::zakuro_aot::AotImage,
+) -> std::io::Result<()> {
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = cache_path.with_extension("aot.tmp");
+    let write_res = std::fs::File::create(&tmp_path).and_then(|file| {
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+        image.write_to(&mut writer)
+    });
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, cache_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn compile_and_cache_kiu_aot(
+    title: &zakuro_fs::Title,
+    code_bytes: &[u8],
+    text_hash: u64,
+    cache_path: &Path,
+    progress: Option<&KiuCompileProgress>,
+) -> Result<zakuro_core::zakuro_aot::LoadedAot, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let program_id = title.program_id();
+    let hints = kiu_common::builtin_hints(program_id, text_hash);
+    let t0 = Instant::now();
+    let image = zakuro_core::zakuro_aot::compile_title(
+        program_id,
+        &title.exheader,
+        code_bytes,
+        &kiu_common::KIU_USA_OVERRIDE_ADDRS,
+        &hints,
+        kiu_common::aot_compile_options(program_id),
+        |done, total| {
+            if let Some(p) = progress {
+                p.done.store(done, Relaxed);
+                p.total.store(total, Relaxed);
+            }
+        },
+    );
+    log::info!(
+        "kiu: compiled {:.2} MiB native AOT in {:.2?}",
+        image.code_bytes().len() as f64 / (1024.0 * 1024.0),
+        t0.elapsed()
+    );
+    if let Some(p) = progress {
+        p.stage.store(1, Relaxed);
+    }
+    match save_kiu_aot_cache(cache_path, &image) {
+        Ok(()) => log::info!("kiu: saved AOT cache to {}", cache_path.display()),
+        Err(err) => log::warn!("kiu: could not save AOT cache {}: {err}", cache_path.display()),
+    }
+    if let Some(p) = progress {
+        p.stage.store(2, Relaxed);
+    }
+    let loaded = image.into_loaded_exec()?;
+    Ok(attach_kiu_overrides(loaded, program_id, text_hash))
+}
+
 struct App {
     options: cli::Options,
     settings: Settings,
     linked: Option<Linked>,
+    kiu_mode: bool,
+    kiu_launcher: KiuLauncher,
     data_dir: Option<PathBuf>,
     game: Option<Running>,
     library: Library,
@@ -579,7 +816,8 @@ impl ApplicationHandler for App {
         }
 
         let size = self.window_size();
-        let attributes = Window::default_attributes().with_title("Zakuro").with_inner_size(size);
+        let title = if self.kiu_mode { KIU_WINDOW_TITLE } else { "Zakuro" };
+        let attributes = Window::default_attributes().with_title(title).with_inner_size(size);
         let renderer = self.options.renderer.unwrap_or(match self.settings.renderer {
             Renderer::Vulkan => RendererKind::Vulkan,
             Renderer::OpenGl => RendererKind::OpenGl,
@@ -606,7 +844,11 @@ impl ApplicationHandler for App {
                 self.backend = Some(backend);
                 // the game the command line names starts on the device the
                 // presenter may lend the renderer, once there is one
-                self.start();
+                if self.kiu_mode && !self.options.test_pattern {
+                    self.start_kiu_windowed();
+                } else {
+                    self.start();
+                }
             }
             Err(error) => {
                 eprintln!("zakuro: could not start the {renderer:?} backend: {error}");
@@ -707,6 +949,21 @@ impl ApplicationHandler for App {
                 self.touch();
                 self.tilt();
             }
+            WindowEvent::HoveredFile(_) => {
+                if let KiuLauncher::NeedsRom { hovered_file, .. } = &mut self.kiu_launcher {
+                    *hovered_file = true;
+                }
+            }
+            WindowEvent::HoveredFileCancelled => {
+                if let KiuLauncher::NeedsRom { hovered_file, .. } = &mut self.kiu_launcher {
+                    *hovered_file = false;
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                if self.kiu_mode && matches!(self.kiu_launcher, KiuLauncher::NeedsRom { .. }) {
+                    self.launch_kiu_path(path, false, true);
+                }
+            }
             WindowEvent::RedrawRequested => self.step(event_loop),
             _ => {}
         }
@@ -740,13 +997,32 @@ impl App {
     fn config(&self) -> Config {
         let interpret = self.options.interpreter || !self.settings.recompiled;
         let hardware_renderer = self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer);
+        let (aot_overrides, aot_plugin_state, aot_hints) = if self.kiu_mode && !interpret {
+            (
+                kiu_common::overrides_for(
+                    kiu_common::KIU_USA_PROGRAM_ID,
+                    kiu_common::KIU_USA_TEXT_HASH,
+                )
+                .to_vec(),
+                Some(kiu_common::default_plugin_state()),
+                kiu_common::builtin_hints(
+                    kiu_common::KIU_USA_PROGRAM_ID,
+                    kiu_common::KIU_USA_TEXT_HASH,
+                ),
+            )
+        } else {
+            (Vec::new(), None, Vec::new())
+        };
         Config {
             new3ds: self.options.new3ds,
             data_dir: self.data_dir.clone(),
             language: self.settings.language.code(),
             recompiled: self.options.recompiled.clone().filter(|_| !interpret).map(Into::into),
             linked: self.linked.filter(|_| !interpret),
-            find_recompiled: !interpret,
+            find_recompiled: !interpret && !self.kiu_mode,
+            aot_overrides,
+            aot_plugin_state,
+            aot_hints,
             hardware_renderer,
             gpu_thread: Some(hardware_renderer),
             texture_packs: self.settings.texture_packs,
@@ -787,41 +1063,318 @@ impl App {
         }
     }
 
-    /// starts the game at path, in place of any other.
-    fn play(&mut self, path: &Path) -> Result<(), String> {
-        // the old game and what it holds on the GPU go first, its sound too
+    fn start_kiu_headless(&mut self) {
+        let Some(rom_path) = self
+            .options
+            .rom
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| self.settings.rom_path.clone())
+        else {
+            eprintln!("{KIU_WINDOW_TITLE}: --headless requires a ROM path");
+            std::process::exit(1);
+        };
+        let (title, code_bytes, modded, text_hash) = match prepare_kiu_rom(&rom_path, self.data_dir.as_deref()) {
+            Ok(prepared) => prepared,
+            Err(notice) => {
+                eprintln!("{KIU_WINDOW_TITLE}: {}", notice.heading);
+                for line in notice.paragraphs {
+                    if !line.is_empty() {
+                        eprintln!("  {line}");
+                    }
+                }
+                std::process::exit(1);
+            }
+        };
+        let interpret = self.options.interpreter || !self.settings.recompiled;
+        let loaded_aot = if !interpret && self.options.recompiled.is_none() {
+            let program_id = title.program_id();
+            let cache_path = kiu_cache_path(self.data_dir.as_deref(), program_id, text_hash);
+            match load_kiu_aot_cache(&cache_path, program_id, text_hash) {
+                Some(loaded) => Some(loaded),
+                None => match compile_and_cache_kiu_aot(&title, &code_bytes, text_hash, &cache_path, None) {
+                    Ok(loaded) => Some(loaded),
+                    Err(err) => {
+                        eprintln!("{KIU_WINDOW_TITLE}: AOT compilation failed: {err}");
+                        std::process::exit(1);
+                    }
+                },
+            }
+        } else {
+            None
+        };
+        if let Err(err) = self.boot_kiu_system(&rom_path, title, Some((code_bytes, modded)), loaded_aot) {
+            eprintln!("{KIU_WINDOW_TITLE}: {err}");
+            std::process::exit(1);
+        }
+        if self.options.profile {
+            if let Some(game) = &mut self.game {
+                game.system.enable_profiler();
+            }
+        }
+    }
+
+    fn start_kiu_windowed(&mut self) {
+        let candidate = self
+            .options
+            .rom
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| self.settings.rom_path.clone());
+        match candidate {
+            Some(path) => {
+                let persist = self.options.rom.is_some();
+                self.launch_kiu_path(path, false, persist);
+            }
+            None => {
+                self.kiu_launcher = KiuLauncher::NeedsRom { notice: None, hovered_file: false };
+            }
+        }
+    }
+
+    fn launch_kiu_path(&mut self, rom_path: PathBuf, force_rebuild: bool, persist_rom_path: bool) {
+        let (title, code_bytes, modded, text_hash) = match prepare_kiu_rom(&rom_path, self.data_dir.as_deref()) {
+            Ok(prepared) => prepared,
+            Err(notice) => {
+                self.kiu_launcher = KiuLauncher::NeedsRom { notice: Some(notice), hovered_file: false };
+                return;
+            }
+        };
+        self.launch_kiu_prepared(rom_path, title, code_bytes, modded, text_hash, force_rebuild, persist_rom_path);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_kiu_prepared(
+        &mut self,
+        rom_path: PathBuf,
+        title: zakuro_fs::Title,
+        code_bytes: Vec<u8>,
+        modded: bool,
+        text_hash: u64,
+        force_rebuild: bool,
+        persist_rom_path: bool,
+    ) {
+        if persist_rom_path && self.settings.rom_path.as_ref() != Some(&rom_path) {
+            self.settings.rom_path = Some(rom_path.clone());
+            self.settings.save();
+        }
+        let interpret = self.options.interpreter || !self.settings.recompiled;
+        if interpret || self.options.recompiled.is_some() {
+            if let Err(err) = self.boot_kiu_system(&rom_path, title, Some((code_bytes, modded)), None) {
+                self.kiu_launcher = KiuLauncher::NeedsRom {
+                    notice: Some(kiu_common::RomNotice::unreadable(
+                        rom_path.file_name().and_then(|n| n.to_str()).unwrap_or("rom"),
+                        &err,
+                    )),
+                    hovered_file: false,
+                };
+            } else {
+                self.kiu_launcher = KiuLauncher::Playing;
+            }
+            return;
+        }
+
+        let program_id = title.program_id();
+        let cache_path = kiu_cache_path(self.data_dir.as_deref(), program_id, text_hash);
+        if force_rebuild {
+            let _ = std::fs::remove_file(&cache_path);
+        } else if let Some(loaded) = load_kiu_aot_cache(&cache_path, program_id, text_hash) {
+            match self.boot_kiu_system(&rom_path, title, Some((code_bytes, modded)), Some(loaded)) {
+                Ok(()) => self.kiu_launcher = KiuLauncher::Playing,
+                Err(err) => {
+                    self.kiu_launcher = KiuLauncher::NeedsRom {
+                        notice: Some(kiu_common::RomNotice::unreadable(
+                            rom_path.file_name().and_then(|n| n.to_str()).unwrap_or("rom"),
+                            &err,
+                        )),
+                        hovered_file: false,
+                    };
+                }
+            }
+            return;
+        }
+
+        let progress = std::sync::Arc::new(KiuCompileProgress {
+            done: std::sync::atomic::AtomicUsize::new(0),
+            total: std::sync::atomic::AtomicUsize::new(0),
+            stage: std::sync::atomic::AtomicU8::new(0),
+        });
+        let progress_worker = std::sync::Arc::clone(&progress);
+        let (send, receiver) = std::sync::mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("kiu-aot-compile".into())
+            .stack_size(16 << 20)
+            .spawn(move || {
+                let res = compile_and_cache_kiu_aot(
+                    &title,
+                    &code_bytes,
+                    text_hash,
+                    &cache_path,
+                    Some(&progress_worker),
+                )
+                .map(|loaded| KiuPreparedBoot { rom_path, title, code_bytes, modded, loaded });
+                let _ = send.send(res);
+            });
+        match spawn {
+            Ok(_) => {
+                self.kiu_launcher = KiuLauncher::Compiling(KiuCompileJob { progress, receiver });
+            }
+            Err(err) => {
+                self.kiu_launcher = KiuLauncher::NeedsRom {
+                    notice: Some(kiu_common::RomNotice {
+                        heading: "Compiler Thread Error".to_owned(),
+                        paragraphs: vec![format!("Could not start background AOT compiler: {err}")],
+                    }),
+                    hovered_file: false,
+                };
+            }
+        }
+    }
+
+    fn poll_kiu_compile(&mut self) {
+        let KiuLauncher::Compiling(job) = &self.kiu_launcher else {
+            return;
+        };
+        match job.receiver.try_recv() {
+            Ok(Ok(prepared)) => {
+                if self.settings.rom_path.as_ref() != Some(&prepared.rom_path) {
+                    self.settings.rom_path = Some(prepared.rom_path.clone());
+                    self.settings.save();
+                }
+                self.kiu_launcher = KiuLauncher::Playing;
+                if let Err(err) = self.boot_kiu_system(
+                    &prepared.rom_path,
+                    prepared.title,
+                    Some((prepared.code_bytes, prepared.modded)),
+                    Some(prepared.loaded),
+                ) {
+                    self.kiu_launcher = KiuLauncher::NeedsRom {
+                        notice: Some(kiu_common::RomNotice::unreadable(
+                            prepared
+                                .rom_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("rom"),
+                            &err,
+                        )),
+                        hovered_file: false,
+                    };
+                }
+            }
+            Ok(Err(err)) => {
+                self.kiu_launcher = KiuLauncher::NeedsRom {
+                    notice: Some(kiu_common::RomNotice {
+                        heading: "AOT Compilation Failed".to_owned(),
+                        paragraphs: vec![err],
+                    }),
+                    hovered_file: false,
+                };
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.kiu_launcher = KiuLauncher::NeedsRom {
+                    notice: Some(kiu_common::RomNotice {
+                        heading: "AOT Compilation Failed".to_owned(),
+                        paragraphs: vec!["The background AOT compiler stopped unexpectedly.".to_owned()],
+                    }),
+                    hovered_file: false,
+                };
+            }
+        }
+    }
+
+    fn stop_active_game(&mut self) {
+        self.game = None;
+        if let Some(window) = &self.window {
+            window.set_window_icon(None);
+        }
+        if let Some(room) = &self.room {
+            room.playing("");
+        }
+        if let Some(audio) = &self.audio {
+            audio.clear();
+        }
+        self.menus.menu_open = false;
+        self.menus.options_open = false;
+        self.set_mouse_aim(None);
+        self.keyboard.release();
+    }
+
+    fn boot_kiu_system(
+        &mut self,
+        path: &Path,
+        title: zakuro_fs::Title,
+        preloaded_code: Option<(Vec<u8>, bool)>,
+        loaded_aot: Option<zakuro_core::zakuro_aot::LoadedAot>,
+    ) -> Result<(), String> {
+        let t0 = Instant::now();
         self.game = None;
         if let Some(audio) = &self.audio {
             audio.clear();
         }
-        // a Download Play guest goes with the game
         self.dlp_guest = None;
+        let program_id = title.program_id();
+        let text_hash = preloaded_code
+            .as_ref()
+            .map(|(bytes, _)| zakuro_core::zakuro_aot::discover::Image::text_hash(&title.exheader, bytes))
+            .unwrap_or(kiu_common::KIU_USA_TEXT_HASH);
         let mut config = self.config();
         config.wireless_reboot = self.wireless_reboot.take();
-        // the update, DLC and Download Play child found with the game in
-        // the library
-        if let Some(game) = self.library.games.iter().find(|game| game.path == path) {
-            config.update = game.update.as_ref().map(|update| update.path.clone());
-            config.dlc = game.dlc.iter().map(|dlc| dlc.path.clone()).collect();
-            config.dlp_child = game.dlp_child.as_ref().map(|child| child.path.clone());
+        if !self.options.interpreter && self.settings.recompiled {
+            config.aot_overrides = kiu_common::overrides_for(program_id, text_hash).to_vec();
+            config.aot_plugin_state = Some(kiu_common::default_plugin_state());
+            config.aot_hints = kiu_common::builtin_hints(program_id, text_hash);
         }
-        // a recording starts the clock at a known time, for playing it back
+        let (record, clock, replay) = self.replay_and_clock(&mut config)?;
+        let mut system = loader::load_preloaded(title, preloaded_code, config, None)
+            .map_err(|error| format!("could not open {}, {error}", path.display()))?;
+        if let Some(aot) = loaded_aot {
+            system.set_aot(aot);
+        }
+        self.finish_starting_game(path, system, replay, record, clock)?;
+        if self.options.profile {
+            if let Some(game) = &mut self.game {
+                game.system.enable_profiler();
+            }
+        }
+        log::info!(
+            "kiu: booted {} in {:.0}ms",
+            path.display(),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(())
+    }
+
+    fn replay_and_clock(
+        &self,
+        config: &mut Config,
+    ) -> Result<(Option<PathBuf>, u64, Option<zakuro_core::replay::Replay>), String> {
         let record = std::env::var_os("ZAKURO_RECORD").map(PathBuf::from);
         let clock = zakuro_core::memory::config::host_clock();
         if record.is_some() {
             config.clock = Some(clock);
         }
-        // and plays back from the clock it was made at
         let replay = match std::env::var_os("ZAKURO_REPLAY").map(PathBuf::from) {
             Some(file) => {
-                let replay = zakuro_core::replay::Replay::open(&file).map_err(|error| format!("could not read {}, {error}", file.display()))?;
+                let replay = zakuro_core::replay::Replay::open(&file)
+                    .map_err(|error| format!("could not read {}, {error}", file.display()))?;
                 log::info!("playing back the inputs in {}", file.display());
                 config.clock = Some(replay.clock());
                 Some(replay)
             }
             None => None,
         };
-        let system = loader::load(path, config).map_err(|error| format!("could not open {}, {error}", path.display()))?;
+        Ok((record, clock, replay))
+    }
+
+    fn finish_starting_game(
+        &mut self,
+        path: &Path,
+        system: System,
+        replay: Option<zakuro_core::replay::Replay>,
+        record: Option<PathBuf>,
+        clock: u64,
+    ) -> Result<(), String> {
         let outdated = system.recompiled.as_ref().is_some_and(|code| code.outdated());
         let smdh = system.title.as_ref().and_then(|title| library::Smdh::parse(title.exefs_file("icon")?));
         // the window and the taskbar show the game's own icon
@@ -884,20 +1437,52 @@ impl App {
         Ok(())
     }
 
-    fn back_to_library(&mut self) {
+    /// starts the game at path, in place of any other.
+    fn play(&mut self, path: &Path) -> Result<(), String> {
+        if self.kiu_mode {
+            let (title, code_bytes, modded, text_hash) =
+                prepare_kiu_rom(path, self.data_dir.as_deref())
+                    .map_err(|notice| format!("{}: {}", notice.heading, notice.paragraphs.join(" ")))?;
+            let interpret = self.options.interpreter || !self.settings.recompiled;
+            let loaded_aot = if !interpret && self.options.recompiled.is_none() {
+                let program_id = title.program_id();
+                let cache_path = kiu_cache_path(self.data_dir.as_deref(), program_id, text_hash);
+                match load_kiu_aot_cache(&cache_path, program_id, text_hash) {
+                    Some(loaded) => Some(loaded),
+                    None => Some(compile_and_cache_kiu_aot(&title, &code_bytes, text_hash, &cache_path, None)?),
+                }
+            } else {
+                None
+            };
+            self.kiu_launcher = KiuLauncher::Playing;
+            return self.boot_kiu_system(path, title, Some((code_bytes, modded)), loaded_aot);
+        }
+        // the old game and what it holds on the GPU go first, its sound too
         self.game = None;
-        if let Some(window) = &self.window {
-            window.set_window_icon(None);
-        }
-        if let Some(room) = &self.room {
-            room.playing("");
-        }
         if let Some(audio) = &self.audio {
             audio.clear();
         }
-        self.menus.menu_open = false;
-        self.menus.options_open = false;
-        self.keyboard.release();
+        // a Download Play guest goes with the game
+        self.dlp_guest = None;
+        let mut config = self.config();
+        config.wireless_reboot = self.wireless_reboot.take();
+        // the update, DLC and Download Play child found with the game in
+        // the library
+        if let Some(game) = self.library.games.iter().find(|game| game.path == path) {
+            config.update = game.update.as_ref().map(|update| update.path.clone());
+            config.dlc = game.dlc.iter().map(|dlc| dlc.path.clone()).collect();
+            config.dlp_child = game.dlp_child.as_ref().map(|child| child.path.clone());
+        }
+        let (record, clock, replay) = self.replay_and_clock(&mut config)?;
+        let system = loader::load(path, config).map_err(|error| format!("could not open {}, {error}", path.display()))?;
+        self.finish_starting_game(path, system, replay, record, clock)
+    }
+
+    fn back_to_library(&mut self) {
+        self.stop_active_game();
+        if self.kiu_mode {
+            self.kiu_launcher = KiuLauncher::NeedsRom { notice: None, hovered_file: false };
+        }
     }
 
     fn key(&mut self, event: KeyEvent, consumed: bool) {
@@ -1226,7 +1811,9 @@ impl App {
     /// the window size that fits the screens at the chosen scale.
     fn window_size(&self) -> winit::dpi::Size {
         let kiu_16x9 = self.layout == Screens::Auto
-            && (self.linked.is_some() || self.game.as_ref().is_some_and(|game| game.is_kiu));
+            && (self.kiu_mode
+                || self.linked.is_some()
+                || self.game.as_ref().is_some_and(|game| game.is_kiu));
         let (width, height) = if kiu_16x9 {
             let h = 240 * self.scale;
             let w = (zakuro_gpu::backend::FUSE_DECK_WIDTH * self.scale as f32).round() as u32;
@@ -1404,6 +1991,69 @@ impl App {
             }
             Action::Library => self.back_to_library(),
             Action::Fullscreen => self.toggle_fullscreen(),
+            Action::SelectKiuRom => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Select Decrypted USA ROM (.3ds / .cci / .cia)")
+                    .add_filter("Nintendo 3DS ROMs (.3ds, .cci, .cia)", &["3ds", "cci", "cia", "cxi"])
+                    .pick_file();
+                self.next_frame = Instant::now();
+                if let Some(path) = picked {
+                    self.launch_kiu_path(path, false, true);
+                }
+            }
+            Action::ChangeRom => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Select Decrypted USA ROM (.3ds / .cci / .cia)")
+                    .add_filter("Nintendo 3DS ROMs (.3ds, .cci, .cia)", &["3ds", "cci", "cia", "cxi"])
+                    .pick_file();
+                self.next_frame = Instant::now();
+                if let Some(path) = picked {
+                    match prepare_kiu_rom(&path, self.data_dir.as_deref()) {
+                        Ok((title, code_bytes, modded, text_hash)) => {
+                            self.stop_active_game();
+                            self.menus.settings_open = false;
+                            self.launch_kiu_prepared(
+                                path,
+                                title,
+                                code_bytes,
+                                modded,
+                                text_hash,
+                                false,
+                                true,
+                            );
+                        }
+                        Err(notice) if self.game.is_some() => {
+                            self.menus.message = Some(format!(
+                                "{}\n\n{}",
+                                notice.heading,
+                                notice.paragraphs.join("\n")
+                            ));
+                        }
+                        Err(notice) => {
+                            self.kiu_launcher = KiuLauncher::NeedsRom {
+                                notice: Some(notice),
+                                hovered_file: false,
+                            };
+                        }
+                    }
+                }
+            }
+            Action::RebuildAotCache => {
+                let rom_path = self
+                    .game
+                    .as_ref()
+                    .map(|game| game.path.clone())
+                    .or_else(|| self.settings.rom_path.clone());
+                self.stop_active_game();
+                if let Some(path) = rom_path {
+                    self.launch_kiu_path(path, true, false);
+                } else {
+                    self.kiu_launcher = KiuLauncher::NeedsRom {
+                        notice: Some(kiu_common::RomNotice::missing_rom(KIU_ROM_HINT)),
+                        hovered_file: false,
+                    };
+                }
+            }
             Action::CopyReport => {
                 if let (Some(game), Some(gui)) = (&self.game, &self.gui) {
                     gui.ctx.copy_text(report::text(&game.name, &game.system));
@@ -1478,7 +2128,11 @@ impl App {
         if now > self.next_frame + CATCH_UP_LIMIT {
             self.next_frame = now;
         }
-        self.library.poll();
+        if self.kiu_mode {
+            self.poll_kiu_compile();
+        } else {
+            self.library.poll();
+        }
         self.poll_jobs();
         self.poll_gamepads();
         // a room that went away takes the game's local wireless with it
@@ -1585,8 +2239,16 @@ impl App {
             }
             if let Some(window) = &self.window {
                 let status = self.game.as_ref().map(|game| game.system.status_line());
-                let game = self.game.as_ref().zip(status.as_deref()).map(|(game, status)| (game.name.as_str(), status));
-                window.set_title(&window_title(self.linked.is_some(), game));
+                let title = if self.kiu_mode {
+                    match status.as_deref() {
+                        Some(status) => format!("{KIU_WINDOW_TITLE} - {status}"),
+                        None => KIU_WINDOW_TITLE.to_owned(),
+                    }
+                } else {
+                    let game = self.game.as_ref().zip(status.as_deref()).map(|(game, status)| (game.name.as_str(), status));
+                    window_title(self.linked.is_some(), game)
+                };
+                window.set_title(&title);
             }
             let underruns = self.audio.as_ref().map_or(0, |audio| audio.take_underruns());
             if underruns > 0 && playing {
@@ -2042,6 +2704,15 @@ impl App {
             None => "1",
         };
         let warming = self.game.as_ref().and(warm::progress());
+        let compile_status = match &self.kiu_launcher {
+            KiuLauncher::Compiling(job) => Some(job.ui_status()),
+            _ => None,
+        };
+        let (kiu_notice, kiu_hovered) = match &self.kiu_launcher {
+            KiuLauncher::NeedsRom { notice, hovered_file } => (notice.as_ref(), *hovered_file),
+            _ => (None, false),
+        };
+        let kiu_mode = self.kiu_mode;
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();
         let overlay = gui.frame(window, |ui| {
@@ -2068,6 +2739,20 @@ impl App {
             match &game {
                 Some((name, fps, recompiled)) => {
                     actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref()))
+                }
+                None if kiu_mode => {
+                    let stage = match &compile_status {
+                        Some((stage, fraction, detail)) => menus::KiuSetupStage::Compiling {
+                            stage,
+                            fraction: *fraction,
+                            detail,
+                        },
+                        None => menus::KiuSetupStage::NeedsRom {
+                            notice: kiu_notice,
+                            hovered_file: kiu_hovered,
+                        },
+                    };
+                    actions.extend(menus.kiu_setup(ui, &stage));
                 }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
@@ -2250,5 +2935,50 @@ mod tests {
         assert_eq!(leave(true, true, land, true), Away { paused: false, aim: land }, "a pause of the player's own stays theirs");
         assert_eq!(leave(true, false, land, false), Away { paused: true, aim: None }, "no mouse taken back");
         assert_eq!(leave(true, false, None, true), Away { paused: true, aim: None }, "no aim to take back");
+    }
+
+    #[test]
+    fn kiu_cache_path_uses_format_version_program_id_and_text_hash() {
+        let dir = Path::new("/tmp/zakuro-data");
+        let path = kiu_cache_path(Some(dir), 0x0004_0000_0003_0100, 0xD6E0_28C6_175A_2B07);
+        assert_eq!(
+            path,
+            PathBuf::from(format!(
+                "/tmp/zakuro-data/cache/aot_v{}_0004000000030100_D6E028C6175A2B07.aot",
+                zakuro_core::zakuro_aot::FORMAT_VERSION
+            ))
+        );
+    }
+
+    #[test]
+    fn kiu_aot_cache_save_and_load_roundtrips_and_rejects_mismatch() {
+        let dir = std::env::temp_dir().join(format!("zakuro-kiu-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let program_id = kiu_common::KIU_USA_PROGRAM_ID;
+        let text_hash = kiu_common::KIU_USA_TEXT_HASH;
+        let cache_path = kiu_cache_path(Some(&dir), program_id, text_hash);
+
+        let image = zakuro_core::zakuro_aot::AotImage {
+            program_id,
+            text_hash,
+            enter_offset: 0,
+            code: vec![0xC3; 16],
+            entries: vec![(0x0010_0000, 0)],
+            origins: zakuro_core::zakuro_aot::discover::OriginData {
+                owners: vec![u32::MAX],
+                ..Default::default()
+            },
+        };
+        save_kiu_aot_cache(&cache_path, &image).unwrap();
+        assert!(cache_path.is_file());
+        assert!(!cache_path.with_extension("aot.tmp").exists());
+
+        let loaded = load_kiu_aot_cache(&cache_path, program_id, text_hash);
+        assert!(loaded.is_some());
+
+        // Header mismatch removes stale file and returns None.
+        assert!(load_kiu_aot_cache(&cache_path, program_id, text_hash ^ 1).is_none());
+        assert!(!cache_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

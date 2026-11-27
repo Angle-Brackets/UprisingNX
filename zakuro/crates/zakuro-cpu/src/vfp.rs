@@ -87,6 +87,16 @@ impl Vfp {
         }
     }
 
+    #[inline(always)]
+    fn read_f32(&self, index: usize) -> f32 {
+        self.flush(self.get_f32(index))
+    }
+
+    #[inline(always)]
+    fn read_f64(&self, index: usize) -> f64 {
+        self.flush_f64(self.get_f64(index))
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.fpexc & (1 << 30) != 0
     }
@@ -163,15 +173,23 @@ pub fn data_processing(cpu: &mut Cpu, op: u32) -> Option<Exit> {
         // single-precision operations are computed in f32 rather than promoted
         // to f64, so the result is rounded exactly once as hardware does.
         if double {
-            let (a, b, acc) = (cpu.vfp.get_f64(n), cpu.vfp.get_f64(m), cpu.vfp.get_f64(d));
-            let result = operation.apply(a, b, acc);
+            let (a, b, acc) = (
+                cpu.vfp.read_f64(n),
+                cpu.vfp.read_f64(m),
+                cpu.vfp.read_f64(d),
+            );
+            let result = operation.apply(a, b, acc, |v| cpu.vfp.flush_f64(v));
             if result.is_nan() && !(a.is_nan() || b.is_nan() || acc.is_nan()) {
                 trace_nan(cpu, op, operation, [a, b, acc]);
             }
             cpu.vfp.set_f64(d, result);
         } else {
-            let (a, b, acc) = (cpu.vfp.get_f32(n), cpu.vfp.get_f32(m), cpu.vfp.get_f32(d));
-            let result = operation.apply(a, b, acc);
+            let (a, b, acc) = (
+                cpu.vfp.read_f32(n),
+                cpu.vfp.read_f32(m),
+                cpu.vfp.read_f32(d),
+            );
+            let result = operation.apply(a, b, acc, |v| cpu.vfp.flush(v));
             if result.is_nan() && !(a.is_nan() || b.is_nan() || acc.is_nan()) {
                 trace_nan(cpu, op, operation, [a as f64, b as f64, acc as f64]);
             }
@@ -210,7 +228,7 @@ enum Arithmetic {
 
 impl Arithmetic {
     /// a and b are the operands, acc the destination's old value.
-    fn apply<T>(self, a: T, b: T, acc: T) -> T
+    fn apply<T>(self, a: T, b: T, acc: T, flush: impl Fn(T) -> T) -> T
     where
         T: std::ops::Add<Output = T>
             + std::ops::Sub<Output = T>
@@ -220,12 +238,12 @@ impl Arithmetic {
             + Copy,
     {
         match self {
-            Arithmetic::MultiplyAccumulate => acc + a * b,
-            Arithmetic::MultiplySubtract => acc - a * b,
-            Arithmetic::NegateMultiplyAccumulate => -acc - a * b,
-            Arithmetic::NegateMultiplySubtract => -acc + a * b,
+            Arithmetic::MultiplyAccumulate => acc + flush(a * b),
+            Arithmetic::MultiplySubtract => acc - flush(a * b),
+            Arithmetic::NegateMultiplyAccumulate => -acc - flush(a * b),
+            Arithmetic::NegateMultiplySubtract => -acc + flush(a * b),
             Arithmetic::Multiply => a * b,
-            Arithmetic::NegateMultiply => -(a * b),
+            Arithmetic::NegateMultiply => -flush(a * b),
             Arithmetic::Add => a + b,
             Arithmetic::Subtract => a - b,
             Arithmetic::Divide => a / b,
@@ -291,12 +309,12 @@ fn extension(cpu: &mut Cpu, op: u32, double: bool, rd: usize, rm: usize) -> Opti
         (0b0111, true) => {
             if double {
                 // source is double, destination single.
-                let v = cpu.vfp.get_f64(rm) as f32;
+                let v = f64_to_f32_rmode(cpu.vfp.read_f64(rm), bits(cpu.vfp.fpscr, 22, 23));
                 let sd = sreg(bits(op, 12, 15), bit(op, 22));
                 cpu.vfp.set_f32(sd, v);
             } else {
                 let sm = sreg(op & 0xF, bit(op, 5));
-                let v = cpu.vfp.get_f32(sm) as f64;
+                let v = cpu.vfp.read_f32(sm) as f64;
                 let dd = dreg(bits(op, 12, 15), bit(op, 22));
                 cpu.vfp.set_f64(dd, v);
             }
@@ -316,9 +334,9 @@ fn extension(cpu: &mut Cpu, op: u32, double: bool, rd: usize, rm: usize) -> Opti
         // VCVT to integer.
         (0b1100, _) | (0b1101, _) => {
             let source = if double {
-                cpu.vfp.get_f64(rm)
+                cpu.vfp.read_f64(rm)
             } else {
-                cpu.vfp.get_f32(rm) as f64
+                cpu.vfp.read_f32(rm) as f64
             };
             let rounded = if top {
                 source.trunc()
@@ -359,7 +377,7 @@ fn monadic(cpu: &mut Cpu, double: bool, second: bool, top: bool, rd: usize, rm: 
             (false, true) => raw(cpu, rm) & !(1 << 63),
             (true, false) => raw(cpu, rm) ^ (1 << 63),
             (true, true) => {
-                let v = cpu.vfp.get_f64(rm).sqrt();
+                let v = cpu.vfp.read_f64(rm).sqrt();
                 cpu.vfp.set_f64(rd, v);
                 return;
             }
@@ -374,12 +392,13 @@ fn monadic(cpu: &mut Cpu, double: bool, second: bool, top: bool, rd: usize, rm: 
             (false, true) => cpu.vfp.regs[rd] = raw & 0x7FFF_FFFF,
             (true, false) => cpu.vfp.regs[rd] = raw ^ 0x8000_0000,
             (true, true) => {
-                let v = f32::from_bits(raw).sqrt();
-                if v.is_nan() && !f32::from_bits(raw).is_nan() {
+                let in_val = cpu.vfp.read_f32(rm);
+                let v = in_val.sqrt();
+                if v.is_nan() && !in_val.is_nan() {
                     log::trace!(
                         target: "zakuro_cpu::vfp::nan",
                         "NaN from VSQRT of {} at 0x{:08X}, lr 0x{:08X}",
-                        f32::from_bits(raw),
+                        in_val,
                         cpu.current_pc(),
                         cpu.regs[14],
                     );
@@ -393,13 +412,13 @@ fn monadic(cpu: &mut Cpu, double: bool, second: bool, top: bool, rd: usize, rm: 
 fn compare(cpu: &mut Cpu, double: bool, rd: usize, rm: Option<usize>) {
     let (a, b) = if double {
         (
-            cpu.vfp.get_f64(rd),
-            rm.map_or(0.0, |r| cpu.vfp.get_f64(r)),
+            cpu.vfp.read_f64(rd),
+            rm.map_or(0.0, |r| cpu.vfp.read_f64(r)),
         )
     } else {
         (
-            cpu.vfp.get_f32(rd) as f64,
-            rm.map_or(0.0, |r| cpu.vfp.get_f32(r) as f64),
+            cpu.vfp.read_f32(rd) as f64,
+            rm.map_or(0.0, |r| cpu.vfp.read_f32(r) as f64),
         )
     };
 
@@ -416,6 +435,53 @@ fn compare(cpu: &mut Cpu, double: bool, rd: usize, rm: Option<usize>) {
     };
 
     cpu.vfp.fpscr = (cpu.vfp.fpscr & !FPSCR_FLAG_MASK) | (flags << 28);
+}
+
+fn f64_to_f32_rmode(d: f64, rmode: u32) -> f32 {
+    let rn = d as f32;
+    if rmode == 0 || d.is_nan() || d == 0.0 || d.is_infinite() {
+        return rn;
+    }
+    if rn.is_infinite() {
+        let towards_inf = match rmode {
+            0b01 => d > 0.0,
+            0b10 => d < 0.0,
+            _ => false,
+        };
+        return if towards_inf {
+            rn
+        } else if d.is_sign_negative() {
+            -f32::MAX
+        } else {
+            f32::MAX
+        };
+    }
+    let exact = rn as f64;
+    match rmode {
+        0b01 => {
+            if d > exact {
+                rn.next_up()
+            } else {
+                rn
+            }
+        }
+        0b10 => {
+            if d < exact {
+                rn.next_down()
+            } else {
+                rn
+            }
+        }
+        _ => {
+            if d > 0.0 && exact > d {
+                rn.next_down()
+            } else if d < 0.0 && exact < d {
+                rn.next_up()
+            } else {
+                rn
+            }
+        }
+    }
 }
 
 fn round_to_mode(value: f64, mode: u32) -> f64 {
